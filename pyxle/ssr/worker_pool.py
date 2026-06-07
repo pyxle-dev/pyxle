@@ -245,6 +245,7 @@ class SsrWorkerPool:
         props: dict[str, Any],
         *,
         request_pathname: str | None = None,
+        csrf_token: str | None = None,
     ) -> dict[str, Any]:
         """Send a render request to the next available worker.
 
@@ -252,6 +253,11 @@ class SsrWorkerPool:
         component code via ``globalThis.__PYXLE_CURRENT_PATHNAME__``
         during SSR, so hooks like ``usePathname`` return the correct
         path instead of a fallback and hydrate cleanly.
+
+        ``csrf_token`` is similarly exposed via
+        ``globalThis.__PYXLE_CSRF_TOKEN__``. ``<Form>`` reads it at SSR
+        time so a no-JS submission can carry a hidden ``_csrf_token``
+        field that satisfies the CSRF middleware.
 
         Auto-starts the pool on first call if :meth:`start` was not called
         explicitly.  Raises :class:`WorkerPoolError` if no healthy workers
@@ -276,6 +282,8 @@ class SsrWorkerPool:
         }
         if request_pathname is not None:
             payload["requestPathname"] = request_pathname
+        if csrf_token is not None:
+            payload["csrfToken"] = csrf_token
 
         try:
             result = await asyncio.wait_for(

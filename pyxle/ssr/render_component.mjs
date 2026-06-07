@@ -173,15 +173,23 @@ export default entry.contents;
     const headRegistry = createHeadRegistry();
     globalThis.__PYXLE_HEAD_REGISTRY__ = headRegistry;
 
-    // Expose the request pathname to SSR code (e.g. usePathname).
-    // The subprocess renderer receives it via an env var because the
-    // argv signature is stable and argv already carries large JSON props.
+    // Expose the request pathname / CSRF token to SSR code (e.g.
+    // usePathname, <Form>'s hidden field). The subprocess renderer
+    // receives both via env vars because the argv signature is stable
+    // and argv already carries large JSON props.
     const requestPathname = process.env.PYXLE_REQUEST_PATHNAME;
+    const csrfToken = process.env.PYXLE_CSRF_TOKEN;
     const previousPathname = globalThis.__PYXLE_CURRENT_PATHNAME__;
+    const previousCsrf = globalThis.__PYXLE_CSRF_TOKEN__;
     if (typeof requestPathname === 'string' && requestPathname.length > 0) {
       globalThis.__PYXLE_CURRENT_PATHNAME__ = requestPathname;
     } else {
       delete globalThis.__PYXLE_CURRENT_PATHNAME__;
+    }
+    if (typeof csrfToken === 'string' && csrfToken.length > 0) {
+      globalThis.__PYXLE_CSRF_TOKEN__ = csrfToken;
+    } else {
+      delete globalThis.__PYXLE_CSRF_TOKEN__;
     }
 
     try {
@@ -196,6 +204,11 @@ export default entry.contents;
         delete globalThis.__PYXLE_CURRENT_PATHNAME__;
       } else {
         globalThis.__PYXLE_CURRENT_PATHNAME__ = previousPathname;
+      }
+      if (previousCsrf === undefined) {
+        delete globalThis.__PYXLE_CSRF_TOKEN__;
+      } else {
+        globalThis.__PYXLE_CSRF_TOKEN__ = previousCsrf;
       }
     }
   } finally {

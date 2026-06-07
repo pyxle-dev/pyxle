@@ -111,6 +111,52 @@ async def test_renderer_forwards_request_pathname_to_new_factories(tmp_path: Pat
 
 
 @pytest.mark.anyio
+async def test_renderer_forwards_csrf_token_to_factories(tmp_path: Path) -> None:
+    """Render callables declaring ``csrf_token`` receive the SSR-time
+    token so ``<Form>`` can embed it as a hidden input. Pathname and
+    csrf flow through the same kwargs in tandem."""
+    seen: list[tuple[str | None, str | None]] = []
+
+    async def factory(path: Path):
+        async def render(props, *, request_pathname=None, csrf_token=None):
+            seen.append((request_pathname, csrf_token))
+            return RenderResult(html="ok")
+
+        return render
+
+    renderer = ComponentRenderer(factory=factory)
+    component = tmp_path / "c.jsx"
+    component.write_text("export default () => null;\n", encoding="utf-8")
+
+    await renderer.render(component, {}, request_pathname="/x", csrf_token="tok-1")
+    await renderer.render(component, {}, csrf_token="tok-2")
+    await renderer.render(component, {})  # neither
+
+    assert seen == [("/x", "tok-1"), (None, "tok-2"), (None, None)]
+
+
+@pytest.mark.anyio
+async def test_renderer_passes_csrf_only_when_factory_accepts_it(tmp_path: Path) -> None:
+    """Legacy factories accepting only ``request_pathname`` still work —
+    we don't crash by passing an unexpected ``csrf_token`` kwarg."""
+    seen: list[str | None] = []
+
+    async def factory(path: Path):
+        async def render(props, *, request_pathname=None):  # no csrf_token
+            seen.append(request_pathname)
+            return RenderResult(html="ok")
+
+        return render
+
+    renderer = ComponentRenderer(factory=factory)
+    component = tmp_path / "c.jsx"
+    component.write_text("export default () => null;\n", encoding="utf-8")
+
+    await renderer.render(component, {}, request_pathname="/x", csrf_token="tok-ignored")
+    assert seen == ["/x"]
+
+
+@pytest.mark.anyio
 async def test_renderer_omits_pathname_for_legacy_factories(tmp_path: Path) -> None:
     """Callables without ``request_pathname`` still work (back-compat)."""
     call_count = 0
@@ -249,6 +295,7 @@ async def test_default_factory_invokes_runtime(monkeypatch: pytest.MonkeyPatch, 
             props: dict[str, object],
             *,
             request_pathname: str | None = None,
+            csrf_token: str | None = None,
         ) -> RenderResult:
             return RenderResult(html=f"rendered:{props['value']}:{self.path.name}")
 

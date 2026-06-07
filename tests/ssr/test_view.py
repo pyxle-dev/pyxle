@@ -29,6 +29,7 @@ class StubRenderer:
     def __init__(self) -> None:
         self.calls: list[tuple[Path, dict[str, object]]] = []
         self.request_pathnames: list[str | None] = []
+        self.csrf_tokens: list[str | None] = []
         self.responses: list[RenderResult] = []
 
     async def render(
@@ -37,9 +38,11 @@ class StubRenderer:
         props: dict[str, object],
         *,
         request_pathname: str | None = None,
+        csrf_token: str | None = None,
     ) -> RenderResult:
         self.calls.append((component_path, props))
         self.request_pathnames.append(request_pathname)
+        self.csrf_tokens.append(csrf_token)
         if self.responses:
             return self.responses.pop(0)
         return RenderResult(html="<div></div>")
@@ -474,6 +477,7 @@ async def load_home(request):
             props: dict[str, object],
             *,
             request_pathname: str | None = None,
+            csrf_token: str | None = None,
         ) -> str:  # type: ignore[override]
             raise ComponentRenderError("render boom")
 
@@ -538,6 +542,7 @@ async def load_home(request):
             props: dict[str, object],
             *,
             request_pathname: str | None = None,
+            csrf_token: str | None = None,
         ) -> str:  # type: ignore[override]
             raise ComponentRenderError("render boom")
 
@@ -1269,3 +1274,1007 @@ def test_import_server_module_reimports_in_debug(tmp_path: Path) -> None:
     assert second.COUNTER == 0  # Reset — module was re-executed
 
     sys.modules.pop(key, None)
+
+
+@pytest.mark.anyio
+async def test_build_page_response_forwards_csrf_token_from_scope(
+    settings: DevServerSettings, tmp_path: Path
+) -> None:
+    """The CSRF middleware stashes the active token on
+    ``scope['pyxle.csrf_token']`` so SSR can plumb it through to
+    ``globalThis.__PYXLE_CSRF_TOKEN__`` — that's how ``<Form>`` learns
+    the token at render time without doing a network round-trip.
+    """
+    renderer = StubRenderer()
+    renderer.responses.append(RenderResult(html="<main>x</main>"))
+    overlay = StubOverlay()
+    page = _page_route(tmp_path, loader_name=None)
+
+    request = Request(
+        {
+            "type": "http",
+            "http_version": "1.1",
+            "method": "GET",
+            "path": "/",
+            "root_path": "",
+            "headers": [],
+            "pyxle.csrf_token": "tok-from-middleware",
+        }
+    )
+
+    await build_page_response(
+        request=request,
+        settings=settings,
+        page=page,
+        renderer=renderer,
+        overlay=overlay,
+    )
+
+    assert renderer.csrf_tokens[-1] == "tok-from-middleware"
+
+
+@pytest.mark.anyio
+async def test_build_page_response_omits_csrf_token_when_absent(
+    settings: DevServerSettings, tmp_path: Path
+) -> None:
+    """If no CSRF middleware is in the stack, the renderer just sees
+    ``None`` and ``<Form>`` drops back to its cookie-only path. The
+    framework should never invent a token of its own."""
+    renderer = StubRenderer()
+    renderer.responses.append(RenderResult(html="<main>x</main>"))
+    overlay = StubOverlay()
+    page = _page_route(tmp_path, loader_name=None)
+
+    request = Request(
+        {
+            "type": "http",
+            "http_version": "1.1",
+            "method": "GET",
+            "path": "/",
+            "root_path": "",
+            "headers": [],
+            # No "state" key whatsoever — CSRF middleware not present.
+        }
+    )
+
+    await build_page_response(
+        request=request,
+        settings=settings,
+        page=page,
+        renderer=renderer,
+        overlay=overlay,
+    )
+
+    assert renderer.csrf_tokens[-1] is None
+
+
+# ---------------------------------------------------------------------------
+# Helpers for error / not-found boundary tests
+# ---------------------------------------------------------------------------
+
+
+def _boundary_page(tmp_path: Path, *, filename: str, module_key: str) -> PageRoute:
+    """Build a PageRoute standing in for a compiled error/not-found boundary.
+
+    The boundary has no loader and static head elements so that rendering it
+    only depends on the stub renderer succeeding.
+    """
+    stem = filename.removesuffix(".pyxl")
+    return PageRoute(
+        path=f"/__{stem}",
+        source_relative_path=Path(filename),
+        source_absolute_path=tmp_path / "pages" / filename,
+        server_module_path=tmp_path / "server" / f"{stem}.py",
+        client_module_path=tmp_path / "client" / f"{stem}.jsx",
+        metadata_path=tmp_path / "metadata" / f"{stem}.json",
+        module_key=module_key,
+        client_asset_path=f"/pages/{stem}.jsx",
+        server_asset_path=f"/pages/{stem}.py",
+        content_hash="hash",
+        loader_name=None,
+        loader_line=None,
+        head_elements=("<title>Boundary</title>",),
+        head_is_dynamic=False,
+    )
+
+
+@pytest.mark.anyio
+async def test_build_page_response_loader_error_renders_error_boundary(
+    settings: DevServerSettings, tmp_path: Path
+) -> None:
+    """A LoaderError with a registered error boundary returns the rendered
+    boundary document (status from the error) rather than the default
+    fallback. Exercises the ``return boundary_response`` path and the
+    ``overlay is None`` branch in the LoaderError handler."""
+    from pyxle.devserver.error_pages import ErrorBoundaryRegistry
+
+    server_module = tmp_path / "server" / "le_boundary.py"
+    server_module.parent.mkdir(parents=True, exist_ok=True)
+    server_module.write_text(
+        "from pyxle.runtime import LoaderError\n"
+        "async def my_loader(request):\n"
+        "    raise LoaderError('Teapot', status_code=418, data={'why': 'brew'})\n",
+        encoding="utf-8",
+    )
+
+    page = replace(
+        _page_route(tmp_path, loader_name="my_loader"),
+        server_module_path=server_module,
+        module_key="pyxle.server.pages.le_boundary",
+        head_elements=(),
+    )
+    boundary = _boundary_page(tmp_path, filename="error.pyxl", module_key="pyxle.server.pages.le_boundary_err")
+    registry = ErrorBoundaryRegistry(error_pages={".": boundary}, not_found_pages={})
+
+    renderer = StubRenderer()
+    renderer.responses.append(RenderResult(html="<aside>boundary rendered</aside>"))
+    request = Request({"type": "http", "method": "GET", "path": "/", "query_string": b"", "headers": []})
+
+    response = await build_page_response(
+        request=request,
+        settings=settings,
+        page=page,
+        renderer=renderer,
+        error_boundaries=registry,
+        overlay=None,
+    )
+
+    assert response.status_code == 418
+    body = (await _read_response_body(response)).decode()
+    assert "<aside>boundary rendered</aside>" in body
+    # The boundary component receives the structured error context as props.
+    assert renderer.calls[-1][0] == boundary.client_module_path
+    error_props = renderer.calls[-1][1]["error"]
+    assert error_props["message"] == "Teapot"
+    assert error_props["statusCode"] == 418
+    assert error_props["type"] == "LoaderError"
+    assert error_props["data"] == {"why": "brew"}
+
+
+@pytest.mark.anyio
+async def test_build_page_response_loader_exec_error_renders_error_boundary(
+    settings: DevServerSettings, tmp_path: Path
+) -> None:
+    """A LoaderExecutionError (loader returns a non-mapping) with a registered
+    boundary returns the rendered boundary at status 500. Exercises the
+    ``return boundary_response`` path in the LoaderExecutionError handler."""
+    from pyxle.devserver.error_pages import ErrorBoundaryRegistry
+
+    server_module = tmp_path / "server" / "lee_boundary.py"
+    server_module.parent.mkdir(parents=True, exist_ok=True)
+    server_module.write_text("async def my_loader(request):\n    return 'not a mapping'\n", encoding="utf-8")
+
+    page = replace(
+        _page_route(tmp_path, loader_name="my_loader"),
+        server_module_path=server_module,
+        module_key="pyxle.server.pages.lee_boundary",
+        head_elements=(),
+    )
+    boundary = _boundary_page(tmp_path, filename="error.pyxl", module_key="pyxle.server.pages.lee_boundary_err")
+    registry = ErrorBoundaryRegistry(error_pages={".": boundary}, not_found_pages={})
+
+    renderer = StubRenderer()
+    renderer.responses.append(RenderResult(html="<aside>exec boundary</aside>"))
+    overlay = StubOverlay()
+    request = Request({"type": "http", "method": "GET", "path": "/", "query_string": b"", "headers": []})
+
+    response = await build_page_response(
+        request=request,
+        settings=settings,
+        page=page,
+        renderer=renderer,
+        error_boundaries=registry,
+        overlay=overlay,
+    )
+
+    assert response.status_code == 500
+    body = (await _read_response_body(response)).decode()
+    assert "<aside>exec boundary</aside>" in body
+    assert renderer.calls[-1][1]["error"]["type"] == "LoaderExecutionError"
+
+
+@pytest.mark.anyio
+async def test_build_page_response_head_error_renders_error_boundary(
+    settings: DevServerSettings, tmp_path: Path
+) -> None:
+    """A HeadEvaluationError with a registered boundary returns the rendered
+    boundary at status 500, and skips overlay notification when overlay is
+    None. Exercises the ``return boundary_response`` path and the
+    ``overlay is None`` branch in the HeadEvaluationError handler."""
+    from pyxle.devserver.error_pages import ErrorBoundaryRegistry
+
+    server_module = tmp_path / "server" / "head_boundary.py"
+    server_module.parent.mkdir(parents=True, exist_ok=True)
+    server_module.write_text("HEAD = ['<title>Ok</title>', 123]\n", encoding="utf-8")
+
+    page = replace(
+        _page_route(tmp_path, loader_name=None),
+        server_module_path=server_module,
+        head_elements=(),
+        head_is_dynamic=True,
+    )
+    boundary = _boundary_page(tmp_path, filename="error.pyxl", module_key="pyxle.server.pages.head_boundary_err")
+    registry = ErrorBoundaryRegistry(error_pages={".": boundary}, not_found_pages={})
+
+    renderer = StubRenderer()
+    renderer.responses.append(RenderResult(html="<aside>head boundary</aside>"))
+    request = Request({"type": "http", "method": "GET", "path": "/", "query_string": b"", "headers": []})
+
+    response = await build_page_response(
+        request=request,
+        settings=settings,
+        page=page,
+        renderer=renderer,
+        error_boundaries=registry,
+        overlay=None,
+    )
+
+    assert response.status_code == 500
+    body = (await _read_response_body(response)).decode()
+    assert "<aside>head boundary</aside>" in body
+    assert renderer.calls[-1][1]["error"]["type"] == "HeadEvaluationError"
+
+
+@pytest.mark.anyio
+async def test_build_page_response_renderer_error_renders_error_boundary(
+    settings: DevServerSettings, tmp_path: Path
+) -> None:
+    """A ComponentRenderError with a registered boundary re-renders the
+    boundary component (the first render raises, the second succeeds) and
+    returns it at status 500. Exercises the ``return boundary_response`` path
+    in the ComponentRenderError handler and the ``overlay is None`` branch."""
+    from pyxle.devserver.error_pages import ErrorBoundaryRegistry
+
+    server_module = tmp_path / "server" / "render_boundary.py"
+    server_module.parent.mkdir(parents=True, exist_ok=True)
+    server_module.write_text("async def my_loader(request):\n    return {}\n", encoding="utf-8")
+
+    page = replace(
+        _page_route(tmp_path, loader_name="my_loader"),
+        server_module_path=server_module,
+        module_key="pyxle.server.pages.render_boundary",
+        head_elements=(),
+    )
+    boundary = _boundary_page(tmp_path, filename="error.pyxl", module_key="pyxle.server.pages.render_boundary_err")
+    registry = ErrorBoundaryRegistry(error_pages={".": boundary}, not_found_pages={})
+
+    class FailFirstRenderer(StubRenderer):
+        async def render(
+            self,
+            component_path: Path,
+            props: dict[str, object],
+            *,
+            request_pathname: str | None = None,
+            csrf_token: str | None = None,
+        ) -> RenderResult:
+            self.calls.append((component_path, props))
+            if len(self.calls) == 1:
+                raise ComponentRenderError("render boom")
+            return RenderResult(html="<aside>render boundary</aside>")
+
+    renderer = FailFirstRenderer()
+    request = Request({"type": "http", "method": "GET", "path": "/", "query_string": b"", "headers": []})
+
+    response = await build_page_response(
+        request=request,
+        settings=settings,
+        page=page,
+        renderer=renderer,
+        error_boundaries=registry,
+        overlay=None,
+    )
+
+    assert response.status_code == 500
+    body = (await _read_response_body(response)).decode()
+    assert "<aside>render boundary</aside>" in body
+    # Two render attempts: the page (which raised) and the boundary.
+    assert len(renderer.calls) == 2
+    assert renderer.calls[-1][0] == boundary.client_module_path
+    assert renderer.calls[-1][1]["error"]["type"] == "ComponentRenderError"
+
+
+@pytest.mark.anyio
+async def test_build_page_response_clears_overlay_on_missing_manifest(
+    settings: DevServerSettings, tmp_path: Path
+) -> None:
+    """When the manifest lookup fails (production with an empty manifest), the
+    response falls back to a fully-rendered document and the overlay is still
+    notified that the route is clear. Exercises the overlay ``notify_clear``
+    inside the ManifestLookupError branch."""
+    renderer = StubRenderer()
+    renderer.responses.append(RenderResult(html="<section>prod</section>"))
+    overlay = StubOverlay()
+
+    prod_settings = replace(settings, debug=False, page_manifest={})
+    page = _page_route(tmp_path, loader_name=None)
+    request = Request({"type": "http", "http_version": "1.1", "method": "GET", "path": "/", "root_path": "", "headers": []})
+
+    response = await build_page_response(
+        request=request,
+        settings=prod_settings,
+        page=page,
+        renderer=renderer,
+        overlay=overlay,
+    )
+
+    body = (await _read_response_body(response)).decode()
+    assert "Missing Manifest Entry" in body
+    assert overlay.events == [("clear", "/")]
+
+
+@pytest.mark.anyio
+async def test_build_page_response_loader_error_without_boundary_or_overlay(
+    settings: DevServerSettings, tmp_path: Path
+) -> None:
+    """A LoaderError with neither an overlay nor an error boundary falls back
+    to the default error document. Exercises the ``overlay is None`` branch in
+    the LoaderError handler together with the no-boundary fallback."""
+    server_module = tmp_path / "server" / "le_plain.py"
+    server_module.parent.mkdir(parents=True, exist_ok=True)
+    server_module.write_text(
+        "from pyxle.runtime import LoaderError\n"
+        "async def my_loader(request):\n"
+        "    raise LoaderError('Denied', status_code=403)\n",
+        encoding="utf-8",
+    )
+
+    page = replace(
+        _page_route(tmp_path, loader_name="my_loader"),
+        server_module_path=server_module,
+        module_key="pyxle.server.pages.le_plain",
+        head_elements=(),
+    )
+
+    renderer = StubRenderer()
+    request = Request({"type": "http", "method": "GET", "path": "/", "query_string": b"", "headers": []})
+
+    response = await build_page_response(
+        request=request,
+        settings=settings,
+        page=page,
+        renderer=renderer,
+        overlay=None,
+    )
+
+    body = (await _read_response_body(response)).decode()
+    assert response.status_code == 403
+    assert "Denied" in body
+
+
+# ---------------------------------------------------------------------------
+# build_not_found_response
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_build_not_found_response_returns_none_without_registry(
+    settings: DevServerSettings, tmp_path: Path
+) -> None:
+    """With no error-boundary registry, build_not_found_response returns None
+    so the caller falls back to the default 404."""
+    from pyxle.ssr.view import build_not_found_response
+
+    renderer = StubRenderer()
+    request = Request({"type": "http", "method": "GET", "path": "/missing", "query_string": b"", "headers": []})
+
+    result = await build_not_found_response(
+        request=request,
+        settings=settings,
+        renderer=renderer,
+        error_boundaries=None,
+    )
+
+    assert result is None
+
+
+@pytest.mark.anyio
+async def test_build_not_found_response_returns_none_without_boundary(
+    settings: DevServerSettings, tmp_path: Path
+) -> None:
+    """With a registry that has no matching not-found boundary, the function
+    returns None."""
+    from pyxle.devserver.error_pages import ErrorBoundaryRegistry
+    from pyxle.ssr.view import build_not_found_response
+
+    registry = ErrorBoundaryRegistry(error_pages={}, not_found_pages={})
+    renderer = StubRenderer()
+    request = Request({"type": "http", "method": "GET", "path": "/missing", "query_string": b"", "headers": []})
+
+    result = await build_not_found_response(
+        request=request,
+        settings=settings,
+        renderer=renderer,
+        error_boundaries=registry,
+    )
+
+    assert result is None
+
+
+@pytest.mark.anyio
+async def test_build_not_found_response_renders_boundary_document(
+    settings: DevServerSettings, tmp_path: Path
+) -> None:
+    """A matching not-found boundary is rendered into a 404 document. Exercises
+    the debug module purge and the document-rendering success path of
+    build_not_found_response."""
+    from pyxle.devserver.error_pages import ErrorBoundaryRegistry
+    from pyxle.ssr.view import build_not_found_response
+
+    boundary = _boundary_page(tmp_path, filename="not-found.pyxl", module_key="pyxle.server.pages.notfound")
+    registry = ErrorBoundaryRegistry(error_pages={}, not_found_pages={".": boundary})
+
+    renderer = StubRenderer()
+    renderer.responses.append(RenderResult(html="<h1>Page not found</h1>"))
+    # debug=True drives the _purge_page_modules branch inside build_not_found_response.
+    request = Request({"type": "http", "method": "GET", "path": "/missing", "query_string": b"", "headers": []})
+
+    response = await build_not_found_response(
+        request=request,
+        settings=replace(settings, debug=True),
+        renderer=renderer,
+        error_boundaries=registry,
+    )
+
+    assert response is not None
+    assert response.status_code == 404
+    body = (await _read_response_body(response)).decode()
+    assert "<h1>Page not found</h1>" in body
+    assert "<title>Boundary</title>" in body
+    assert renderer.calls[-1][0] == boundary.client_module_path
+
+
+@pytest.mark.anyio
+async def test_build_not_found_response_returns_none_when_boundary_fails(
+    settings: DevServerSettings, tmp_path: Path
+) -> None:
+    """If rendering the not-found boundary itself raises, the function returns
+    None so the caller uses the default 404."""
+    from pyxle.devserver.error_pages import ErrorBoundaryRegistry
+    from pyxle.ssr.view import build_not_found_response
+
+    boundary = _boundary_page(tmp_path, filename="not-found.pyxl", module_key="pyxle.server.pages.notfound_fail")
+    registry = ErrorBoundaryRegistry(error_pages={}, not_found_pages={".": boundary})
+
+    class BrokenRenderer(StubRenderer):
+        async def render(
+            self,
+            component_path: Path,
+            props: dict[str, object],
+            *,
+            request_pathname: str | None = None,
+            csrf_token: str | None = None,
+        ) -> RenderResult:
+            raise ComponentRenderError("boundary boom")
+
+    renderer = BrokenRenderer()
+    request = Request({"type": "http", "method": "GET", "path": "/missing", "query_string": b"", "headers": []})
+
+    result = await build_not_found_response(
+        request=request,
+        settings=settings,
+        renderer=renderer,
+        error_boundaries=registry,
+    )
+
+    assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Navigation response edge branches
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_build_page_navigation_response_success_without_overlay(
+    settings: DevServerSettings, tmp_path: Path
+) -> None:
+    """The navigation success path skips overlay notification when overlay is
+    None and still returns the JSON payload. Exercises the production-mode
+    purge skip and the ``overlay is None`` branch of the success path."""
+    renderer = StubRenderer()
+    renderer.responses.append(RenderResult(html="<main>nav</main>"))
+
+    # debug=False skips the _purge_page_modules call at the top of the function.
+    prod_settings = replace(settings, debug=False)
+    page = _page_route(tmp_path, loader_name=None)
+    request = Request({"type": "http", "http_version": "1.1", "method": "GET", "path": "/", "root_path": "", "headers": []})
+
+    response = await build_page_navigation_response(
+        request=request,
+        settings=prod_settings,
+        page=page,
+        renderer=renderer,
+        overlay=None,
+    )
+
+    payload = json.loads(await _read_response_body(response))
+    assert response.status_code == 200
+    assert payload["ok"] is True
+    assert payload["props"] == {"data": {}}
+    assert "<title>Home</title>" in payload["headMarkup"]
+
+
+@pytest.mark.anyio
+async def test_build_page_navigation_response_loader_error_without_overlay(
+    settings: DevServerSettings, tmp_path: Path
+) -> None:
+    """A LoaderError in navigation mode without an overlay still returns the
+    structured error payload. Exercises the ``overlay is None`` branch in
+    _navigation_error_response."""
+    server_module = tmp_path / "server" / "nav_le_noov.py"
+    server_module.parent.mkdir(parents=True, exist_ok=True)
+    server_module.write_text(
+        "from pyxle.runtime import LoaderError\n"
+        "async def my_loader(request):\n"
+        "    raise LoaderError('Nope', status_code=401)\n",
+        encoding="utf-8",
+    )
+
+    page = replace(
+        _page_route(tmp_path, loader_name="my_loader"),
+        path="/nav",
+        server_module_path=server_module,
+        module_key="pyxle.server.pages.nav_le_noov",
+        head_elements=(),
+    )
+    renderer = StubRenderer()
+    request = Request({"type": "http", "method": "GET", "path": "/nav", "query_string": b"", "headers": []})
+
+    response = await build_page_navigation_response(
+        request=request,
+        settings=settings,
+        page=page,
+        renderer=renderer,
+        overlay=None,
+    )
+
+    payload = json.loads(await _read_response_body(response))
+    assert response.status_code == 401
+    assert payload["ok"] is False
+    assert payload["stage"] == "loader"
+    assert payload["errorType"] == "LoaderError"
+    assert "Nope" in payload["error"]
+
+
+# ---------------------------------------------------------------------------
+# Loader result shapes and head resolution edge cases
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_build_page_response_sync_loader_single_tuple(
+    settings: DevServerSettings, tmp_path: Path
+) -> None:
+    """A *synchronous* loader returning a one-element ``(mapping,)`` tuple is
+    accepted with the default 200 status. Exercises the non-awaitable loader
+    branch and the single-element tuple branch of _normalize_loader_result."""
+    server_module = tmp_path / "server" / "sync_one.py"
+    server_module.parent.mkdir(parents=True, exist_ok=True)
+    # Sync def (no await) returning a 1-tuple — no explicit status code.
+    server_module.write_text("def load_home(request):\n    return ({'value': 'solo'},)\n", encoding="utf-8")
+
+    page = replace(
+        _page_route(tmp_path, loader_name="load_home"),
+        server_module_path=server_module,
+        module_key="pyxle.server.pages.sync_one",
+    )
+    renderer = StubRenderer()
+    renderer.responses.append(RenderResult(html="<p>solo</p>"))
+    request = Request({"type": "http", "method": "GET", "path": "/", "query_string": b"", "headers": []})
+
+    response = await build_page_response(
+        request=request,
+        settings=settings,
+        page=page,
+        renderer=renderer,
+    )
+
+    assert response.status_code == 200
+    body = (await _read_response_body(response)).decode()
+    assert "<p>solo</p>" in body
+    assert renderer.calls[-1][1] == {"data": {"value": "solo"}}
+
+
+# ---------------------------------------------------------------------------
+# Production sanitization + server-side logging of SPA-navigation failures.
+#
+# Page (HTML) responses already sanitize in production via
+# ``render_error_document``. The SPA-navigation channel returns JSON, so it
+# needs the SAME treatment — an exception message can carry file paths, row
+# IDs, or secrets, and must never reach the client (CLAUDE.md rule 18). And
+# because production responses are deliberately opaque, the real error must be
+# written to the server log so an operator can still diagnose a 500.
+# ---------------------------------------------------------------------------
+
+
+def _nav_render_fault(tmp_path: Path, *, message: str):
+    """Return a ``(page, renderer, request)`` triple whose SSR render raises a
+    ``ComponentRenderError`` carrying ``message``."""
+    server_module = tmp_path / "server" / "nav_fault.py"
+    server_module.parent.mkdir(parents=True, exist_ok=True)
+    server_module.write_text(
+        "async def load_home(request):\n    return {}\n", encoding="utf-8"
+    )
+    page = replace(
+        _page_route(tmp_path, loader_name="load_home"),
+        server_module_path=server_module,
+        module_key="pyxle.server.pages.nav_fault",
+    )
+
+    class _FailingRenderer(StubRenderer):
+        async def render(
+            self,
+            component_path: Path,
+            props: dict[str, object],
+            *,
+            request_pathname: str | None = None,
+            csrf_token: str | None = None,
+        ) -> str:  # type: ignore[override]
+            raise ComponentRenderError(message)
+
+    request = Request(
+        {
+            "type": "http",
+            "http_version": "1.1",
+            "method": "GET",
+            "path": "/",
+            "root_path": "",
+            "headers": [],
+        }
+    )
+    return page, _FailingRenderer(), request
+
+
+@pytest.mark.anyio
+async def test_navigation_error_payload_sanitized_in_production(
+    settings: DevServerSettings, tmp_path: Path
+) -> None:
+    """In production the navigation-error JSON must not echo the exception
+    message or its concrete type — that would leak internal state to any
+    client that triggers a render error during SPA navigation."""
+    page, renderer, request = _nav_render_fault(
+        tmp_path, message="boom at /srv/app/secret_db.py row 42"
+    )
+    prod_settings = replace(settings, debug=False)
+
+    response = await build_page_navigation_response(
+        request=request,
+        settings=prod_settings,
+        page=page,
+        renderer=renderer,
+        overlay=None,
+    )
+    payload = json.loads(await _read_response_body(response))
+
+    assert response.status_code == 500
+    assert payload["ok"] is False
+    assert payload["stage"] == "renderer"
+    # The exception detail must NOT reach the client.
+    assert "secret_db.py" not in payload["error"]
+    assert "row 42" not in payload["error"]
+    assert payload["errorType"] == "ServerError"
+
+
+@pytest.mark.anyio
+async def test_navigation_error_payload_detailed_in_dev(
+    settings: DevServerSettings, tmp_path: Path
+) -> None:
+    """In development (the default fixture, ``debug=True``) the detail IS
+    exposed — the developer needs it, and it mirrors the dev error overlay."""
+    page, renderer, request = _nav_render_fault(tmp_path, message="render boom detail")
+
+    response = await build_page_navigation_response(
+        request=request,
+        settings=settings,
+        page=page,
+        renderer=renderer,
+        overlay=None,
+    )
+    payload = json.loads(await _read_response_body(response))
+
+    assert response.status_code == 500
+    assert payload["errorType"] == "ComponentRenderError"
+    assert "render boom detail" in payload["error"]
+
+
+@pytest.mark.anyio
+async def test_render_failure_is_logged_server_side(
+    settings: DevServerSettings, tmp_path: Path, caplog
+) -> None:
+    """Production responses are opaque, so the real error must land in the
+    server log (with the route and full detail) for the operator to diagnose."""
+    page, renderer, request = _nav_render_fault(tmp_path, message="loggable failure detail")
+    prod_settings = replace(settings, debug=False)
+
+    with caplog.at_level("ERROR", logger="pyxle.ssr.view"):
+        await build_page_navigation_response(
+            request=request,
+            settings=prod_settings,
+            page=page,
+            renderer=renderer,
+            overlay=None,
+        )
+
+    fault_logs = [
+        r for r in caplog.records
+        if r.name == "pyxle.ssr.view" and r.levelname == "ERROR"
+    ]
+    assert fault_logs, "a 500 render fault must be logged server-side"
+    message = fault_logs[-1].getMessage()
+    assert page.path in message  # the route
+    assert "loggable failure detail" in message  # the real, unsanitized detail
+
+
+def test_resolve_head_elements_imports_module_when_none(tmp_path: Path) -> None:
+    """When ``head_is_dynamic`` is True and no module is passed, the resolver
+    imports the server module itself to read ``HEAD``. Exercises the lazy
+    module import inside _resolve_head_elements."""
+    server_module = tmp_path / "server" / "head_lazy.py"
+    server_module.parent.mkdir(parents=True, exist_ok=True)
+    server_module.write_text("HEAD = ['<meta name=\"lazy\" content=\"yes\" />']\n", encoding="utf-8")
+
+    page = replace(
+        _page_route(tmp_path, loader_name=None),
+        server_module_path=server_module,
+        module_key="pyxle.server.pages.head_lazy",
+        head_elements=(),
+        head_is_dynamic=True,
+    )
+
+    resolved = ssr_view._resolve_head_elements(page, None, {}, debug=False)
+    assert resolved == ('<meta name="lazy" content="yes" />',)
+
+    sys.modules.pop("pyxle.server.pages.head_lazy", None)
+
+
+def test_evaluate_head_callable_awaitable_without_close_raises(tmp_path: Path) -> None:
+    """An awaitable HEAD return value that lacks a ``close`` method is still
+    rejected. Exercises the ``hasattr(value, 'close')`` False branch in
+    _evaluate_head_callable."""
+    from pyxle.ssr.view import _evaluate_head_callable
+
+    page = _page_route(tmp_path, loader_name=None)
+
+    class AwaitableNoClose:
+        def __await__(self):
+            yield
+            return "<title>x</title>"
+
+    def head(data):
+        return AwaitableNoClose()
+
+    with pytest.raises(HeadEvaluationError, match="must return synchronously"):
+        _evaluate_head_callable(page, head, {"k": "v"})
+
+
+# ---------------------------------------------------------------------------
+# Layout loaders (real compilation)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_build_page_response_executes_layout_loaders(
+    settings: DevServerSettings, tmp_path: Path
+) -> None:
+    """A ``layout.pyxl`` declaring a ``@server`` loader contributes its data
+    under ``layoutData`` in the rendered component props. Exercises the layout
+    loader execution loop and the ``props['layoutData']`` assignment."""
+    layout_path = settings.pages_dir / "layout.pyxl"
+    layout_path.write_text(
+        "from pyxle.runtime import server\n"
+        "\n"
+        "@server\n"
+        "async def load_layout(request):\n"
+        "    return {'banner': 'from-layout'}\n"
+        "\n"
+        "import React from 'react';\n"
+        "\n"
+        "export default function Layout({ children }) {\n"
+        "    return <div>{children}</div>;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    page_path = settings.pages_dir / "index.pyxl"
+    page_path.write_text(
+        "import React from 'react';\n"
+        "\n"
+        "export default function Home({ data }) {\n"
+        "    return <div>home</div>;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    from pyxle.devserver.builder import build_once
+    from pyxle.devserver.registry import load_metadata_registry
+    from pyxle.devserver.routes import build_route_table
+
+    build_once(settings)
+    registry = load_metadata_registry(settings)
+    routes = build_route_table(registry)
+    page = routes.find_page("/")
+    assert page is not None
+
+    renderer = StubRenderer()
+    renderer.responses.append(RenderResult(html="<div>home</div>"))
+    request = Request({"type": "http", "method": "GET", "path": "/", "query_string": b"", "headers": []})
+
+    response = await build_page_response(
+        request=request,
+        settings=settings,
+        page=page,
+        renderer=renderer,
+    )
+
+    assert response.status_code == 200
+    props = renderer.calls[-1][1]
+    assert props["data"] == {}
+    assert props["layoutData"] == {"banner": "from-layout"}
+
+
+@pytest.mark.anyio
+async def test_execute_layout_loaders_merges_tuple_and_skips_missing(
+    settings: DevServerSettings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """_execute_layout_loaders walks every discovered layout loader, handling:
+
+    * a layout whose module is missing the named loader (skipped),
+    * a *synchronous* loader returning a ``(dict, ...)`` tuple (the leading
+      dict is used),
+    * a synchronous loader returning a non-mapping (ignored).
+
+    The surviving mapping results are merged into a single dict.
+    """
+    from pyxle.devserver.registry import LayoutLoaderInfo
+    from pyxle.ssr.view import _execute_layout_loaders
+
+    layout_dir = tmp_path / "layouts"
+    layout_dir.mkdir()
+
+    # Module A: declares a loader name that does not exist on the module.
+    missing_mod = layout_dir / "missing.py"
+    missing_mod.write_text("OTHER = 1\n", encoding="utf-8")
+
+    # Module B: synchronous loader returning a one-tuple of a dict.
+    tuple_mod = layout_dir / "tuple_layout.py"
+    tuple_mod.write_text(
+        "def load_layout(request):\n    return ({'banner': 'tuple-data'},)\n",
+        encoding="utf-8",
+    )
+
+    # Module C: synchronous loader returning a non-mapping (must be ignored).
+    nonmap_mod = layout_dir / "nonmap_layout.py"
+    nonmap_mod.write_text(
+        "def load_layout(request):\n    return 'not-a-mapping'\n",
+        encoding="utf-8",
+    )
+
+    infos = (
+        LayoutLoaderInfo(
+            relative_path=Path("missing.pyxl"),
+            server_module_path=missing_mod,
+            module_key="pyxle._test_layout_missing",
+            loader_name="load_layout",
+        ),
+        LayoutLoaderInfo(
+            relative_path=Path("tuple_layout.pyxl"),
+            server_module_path=tuple_mod,
+            module_key="pyxle._test_layout_tuple",
+            loader_name="load_layout",
+        ),
+        LayoutLoaderInfo(
+            relative_path=Path("nonmap_layout.pyxl"),
+            server_module_path=nonmap_mod,
+            module_key="pyxle._test_layout_nonmap",
+            loader_name="load_layout",
+        ),
+    )
+
+    monkeypatch.setattr(
+        "pyxle.devserver.registry.find_layout_loaders",
+        lambda _settings, _path: infos,
+    )
+
+    page = _page_route(tmp_path, loader_name=None)
+    request = Request({"type": "http", "method": "GET", "path": "/", "query_string": b"", "headers": []})
+
+    try:
+        layout_data = await _execute_layout_loaders(
+            settings=replace(settings, debug=True),
+            page=page,
+            request=request,
+        )
+    finally:
+        for key in (
+            "pyxle._test_layout_missing",
+            "pyxle._test_layout_tuple",
+            "pyxle._test_layout_nonmap",
+        ):
+            sys.modules.pop(key, None)
+
+    # Only the tuple loader contributed mapping data; the missing-loader module
+    # was skipped and the non-mapping return was ignored.
+    assert layout_data == {"banner": "tuple-data"}
+
+
+# ---------------------------------------------------------------------------
+# Server module importer + module purge edge cases
+# ---------------------------------------------------------------------------
+
+
+def test_ensure_app_root_importable_inserts_project_root(tmp_path: Path) -> None:
+    """A compiled module under a ``.pyxle-build`` directory makes its project
+    root (the directory containing ``.pyxle-build``) importable. Exercises the
+    ``sys.path.insert`` line of _ensure_app_root_importable."""
+    from pyxle.ssr.view import _ensure_app_root_importable
+
+    module_path = tmp_path / ".pyxle-build" / "server" / "pages" / "deep.py"
+    module_path.parent.mkdir(parents=True)
+    module_path.write_text("X = 1\n", encoding="utf-8")
+
+    project_root = str(tmp_path.resolve())
+    if project_root in sys.path:
+        sys.path.remove(project_root)
+
+    try:
+        _ensure_app_root_importable(module_path)
+        assert project_root in sys.path
+        # Calling again is idempotent — it must not duplicate the entry.
+        _ensure_app_root_importable(module_path)
+        assert sys.path.count(project_root) == 1
+    finally:
+        while project_root in sys.path:
+            sys.path.remove(project_root)
+
+
+def test_import_server_module_raises_when_spec_unavailable(tmp_path: Path) -> None:
+    """A module path with an unrecognized extension yields no import spec, so
+    the importer raises a LoaderExecutionError naming the path. Exercises the
+    ``spec is None`` guard in _import_server_module."""
+    from pyxle.ssr.view import LoaderExecutionError, _import_server_module
+
+    bad_path = tmp_path / "module.unknownext"
+    bad_path.write_text("X = 1\n", encoding="utf-8")
+
+    with pytest.raises(LoaderExecutionError, match="Unable to load page module"):
+        _import_server_module("pyxle._test_no_spec", bad_path)
+
+    assert "pyxle._test_no_spec" not in sys.modules
+
+
+def test_purge_page_modules_swallows_resolve_filenotfound() -> None:
+    """If resolving the pages directory raises FileNotFoundError (e.g. the
+    working directory was removed), the purge exits cleanly. Exercises the
+    ``except FileNotFoundError`` guard at the top of _purge_page_modules."""
+    from pyxle.ssr.view import _purge_page_modules
+
+    class ResolveRaises:
+        def resolve(self):
+            raise FileNotFoundError("pages dir is gone")
+
+    # Should not raise.
+    _purge_page_modules(ResolveRaises())  # type: ignore[arg-type]
+
+
+def test_purge_page_modules_skips_modules_with_unresolvable_file(tmp_path: Path) -> None:
+    """A loaded module whose ``__file__`` cannot be resolved (it contains a NUL
+    byte, raising ValueError) is skipped without aborting the purge. Exercises
+    the ``except (OSError, ValueError)`` guard inside the purge loop."""
+    from types import ModuleType
+
+    from pyxle.ssr.view import _purge_page_modules
+
+    pages_dir = tmp_path / "pages"
+    pages_dir.mkdir()
+
+    poisoned = ModuleType("pyxle._test_poisoned_file")
+    poisoned.__file__ = "/tmp/bad\x00name.py"
+    sys.modules["pyxle._test_poisoned_file"] = poisoned
+
+    try:
+        # The poisoned module must not crash the purge; it is simply skipped
+        # (left in sys.modules because its path could not be compared).
+        _purge_page_modules(pages_dir)
+        assert "pyxle._test_poisoned_file" in sys.modules
+    finally:
+        sys.modules.pop("pyxle._test_poisoned_file", None)

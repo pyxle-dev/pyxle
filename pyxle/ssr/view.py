@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import inspect
+import logging
 import secrets
 import sys
 from collections.abc import Callable, Mapping
@@ -46,6 +47,50 @@ class PageArtifacts:
     head_markup: str
     inline_styles: tuple[InlineStyleFragment, ...]
     status_code: int
+
+
+_logger = logging.getLogger(__name__)
+
+
+def _log_render_failure(
+    page: PageRoute, *, stage: str, error: BaseException, status_code: int
+) -> None:
+    """Record a server-side log line for a failed page render.
+
+    Production error responses are deliberately sanitized -- they expose no
+    exception detail to the client (CLAUDE.md rule 18) -- so this log is the
+    only record of what actually failed. Only genuine server faults
+    (``status_code >= 500``) are logged at error level; an intentional sub-500
+    signal (e.g. a loader raising a 404) is not a server error and stays quiet.
+    """
+    if status_code < 500:
+        return
+    _logger.error(
+        "SSR %s error while rendering route %s: %s",
+        stage,
+        page.path,
+        error,
+        exc_info=error,
+    )
+
+
+def _error_response(
+    *,
+    settings: DevServerSettings,
+    page: PageRoute,
+    stage: str,
+    error: BaseException,
+    status_code: int,
+) -> HTMLResponse:
+    """Log the failure server-side, then return the sanitized HTML error page.
+
+    Centralizes the "log, then render the fallback document" pair so every
+    error branch in :func:`build_page_response` behaves consistently and the
+    production response never leaks internals.
+    """
+    _log_render_failure(page, stage=stage, error=error, status_code=status_code)
+    fallback = render_error_document(settings=settings, page=page, error=error)
+    return HTMLResponse(fallback, status_code=status_code)
 
 
 async def build_page_response(
@@ -127,8 +172,10 @@ async def build_page_response(
         )
         if boundary_response is not None:
             return boundary_response
-        fallback = render_error_document(settings=settings, page=page, error=exc)
-        return HTMLResponse(fallback, status_code=exc.status_code)
+        return _error_response(
+            settings=settings, page=page, stage="loader", error=exc,
+            status_code=exc.status_code,
+        )
     except LoaderExecutionError as exc:
         loader_breadcrumb = _make_loader_breadcrumb(page, status="failed", detail=str(exc))
         if overlay is not None:
@@ -148,8 +195,9 @@ async def build_page_response(
         )
         if boundary_response is not None:
             return boundary_response
-        fallback = render_error_document(settings=settings, page=page, error=exc)
-        return HTMLResponse(fallback, status_code=500)
+        return _error_response(
+            settings=settings, page=page, stage="loader", error=exc, status_code=500,
+        )
     except HeadEvaluationError as exc:
         if overlay is not None:
             await overlay.notify_error(
@@ -168,8 +216,9 @@ async def build_page_response(
         )
         if boundary_response is not None:
             return boundary_response
-        fallback = render_error_document(settings=settings, page=page, error=exc)
-        return HTMLResponse(fallback, status_code=500)
+        return _error_response(
+            settings=settings, page=page, stage="server", error=exc, status_code=500,
+        )
     except ComponentRenderError as exc:
         if overlay is not None:
             await overlay.notify_error(
@@ -188,8 +237,9 @@ async def build_page_response(
         )
         if boundary_response is not None:
             return boundary_response
-        fallback = render_error_document(settings=settings, page=page, error=exc)
-        return HTMLResponse(fallback, status_code=500)
+        return _error_response(
+            settings=settings, page=page, stage="renderer", error=exc, status_code=500,
+        )
     except Exception as exc:  # pragma: no cover - defensive guardrail
         if overlay is not None:
             await overlay.notify_error(
@@ -197,8 +247,9 @@ async def build_page_response(
                 error=exc,
                 breadcrumbs=_compose_breadcrumbs(loader_breadcrumb, stage="server", message=str(exc)),
             )
-        fallback = render_error_document(settings=settings, page=page, error=exc)
-        return HTMLResponse(fallback, status_code=500)
+        return _error_response(
+            settings=settings, page=page, stage="server", error=exc, status_code=500,
+        )
 
 
 async def build_page_navigation_response(
@@ -243,6 +294,7 @@ async def build_page_navigation_response(
         loader_breadcrumb = _make_loader_breadcrumb(page, status="failed", detail=str(exc))
         return await _navigation_error_response(
             request=request,
+            settings=settings,
             page=page,
             overlay=overlay,
             loader_breadcrumb=loader_breadcrumb,
@@ -254,6 +306,7 @@ async def build_page_navigation_response(
         loader_breadcrumb = _make_loader_breadcrumb(page, status="failed", detail=str(exc))
         return await _navigation_error_response(
             request=request,
+            settings=settings,
             page=page,
             overlay=overlay,
             loader_breadcrumb=loader_breadcrumb,
@@ -263,6 +316,7 @@ async def build_page_navigation_response(
     except HeadEvaluationError as exc:
         return await _navigation_error_response(
             request=request,
+            settings=settings,
             page=page,
             overlay=overlay,
             loader_breadcrumb=loader_breadcrumb,
@@ -272,6 +326,7 @@ async def build_page_navigation_response(
     except ComponentRenderError as exc:
         return await _navigation_error_response(
             request=request,
+            settings=settings,
             page=page,
             overlay=overlay,
             loader_breadcrumb=loader_breadcrumb,
@@ -281,6 +336,7 @@ async def build_page_navigation_response(
     except Exception as exc:  # pragma: no cover - defensive guardrail
         return await _navigation_error_response(
             request=request,
+            settings=settings,
             page=page,
             overlay=overlay,
             loader_breadcrumb=loader_breadcrumb,
@@ -451,6 +507,25 @@ def _compose_component_props(
     return props
 
 
+def _csrf_token_for_request(request: Request) -> str | None:
+    """Pluck the CSRF token the CSRF middleware stashed on the request scope.
+
+    The middleware computes the active token before invoking the inner
+    app and stores it under ``scope["pyxle.csrf_token"]``. SSR forwards
+    it to ``globalThis.__PYXLE_CSRF_TOKEN__`` so ``<Form>`` can embed it
+    in the rendered HTML as ``<input type="hidden" ...>`` — that's what
+    makes a no-JS submission satisfy the CSRF check.
+
+    Returns ``None`` when CSRF is disabled or the middleware isn't in
+    the stack; ``<Form>`` will then skip the hidden field and fall back
+    to the cookie / header path that JavaScript handles.
+    """
+    token = request.scope.get("pyxle.csrf_token")
+    if isinstance(token, str) and token:
+        return token
+    return None
+
+
 async def _create_page_artifacts(
     *,
     request: Request,
@@ -496,6 +571,7 @@ async def _create_page_artifacts(
         page.client_module_path,
         component_props,
         request_pathname=request.url.path,
+        csrf_token=_csrf_token_for_request(request),
     )
     body_html = render_result.html
     inline_styles = render_result.inline_styles
@@ -567,6 +643,7 @@ async def _try_error_boundary(
             boundary_page.client_module_path,
             {"error": error_context},
             request_pathname=request.url.path,
+            csrf_token=_csrf_token_for_request(request),
         )
         script_nonce = secrets.token_urlsafe(24)
         head_elements = boundary_page.head_elements
@@ -607,6 +684,7 @@ def _build_error_context(error: BaseException, status_code: int) -> dict[str, An
 async def _navigation_error_response(
     *,
     request: Request,
+    settings: DevServerSettings,
     page: PageRoute,
     overlay: OverlayManager | None,
     loader_breadcrumb: dict[str, str],
@@ -618,13 +696,29 @@ async def _navigation_error_response(
     if overlay is not None:
         await overlay.notify_error(route_path=page.path, error=error, breadcrumbs=breadcrumbs)
 
+    _log_render_failure(page, stage=stage, error=error, status_code=status_code)
+
+    # Navigation errors return JSON, so they need the same production
+    # sanitization the HTML error document applies (CLAUDE.md rule 18): an
+    # exception message may carry file paths, row IDs, or secrets, and a
+    # client must never receive them. In dev we surface the detail (redacted
+    # for obvious secrets, mirroring the dev error overlay) to aid debugging.
+    if settings.debug:
+        from pyxle.devserver._security import redact_sensitive_patterns  # noqa: PLC0415
+
+        error_message = redact_sensitive_patterns(str(error) or error.__class__.__name__)
+        error_type = error.__class__.__name__
+    else:
+        error_message = "The server encountered an error while processing this request."
+        error_type = "ServerError"
+
     payload = {
         "ok": False,
         "routePath": page.path,
         "requestedPath": request.url.path,
         "stage": stage,
-        "error": str(error),
-        "errorType": error.__class__.__name__,
+        "error": error_message,
+        "errorType": error_type,
     }
     return JSONResponse(payload, status_code=status_code)
 

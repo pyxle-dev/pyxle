@@ -222,7 +222,7 @@ async function main() {
   process.exit(0);
 }
 
-async function renderRequest({ componentPath, props, clientRoot, projectRoot: projectRootArg, requestPathname }) {
+async function renderRequest({ componentPath, props, clientRoot, projectRoot: projectRootArg, requestPathname, csrfToken }) {
   if (!componentPath) {
     throw new Error('Missing componentPath in render request.');
   }
@@ -347,14 +347,21 @@ export default entry.contents;
     throw new Error('Component does not export a default function.');
   }
 
-  // Make the request path visible to hooks like usePathname() during SSR.
-  // Cleared in `finally` so a request with no pathname can't inherit the
-  // previous request's value through the global.
+  // Make the request path / CSRF token visible to SSR code (e.g.
+  // usePathname, <Form>'s hidden field). Cleared in `finally` so a
+  // request without these values can't inherit the previous request's
+  // value via the global.
   const previousPathname = globalThis.__PYXLE_CURRENT_PATHNAME__;
+  const previousCsrf = globalThis.__PYXLE_CSRF_TOKEN__;
   if (typeof requestPathname === 'string') {
     globalThis.__PYXLE_CURRENT_PATHNAME__ = requestPathname;
   } else {
     delete globalThis.__PYXLE_CURRENT_PATHNAME__;
+  }
+  if (typeof csrfToken === 'string' && csrfToken.length > 0) {
+    globalThis.__PYXLE_CSRF_TOKEN__ = csrfToken;
+  } else {
+    delete globalThis.__PYXLE_CSRF_TOKEN__;
   }
 
   try {
@@ -368,6 +375,11 @@ export default entry.contents;
       delete globalThis.__PYXLE_CURRENT_PATHNAME__;
     } else {
       globalThis.__PYXLE_CURRENT_PATHNAME__ = previousPathname;
+    }
+    if (previousCsrf === undefined) {
+      delete globalThis.__PYXLE_CSRF_TOKEN__;
+    } else {
+      globalThis.__PYXLE_CSRF_TOKEN__ = previousCsrf;
     }
   }
 }

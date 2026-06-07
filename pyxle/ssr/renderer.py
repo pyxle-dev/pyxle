@@ -73,6 +73,7 @@ class ComponentRenderer:
         props: Dict[str, Any],
         *,
         request_pathname: str | None = None,
+        csrf_token: str | None = None,
     ) -> RenderResult:
         """Render ``component_path`` with the provided props.
 
@@ -80,6 +81,11 @@ class ComponentRenderer:
         to component code via ``globalThis.__PYXLE_CURRENT_PATHNAME__``
         during rendering, so hooks like ``usePathname`` return the
         request's actual path and hydrate without mismatches.
+
+        ``csrf_token`` is exposed via ``globalThis.__PYXLE_CSRF_TOKEN__``
+        for the same render. ``<Form>`` reads it at SSR time so the
+        rendered HTML carries a hidden ``_csrf_token`` field — that's
+        what makes a no-JS form POST satisfy the CSRF middleware.
         """
 
         resolved = component_path.resolve()
@@ -94,7 +100,12 @@ class ComponentRenderer:
                     self._cache[resolved] = cached
 
         _, render_fn = cached
-        result = _invoke_render(render_fn, props, request_pathname=request_pathname)
+        result = _invoke_render(
+            render_fn,
+            props,
+            request_pathname=request_pathname,
+            csrf_token=csrf_token,
+        )
         resolved_result = await _ensure_awaitable(result)
         return _normalize_render_output(resolved_result)
 
@@ -110,14 +121,15 @@ def _invoke_render(
     props: Dict[str, Any],
     *,
     request_pathname: str | None,
+    csrf_token: str | None = None,
 ) -> Any:
     """Call *render_fn* with the right signature for its parameters.
 
-    Render callables returned by the built-in factories accept an optional
-    ``request_pathname`` keyword argument.  Third-party callables (and
-    tests written before this parameter existed) may accept only ``props``.
-    Introspection lets us preserve both — we check the signature once per
-    call and pass the keyword only when accepted.
+    Render callables returned by the built-in factories accept optional
+    ``request_pathname`` and ``csrf_token`` keyword arguments. Third-party
+    callables (and tests written before these parameters existed) may
+    accept only ``props``. Introspection lets us preserve both — we check
+    the signature once per call and pass each keyword only when accepted.
     """
     try:
         sig = inspect.signature(render_fn)
@@ -125,20 +137,27 @@ def _invoke_render(
         # Builtins / C-extension callables — just pass props positionally.
         return render_fn(props)
 
-    accepts_pathname = False
+    accepted_kwargs: dict[str, str | None] = {}
+    has_var_keyword = False
+    accepts: dict[str, bool] = {"request_pathname": False, "csrf_token": False}
+
     for param in sig.parameters.values():
         if param.kind == inspect.Parameter.VAR_KEYWORD:
-            accepts_pathname = True
-            break
-        if param.name == "request_pathname" and param.kind in (
+            has_var_keyword = True
+            continue
+        if param.name in accepts and param.kind in (
             inspect.Parameter.KEYWORD_ONLY,
             inspect.Parameter.POSITIONAL_OR_KEYWORD,
         ):
-            accepts_pathname = True
-            break
+            accepts[param.name] = True
 
-    if accepts_pathname:
-        return render_fn(props, request_pathname=request_pathname)
+    if has_var_keyword or accepts["request_pathname"]:
+        accepted_kwargs["request_pathname"] = request_pathname
+    if has_var_keyword or accepts["csrf_token"]:
+        accepted_kwargs["csrf_token"] = csrf_token
+
+    if accepted_kwargs:
+        return render_fn(props, **accepted_kwargs)
     return render_fn(props)
 
 
@@ -149,9 +168,13 @@ def _default_factory(component_path: Path) -> _RenderCallable:
         props: Dict[str, Any],
         *,
         request_pathname: str | None = None,
+        csrf_token: str | None = None,
     ) -> RenderResult:
         return await asyncio.to_thread(
-            runtime.render, props, request_pathname=request_pathname
+            runtime.render,
+            props,
+            request_pathname=request_pathname,
+            csrf_token=csrf_token,
         )
 
     return _render
@@ -169,6 +192,7 @@ class _NodeComponentRuntime:
         props: Dict[str, Any],
         *,
         request_pathname: str | None = None,
+        csrf_token: str | None = None,
     ) -> RenderResult:
         try:
             serialized_props = json.dumps(props, ensure_ascii=False, separators=(",", ":"))
@@ -189,12 +213,15 @@ class _NodeComponentRuntime:
         from pyxle.ssr.worker_pool import _build_node_env
 
         env = _build_node_env(self._project_root)
-        # The Node runtime reads the pathname from this env var and sets
-        # globalThis.__PYXLE_CURRENT_PATHNAME__ before invoking the page
-        # component. Picking an env var (rather than yet another argv slot)
-        # keeps the subprocess command signature stable.
+        # The Node runtime reads the pathname / csrf token from these env
+        # vars and sets ``globalThis.__PYXLE_CURRENT_PATHNAME__`` /
+        # ``globalThis.__PYXLE_CSRF_TOKEN__`` before invoking the page
+        # component. Using env vars (rather than extra argv slots) keeps
+        # the subprocess command signature stable.
         if request_pathname is not None:
             env["PYXLE_REQUEST_PATHNAME"] = request_pathname
+        if csrf_token is not None:
+            env["PYXLE_CSRF_TOKEN"] = csrf_token
 
         try:
             process = subprocess.run(  # noqa: S603 - controlled command invocation
@@ -348,6 +375,7 @@ def pool_render_factory(pool: Any) -> _RenderFactory:
             props: Dict[str, Any],
             *,
             request_pathname: str | None = None,
+            csrf_token: str | None = None,
         ) -> RenderResult:
             try:
                 # Validate JSON-serializability without a redundant round-trip.
@@ -359,7 +387,10 @@ def pool_render_factory(pool: Any) -> _RenderFactory:
 
             try:
                 result = await pool.render(
-                    component_path, props, request_pathname=request_pathname
+                    component_path,
+                    props,
+                    request_pathname=request_pathname,
+                    csrf_token=csrf_token,
                 )
             except WorkerPoolError as exc:
                 raise ComponentRenderError(str(exc)) from exc
