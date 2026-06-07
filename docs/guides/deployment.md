@@ -114,6 +114,52 @@ example.com {
 }
 ```
 
+## CDN and edge caching
+
+Pages that render the same HTML for everyone -- a landing page, docs, marketing
+routes -- don't need to hit your origin on every request. Declare them in the
+[`cache`](../reference/configuration.md#edge-caching) block and Pyxle serves them
+`Cache-Control: public, s-maxage=<seconds>` (with a `stale-while-revalidate`
+window) so a CDN or reverse proxy absorbs the load. This is what lets a small
+origin survive a traffic spike.
+
+```json
+{
+  "cache": {
+    "/": 60,
+    "/docs/*": 300
+  },
+  "csrf": {
+    "exemptPaths": ["/api/__actions/"]
+  }
+}
+```
+
+Two things to know before relying on it:
+
+1. **A cacheable response carries no CSRF cookie**, because a shared cache must
+   never replay one user's token to another (and most CDNs won't cache a
+   response that sets a cookie). Any `@action` reachable from a cached route must
+   therefore be CSRF-exempt -- hence the `csrf.exemptPaths` above. Only cache
+   routes that render no per-user state and whose actions are safe to exempt.
+
+2. **The headers make a response *eligible*; the CDN still has to opt in.** Many
+   CDNs don't cache HTML by default:
+
+   - **Cloudflare** — add a Cache Rule (or Page Rule) with *Cache Everything*
+     for the cached paths. Cloudflare honors `s-maxage` for the edge TTL once the
+     rule is in place. (Cloudflare ignores `Vary` headers other than
+     `Accept-Encoding`; Pyxle's SPA navigation accounts for this and falls back
+     to a normal full-page load if the edge ever serves cached HTML to an
+     in-app navigation request, so nothing breaks.)
+   - **Nginx / Caddy / Varnish** — enable `proxy_cache` (or the equivalent) for
+     those routes; they respect `s-maxage` out of the box.
+
+Content-hashed client bundles (under `/client/.../dist/assets/`) are already sent
+`Cache-Control: public, max-age=31536000, immutable`, and other static files get
+`public, max-age=3600` -- independent of the `cache` block above, which governs
+*page* responses.
+
 ## Docker
 
 ```dockerfile

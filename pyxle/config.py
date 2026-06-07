@@ -42,6 +42,47 @@ class CsrfConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class CacheConfig:
+    """Edge-cache policy: which page routes may be served from a shared cache
+    (a CDN or reverse proxy), and for how long.
+
+    Each entry maps a path pattern to a max-age in seconds — either an exact
+    path (``/about``) or a prefix wildcard (``/docs/*``, which matches
+    ``/docs`` and anything beneath it). A matched page response is sent
+    ``Cache-Control: public, s-maxage=<N>, stale-while-revalidate=<N>``
+    instead of the default ``private, no-cache``, and its CSRF cookie is
+    omitted — a per-user ``Set-Cookie`` must never ride on a shared-cached
+    response. Only mark routes that render no per-user data.
+    """
+
+    routes: tuple[tuple[str, int], ...] = ()
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.routes)
+
+    def max_age_for(self, path: str) -> int | None:
+        """Return the ``s-maxage`` (seconds) for ``path`` if a route matches.
+
+        Exact matches win over wildcards; among wildcards the most specific
+        (longest) prefix wins, so ``/docs/api`` can override ``/docs/*``.
+        """
+        best_age: int | None = None
+        best_score = -1
+        for pattern, max_age in self.routes:
+            if pattern.endswith("/*"):
+                prefix = pattern[:-2]
+                if path == prefix or path.startswith(prefix + "/"):
+                    score = len(prefix)
+                    if score > best_score:
+                        best_score, best_age = score, max_age
+            elif path == pattern:
+                # Exact match: highest possible precedence.
+                return max_age
+        return best_age
+
+
+@dataclass(frozen=True, slots=True)
 class PyxleConfig:
     """Resolved configuration values for a Pyxle project."""
 
@@ -60,6 +101,7 @@ class PyxleConfig:
     global_scripts: tuple[str, ...] = ()
     cors: CorsConfig = CorsConfig()
     csrf: CsrfConfig = CsrfConfig()
+    cache: CacheConfig = CacheConfig()
     # Plugin entries as the raw payload from ``pyxle.config.json`` —
     # either a bare string (``"pyxle-auth"``) or an object
     # (``{"name": "pyxle-auth", "settings": {...}}``). Resolved into
@@ -85,6 +127,7 @@ class PyxleConfig:
             "api_route_hooks": self.api_route_middleware,
             "cors": self.cors,
             "csrf": self.csrf,
+            "cache": self.cache,
             "plugins": self.plugins,
         }
 
@@ -188,6 +231,7 @@ def _parse_config_dict(data: Dict[str, Any], *, source: Path) -> PyxleConfig:
         "styling",
         "cors",
         "csrf",
+        "cache",
         "plugins",
     }
     unknown_keys = set(data) - allowed_top_keys
@@ -219,6 +263,7 @@ def _parse_config_dict(data: Dict[str, Any], *, source: Path) -> PyxleConfig:
     global_styles, global_scripts = _parse_styling_block(data.get("styling"), source=source)
     cors_config = _parse_cors_block(data.get("cors"), source=source)
     csrf_config = _parse_csrf_block(data.get("csrf"), source=source)
+    cache_config = _parse_cache_block(data.get("cache"), source=source)
     plugins = _parse_plugins_block(data.get("plugins"), source=source)
 
     return PyxleConfig(
@@ -237,6 +282,7 @@ def _parse_config_dict(data: Dict[str, Any], *, source: Path) -> PyxleConfig:
         global_scripts=global_scripts,
         cors=cors_config,
         csrf=csrf_config,
+        cache=cache_config,
         plugins=plugins,
     )
 
@@ -408,6 +454,55 @@ def _parse_cors_block(value: Any, *, source: Path) -> CorsConfig:
         credentials=credentials,
         max_age=max_age,
     )
+
+
+def _parse_cache_block(value: Any, *, source: Path) -> CacheConfig:
+    """Parse the ``cache`` block — a map of route pattern → max-age seconds.
+
+    Accepts shorthand integers (``{"/": 120, "/docs/*": 300}``) or objects
+    (``{"/": {"sMaxage": 120}}``). A pattern is an exact path or a ``/x/*``
+    prefix wildcard.
+    """
+    if value is None:
+        return CacheConfig()
+    if not isinstance(value, Mapping):
+        raise ConfigError(
+            f"Invalid value for 'cache' in '{source}': expected an object mapping "
+            f"route patterns to a max-age in seconds."
+        )
+    routes: list[tuple[str, int]] = []
+    for pattern, rule in value.items():
+        if not isinstance(pattern, str) or not pattern.startswith("/"):
+            raise ConfigError(
+                f"Invalid cache route '{pattern}' in '{source}': patterns must be "
+                f"absolute paths (e.g. '/' or '/docs/*')."
+            )
+        if isinstance(rule, bool):
+            # bool is an int subclass — reject explicitly so 'true' isn't a max-age.
+            raise ConfigError(
+                f"Invalid value for cache route '{pattern}' in '{source}': expected "
+                f"a max-age in seconds or an object, got a boolean."
+            )
+        if isinstance(rule, int):
+            max_age = rule
+        elif isinstance(rule, Mapping):
+            max_age = rule.get("sMaxage", rule.get("maxAge"))
+            if not isinstance(max_age, int) or isinstance(max_age, bool):
+                raise ConfigError(
+                    f"Invalid 'sMaxage' for cache route '{pattern}' in '{source}': "
+                    f"expected an integer number of seconds."
+                )
+        else:
+            raise ConfigError(
+                f"Invalid value for cache route '{pattern}' in '{source}': expected "
+                f"a max-age in seconds or an object."
+            )
+        if max_age < 0:
+            raise ConfigError(
+                f"Invalid max-age for cache route '{pattern}' in '{source}': must be >= 0."
+            )
+        routes.append((pattern, max_age))
+    return CacheConfig(routes=tuple(routes))
 
 
 def _parse_csrf_block(value: Any, *, source: Path) -> CsrfConfig:

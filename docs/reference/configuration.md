@@ -42,6 +42,7 @@ Pyxle is configured via `pyxle.config.json` in the project root. All fields are 
     "cookieSameSite": "lax",
     "exemptPaths": []
   },
+  "cache": {},
   "plugins": []
 }
 ```
@@ -177,6 +178,39 @@ Route-level hooks applied to specific route types.
 
 Shorthand to disable: `"csrf": false`
 
+## Edge caching
+
+Mark page routes that render **no per-user data** as publicly cacheable. A matched page is served `Cache-Control: public, s-maxage=<seconds>` (plus a `stale-while-revalidate` window) instead of the default `private, no-cache`, so a shared cache -- a CDN or reverse proxy -- can absorb the traffic instead of your origin. It's Pyxle's config-driven equivalent of Next.js per-route revalidation.
+
+```json
+{
+  "cache": {
+    "/": 60,
+    "/blog/*": 600,
+    "/docs/*": { "sMaxage": 300 }
+  }
+}
+```
+
+Each key is a route pattern; each value is the shared-cache lifetime in seconds:
+
+| Form | Example | Meaning |
+|------|---------|---------|
+| Integer shorthand | `"/": 60` | `s-maxage=60` for the exact path `/` |
+| Prefix wildcard | `"/docs/*": 300` | `s-maxage=300` for `/docs` and anything beneath it |
+| Object form | `"/": { "sMaxage": 60 }` | Same as the shorthand, with room to grow |
+
+**Matching.** An exact path wins over a wildcard; among wildcards the longest (most specific) prefix wins. A pattern must be an absolute path. A wildcard (`/docs/*`) matches the bare prefix (`/docs`) and any segment beneath it (`/docs/guides/intro`), but not a path that merely shares the string (`/docsearch`).
+
+**A cacheable response carries no CSRF cookie.** A per-user `Set-Cookie` must never ride on a response that a shared cache can replay to other users -- and most CDNs refuse to cache any response that sets a cookie at all. So on a cacheable route Pyxle omits the CSRF cookie, which means any `@action` reachable from that route must be exempt via [`csrf.exemptPaths`](#csrf). **Only mark routes that render no per-user state and whose actions are safe to exempt.**
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `cache` | `object` | `{}` | Map of route pattern → shared-cache lifetime. Empty = no shared caching (every page stays `private, no-cache`). |
+| `cache."<pattern>"` | `integer` \| `{ "sMaxage": integer }` | -- | Lifetime in seconds (≥ 0) for the matched route. |
+
+> **Turning it on at the edge.** These headers make a response *eligible* for shared caching, but some CDNs don't cache HTML by default. On Cloudflare, you must also add a Cache Rule ("Cache Everything") for the cached paths -- the headers alone are necessary but not sufficient. See [Deployment → CDN and edge caching](../guides/deployment.md#cdn-and-edge-caching).
+
 ## Plugins
 
 ### `plugins`
@@ -252,3 +286,4 @@ Pyxle validates your config file at startup:
 - Directory values must be non-empty strings
 - Middleware entries must be non-empty `"module:Class"` strings
 - CORS and CSRF sub-fields are type-checked
+- Cache routes must be absolute-path patterns mapping to a non-negative integer lifetime

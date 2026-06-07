@@ -2633,10 +2633,21 @@ def _render_use_action_component() -> str:
             import { useState, useCallback, useRef } from 'react';
             import { invalidate } from './index.js';
 
+            // Resolve the active CSRF token. Three sources, in order:
+            //   1. ``document.cookie`` — the live value on the client.
+            //   2. ``globalThis.__PYXLE_CSRF_TOKEN__`` — set by the SSR
+            //      pipeline from the request's CSRF middleware. Used
+            //      during SSR (where ``document`` is undefined).
+            //   3. ``""`` — CSRF disabled or token unknown.
             function getCsrfToken() {
-              if (typeof document === 'undefined') return '';
-              const match = document.cookie.match(/(?:^|;\s*)pyxle-csrf=([^;]*)/);
-              return match ? decodeURIComponent(match[1]) : '';
+              if (typeof document !== 'undefined') {
+                const match = document.cookie.match(/(?:^|;\\s*)pyxle-csrf=([^;]*)/);
+                if (match) return decodeURIComponent(match[1]);
+              }
+              if (typeof globalThis !== 'undefined' && typeof globalThis.__PYXLE_CSRF_TOKEN__ === 'string') {
+                return globalThis.__PYXLE_CSRF_TOKEN__;
+              }
+              return '';
             }
 
             // Honour ``x-pyxle-invalidate: /path/a, /path/b`` on any
@@ -2764,10 +2775,22 @@ def _render_form_component() -> str:
             import React, { useRef, useState, useCallback } from 'react';
             import { invalidate } from './index.js';
 
+            // Resolve the active CSRF token. Three sources, in order:
+            //   1. ``document.cookie`` — the live value on the client.
+            //   2. ``globalThis.__PYXLE_CSRF_TOKEN__`` — set by the SSR
+            //      pipeline. Available during SSR + first hydrate so
+            //      the rendered ``<input type="hidden" name="_csrf_token">``
+            //      matches what the browser will see.
+            //   3. ``""`` — CSRF disabled or token unknown.
             function getCsrfToken() {
-              if (typeof document === 'undefined') return '';
-              const match = document.cookie.match(/(?:^|;\s*)pyxle-csrf=([^;]*)/);
-              return match ? decodeURIComponent(match[1]) : '';
+              if (typeof document !== 'undefined') {
+                const match = document.cookie.match(/(?:^|;\\s*)pyxle-csrf=([^;]*)/);
+                if (match) return decodeURIComponent(match[1]);
+              }
+              if (typeof globalThis !== 'undefined' && typeof globalThis.__PYXLE_CSRF_TOKEN__ === 'string') {
+                return globalThis.__PYXLE_CSRF_TOKEN__;
+              }
+              return '';
             }
 
             // See useAction for the rationale — comma-split the header
@@ -2818,6 +2841,11 @@ def _render_form_component() -> str:
               const formRef = useRef(null);
 
               const actionUrl = resolveActionUrl(action, pagePath);
+              // Read once at render so SSR markup and the first hydrate
+              // match. The hidden ``_csrf_token`` field is what makes a
+              // no-JS form POST satisfy the CSRF middleware — JS
+              // submissions still take the header path below.
+              const csrfFieldValue = getCsrfToken();
 
               const handleSubmit = useCallback(
                 async (event) => {
@@ -2889,6 +2917,9 @@ def _render_form_component() -> str:
                   onSubmit={handleSubmit}
                   {...rest}
                 >
+                  {csrfFieldValue ? (
+                    <input type="hidden" name="_csrf_token" value={csrfFieldValue} />
+                  ) : null}
                   {children}
                   {error && (
                     <p role="alert" style={{ color: 'red', marginTop: '0.5rem' }}>

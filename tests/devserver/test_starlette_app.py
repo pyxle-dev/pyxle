@@ -4,6 +4,7 @@ import json
 import sys
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 from starlette.applications import Starlette
@@ -930,3 +931,1418 @@ def test_dev_mode_cors_allows_localhost_when_bound_to_all_interfaces(
         headers={"Origin": f"http://localhost:{vite_port + 1}"},
     )
     assert resp_wrong_port.headers.get("access-control-allow-origin") is None
+
+
+# ---------------------------------------------------------------------------
+# _import_middleware_class — plugin-contributed middleware spec resolver
+# ---------------------------------------------------------------------------
+
+
+def test_import_middleware_class_colon_form() -> None:
+    """``package.module:Attribute`` resolves to the named class."""
+    from pyxle.devserver.starlette_app import _import_middleware_class
+    from tests.devserver.sample_middlewares import HeaderCaptureMiddleware
+
+    resolved = _import_middleware_class(
+        "tests.devserver.sample_middlewares:HeaderCaptureMiddleware"
+    )
+    assert resolved is HeaderCaptureMiddleware
+
+
+def test_import_middleware_class_dotted_form() -> None:
+    """``package.module.Attribute`` (no colon) also resolves the class."""
+    from pyxle.devserver.starlette_app import _import_middleware_class
+    from tests.devserver.sample_middlewares import SimpleAsgiMiddleware
+
+    resolved = _import_middleware_class(
+        "tests.devserver.sample_middlewares.SimpleAsgiMiddleware"
+    )
+    assert resolved is SimpleAsgiMiddleware
+
+
+def test_import_middleware_class_rejects_bare_name() -> None:
+    """A spec with neither ':' nor '.' is unresolvable and must raise."""
+    from pyxle.devserver.starlette_app import _import_middleware_class
+
+    with pytest.raises(ValueError) as excinfo:
+        _import_middleware_class("notamodulespec")
+    assert "package.module:Class" in str(excinfo.value)
+
+
+def test_import_middleware_class_missing_attribute() -> None:
+    """A valid module but missing attribute reports the attribute name."""
+    from pyxle.devserver.starlette_app import _import_middleware_class
+
+    with pytest.raises(AttributeError) as excinfo:
+        _import_middleware_class(
+            "tests.devserver.sample_middlewares:DoesNotExist"
+        )
+    assert "DoesNotExist" in str(excinfo.value)
+
+
+def test_import_middleware_class_non_class_target() -> None:
+    """A spec resolving to a non-class value is rejected with a clear type error."""
+    from pyxle.devserver.starlette_app import _import_middleware_class
+
+    # ``invalid_factory`` is a function, not a class.
+    with pytest.raises(TypeError) as excinfo:
+        _import_middleware_class(
+            "tests.devserver.sample_middlewares:invalid_factory"
+        )
+    assert "non-class" in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# HttpOnlyStaticFiles — non-HTTP scope handling
+# ---------------------------------------------------------------------------
+
+
+def test_http_only_static_ignores_lifespan_scope(project: DevServerSettings) -> None:
+    """A non-http, non-websocket scope (e.g. ``lifespan``) is silently
+    ignored — the static app neither serves nor closes a socket."""
+    import asyncio
+
+    from pyxle.devserver.starlette_app import HttpOnlyStaticFiles
+
+    static_app = HttpOnlyStaticFiles(directory=project.public_dir, check_dir=False)
+
+    sent: list[dict] = []
+
+    async def receive() -> dict:
+        return {"type": "lifespan.startup"}
+
+    async def send(message: dict) -> None:
+        sent.append(message)
+
+    asyncio.run(static_app({"type": "lifespan"}, receive, send))
+
+    # Bare ``return`` — nothing is sent for an unsupported scope type.
+    assert sent == []
+
+
+# ---------------------------------------------------------------------------
+# StaticAssetsMiddleware — method gating and _try_static edge branches
+# ---------------------------------------------------------------------------
+
+
+def _static_assets_app(
+    *, public_directory: Path | None = None, client_directory: Path | None = None
+) -> Starlette:
+    """Build a Starlette app whose only middleware is StaticAssetsMiddleware,
+    falling through to a sentinel handler when no static file matches."""
+    from starlette.middleware import Middleware
+
+    from pyxle.devserver.starlette_app import StaticAssetsMiddleware
+
+    async def fallthrough(request):  # noqa: ANN001
+        return PlainTextResponse("FELL-THROUGH")
+
+    app = Starlette(
+        middleware=[
+            Middleware(
+                StaticAssetsMiddleware,
+                public_directory=public_directory,
+                client_directory=client_directory,
+            )
+        ],
+    )
+    app.router.add_route("/{path:path}", fallthrough, methods=["GET", "POST"])
+    return app
+
+
+def test_static_assets_middleware_passes_through_non_get_methods(
+    tmp_path: Path,
+) -> None:
+    """Only GET/HEAD are served from static dirs; a POST to a path that
+    matches a real public file must bypass the static layer entirely."""
+    public_dir = tmp_path / "public"
+    public_dir.mkdir()
+    (public_dir / "robots.txt").write_text("User-agent: *", encoding="utf-8")
+
+    app = _static_assets_app(public_directory=public_dir)
+    client = TestClient(app)
+
+    # GET serves the static file.
+    got = client.get("/robots.txt")
+    assert got.status_code == 200
+    assert "User-agent" in got.text
+
+    # POST is not a static method — falls through to the app handler.
+    posted = client.post("/robots.txt")
+    assert posted.status_code == 200
+    assert posted.text == "FELL-THROUGH"
+
+
+def test_static_assets_middleware_public_branch_when_client_dir_present(
+    tmp_path: Path,
+) -> None:
+    """With a client dir configured, a non-/client path skips the client
+    branch (181->190) and is served from the public dir instead."""
+    public_dir = tmp_path / "public"
+    public_dir.mkdir()
+    (public_dir / "favicon.ico").write_text("ICON", encoding="utf-8")
+    client_dir = tmp_path / "client"
+    client_dir.mkdir()
+
+    app = _static_assets_app(public_directory=public_dir, client_directory=client_dir)
+    client = TestClient(app)
+
+    resp = client.get("/favicon.ico")
+    assert resp.status_code == 200
+    assert resp.text == "ICON"
+    # public assets get the short-lived cache header (not the immutable one).
+    assert resp.headers["cache-control"] == "public, max-age=3600"
+
+
+def test_static_assets_middleware_serves_hashed_client_asset_immutable(
+    tmp_path: Path,
+) -> None:
+    """Vite hashed assets under /client/dist/assets/ are immutable and get a
+    one-year ``immutable`` cache header (line 230)."""
+    client_dir = tmp_path / "client"
+    hashed_dir = client_dir / "dist" / "assets"
+    hashed_dir.mkdir(parents=True)
+    (hashed_dir / "index-a1b2c3d4.js").write_text("export const x = 1;", encoding="utf-8")
+
+    app = _static_assets_app(client_directory=client_dir)
+    client = TestClient(app)
+
+    resp = client.get("/client/dist/assets/index-a1b2c3d4.js")
+    assert resp.status_code == 200
+    assert "export const x" in resp.text
+    assert resp.headers["cache-control"] == "public, max-age=31536000, immutable"
+
+
+def test_static_assets_middleware_unmatched_client_path_falls_through(
+    tmp_path: Path,
+) -> None:
+    """A /client request with no matching file returns False from
+    _try_static and falls through to the app (404 from static is swallowed)."""
+    client_dir = tmp_path / "client"
+    client_dir.mkdir()
+
+    app = _static_assets_app(client_directory=client_dir)
+    client = TestClient(app)
+
+    resp = client.get("/client/assets/missing.js")
+    assert resp.status_code == 200
+    assert resp.text == "FELL-THROUGH"
+
+
+def test_try_static_returns_false_on_prefix_mismatch(tmp_path: Path) -> None:
+    """Calling _try_static with a prefix the path does not start with is a
+    no-op that returns False (defensive guard, line 209)."""
+    import asyncio
+
+    from pyxle.devserver.starlette_app import HttpOnlyStaticFiles, StaticAssetsMiddleware
+
+    client_dir = tmp_path / "client"
+    client_dir.mkdir()
+    static = HttpOnlyStaticFiles(directory=client_dir, check_dir=False)
+
+    scope = {"type": "http", "method": "GET", "path": "/not-client/foo.js"}
+
+    async def receive() -> dict:
+        return {"type": "http.request"}
+
+    send = AsyncMock()
+
+    result = asyncio.run(
+        StaticAssetsMiddleware._try_static(
+            static, scope, receive, send, prefix="/client"
+        )
+    )
+    assert result is False
+    # The guard short-circuits before touching the static app, so nothing
+    # is ever sent on the wire.
+    send.assert_not_awaited()
+
+
+def test_try_static_handles_scope_without_bytes_raw_path(tmp_path: Path) -> None:
+    """When the scope's raw_path is absent/non-bytes, the prefix-stripping
+    path skips the raw_path re-encode (214->216) and still serves the file."""
+    import asyncio
+
+    from pyxle.devserver.starlette_app import HttpOnlyStaticFiles, StaticAssetsMiddleware
+
+    client_dir = tmp_path / "client"
+    client_dir.mkdir()
+    (client_dir / "app.js").write_text("CLIENTJS", encoding="utf-8")
+    static = HttpOnlyStaticFiles(directory=client_dir, check_dir=False)
+
+    # No "raw_path" key at all → the isinstance(raw_path, bytes) guard is False.
+    scope = {
+        "type": "http",
+        "method": "GET",
+        "path": "/client/app.js",
+        "headers": [],
+    }
+
+    async def receive() -> dict:
+        return {"type": "http.request"}
+
+    started: list[dict] = []
+    body = bytearray()
+
+    async def send(message: dict) -> None:
+        if message["type"] == "http.response.start":
+            started.append(message)
+        elif message["type"] == "http.response.body":
+            body.extend(message.get("body", b""))
+
+    result = asyncio.run(
+        StaticAssetsMiddleware._try_static(
+            static, scope, receive, send, prefix="/client"
+        )
+    )
+    assert result is True
+    assert started and started[0]["status"] == 200
+    assert bytes(body) == b"CLIENTJS"
+
+
+def test_try_static_reraises_non_404_http_exception(tmp_path: Path) -> None:
+    """A non-404 HTTPException from the static app (e.g. 405 from a method
+    StaticFiles rejects) propagates rather than being treated as a miss."""
+    import asyncio
+
+    from starlette.exceptions import HTTPException
+
+    from pyxle.devserver.starlette_app import StaticAssetsMiddleware
+
+    class _BoomStatic:
+        async def __call__(self, scope, receive, send):  # noqa: ANN001
+            raise HTTPException(status_code=405)
+
+    scope = {"type": "http", "method": "GET", "path": "/whatever.js"}
+
+    async def receive() -> dict:
+        return {"type": "http.request"}
+
+    send = AsyncMock()
+
+    with pytest.raises(HTTPException) as excinfo:
+        asyncio.run(
+            StaticAssetsMiddleware._try_static(_BoomStatic(), scope, receive, send)
+        )
+    assert excinfo.value.status_code == 405
+
+
+# ---------------------------------------------------------------------------
+# build_api_router / _import_module / _resolve_api_handlers — error paths
+# ---------------------------------------------------------------------------
+
+
+def test_build_api_router_raises_for_unloadable_module_path(project: DevServerSettings) -> None:
+    """A module path with no recognised Python suffix yields a None import
+    spec, surfaced as ApiRouteError (line 322)."""
+    from pyxle.devserver.routes import ApiRoute
+
+    bogus = ApiRoute(
+        path="/api/bogus",
+        source_relative_path=Path("api/bogus"),
+        source_absolute_path=project.pages_dir / "api/bogus",
+        # No ``.py`` suffix → importlib returns spec=None.
+        server_module_path=project.server_build_dir / "api" / "bogus",
+        module_key="pyxle.server.api.bogus_unloadable",
+        content_hash="deadbeef",
+    )
+
+    with pytest.raises(ApiRouteError) as excinfo:
+        build_api_router([bogus])
+    assert "Unable to load API module" in str(excinfo.value)
+
+
+def test_resolve_api_handlers_rejects_non_callable_endpoint(project: DevServerSettings) -> None:
+    """An API module whose ``endpoint`` is not callable is rejected with a
+    descriptive ApiRouteError (line 358)."""
+    write_file(
+        project.pages_dir / "api/bad_endpoint.py",
+        "endpoint = 42  # not callable\n",
+    )
+    build_once(project)
+    registry = load_metadata_registry(project)
+    table = build_route_table(registry)
+    bad = next(r for r in table.apis if r.path == "/api/bad_endpoint")
+
+    with pytest.raises(ApiRouteError) as excinfo:
+        build_api_router([bad])
+    assert "endpoint" in str(excinfo.value)
+    assert "not callable" in str(excinfo.value)
+
+
+def test_resolve_api_handlers_rejects_non_callable_websocket(project: DevServerSettings) -> None:
+    """An API module whose ``websocket`` is not callable is rejected (line 366)."""
+    write_file(
+        project.pages_dir / "api/bad_ws.py",
+        "from starlette.responses import JSONResponse\n"
+        "\n"
+        "async def endpoint(request):\n"
+        "    return JSONResponse({'ok': True})\n"
+        "\n"
+        "websocket = 'not callable'\n",
+    )
+    build_once(project)
+    registry = load_metadata_registry(project)
+    table = build_route_table(registry)
+    bad = next(r for r in table.apis if r.path == "/api/bad_ws")
+
+    with pytest.raises(ApiRouteError) as excinfo:
+        build_api_router([bad])
+    assert "websocket" in str(excinfo.value)
+    assert "not callable" in str(excinfo.value)
+
+
+def test_resolve_api_handler_shim_returns_http_handler(project: DevServerSettings) -> None:
+    """The compatibility shim ``_resolve_api_handler`` returns the HTTP
+    handler for a module that has one (lines 401-407 happy path)."""
+    import importlib.util
+    import sys as _sys
+
+    from pyxle.devserver.starlette_app import _resolve_api_handler
+
+    mod_path = project.server_build_dir / "shim_http.py"
+    write_file(
+        mod_path,
+        "from starlette.responses import JSONResponse\n"
+        "\n"
+        "async def endpoint(request):\n"
+        "    return JSONResponse({'ok': True})\n",
+    )
+    spec = importlib.util.spec_from_file_location("pyxle._shim_http_mod", mod_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    try:
+        handler = _resolve_api_handler(module)
+        assert handler is module.endpoint
+    finally:
+        _sys.modules.pop("pyxle._shim_http_mod", None)
+
+
+def test_resolve_api_handler_shim_raises_for_ws_only_module(
+    project: DevServerSettings,
+) -> None:
+    """The shim raises when a module exposes only a WebSocket handler, telling
+    the caller to use _resolve_api_handlers instead (lines 402-406)."""
+    import importlib.util
+    import sys as _sys
+
+    from pyxle.devserver.starlette_app import _resolve_api_handler
+
+    mod_path = project.server_build_dir / "shim_ws.py"
+    write_file(
+        mod_path,
+        "async def websocket(ws):\n"
+        "    await ws.accept()\n"
+        "    await ws.close()\n",
+    )
+    spec = importlib.util.spec_from_file_location("pyxle._shim_ws_mod", mod_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    try:
+        with pytest.raises(ApiRouteError) as excinfo:
+            _resolve_api_handler(module)
+        assert "WebSocket" in str(excinfo.value)
+    finally:
+        _sys.modules.pop("pyxle._shim_ws_mod", None)
+
+
+# ---------------------------------------------------------------------------
+# _dispatch_action — validation and error envelopes not exercised elsewhere
+# ---------------------------------------------------------------------------
+
+
+def _action_app(module_path: Path, module_key: str, action_name: str) -> TestClient:
+    """Build a TestClient over a single specific (non-catchall) action route."""
+    from pyxle.devserver.routes import ActionRoute
+    from pyxle.devserver.starlette_app import build_action_router
+
+    route = ActionRoute(
+        path=f"/api/__actions/page/{action_name}",
+        page_path="/page",
+        action_name=action_name,
+        server_module_path=module_path,
+        module_key=module_key,
+    )
+    router = build_action_router([route])
+    app = Starlette()
+    app.router.routes.extend(router.routes)
+    return TestClient(app, raise_server_exceptions=False)
+
+
+def test_dispatch_action_rejects_invalid_action_name(tmp_path: Path) -> None:
+    """A route whose action name fails the SAFE_IDENTIFIER_RE check returns a
+    400 'Invalid action name' before any module import (line 589)."""
+    from pyxle.devserver.routes import ActionRoute
+    from pyxle.devserver.starlette_app import build_action_router
+
+    module_path = tmp_path / "server" / "page.py"
+    write_file(module_path, "from pyxle.runtime import action\n")
+
+    # Register a route whose path carries an illegal action segment. The route
+    # path itself is a literal so Starlette matches it; the handler then
+    # validates the (invalid) action name.
+    route = ActionRoute(
+        path="/api/__actions/page/bad-name",
+        page_path="/page",
+        action_name="bad-name",  # hyphen is not a valid identifier
+        server_module_path=module_path,
+        module_key="pyxle.server.pages.badname",
+    )
+    router = build_action_router([route])
+    app = Starlette()
+    app.router.routes.extend(router.routes)
+    client = TestClient(app, raise_server_exceptions=False)
+
+    resp = client.post("/api/__actions/page/bad-name", json={})
+    assert resp.status_code == 400
+    assert resp.json() == {"ok": False, "error": "Invalid action name"}
+
+
+def test_dispatch_action_rejects_oversized_body(tmp_path: Path) -> None:
+    """A Content-Length exceeding the 10 MB action body cap is rejected with
+    413 before the body is read (lines 596-600)."""
+    module_path = tmp_path / "server" / "page.py"
+    write_file(
+        module_path,
+        "from pyxle.runtime import action\n"
+        "\n"
+        "@action\n"
+        "async def upload(request):\n"
+        "    return {'ok': True}\n",
+    )
+    client = _action_app(module_path, "pyxle.server.pages.oversized", "upload")
+
+    too_big = str(11 * 1024 * 1024)
+    resp = client.post(
+        "/api/__actions/page/upload",
+        headers={"content-length": too_big, "content-type": "application/json"},
+        content=b"{}",
+    )
+    assert resp.status_code == 413
+    assert resp.json() == {"ok": False, "error": "Request body too large"}
+
+
+def test_dispatch_action_warns_on_synchronous_action(tmp_path: Path) -> None:
+    """A function decorated @action but defined with ``def`` (not ``async
+    def``) is flagged with a warning before dispatch (lines 617-625).
+
+    The dispatcher always ``await``\\s the action, so a synchronous function
+    that returns a plain dict cannot complete (you can't await a dict) and is
+    caught by the generic error envelope as a 500 — the warning is the
+    actionable signal that tells the developer to make the action ``async``.
+    """
+    import logging
+
+    module_path = tmp_path / "server" / "page.py"
+    write_file(
+        module_path,
+        "from pyxle.runtime import action\n"
+        "\n"
+        "@action\n"
+        "def sync_action(request):\n"
+        "    return {'ran': 'sync'}\n",
+    )
+    # debug=True so the generic-exception path surfaces the real error string.
+    from pyxle.devserver.routes import ActionRoute
+    from pyxle.devserver.starlette_app import build_action_router
+
+    route = ActionRoute(
+        path="/api/__actions/page/sync_action",
+        page_path="/page",
+        action_name="sync_action",
+        server_module_path=module_path,
+        module_key="pyxle.server.pages.syncaction",
+    )
+    router = build_action_router([route], debug=True)
+    app = Starlette()
+    app.router.routes.extend(router.routes)
+    client = TestClient(app, raise_server_exceptions=False)
+
+    # Attach a handler directly to the module logger so the assertion does
+    # not depend on caplog's root-propagation behaviour across the
+    # TestClient worker thread.
+    records: list[logging.LogRecord] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    logger = logging.getLogger("pyxle.devserver.starlette_app")
+    handler = _Capture()
+    previous_level = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(logging.WARNING)
+    try:
+        resp = client.post("/api/__actions/page/sync_action", json={})
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(previous_level)
+
+    # The warning fired (line 618-620) regardless of the eventual outcome.
+    assert any("synchronous" in rec.getMessage() for rec in records)
+    # Awaiting the returned dict fails → generic 500 envelope.
+    assert resp.status_code == 500
+    assert resp.json()["ok"] is False
+
+
+def test_dispatch_action_invalidate_hint_all_empty_skips_header(tmp_path: Path) -> None:
+    """When the invalidate hint is truthy but every URL is empty, the join
+    yields an empty string and no header is emitted (branch 662->664)."""
+    module_path = tmp_path / "server" / "page.py"
+    write_file(
+        module_path,
+        "from pyxle.runtime import action\n"
+        "\n"
+        "@action\n"
+        "async def noop_invalidate(request):\n"
+        "    # Non-empty list, but all entries are empty → joined == ''.\n"
+        "    return {'ok': True, '__pyxle_invalidate__': ['', '']}\n",
+    )
+    client = _action_app(module_path, "pyxle.server.pages.invempty", "noop_invalidate")
+
+    resp = client.post("/api/__actions/page/noop_invalidate", json={})
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True}
+    assert "x-pyxle-invalidate" not in resp.headers
+
+
+def test_dispatch_action_generic_exception_envelope_debug(tmp_path: Path) -> None:
+    """A non-ActionError exception is wrapped in a 500 envelope; in debug the
+    real message is surfaced (lines 642-644)."""
+    from pyxle.devserver.routes import ActionRoute
+    from pyxle.devserver.starlette_app import build_action_router
+
+    module_path = tmp_path / "server" / "page.py"
+    write_file(
+        module_path,
+        "from pyxle.runtime import action\n"
+        "\n"
+        "@action\n"
+        "async def boom(request):\n"
+        "    raise RuntimeError('kaboom detail')\n",
+    )
+    route = ActionRoute(
+        path="/api/__actions/page/boom",
+        page_path="/page",
+        action_name="boom",
+        server_module_path=module_path,
+        module_key="pyxle.server.pages.boomdebug",
+    )
+    router = build_action_router([route], debug=True)
+    app = Starlette()
+    app.router.routes.extend(router.routes)
+    client = TestClient(app, raise_server_exceptions=False)
+
+    resp = client.post("/api/__actions/page/boom", json={})
+    assert resp.status_code == 500
+    body = resp.json()
+    assert body["ok"] is False
+    assert body["error"] == "kaboom detail"
+
+
+def test_dispatch_action_generic_exception_envelope_production(tmp_path: Path) -> None:
+    """In production (debug=False) the same exception is masked behind a
+    generic 'Internal server error' message (line 643 false branch)."""
+    from pyxle.devserver.routes import ActionRoute
+    from pyxle.devserver.starlette_app import build_action_router
+
+    module_path = tmp_path / "server" / "page.py"
+    write_file(
+        module_path,
+        "from pyxle.runtime import action\n"
+        "\n"
+        "@action\n"
+        "async def boom(request):\n"
+        "    raise RuntimeError('leaky internal detail')\n",
+    )
+    route = ActionRoute(
+        path="/api/__actions/page/boom",
+        page_path="/page",
+        action_name="boom",
+        server_module_path=module_path,
+        module_key="pyxle.server.pages.boomprod",
+    )
+    router = build_action_router([route], debug=False)
+    app = Starlette()
+    app.router.routes.extend(router.routes)
+    client = TestClient(app, raise_server_exceptions=False)
+
+    resp = client.post("/api/__actions/page/boom", json={})
+    assert resp.status_code == 500
+    body = resp.json()
+    assert body["ok"] is False
+    assert body["error"] == "Internal server error"
+    assert "leaky internal detail" not in resp.text
+
+
+def test_dispatch_action_emits_invalidate_header_for_list(tmp_path: Path) -> None:
+    """``invalidate_routes(dict, *urls)`` stashes hints the dispatcher lifts
+    into an ``x-pyxle-invalidate`` header, stripping the sentinel (659-663)."""
+    module_path = tmp_path / "server" / "page.py"
+    write_file(
+        module_path,
+        "from pyxle.runtime import action, invalidate_routes\n"
+        "\n"
+        "@action\n"
+        "async def delete_post(request):\n"
+        "    result = {'deleted': True}\n"
+        "    return invalidate_routes(result, '/posts', '/feed')\n",
+    )
+    client = _action_app(module_path, "pyxle.server.pages.invlist", "delete_post")
+
+    resp = client.post("/api/__actions/page/delete_post", json={})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body == {"ok": True, "deleted": True}
+    # Sentinel key must not leak into the JSON body.
+    assert "__pyxle_invalidate__" not in body
+    assert resp.headers["x-pyxle-invalidate"] == "/posts, /feed"
+
+
+def test_dispatch_action_invalidate_header_from_string_hint(tmp_path: Path) -> None:
+    """When the stashed hint is a bare string (not a list) it is normalised to
+    a single-entry header (lines 659-660)."""
+    module_path = tmp_path / "server" / "page.py"
+    write_file(
+        module_path,
+        "from pyxle.runtime import action\n"
+        "\n"
+        "@action\n"
+        "async def touch(request):\n"
+        "    # Hand-craft a string sentinel to exercise the str-normalisation.\n"
+        "    return {'ok': True, '__pyxle_invalidate__': '/dashboard'}\n",
+    )
+    client = _action_app(module_path, "pyxle.server.pages.invstr", "touch")
+
+    resp = client.post("/api/__actions/page/touch", json={})
+    assert resp.status_code == 200
+    assert resp.headers["x-pyxle-invalidate"] == "/dashboard"
+    assert "__pyxle_invalidate__" not in resp.json()
+
+
+def test_catchall_action_missing_name_returns_400(tmp_path: Path) -> None:
+    """A catch-all action request whose captured path is empty yields a 400
+    'Action name missing from request path' (line 696)."""
+    from pyxle.devserver.routes import ActionRoute
+    from pyxle.devserver.starlette_app import build_action_router
+
+    module_path = tmp_path / "server" / "docs.py"
+    write_file(
+        module_path,
+        "from pyxle.runtime import action\n"
+        "\n"
+        "@action\n"
+        "async def search(request):\n"
+        "    return {'ok': True}\n",
+    )
+    route = ActionRoute(
+        path="/api/__actions/docs/{_pyxle_action_path:path}",
+        page_path="/docs",
+        action_name="",
+        server_module_path=module_path,
+        module_key="pyxle.server.pages.docsempty",
+        is_catchall=True,
+    )
+    router = build_action_router([route])
+    app = Starlette()
+    app.router.routes.extend(router.routes)
+    client = TestClient(app, raise_server_exceptions=False)
+
+    # Trailing slash → captured ``_pyxle_action_path`` is empty.
+    resp = client.post("/api/__actions/docs/", json={})
+    assert resp.status_code == 400
+    assert resp.json() == {
+        "ok": False,
+        "error": "Action name missing from request path",
+    }
+
+
+# ---------------------------------------------------------------------------
+# build_client_assets_mount — direct constructor coverage
+# ---------------------------------------------------------------------------
+
+
+def test_build_client_assets_mount_serves_directory(tmp_path: Path) -> None:
+    """``build_client_assets_mount`` mounts a StaticFiles app under /client
+    (lines 726-727)."""
+    from pyxle.devserver.starlette_app import build_client_assets_mount
+
+    client_dir = tmp_path / "dist-client"
+    (client_dir / "assets").mkdir(parents=True)
+    (client_dir / "assets" / "main.js").write_text("MAINJS", encoding="utf-8")
+
+    mount = build_client_assets_mount(client_dir)
+    assert mount.path == "/client"
+    assert mount.name == "pyxle-client-assets"
+
+    app = Starlette()
+    app.router.routes.append(mount)
+    client = TestClient(app)
+
+    resp = client.get("/client/assets/main.js")
+    assert resp.status_code == 200
+    assert resp.text == "MAINJS"
+
+
+# ---------------------------------------------------------------------------
+# create_starlette_app — middleware / hook loading failures + boot wiring
+# ---------------------------------------------------------------------------
+
+
+def test_create_starlette_app_raises_on_bad_custom_middleware(
+    project: DevServerSettings,
+) -> None:
+    """A custom middleware spec that cannot be loaded raises (and is logged)
+    at app-assembly time (lines 789-791)."""
+    from pyxle.devserver.middleware import MiddlewareHookError
+
+    build_once(project)
+    registry = load_metadata_registry(project)
+    table = build_route_table(registry)
+
+    errors: list[str] = []
+
+    class StubLogger(ConsoleLogger):
+        def error(self, message: str) -> None:  # type: ignore[override]
+            errors.append(message)
+
+    broken = replace(
+        project,
+        custom_middlewares=("tests.devserver.sample_middlewares:NoSuchMiddleware",),
+    )
+
+    with pytest.raises(MiddlewareHookError):
+        create_starlette_app(broken, table, logger=StubLogger())
+    assert errors  # the failure was surfaced through the logger
+
+
+def test_create_starlette_app_raises_on_bad_route_hook(
+    project: DevServerSettings,
+) -> None:
+    """A page route-hook spec that fails to resolve raises a RouteHookError,
+    logged via the console logger (lines 898-900)."""
+    from pyxle.devserver.route_hooks import RouteHookError
+
+    build_once(project)
+    registry = load_metadata_registry(project)
+    table = build_route_table(registry)
+
+    errors: list[str] = []
+
+    class StubLogger(ConsoleLogger):
+        def error(self, message: str) -> None:  # type: ignore[override]
+            errors.append(message)
+
+    broken = replace(
+        project,
+        page_route_hooks=("tests.devserver.sample_middlewares:no_such_hook",),
+    )
+
+    with pytest.raises(RouteHookError):
+        create_starlette_app(broken, table, logger=StubLogger())
+    assert errors
+
+
+def test_ensure_project_root_on_sys_path_is_idempotent(project: DevServerSettings) -> None:
+    """When the project root is already on sys.path, no duplicate entry is
+    inserted (branch 59->exit)."""
+    from pyxle.devserver.starlette_app import _ensure_project_root_on_sys_path
+
+    root = str(project.project_root)
+    original = list(sys.path)
+    try:
+        sys.path.insert(0, root)
+        before = sys.path.count(root)
+        _ensure_project_root_on_sys_path(project.project_root)
+        # No additional copy added.
+        assert sys.path.count(root) == before
+    finally:
+        sys.path[:] = original
+
+
+# ---------------------------------------------------------------------------
+# CORS — non-loopback host and user-config merge branches
+# ---------------------------------------------------------------------------
+
+
+def test_dev_mode_cors_for_named_host_origin(
+    project: DevServerSettings,
+    monkeypatch,
+) -> None:
+    """When vite_host is a concrete non-loopback host, exactly that origin is
+    allowed (line 828)."""
+    monkeypatch.setattr(
+        "pyxle.devserver.starlette_app.ComponentRenderer",
+        lambda: object(),
+    )
+
+    async def fake_build_page_response(*, request, settings, page, renderer, overlay=None, **_kw):
+        return PlainTextResponse("page")
+
+    monkeypatch.setattr(
+        "pyxle.devserver.starlette_app.build_page_response",
+        fake_build_page_response,
+    )
+
+    build_once(project)
+    registry = load_metadata_registry(project)
+    table = build_route_table(registry)
+
+    named = replace(project, vite_host="dev.internal")
+    app = create_starlette_app(named, table)
+    client = TestClient(app)
+
+    origin = f"http://dev.internal:{named.vite_port}"
+    resp = client.get("/api/pulse", headers={"Origin": origin})
+    assert resp.status_code == 200
+    assert resp.headers.get("access-control-allow-origin") == origin
+
+    # A different host on the same port must NOT be allowed.
+    other = client.get(
+        "/api/pulse", headers={"Origin": f"http://evil.example:{named.vite_port}"}
+    )
+    assert other.headers.get("access-control-allow-origin") is None
+
+
+def test_dev_mode_user_cors_already_contains_vite_origin(
+    project: DevServerSettings,
+    monkeypatch,
+) -> None:
+    """When the user's CORS origins already include the Vite origin, the merge
+    does not duplicate it (branch 840->839 continues the loop)."""
+    from pyxle.config import CorsConfig
+
+    monkeypatch.setattr(
+        "pyxle.devserver.starlette_app.ComponentRenderer",
+        lambda: object(),
+    )
+
+    async def fake_build_page_response(*, request, settings, page, renderer, overlay=None, **_kw):
+        return PlainTextResponse("page")
+
+    monkeypatch.setattr(
+        "pyxle.devserver.starlette_app.build_page_response",
+        fake_build_page_response,
+    )
+
+    build_once(project)
+    registry = load_metadata_registry(project)
+    table = build_route_table(registry)
+
+    # Pre-seed BOTH loopback vite origins so the merge loop finds them present.
+    vite_origins = (
+        f"http://localhost:{project.vite_port}",
+        f"http://127.0.0.1:{project.vite_port}",
+        "https://app.example.com",
+    )
+    with_cors = replace(project, cors=CorsConfig(origins=vite_origins))
+    app = create_starlette_app(with_cors, table)
+    client = TestClient(app)
+
+    # The user origin works.
+    user_resp = client.get(
+        "/api/pulse", headers={"Origin": "https://app.example.com"}
+    )
+    assert user_resp.headers.get("access-control-allow-origin") == "https://app.example.com"
+
+    # The (already-present) vite origin still works and is not duplicated.
+    vite_resp = client.get(
+        "/api/pulse", headers={"Origin": f"http://127.0.0.1:{project.vite_port}"}
+    )
+    assert (
+        vite_resp.headers.get("access-control-allow-origin")
+        == f"http://127.0.0.1:{project.vite_port}"
+    )
+
+
+def test_dev_mode_user_cors_merges_regex_when_bound_to_all_interfaces(
+    project: DevServerSettings,
+    monkeypatch,
+) -> None:
+    """User CORS + vite_host=0.0.0.0 merges the private-network regex into the
+    CORS middleware kwargs (line 843)."""
+    from pyxle.config import CorsConfig
+
+    monkeypatch.setattr(
+        "pyxle.devserver.starlette_app.ComponentRenderer",
+        lambda: object(),
+    )
+
+    async def fake_build_page_response(*, request, settings, page, renderer, overlay=None, **_kw):
+        return PlainTextResponse("page")
+
+    monkeypatch.setattr(
+        "pyxle.devserver.starlette_app.build_page_response",
+        fake_build_page_response,
+    )
+
+    build_once(project)
+    registry = load_metadata_registry(project)
+    table = build_route_table(registry)
+
+    wildcard = replace(
+        project,
+        vite_host="0.0.0.0",
+        cors=CorsConfig(origins=("https://prod.example.com",)),
+    )
+    app = create_starlette_app(wildcard, table)
+    client = TestClient(app)
+
+    # Explicit user origin allowed.
+    user_resp = client.get(
+        "/api/pulse", headers={"Origin": "https://prod.example.com"}
+    )
+    assert (
+        user_resp.headers.get("access-control-allow-origin")
+        == "https://prod.example.com"
+    )
+
+    # A private-network origin matches the merged regex.
+    lan_origin = f"http://192.168.0.5:{wildcard.vite_port}"
+    lan_resp = client.get("/api/pulse", headers={"Origin": lan_origin})
+    assert lan_resp.headers.get("access-control-allow-origin") == lan_origin
+
+
+def test_production_user_cors_does_not_merge_vite_origin(
+    project: DevServerSettings,
+    monkeypatch,
+) -> None:
+    """With user CORS but debug=False, the Vite origin is NOT auto-merged
+    (branch 837->845 skips the debug merge block)."""
+    from pyxle.config import CorsConfig
+
+    monkeypatch.setattr(
+        "pyxle.devserver.starlette_app.ComponentRenderer",
+        lambda: object(),
+    )
+
+    async def fake_build_page_response(*, request, settings, page, renderer, overlay=None, **_kw):
+        return PlainTextResponse("page")
+
+    monkeypatch.setattr(
+        "pyxle.devserver.starlette_app.build_page_response",
+        fake_build_page_response,
+    )
+
+    build_once(project)
+    registry = load_metadata_registry(project)
+    table = build_route_table(registry)
+
+    prod = replace(
+        project,
+        debug=False,
+        cors=CorsConfig(origins=("https://prod.example.com",)),
+    )
+    app = create_starlette_app(prod, table)
+    client = TestClient(app)
+
+    # User origin works.
+    user_resp = client.get(
+        "/api/pulse", headers={"Origin": "https://prod.example.com"}
+    )
+    assert (
+        user_resp.headers.get("access-control-allow-origin")
+        == "https://prod.example.com"
+    )
+
+    # The Vite origin is NOT in the allowed set in production.
+    vite_origin = f"http://{prod.vite_host}:{prod.vite_port}"
+    vite_resp = client.get("/api/pulse", headers={"Origin": vite_origin})
+    assert vite_resp.headers.get("access-control-allow-origin") is None
+
+
+# ---------------------------------------------------------------------------
+# CSRF middleware wiring
+# ---------------------------------------------------------------------------
+
+
+def test_create_starlette_app_installs_csrf_middleware(
+    project: DevServerSettings,
+    monkeypatch,
+) -> None:
+    """When ``settings.csrf`` is enabled the CSRF middleware is added to the
+    stack: a GET seeds the double-submit cookie and an unprotected POST is
+    rejected with 403 (lines 875-885, 978)."""
+    from pyxle.config import CsrfConfig
+
+    monkeypatch.setattr(
+        "pyxle.devserver.starlette_app.ComponentRenderer",
+        lambda: object(),
+    )
+
+    async def fake_build_page_response(*, request, settings, page, renderer, overlay=None, **_kw):
+        return PlainTextResponse("page")
+
+    monkeypatch.setattr(
+        "pyxle.devserver.starlette_app.build_page_response",
+        fake_build_page_response,
+    )
+
+    build_once(project)
+    registry = load_metadata_registry(project)
+    table = build_route_table(registry)
+
+    with_csrf = replace(project, csrf=CsrfConfig(enabled=True))
+    app = create_starlette_app(with_csrf, table)
+    client = TestClient(app, raise_server_exceptions=False)
+
+    # A GET is a safe method: the CSRF cookie is seeded on the response.
+    got = client.get("/api/pulse")
+    assert got.status_code == 200
+    assert any(
+        cookie.startswith("pyxle-csrf=") for cookie in got.headers.get_list("set-cookie")
+    )
+
+    # A POST without the matching header/token is rejected by the middleware.
+    posted = client.post("/api/__actions/index/noop", json={})
+    assert posted.status_code == 403
+
+
+def test_create_starlette_app_csrf_secure_cookie_in_production(
+    project: DevServerSettings,
+    monkeypatch,
+) -> None:
+    """In production with CSRF enabled and cookie_secure unset, the cookie is
+    forced Secure (lines 881-883)."""
+    from pyxle.config import CsrfConfig
+
+    monkeypatch.setattr(
+        "pyxle.devserver.starlette_app.ComponentRenderer",
+        lambda: object(),
+    )
+
+    async def fake_build_page_response(*, request, settings, page, renderer, overlay=None, **_kw):
+        return PlainTextResponse("page")
+
+    monkeypatch.setattr(
+        "pyxle.devserver.starlette_app.build_page_response",
+        fake_build_page_response,
+    )
+
+    build_once(project)
+    registry = load_metadata_registry(project)
+    table = build_route_table(registry)
+
+    prod_csrf = replace(
+        project,
+        debug=False,
+        csrf=CsrfConfig(enabled=True, cookie_secure=False),
+    )
+    app = create_starlette_app(prod_csrf, table)
+    client = TestClient(app, raise_server_exceptions=False)
+
+    got = client.get("/api/pulse")
+    csrf_cookie = next(
+        c for c in got.headers.get_list("set-cookie") if c.startswith("pyxle-csrf=")
+    )
+    assert "Secure" in csrf_cookie
+
+
+# ---------------------------------------------------------------------------
+# Plugin-contributed middleware
+# ---------------------------------------------------------------------------
+
+
+def _write_plugin_package(tmp_path: Path, *, body: str, package: str) -> Path:
+    """Write a tiny importable plugin package onto a fresh directory and return
+    that directory (to be inserted on sys.path by the caller)."""
+    pkg_root = tmp_path / "plugin_src"
+    (pkg_root / package).mkdir(parents=True, exist_ok=True)
+    (pkg_root / package / "__init__.py").write_text("", encoding="utf-8")
+    (pkg_root / package / "plugin.py").write_text(body, encoding="utf-8")
+    return pkg_root
+
+
+def test_plugin_contributed_middleware_is_applied(
+    project: DevServerSettings,
+    monkeypatch,
+) -> None:
+    """A plugin returning ``(import_string, options)`` from ``middleware()``
+    has that middleware instantiated and added to the stack (lines 986-1007)."""
+    monkeypatch.setattr(
+        "pyxle.devserver.starlette_app.ComponentRenderer",
+        lambda: object(),
+    )
+
+    async def fake_build_page_response(*, request, settings, page, renderer, overlay=None, **_kw):
+        return PlainTextResponse("page")
+
+    monkeypatch.setattr(
+        "pyxle.devserver.starlette_app.build_page_response",
+        fake_build_page_response,
+    )
+
+    pkg_root = _write_plugin_package(
+        tmp_path=project.project_root,
+        package="pyxle_stamp",
+        body=(
+            "from starlette.middleware.base import BaseHTTPMiddleware\n"
+            "from pyxle.plugins import PyxlePlugin\n"
+            "\n"
+            "class StampMiddleware(BaseHTTPMiddleware):\n"
+            "    async def dispatch(self, request, call_next):\n"
+            "        response = await call_next(request)\n"
+            "        response.headers['x-plugin-stamp'] = 'on'\n"
+            "        return response\n"
+            "\n"
+            "class _StampPlugin(PyxlePlugin):\n"
+            "    name = 'pyxle-stamp'\n"
+            "    def middleware(self):\n"
+            "        return ((\n"
+            "            'pyxle_stamp.plugin:StampMiddleware', {},\n"
+            "        ),)\n"
+            "\n"
+            "plugin = _StampPlugin()\n"
+        ),
+    )
+    monkeypatch.syspath_prepend(str(pkg_root))
+
+    build_once(project)
+    registry = load_metadata_registry(project)
+    table = build_route_table(registry)
+
+    with_plugin = replace(project, plugins=("pyxle-stamp",))
+    app = create_starlette_app(with_plugin, table)
+    client = TestClient(app)
+
+    resp = client.get("/api/pulse")
+    assert resp.status_code == 200
+    assert resp.headers.get("x-plugin-stamp") == "on"
+
+
+def test_plugin_middleware_skips_malformed_entry(
+    project: DevServerSettings,
+    monkeypatch,
+) -> None:
+    """A plugin middleware entry that is not a 2-tuple is skipped with a
+    warning, and the app still boots (lines 989-996)."""
+    monkeypatch.setattr(
+        "pyxle.devserver.starlette_app.ComponentRenderer",
+        lambda: object(),
+    )
+
+    async def fake_build_page_response(*, request, settings, page, renderer, overlay=None, **_kw):
+        return PlainTextResponse("page")
+
+    monkeypatch.setattr(
+        "pyxle.devserver.starlette_app.build_page_response",
+        fake_build_page_response,
+    )
+
+    pkg_root = _write_plugin_package(
+        tmp_path=project.project_root,
+        package="pyxle_bad_mw",
+        body=(
+            "from pyxle.plugins import PyxlePlugin\n"
+            "\n"
+            "class _BadMwPlugin(PyxlePlugin):\n"
+            "    name = 'pyxle-bad-mw'\n"
+            "    def middleware(self):\n"
+            "        # Not an (import_string, options) pair.\n"
+            "        return ('this-is-not-a-tuple-pair',)\n"
+            "\n"
+            "plugin = _BadMwPlugin()\n"
+        ),
+    )
+    monkeypatch.syspath_prepend(str(pkg_root))
+
+    build_once(project)
+    registry = load_metadata_registry(project)
+    table = build_route_table(registry)
+
+    warnings: list[str] = []
+
+    class StubLogger(ConsoleLogger):
+        def warning(self, message, *args) -> None:  # type: ignore[override]
+            warnings.append(message % args if args else message)
+
+    with_plugin = replace(project, plugins=("pyxle-bad-mw",))
+    app = create_starlette_app(with_plugin, table, logger=StubLogger())
+    client = TestClient(app)
+
+    resp = client.get("/api/pulse")
+    assert resp.status_code == 200
+    assert any("isn't" in w or "skipping" in w for w in warnings)
+
+
+def test_plugin_middleware_import_failure_raises(
+    project: DevServerSettings,
+    monkeypatch,
+) -> None:
+    """If a plugin middleware import_string cannot be loaded, app assembly
+    logs an error and re-raises (lines 999-1006)."""
+    monkeypatch.setattr(
+        "pyxle.devserver.starlette_app.ComponentRenderer",
+        lambda: object(),
+    )
+
+    async def fake_build_page_response(*, request, settings, page, renderer, overlay=None, **_kw):
+        return PlainTextResponse("page")
+
+    monkeypatch.setattr(
+        "pyxle.devserver.starlette_app.build_page_response",
+        fake_build_page_response,
+    )
+
+    pkg_root = _write_plugin_package(
+        tmp_path=project.project_root,
+        package="pyxle_brokenmw",
+        body=(
+            "from pyxle.plugins import PyxlePlugin\n"
+            "\n"
+            "class _BrokenMwPlugin(PyxlePlugin):\n"
+            "    name = 'pyxle-brokenmw'\n"
+            "    def middleware(self):\n"
+            "        return (('pyxle_brokenmw.plugin:DoesNotExist', {}),)\n"
+            "\n"
+            "plugin = _BrokenMwPlugin()\n"
+        ),
+    )
+    monkeypatch.syspath_prepend(str(pkg_root))
+
+    build_once(project)
+    registry = load_metadata_registry(project)
+    table = build_route_table(registry)
+
+    errors: list[str] = []
+
+    class StubLogger(ConsoleLogger):
+        def error(self, message, *args) -> None:  # type: ignore[override]
+            errors.append(message % args if args else message)
+
+    with_plugin = replace(project, plugins=("pyxle-brokenmw",))
+    with pytest.raises(AttributeError):
+        create_starlette_app(with_plugin, table, logger=StubLogger())
+    assert errors
+
+
+# ---------------------------------------------------------------------------
+# Catch-all not-found handler (not-found.pyxl boundary)
+# ---------------------------------------------------------------------------
+
+
+def _project_with_not_found(project: DevServerSettings) -> None:
+    """Add a root ``not-found.pyxl`` to the project's pages so the route table
+    registers a not-found boundary."""
+    write_file(
+        project.pages_dir / "not-found.pyxl",
+        """import React from 'react';
+
+export default function NotFound() {
+    return <div>Custom 404</div>;
+}
+""",
+    )
+
+
+def test_not_found_handler_renders_boundary_response(
+    project: DevServerSettings,
+    monkeypatch,
+) -> None:
+    """With a not-found.pyxl present, an unknown path is routed to the catch-all
+    handler which returns the rendered boundary response (lines 1049-1055,
+    1077-1085)."""
+    monkeypatch.setattr(
+        "pyxle.devserver.starlette_app.ComponentRenderer",
+        lambda: object(),
+    )
+
+    async def fake_build_page_response(*, request, settings, page, renderer, overlay=None, **_kw):
+        return PlainTextResponse("page")
+
+    monkeypatch.setattr(
+        "pyxle.devserver.starlette_app.build_page_response",
+        fake_build_page_response,
+    )
+
+    async def fake_not_found(*, request, settings, renderer, error_boundaries, overlay=None):
+        return HTMLResponse("<div>Custom 404</div>", status_code=404)
+
+    monkeypatch.setattr(
+        "pyxle.devserver.starlette_app.build_not_found_response",
+        fake_not_found,
+    )
+
+    _project_with_not_found(project)
+    build_once(project)
+    registry = load_metadata_registry(project)
+    table = build_route_table(registry)
+    assert table.error_boundary_pages  # boundary compiled
+
+    app = create_starlette_app(project, table)
+    client = TestClient(app)
+
+    resp = client.get("/this/does/not/exist")
+    assert resp.status_code == 404
+    assert "Custom 404" in resp.text
+
+
+def test_not_found_handler_falls_back_to_plain_404(
+    project: DevServerSettings,
+    monkeypatch,
+) -> None:
+    """When the not-found boundary renderer returns None, the catch-all handler
+    emits a plain 'Not Found' 404 (lines 1086-1087)."""
+    monkeypatch.setattr(
+        "pyxle.devserver.starlette_app.ComponentRenderer",
+        lambda: object(),
+    )
+
+    async def fake_build_page_response(*, request, settings, page, renderer, overlay=None, **_kw):
+        return PlainTextResponse("page")
+
+    monkeypatch.setattr(
+        "pyxle.devserver.starlette_app.build_page_response",
+        fake_build_page_response,
+    )
+
+    async def fake_not_found(*, request, settings, renderer, error_boundaries, overlay=None):
+        return None
+
+    monkeypatch.setattr(
+        "pyxle.devserver.starlette_app.build_not_found_response",
+        fake_not_found,
+    )
+
+    _project_with_not_found(project)
+    build_once(project)
+    registry = load_metadata_registry(project)
+    table = build_route_table(registry)
+
+    app = create_starlette_app(project, table)
+    client = TestClient(app)
+
+    resp = client.get("/missing/page")
+    assert resp.status_code == 404
+    assert resp.text == "Not Found"
+
+
+# ---------------------------------------------------------------------------
+# _health_payload — missing start time
+# ---------------------------------------------------------------------------
+
+
+def test_healthz_payload_without_start_time_uptime_zero(
+    project: DevServerSettings,
+) -> None:
+    """When ``app.state.pyxle_started_at`` is absent/non-numeric, uptime stays
+    0.0 (branch 1119->1122)."""
+    import asyncio
+
+    from pyxle.devserver.starlette_app import _healthz_endpoint
+
+    app = Starlette()
+    # Deliberately do NOT set pyxle_started_at.
+
+    class _Req:
+        def __init__(self, application):
+            self.app = application
+
+    response = asyncio.run(_healthz_endpoint(_Req(app)))  # type: ignore[arg-type]
+    assert response.status_code == 200
+    payload = json.loads(response.body)
+    assert payload["status"] == "ok"
+    assert payload["ready"] is False
+    assert payload["uptime"] == 0.0

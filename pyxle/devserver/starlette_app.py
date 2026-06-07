@@ -143,6 +143,29 @@ class _SecurityHeadersMiddleware:
         await self.app(scope, receive, send_with_security_headers)
 
 
+def _index_static_files(directory: Path | None, *, prefix: str = "") -> frozenset[str]:
+    """Return the set of URL paths served from ``directory`` (e.g. ``/favicon.ico``).
+
+    Built once when the static middleware is constructed so request handling can
+    decide in O(1) whether a path is a static asset. This avoids a filesystem
+    ``stat`` plus a raised-and-caught 404 on every *dynamic* request (API routes,
+    SSR pages) — the common case — since those paths simply aren't in the set and
+    fall straight through to the app. The middleware only runs when serving a
+    production build, whose output is immutable, so this startup snapshot stays
+    correct for the life of the process.
+    """
+    if directory is None:
+        return frozenset()
+    base = Path(directory)
+    if not base.is_dir():
+        return frozenset()
+    paths: set[str] = set()
+    for entry in base.rglob("*"):
+        if entry.is_file():
+            paths.add(f"{prefix}/{entry.relative_to(base).as_posix()}")
+    return frozenset(paths)
+
+
 class StaticAssetsMiddleware:
     """Serve client + public assets ahead of dynamic catch-all routes."""
 
@@ -164,6 +187,11 @@ class StaticAssetsMiddleware:
             if client_directory is not None
             else None
         )
+        # Snapshot the served files so a dynamic request skips the stat + 404
+        # that StaticFiles would otherwise incur on a miss (see
+        # _index_static_files). Production build output is immutable.
+        self._public_paths = _index_static_files(public_directory)
+        self._client_paths = _index_static_files(client_directory, prefix="/client")
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope.get("type") != "http":
@@ -178,7 +206,10 @@ class StaticAssetsMiddleware:
         path = scope.get("path", "")
 
         if self._client_static is not None and path.startswith("/client"):
-            if await self._try_static(
+            # O(1) membership check first: only touch the filesystem for a path
+            # that is actually a known static asset, so dynamic requests that
+            # merely share the path space don't pay a stat + caught 404.
+            if path in self._client_paths and await self._try_static(
                 self._client_static,
                 scope,
                 receive,
@@ -188,7 +219,9 @@ class StaticAssetsMiddleware:
                 return
 
         if self._public_static is not None and not path.startswith("/client"):
-            if await self._try_static(self._public_static, scope, receive, send):
+            if path in self._public_paths and await self._try_static(
+                self._public_static, scope, receive, send
+            ):
                 return
 
         await self.app(scope, receive, send)
@@ -486,11 +519,21 @@ def _make_page_handler(
         )
         # HTML page responses also carry Vary so a browser that
         # cached both the HTML and a nav-JSON payload for the same
-        # URL knows they are distinct entries. `private, no-cache`
-        # allows conditional caching with revalidation but prevents
-        # shared proxies from serving one user's response to another.
+        # URL knows they are distinct entries.
         response.headers["Vary"] = _NAVIGATION_HEADER
-        response.headers["Cache-Control"] = "private, no-cache"
+        # A route the app explicitly declared cacheable (it renders no
+        # per-user data) is served `public, s-maxage=N` so a CDN/proxy can
+        # absorb the load — the CSRF middleware drops its per-user cookie from
+        # such responses. Every other page stays `private, no-cache`, never
+        # shared between users.
+        cache = getattr(settings, "cache", None)
+        max_age = cache.max_age_for(request.url.path) if cache is not None else None
+        if max_age is not None:
+            response.headers["Cache-Control"] = (
+                f"public, s-maxage={max_age}, stale-while-revalidate={max_age * 5}"
+            )
+        else:
+            response.headers["Cache-Control"] = "private, no-cache"
         return response
 
     handler.__name__ = f"page_{route.module_key.replace('.', '_')}"
@@ -529,6 +572,47 @@ def build_action_router(
 
 
 _MAX_ACTION_BODY_BYTES = 10 * 1024 * 1024  # 10 MB
+
+
+def _maybe_install_form_body_shim(request: Request) -> None:
+    """Make ``await request.json()`` work for form-encoded action bodies.
+
+    When the action endpoint is hit by a no-JS ``<Form>`` POST, the
+    body arrives as ``application/x-www-form-urlencoded`` (or
+    ``multipart/form-data``) — Starlette's ``request.json()`` would then
+    raise ``JSONDecodeError`` on the very first byte. To keep user
+    actions ergonomic (the documented and demo-shown pattern is
+    ``body = await request.json()``), this shim:
+
+    1. Detects the form content type and replaces ``request.json`` with
+       a coroutine that returns the parsed form fields as a dict.
+    2. Strips the synthetic ``_csrf_token`` field so it doesn't leak
+       into action ``body`` payloads — the CSRF middleware has already
+       validated and consumed it.
+
+    JSON requests are untouched.
+    """
+    content_type = (request.headers.get("content-type") or "").lower()
+    if not (
+        "application/x-www-form-urlencoded" in content_type
+        or "multipart/form-data" in content_type
+    ):
+        return
+
+    async def _form_as_json() -> dict[str, object]:
+        form = await request.form()
+        result: dict[str, object] = {}
+        for key in form:
+            if key == "_csrf_token":
+                continue
+            values = form.getlist(key)
+            result[key] = values[0] if len(values) == 1 else list(values)
+        return result
+
+    # Bypass Starlette's cached ``_json``: monkey-patch the bound method
+    # for this request only. We deliberately don't subclass ``Request``
+    # since user middleware may compare types or rely on the original.
+    request.json = _form_as_json  # type: ignore[method-assign]
 
 
 async def _dispatch_action(
@@ -582,6 +666,14 @@ async def _dispatch_action(
             action_name,
             module_key,
         )
+
+    # Progressive-enhancement support for ``<Form>``: when the request
+    # body is form-encoded (no-JS form POST) we transparently expose it
+    # as JSON to the action via a thin shim on ``request.json``. User
+    # code can keep doing ``await request.json()`` regardless of how the
+    # body arrived. The shim is keyed off content-type so JSON requests
+    # take the original Starlette path unchanged.
+    _maybe_install_form_body_shim(request)
 
     try:
         result = await action_fn(request)

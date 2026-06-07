@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from pyxle.config import (
+    CacheConfig,
     ConfigError,
     CorsConfig,
     CsrfConfig,
@@ -223,3 +224,146 @@ class TestDevserverKwargs:
         config = PyxleConfig(csrf=CsrfConfig(enabled=False))
         kwargs = config.to_devserver_kwargs()
         assert kwargs["csrf"].enabled is False
+
+    def test_to_devserver_kwargs_includes_cache(self):
+        config = PyxleConfig(cache=CacheConfig(routes=(("/", 60),)))
+        kwargs = config.to_devserver_kwargs()
+        assert kwargs["cache"].routes == (("/", 60),)
+
+
+# ---------------------------------------------------------------------------
+# CacheConfig defaults and route matching
+# ---------------------------------------------------------------------------
+
+
+class TestCacheConfigDefaults:
+    def test_default_not_enabled(self):
+        assert CacheConfig().enabled is False
+
+    def test_enabled_when_routes_set(self):
+        assert CacheConfig(routes=(("/", 60),)).enabled is True
+
+
+class TestCacheConfigMatching:
+    """``max_age_for`` decides which page responses become publicly
+    cacheable. Its precedence rules (exact > longest-prefix wildcard) are
+    security-relevant: a too-greedy match could mark a per-user page as
+    shared-cacheable, so the boundaries get explicit coverage."""
+
+    def test_exact_match(self):
+        cache = CacheConfig(routes=(("/about", 120),))
+        assert cache.max_age_for("/about") == 120
+
+    def test_no_match_returns_none(self):
+        cache = CacheConfig(routes=(("/about", 120),))
+        assert cache.max_age_for("/contact") is None
+
+    def test_wildcard_matches_bare_prefix(self):
+        cache = CacheConfig(routes=(("/docs/*", 300),))
+        # The bare prefix path (no trailing segment) also matches.
+        assert cache.max_age_for("/docs") == 300
+
+    def test_wildcard_matches_nested_path(self):
+        cache = CacheConfig(routes=(("/docs/*", 300),))
+        assert cache.max_age_for("/docs/guides/intro") == 300
+
+    def test_wildcard_respects_path_boundary(self):
+        """``/docs/*`` must NOT match ``/docsearch`` — a shared string
+        prefix that isn't a path-segment boundary is a different route."""
+        cache = CacheConfig(routes=(("/docs/*", 300),))
+        assert cache.max_age_for("/docsearch") is None
+
+    def test_longest_wildcard_prefix_wins(self):
+        # Less-specific listed first so the ``score > best_score`` update
+        # path is exercised when the more-specific rule overtakes it.
+        cache = CacheConfig(routes=(("/docs/*", 100), ("/docs/api/*", 200)))
+        assert cache.max_age_for("/docs/api/auth") == 200
+        assert cache.max_age_for("/docs/guides") == 100
+
+    def test_exact_beats_wildcard(self):
+        cache = CacheConfig(routes=(("/docs/*", 100), ("/docs/api", 200)))
+        assert cache.max_age_for("/docs/api") == 200
+
+    def test_root_wildcard_is_catch_all(self):
+        cache = CacheConfig(routes=(("/*", 30),))
+        assert cache.max_age_for("/anything/here") == 30
+        assert cache.max_age_for("/") == 30
+
+
+# ---------------------------------------------------------------------------
+# Config JSON parsing — cache
+# ---------------------------------------------------------------------------
+
+
+class TestCacheConfigParsing:
+    def _load(self, tmp_path: Path, cache_data) -> PyxleConfig:
+        config_file = tmp_path / "pyxle.config.json"
+        config_file.write_text(json.dumps({"cache": cache_data}))
+        return load_config(tmp_path, config_path=config_file)
+
+    def test_integer_shorthand(self, tmp_path: Path):
+        config = self._load(tmp_path, {"/": 60, "/docs/*": 300})
+        assert config.cache.enabled
+        assert config.cache.max_age_for("/") == 60
+        assert config.cache.max_age_for("/docs/x") == 300
+
+    def test_object_form_smaxage(self, tmp_path: Path):
+        config = self._load(tmp_path, {"/": {"sMaxage": 120}})
+        assert config.cache.max_age_for("/") == 120
+
+    def test_object_form_maxage_fallback(self, tmp_path: Path):
+        config = self._load(tmp_path, {"/": {"maxAge": 90}})
+        assert config.cache.max_age_for("/") == 90
+
+    def test_zero_max_age_allowed(self, tmp_path: Path):
+        # s-maxage=0 (cache but revalidate immediately) is a valid policy.
+        config = self._load(tmp_path, {"/": 0})
+        assert config.cache.max_age_for("/") == 0
+
+    def test_boolean_value_rejected(self, tmp_path: Path):
+        config_file = tmp_path / "pyxle.config.json"
+        config_file.write_text(json.dumps({"cache": {"/": True}}))
+        with pytest.raises(ConfigError, match="boolean"):
+            load_config(tmp_path, config_path=config_file)
+
+    def test_negative_max_age_rejected(self, tmp_path: Path):
+        config_file = tmp_path / "pyxle.config.json"
+        config_file.write_text(json.dumps({"cache": {"/": -5}}))
+        with pytest.raises(ConfigError, match="max-age"):
+            load_config(tmp_path, config_path=config_file)
+
+    def test_non_absolute_pattern_rejected(self, tmp_path: Path):
+        config_file = tmp_path / "pyxle.config.json"
+        config_file.write_text(json.dumps({"cache": {"docs": 60}}))
+        with pytest.raises(ConfigError, match="absolute paths"):
+            load_config(tmp_path, config_path=config_file)
+
+    def test_non_object_cache_rejected(self, tmp_path: Path):
+        config_file = tmp_path / "pyxle.config.json"
+        config_file.write_text(json.dumps({"cache": "nope"}))
+        with pytest.raises(ConfigError, match="cache"):
+            load_config(tmp_path, config_path=config_file)
+
+    def test_non_integer_smaxage_rejected(self, tmp_path: Path):
+        config_file = tmp_path / "pyxle.config.json"
+        config_file.write_text(json.dumps({"cache": {"/": {"sMaxage": "soon"}}}))
+        with pytest.raises(ConfigError, match="sMaxage"):
+            load_config(tmp_path, config_path=config_file)
+
+    def test_object_without_smaxage_rejected(self, tmp_path: Path):
+        config_file = tmp_path / "pyxle.config.json"
+        config_file.write_text(json.dumps({"cache": {"/": {}}}))
+        with pytest.raises(ConfigError, match="sMaxage"):
+            load_config(tmp_path, config_path=config_file)
+
+    def test_list_value_rejected(self, tmp_path: Path):
+        config_file = tmp_path / "pyxle.config.json"
+        config_file.write_text(json.dumps({"cache": {"/": [60]}}))
+        with pytest.raises(ConfigError, match="cache route"):
+            load_config(tmp_path, config_path=config_file)
+
+    def test_no_cache_block_returns_defaults(self, tmp_path: Path):
+        config_file = tmp_path / "pyxle.config.json"
+        config_file.write_text("{}")
+        config = load_config(tmp_path, config_path=config_file)
+        assert config.cache.enabled is False

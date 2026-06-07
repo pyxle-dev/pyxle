@@ -690,3 +690,175 @@ def test_import_module_reimports_when_debug(tmp_path: Path) -> None:
     assert second.COUNTER == 0  # Reset — module was re-executed
 
     sys.modules.pop(key, None)
+
+
+# ---------------------------------------------------------------------------
+# Progressive enhancement: action dispatch must accept form-encoded bodies
+# from no-JS ``<Form>`` POSTs and expose them transparently to user code
+# that does ``await request.json()``.
+# ---------------------------------------------------------------------------
+
+
+def _build_greet_app(tmp_path: Path) -> "TestClient":
+    """Helper: spin up an app with a single greet @action."""
+    module_path = _write_module(
+        tmp_path / "server" / "pages" / "actions.py",
+        """
+        from pyxle.runtime import action, ActionError
+
+        @action
+        async def greet(request):
+            body = await request.json()
+            name = (body.get("name") or "").strip()
+            if not name:
+                raise ActionError("Please enter your name.", status_code=400)
+            return {"greeting": f"Hello, {name}!"}
+        """,
+    )
+    route = ActionRoute(
+        path="/api/__actions/actions/greet",
+        page_path="/actions",
+        action_name="greet",
+        server_module_path=module_path,
+        module_key="pyxle.server.pages.actions",
+    )
+    router = build_action_router([route])
+
+    from starlette.applications import Starlette
+
+    app = Starlette()
+    app.router.routes.extend(router.routes)
+    return TestClient(app, raise_server_exceptions=False)
+
+
+def test_action_accepts_form_encoded_body(tmp_path: Path) -> None:
+    """No-JS ``<Form>`` POST → form-urlencoded body. The dispatch shim
+    makes ``request.json()`` return the parsed fields as a dict."""
+    client = _build_greet_app(tmp_path)
+    response = client.post(
+        "/api/__actions/actions/greet",
+        data={"name": "Shivam"},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["greeting"] == "Hello, Shivam!"
+
+
+def test_action_form_body_strips_synthetic_csrf_field(tmp_path: Path) -> None:
+    """The ``_csrf_token`` form field exists for the middleware. It must
+    not leak into ``request.json()`` so user code's ``body['name']``
+    stays clean."""
+    module_path = _write_module(
+        tmp_path / "server" / "pages" / "echo.py",
+        """
+        from pyxle.runtime import action
+
+        @action
+        async def echo(request):
+            body = await request.json()
+            return {"keys": sorted(body.keys()), "echo": body}
+        """,
+    )
+    route = ActionRoute(
+        path="/api/__actions/echo/echo",
+        page_path="/echo",
+        action_name="echo",
+        server_module_path=module_path,
+        module_key="pyxle.server.pages.echo",
+    )
+    router = build_action_router([route])
+
+    from starlette.applications import Starlette
+
+    app = Starlette()
+    app.router.routes.extend(router.routes)
+    client = TestClient(app, raise_server_exceptions=False)
+
+    response = client.post(
+        "/api/__actions/echo/echo",
+        data={"_csrf_token": "ignored-by-shim", "name": "Shivam", "tier": "pro"},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    # No _csrf_token leakage: user's body is exactly what they sent.
+    assert payload["keys"] == ["name", "tier"]
+    assert payload["echo"] == {"name": "Shivam", "tier": "pro"}
+
+
+def test_action_form_body_empty_field_surfaces_action_error(tmp_path: Path) -> None:
+    """An empty form submission still flows through the @action so the
+    server-side ``ActionError`` reaches the client — the kit demo's
+    "Submit empty to see the server validation error" pattern."""
+    client = _build_greet_app(tmp_path)
+    response = client.post("/api/__actions/actions/greet", data={"name": ""})
+    assert response.status_code == 400
+    payload = response.json()
+    assert payload["ok"] is False
+    assert payload["error"] == "Please enter your name."
+
+
+def test_action_json_body_path_unchanged(tmp_path: Path) -> None:
+    """JSON callers (``useAction`` / fetch) must not be touched by the
+    shim — same content type, same parsing path as before."""
+    client = _build_greet_app(tmp_path)
+    response = client.post(
+        "/api/__actions/actions/greet",
+        json={"name": "Shivam"},
+    )
+    assert response.status_code == 200
+    assert response.json()["greeting"] == "Hello, Shivam!"
+
+
+def test_action_multipart_body(tmp_path: Path) -> None:
+    """Multipart form bodies (file inputs) also get the JSON shim."""
+    client = _build_greet_app(tmp_path)
+    response = client.post(
+        "/api/__actions/actions/greet",
+        files={
+            "name": (None, "Shivam"),
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["greeting"] == "Hello, Shivam!"
+
+
+def test_action_form_body_collapses_repeated_fields(tmp_path: Path) -> None:
+    """Repeated field names (checkbox groups, multi-select) come through
+    as a list — single-value fields stay as plain strings, matching what
+    JSON callers would naturally send."""
+    module_path = _write_module(
+        tmp_path / "server" / "pages" / "tags.py",
+        """
+        from pyxle.runtime import action
+
+        @action
+        async def add(request):
+            body = await request.json()
+            return {"name": body["name"], "tags": body.get("tag")}
+        """,
+    )
+    route = ActionRoute(
+        path="/api/__actions/tags/add",
+        page_path="/tags",
+        action_name="add",
+        server_module_path=module_path,
+        module_key="pyxle.server.pages.tags",
+    )
+    router = build_action_router([route])
+
+    from starlette.applications import Starlette
+
+    app = Starlette()
+    app.router.routes.extend(router.routes)
+    client = TestClient(app, raise_server_exceptions=False)
+
+    response = client.post(
+        "/api/__actions/tags/add",
+        content="name=Shivam&tag=python&tag=react",
+        headers={"content-type": "application/x-www-form-urlencoded"},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["name"] == "Shivam"
+    assert payload["tags"] == ["python", "react"]
