@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Documentation
+    url: https://pyxle.dev/docs
+    about: Most "how do I…?" questions are answered here.
+  - name: Try it in the playground
+    url: https://pyxle.dev/playground
+    about: Reproduce or explore behavior with zero install before filing.
