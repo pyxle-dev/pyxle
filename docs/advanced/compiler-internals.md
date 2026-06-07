@@ -10,25 +10,18 @@ When you run `pyxle dev` or `pyxle build`, the compiler:
 2. Parses each file to separate Python from JSX
 3. Writes server-side Python modules to `.pyxle-build/server/`
 4. Writes client-side JSX modules to `.pyxle-build/client/`
-5. Generates layout composition wrappers in `.pyxle-build/routes/`
+5. Generates layout composition wrappers in `.pyxle-build/client/routes/`
 6. Creates a Vite configuration at `.pyxle-build/vite.config.js`
 
 ## The parser
 
-The parser (`pyxle/compiler/parser.py`) is a state-machine that classifies each line as Python or JSX.
+The parser (`pyxle/compiler/parser.py`) is **AST-driven** — there are no fence markers, string directives, or per-line keyword heuristics. It finds the Python/JSX boundary by walking the source and, at each position, growing the largest region that parses as valid Python via `ast.parse`; when Python stops parsing, it grows a JSX segment until valid Python resumes.
 
-### Line classification
+### How the split works
 
-Lines are classified as Python if they match common Python patterns:
-
-- `import ...` or `from ... import ...`
-- `def ...` or `async def ...`
-- `class ...`
-- Decorator lines starting with `@`
-- Control flow: `if`, `for`, `while`, `try`, `except`, `finally`, `with`
-- Continuation of multi-line Python constructs (strings, brackets)
-
-Everything else is treated as JSX.
+- The boundary is decided by **what parses as Python**, not by the leading keyword. `import React from 'react'` is not valid Python, so it lands in JSX; `from db import users` is, so it stays in Python.
+- Arbitrary alternation is supported (`python | jsx | python | jsx | ...`), including JSX-first files.
+- Inside a JSX segment the parser tracks JS structural state (string and template literals, block comments, brace/paren/bracket depth), so Python-looking text inside a JSX body or template literal is never misclassified.
 
 ### What the parser extracts
 
@@ -46,13 +39,13 @@ Everything else is treated as JSX.
 
 ### Validation
 
-The parser enforces:
+The parser enforces (raising a compile-time error otherwise):
 
 - At most one `@server` loader per file
-- `@server` functions must be `async`
-- `@action` functions must be `async`
-- Loader and action names must be valid Python identifiers
-- No circular decorator stacking
+- `@server` and `@action` functions must be `async`
+- `@server` / `@action` must be defined at module scope (not nested)
+- Their first parameter must be named `request`
+- `@action` function names must be unique within the file
 
 ## Code generation
 

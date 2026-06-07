@@ -5,7 +5,7 @@ highlighting, diagnostics, completions, hover documentation, go-to-definition,
 and formatting. Everything works out of the box with a single install.
 
 > **Beta release.** The language toolkit is production-usable but still
-> evolving. [Report issues on GitHub.](https://github.com/pyxle-framework/pyxle-langkit/issues)
+> evolving. [Report issues on GitHub.](https://github.com/pyxle-dev/pyxle-langkit/issues)
 
 ---
 
@@ -302,4 +302,4 @@ The VS Code extension is a thin LSP client (~100 lines of TypeScript)
 that connects to the server and manages the status bar. All the
 intelligence is in the server, making it easy to support other editors.
 
-Source code: [github.com/pyxle-framework/pyxle-langkit](https://github.com/pyxle-framework/pyxle-langkit)
+Source code: [github.com/pyxle-dev/pyxle-langkit](https://github.com/pyxle-dev/pyxle-langkit)

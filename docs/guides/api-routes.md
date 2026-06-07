@@ -4,17 +4,17 @@ Files under `pages/api/` are API endpoints. They are plain Python files (not `.p
 
 ## Basic API route
 
-Create `pages/api/hello.py`:
+Create `pages/api/hello.py`. An API module exports an **`endpoint`** callable that receives the Starlette `Request` and returns a response:
 
 ```python
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-async def get(request: Request) -> JSONResponse:
+async def endpoint(request: Request) -> JSONResponse:
     return JSONResponse({"message": "Hello, world!"})
 ```
 
-This responds to `GET /api/hello`:
+`endpoint` handles every HTTP method bound to the route. This responds to `GET /api/hello`:
 
 ```bash
 curl http://localhost:8000/api/hello
@@ -23,30 +23,26 @@ curl http://localhost:8000/api/hello
 
 ## HTTP methods
 
-Define functions named after HTTP methods:
+`endpoint` receives every method bound to the route. Branch on `request.method` to handle more than one:
 
 ```python
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-async def get(request: Request) -> JSONResponse:
-    users = await fetch_all_users()
-    return JSONResponse({"users": users})
+async def endpoint(request: Request) -> JSONResponse:
+    if request.method == "GET":
+        users = await fetch_all_users()
+        return JSONResponse({"users": users})
 
-async def post(request: Request) -> JSONResponse:
-    body = await request.json()
-    user = await create_user(body["name"], body["email"])
-    return JSONResponse({"user": user}, status_code=201)
+    if request.method == "POST":
+        body = await request.json()
+        user = await create_user(body["name"], body["email"])
+        return JSONResponse({"user": user}, status_code=201)
 
-async def delete(request: Request) -> JSONResponse:
-    body = await request.json()
-    await remove_user(body["id"])
-    return JSONResponse({"deleted": True})
+    return JSONResponse({"error": "Method not allowed"}, status_code=405)
 ```
 
-Supported methods: `get`, `post`, `put`, `patch`, `delete`, `options`.
-
-Requests to unsupported methods return `405 Method Not Allowed`.
+For multi-method endpoints with automatic `405 Method Not Allowed` handling, use an `HTTPEndpoint` class (below) — Starlette dispatches each request to the matching `get`/`post`/… method and rejects the rest.
 
 ## Using HTTPEndpoint classes
 
@@ -123,7 +119,7 @@ pages/api/users/[id].py  -->  /api/users/:id
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-async def get(request: Request) -> JSONResponse:
+async def endpoint(request: Request) -> JSONResponse:
     user_id = request.path_params["id"]
     user = await fetch_user(user_id)
     if user is None:
@@ -134,7 +130,7 @@ async def get(request: Request) -> JSONResponse:
 ## Reading request bodies
 
 ```python
-async def post(request: Request) -> JSONResponse:
+async def endpoint(request: Request) -> JSONResponse:
     # JSON body
     body = await request.json()
 
@@ -152,7 +148,7 @@ async def post(request: Request) -> JSONResponse:
 Return appropriate HTTP status codes:
 
 ```python
-async def get(request: Request) -> JSONResponse:
+async def endpoint(request: Request) -> JSONResponse:
     api_key = request.headers.get("x-api-key")
     if not api_key:
         return JSONResponse({"error": "Missing API key"}, status_code=401)
@@ -172,8 +168,10 @@ async def get(request: Request) -> JSONResponse:
 | HTTP methods | Any (GET, POST, PUT, etc.) | POST only |
 | Response format | Any Starlette Response | JSON dict |
 | Called from | Anywhere (curl, fetch, etc.) | `<Form>` or `useAction` |
-| CSRF protection | Not by default | Enabled by default |
+| CSRF protection | On for POST/PUT/PATCH/DELETE¹ | Enabled by default |
 | Use case | Public APIs, webhooks, integrations | Form submissions, mutations |
+
+¹ CSRF runs app-wide, so a state-changing API request (POST/PUT/PATCH/DELETE) must carry the double-submit token by default — same as any other route. A public webhook or third-party integration that can't send the token must list its path prefix in [`csrf.exemptPaths`](security.md). Safe methods (GET/HEAD/OPTIONS) are never checked.
 
 ## Next steps
 

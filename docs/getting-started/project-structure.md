@@ -14,8 +14,9 @@ my-app/
   public/
     branding/             # SVG logos and assets
     styles/
-      tailwind.css        # Compiled Tailwind output (generated)
+      tailwind.css        # Compiled Tailwind output (pre-built in scaffold)
     favicon.ico
+  AGENTS.md               # Conventions guide for AI coding agents
   package.json            # Node.js dependencies and scripts
   pyxle.config.json       # Framework configuration
   requirements.txt        # Python dependencies
@@ -58,8 +59,8 @@ Created automatically when you run `pyxle dev` or `pyxle build`. Contains compil
 ```
 .pyxle-build/
   server/           # Compiled Python modules from @server blocks
-  client/           # Transpiled JSX components for Vite
-  routes/           # Composed page+layout wrappers
+  client/           # Transpiled JSX components + composed page/layout wrappers
+  metadata/         # Per-page metadata (route, loader, head, scripts)
   vite.config.js    # Auto-generated Vite configuration
 ```
 
@@ -90,6 +91,7 @@ async def load_home(request):
 
 ```jsx
 // JSX section -- receives loader data as props
+import React from 'react';
 import { Head } from 'pyxle/client';
 
 export default function HomePage({ data }) {
@@ -110,25 +112,25 @@ export default function HomePage({ data }) {
 The root layout wraps every page. It is JSX-only (no Python section needed):
 
 ```jsx
+import React from 'react';
+
 export default function AppLayout({ children }) {
-  return (
-    <div className="min-h-screen">
-      {children}
-    </div>
-  );
+  return <>{children}</>;
 }
 ```
 
 ### `pages/api/pulse.py`
 
-A plain Python file that serves as an API endpoint. Returns JSON by default:
+A plain Python file that serves as an API endpoint. It exports an `endpoint` callable and returns JSON:
 
 ```python
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-async def get(request: Request) -> JSONResponse:
-    return JSONResponse({"status": "ok"})
+from pyxle import __version__
+
+async def endpoint(request: Request) -> JSONResponse:
+    return JSONResponse({"status": "ok", "pyxle": __version__})
 ```
 
 ### `pyxle.config.json`
@@ -163,9 +165,12 @@ Tailwind CSS configuration. The scaffold configures it to scan your `pages/` dir
 
 ```javascript
 module.exports = {
-  content: ['./pages/**/*.{pyxl,jsx,js,tsx,ts}'],
-  darkMode: 'class',
-  // ...
+  content: [
+    './pages/**/*.{pyxl,js,jsx,ts,tsx}',
+    './.pyxle-build/client/pages/**/*.{js,jsx,ts,tsx}',
+  ],
+  theme: { extend: {} },
+  plugins: [],
 };
 ```
 

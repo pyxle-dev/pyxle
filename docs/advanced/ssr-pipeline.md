@@ -117,10 +117,11 @@ In dev mode, the error overlay shows the error with breadcrumbs indicating which
 
 ## Client-side navigation
 
-When navigating between pages client-side, Pyxle uses a JSON endpoint instead of full HTML:
+When navigating between pages client-side, Pyxle requests a JSON payload for the same URL instead of full HTML — signalled by a request header, not a query param:
 
 ```
-GET /page-path?__pyxle_nav=1
+GET /page-path
+x-pyxle-navigation: 1
 ```
 
 This returns:

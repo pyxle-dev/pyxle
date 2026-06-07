@@ -1,15 +1,18 @@
 # The CLI
 
 `pyxle` is the command-line entry point users actually type. It's a
-**Typer application** with five commands:
+**Typer application** with a small set of single-purpose commands:
 
 | Command | Purpose |
 |---|---|
 | `pyxle init <name>` | Scaffold a new Pyxle project |
+| `pyxle install [path]` | Install Python + Node dependencies |
 | `pyxle dev [path]` | Run the development server |
 | `pyxle build [path]` | Compile and bundle for production |
 | `pyxle serve [path]` | Serve a production build |
 | `pyxle check [path]` | Validate the project without serving |
+| `pyxle routes [path]` | Print the file-based route table |
+| `pyxle typecheck [path]` | TypeScript-check compiled JSX |
 
 This doc explains what each command does, how flags and configuration
 flow from user input to the rest of the framework, and the design

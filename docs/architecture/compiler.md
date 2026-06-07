@@ -141,21 +141,18 @@ startup to build its routing table without re-parsing the source:
 
 ```json
 {
-  "source_relative_path": "index.pyxl",
   "route_path": "/",
   "alternate_route_paths": [],
+  "client_path": "/pages/index.jsx",
+  "server_path": "/pages/index.py",
   "loader_name": "load_home",
   "loader_line": 4,
-  "head_elements": [],
-  "head_is_dynamic": false,
+  "head": [],
+  "head_dynamic": false,
+  "scripts": [],
+  "images": [],
   "head_jsx_blocks": [],
-  "script_declarations": [],
-  "image_declarations": [],
-  "actions": [],
-  "module_key": "pyxle.server.pages.index",
-  "client_path": "pages/index.jsx",
-  "server_path": "pages/index.py",
-  "content_hash": "abc123..."
+  "actions": []
 }
 ```
 
@@ -436,10 +433,11 @@ it did:
 @dataclass(frozen=True)
 class CompilationResult:
     source_path: Path
-    page_relative_path: Path
-    server_output_path: Path
-    client_output_path: Path
-    metadata_output_path: Path
+    python_code: str
+    jsx_code: str
+    server_output: Path
+    client_output: Path
+    metadata_output: Path
     metadata: PageMetadata
 ```
 
@@ -451,27 +449,24 @@ about a page without re-parsing it:
 ```python
 @dataclass(frozen=True)
 class PageMetadata:
-    source_relative_path: Path
     route_path: str
     alternate_route_paths: tuple[str, ...]
-    loader_name: str | None
-    loader_line: int | None
-    head_elements: tuple[str, ...]
-    head_is_dynamic: bool
-    head_jsx_blocks: tuple[str, ...]
-    script_declarations: tuple[ScriptDeclaration, ...]
-    image_declarations: tuple[ImageDeclaration, ...]
-    actions: tuple[ActionDeclaration, ...]
-    module_key: str
     client_path: str
     server_path: str
-    content_hash: str
+    loader_name: str | None
+    loader_line: int | None
+    head_elements: tuple[str, ...]      # serialized as "head"
+    head_is_dynamic: bool               # serialized as "head_dynamic"
+    scripts: tuple[ScriptDeclaration, ...] = ()
+    images: tuple[ImageDeclaration, ...] = ()
+    head_jsx_blocks: tuple[str, ...] = ()
+    actions: tuple[ActionDeclaration, ...] = ()
 ```
 
-The `content_hash` is a SHA256 of the source file contents. The
-incremental builder uses it to detect "this file's content hasn't
-changed since the last compile" and skip recompilation. Source:
-`devserver/builder.py:62`.
+A content hash of each source file (a SHA256, computed by the
+incremental builder — it is **not** stored on `PageMetadata`) lets the
+builder detect "this file's content hasn't changed since the last
+compile" and skip recompilation. Source: `devserver/builder.py`.
 
 ---
 

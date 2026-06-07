@@ -161,8 +161,8 @@ Pyxle's `@server` and `@action` decorators set **one attribute**
 each and return the function unchanged. There is no dependency
 injection container, no runtime monkey-patching, no metaclass
 inheritance, no proxy object intercepting attribute access. You
-can read `pyxle/runtime.py` in ten seconds — it's 83 lines
-including docstrings.
+can read `pyxle/runtime.py` in a few seconds — it's around 150
+lines including docstrings.
 
 This is a massive advantage for agents because **the agent's
 mental model of the code matches the actual execution**. In
@@ -191,7 +191,7 @@ pages/
 │   ├── layout.pyxl       → (wraps everything under /admin/*)
 │   └── stats.pyxl        → /admin/stats
 └── api/
-    └── health.py        → /api/health
+    └── pulse.py         → /api/pulse
 ```
 
 For an agent, this means zero tokens spent reading routing
@@ -235,21 +235,23 @@ The checker also:
 
 ### 6. Tiny CLI surface
 
-The entire framework is five commands:
+The CLI is small and single-purpose:
 
 ```
 pyxle init <name>    # scaffold a new project
+pyxle install        # install Python + Node dependencies
 pyxle dev            # run the dev server
 pyxle check          # validate the project without serving
 pyxle build          # compile + bundle for production
 pyxle serve          # serve a production build
+pyxle routes         # print the file-based route table
 ```
 
-That's the whole vocabulary the agent has to memorise. There is
-no `pyxle db migrate`, no `pyxle generate component`, no
-`pyxle admin createsuperuser`. Every command has a clear,
-single-purpose behaviour, and the agent doesn't have to search
-the docs to figure out which command does what.
+(plus `pyxle typecheck` for TypeScript-checking compiled JSX — that's
+the whole surface.) There is no `pyxle db migrate`, no
+`pyxle generate component`, no `pyxle admin createsuperuser`. Every
+command has a clear, single-purpose behaviour, and the agent doesn't
+have to search the docs to figure out which command does what.
 
 ### 7. Async by default, enforced at compile time
 
@@ -539,7 +541,7 @@ Honesty builds trust. Here's where Pyxle isn't the right choice:
   Astro or Eleventy are simpler.
 - **A pure JSON API.** If you're building a backend-only service
   with no UI, FastAPI is simpler.
-- **A mature production framework.** Pyxle is in beta (0.1.x).
+- **A mature production framework.** Pyxle is young (0.4.x).
   It's genuinely usable and under active development, but it
   doesn't have the decade of battle-testing that Django,
   Next.js, or Rails have. Best fit: greenfield projects,

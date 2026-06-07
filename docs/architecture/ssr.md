@@ -250,8 +250,10 @@ delegates to either:
 - **Worker pool mode** (default, `--ssr-workers >= 1`) — keep N
   persistent Node.js workers alive
 
-Both modes use the same Node.js entry script (`render_component.mjs`)
-under the hood.
+Each mode has its own Node.js entry script: subprocess mode runs
+`render_component.mjs` (one render per process), while the worker pool runs
+the long-lived `ssr_worker.mjs` (a persistent render loop). Both share the
+same esbuild + React rendering core.
 
 ### The render protocol
 

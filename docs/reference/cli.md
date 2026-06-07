@@ -23,7 +23,7 @@ pyxle init <name> [options]
 |----------------|-------------|
 | `name` | Project directory name (required) |
 | `--force` / `-f` | Overwrite existing directory |
-| `--template` / `-t` | Template name (default: `"default"`) |
+| `--template` / `-t` | Project template. Only `"default"` is supported today (other values error). |
 | `--install` / `--no-install` | Run `pip install` and `npm install` after scaffolding (default: no) |
 
 **Examples:**
@@ -159,18 +159,22 @@ pyxle check [directory] [options]
 **Example output:**
 
 ```
-  Compiling pages/index.pyxl
-  Compiling pages/about.pyxl
-  2 pages compiled, 0 errors
+ℹ️  Checked 12 .pyxl file(s) in my-app/
+✅ All checks passed
 ```
 
-Errors are reported with file location and hints:
+Errors are reported per file as `[section] line N: message`, with the file path on the next line (every file is checked, so one broken file never aborts the scan):
 
 ```
-  error: @server function must be async
-    --> pages/index.pyxl:15:1
-    hint: Change 'def load_page' to 'async def load_page'
+ℹ️  Checked 12 .pyxl file(s) in my-app/
+  error: [python] line 15: @server function must be async
+    --> pages/index.pyxl
+  error: [jsx] line 8:10: Unterminated JSX contents
+    --> pages/settings.pyxl
+❌ Check failed with 2 error(s)
 ```
+
+Exit code is `0` when clean, `1` when any error is found.
 
 ## `pyxle typecheck`
 
@@ -204,9 +208,15 @@ pyxle routes [directory] [options]
 **Example output:**
 
 ```
-Route              File                      Loader
-/                  pages/index.pyxl           load_home
-/about             pages/about.pyxl           --
-/blog/{slug}       pages/blog/[slug].pyxl     load_post
-/api/pulse         pages/api/pulse.py        --
+ℹ️  Routes for my-app/
+
+  Pages:
+  ▶️  /  — pages/index.pyxl  [loader=load_home]
+  ▶️  /about  — pages/about.pyxl
+  ▶️  /blog/{slug}  — pages/blog/[slug].pyxl  [loader=load_post]
+
+  API Routes:
+  ▶️  /api/pulse  — pages/api/pulse.py
 ```
+
+Use `--json` for machine-readable output.

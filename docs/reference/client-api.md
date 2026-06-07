@@ -51,6 +51,11 @@ Loads external scripts with configurable loading strategies.
 | `strategy` | `string` | `"afterInteractive"` | When to load the script |
 | `async` | `boolean` | `false` | HTML `async` attribute |
 | `defer` | `boolean` | `false` | HTML `defer` attribute |
+| `module` | `boolean` | `false` | Load as `type="module"` |
+| `noModule` | `boolean` | `false` | Add the `nomodule` attribute (legacy-browser fallback) |
+| `crossOrigin` | `string` | -- | `crossorigin` attribute |
+| `integrity` | `string` | -- | Subresource Integrity (SRI) hash |
+| `referrerPolicy` | `string` | -- | `referrerpolicy` attribute |
 | `onLoad` | `() => void` | -- | Callback on successful load |
 | `onError` | `() => void` | -- | Callback on load failure |
 
@@ -84,6 +89,10 @@ Renders an `<img>` tag with automatic lazy loading.
 | `height` | `number` | -- | Image height in pixels |
 | `priority` | `boolean` | `false` | Eager loading (above-the-fold images) |
 | `lazy` | `boolean` | `true` | Lazy loading (below-the-fold images) |
+| `placeholder` | `string` | `"empty"` | `"blur"` shows a blur-up placeholder while loading |
+| `blurDataURL` | `string` | -- | Data URL used for the `placeholder="blur"` preview |
+| `placeholderColor` | `string` | `"#e5e5e5"` | Solid placeholder colour shown before the image loads |
+| `fallbackSrc` | `string` | -- | Image swapped in automatically if `src` fails to load |
 
 **Behaviour:** Renders a standard `<img>` with `loading="eager"` when `priority` is true, `loading="lazy"` otherwise. All additional props are forwarded to the `<img>` element.
 
@@ -104,9 +113,9 @@ Renders children only on the client after hydration.
 | Prop | Type | Default | Description |
 |------|------|---------|-------------|
 | `children` | `ReactNode` | -- | Content to render on the client |
-| `fallback` | `ReactNode` | `null` | Placeholder shown during SSR |
+| `fallback` | `ReactNode` | empty `<div>` | Placeholder shown during SSR and the first client render |
 
-**Behaviour:** Returns `fallback` during SSR and on first client render. After `useEffect` fires (hydration complete), switches to rendering `children`. Prevents hydration mismatch for browser-only content.
+**Behaviour:** Returns `fallback` — or an empty `<div>` when no fallback is given — during SSR and on the first client render. After `useEffect` fires (hydration complete), switches to rendering `children`. Prevents hydration mismatch for browser-only content.
 
 ---
 

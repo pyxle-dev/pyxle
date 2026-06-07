@@ -24,6 +24,8 @@ pip install -r requirements.txt
 npm install
 ```
 
+`requirements.txt` lists your app's runtime dependencies (Starlette, Uvicorn, HTTPX). Pyxle itself comes from the `pip install pyxle-framework` in step 1.
+
 ## 3. Start the dev server
 
 ```bash
@@ -71,9 +73,13 @@ pyxle routes
 This prints the route table derived from your `pages/` directory:
 
 ```
-Route          File                  Loader
-/              pages/index.pyxl       load_home
-/api/pulse     pages/api/pulse.py    --
+ℹ️  Routes for my-app/
+
+  Pages:
+  ▶️  /  — pages/index.pyxl  [loader=load_home]
+
+  API Routes:
+  ▶️  /api/pulse  — pages/api/pulse.py
 ```
 
 ## 6. Validate your project

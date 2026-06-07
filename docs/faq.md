@@ -20,9 +20,13 @@ Django and Flask are backend frameworks that render templates. Pyxle is a full-s
 - Includes a bundler (Vite) for hot reload and optimised builds
 - Offers file-based routing instead of URL configuration
 
+### How does Pyxle compare to Reflex, NiceGUI, or Streamlit?
+
+Those frameworks let you build the UI in pure Python; Pyxle has you write real React/JSX — so the entire npm React ecosystem is available — colocated with your Python. The honest trade-offs, and when each of them is the better choice, are laid out in the full [framework comparison](guides/comparison.md).
+
 ### Is Pyxle production-ready?
 
-Pyxle is in **beta** (version 0.3.0). The core features are implemented and tested (1150+ tests, 95%+ coverage), but the API may change before 1.0. Use it for new projects and experiments, but be prepared for breaking changes.
+Pyxle is in **beta** (version 0.4.0). The core features are implemented and tested (1,370+ tests, with a 95% coverage gate enforced in CI), but the API may change before 1.0. Use it for new projects and experiments, but be prepared for breaking changes.
 
 ### What Python version do I need?
 

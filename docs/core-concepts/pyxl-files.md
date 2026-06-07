@@ -31,7 +31,7 @@ export default function MyPage({ data }) {
 }
 ```
 
-The compiler automatically detects which lines are Python and which are JSX. Python code uses `@server`/`@action` decorators, imports, and standard Python syntax. Everything else is treated as JSX.
+The compiler finds the boundary automatically: it grows the largest region that parses as valid **Python** (using Python's own AST), and treats whatever isn't valid Python as **JSX**. There are no separator comments or directives to write.
 
 ## The Python section
 
@@ -64,7 +64,7 @@ async def delete_user(request):
 - **One `@server` loader per file.** The loader receives a Starlette `Request` and must return a JSON-serializable dict.
 - **Multiple `@action` functions are allowed.** Each becomes a callable endpoint.
 - **The `@server` function must be `async`.** Pyxle enforces this at compile time.
-- **Imports are auto-detected.** Lines starting with `import` or `from` are classified as Python.
+- **Use any Python imports.** Standard `import` / `from` statements stay in the Python section because they parse as valid Python. (A JavaScript import such as `import React from 'react'` isn't valid Python, so it is correctly treated as part of the JSX section — the split is by what parses, not by the leading keyword.)
 - **The `@server` and `@action` decorators are available globally** -- you do not need to import them (the compiler injects the import automatically).
 
 ## The JSX section

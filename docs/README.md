@@ -2,7 +2,13 @@
 
 Pyxle is a Python-first full-stack web framework that brings the Next.js developer experience to the Python ecosystem. Write server logic in Python, UI in React, and ship them together in `.pyxl` files.
 
-**Current version:** 0.3.0 (beta)
+**Current version:** 0.4.0 (beta)
+
+## What's new in 0.4.0
+
+- **Edge caching.** Declare cacheable routes in [`pyxle.config.json::cache`](reference/configuration.md#edge-caching) and pages are served `Cache-Control: public, s-maxage=N` (plus `stale-while-revalidate`) so a CDN or reverse proxy can absorb traffic instead of your origin — Pyxle's config-driven take on per-route revalidation. The per-user CSRF cookie is automatically omitted from cacheable responses. See [Deployment → CDN and edge caching](guides/deployment.md#cdn-and-edge-caching).
+- **Hardened production errors.** SSR render failures — including the SPA-navigation JSON path — are sanitized in the response (no exception type, message, or path leaks to the client) while the full error is written to the server log for operators.
+- **Faster static serving.** The static-asset middleware indexes public/client paths up front, skipping a per-request filesystem `stat` + exception on every dynamic request.
 
 ## What's new in 0.3.0
 
@@ -40,6 +46,7 @@ The fundamentals of how Pyxle works.
 
 Practical guides for common tasks.
 
+- [Comparison](guides/comparison.md) -- Pyxle vs. Reflex, Django, NiceGUI, Streamlit, and Next.js + FastAPI
 - [Styling](guides/styling.md) -- Tailwind CSS, global stylesheets, and inline styles
 - [Head Management](guides/head-management.md) -- `<Head>` component, the `HEAD` variable, and dynamic meta tags
 - [API Routes](guides/api-routes.md) -- Building JSON APIs under `pages/api/`
@@ -100,7 +107,7 @@ For framework contributors and power users.
 
 ## Links
 
-- GitHub: [github.com/pyxle-framework/pyxle](https://github.com/pyxle-framework/pyxle)
-- Issues: [github.com/pyxle-framework/pyxle/issues](https://github.com/pyxle-framework/pyxle/issues)
+- GitHub: [github.com/pyxle-dev/pyxle](https://github.com/pyxle-dev/pyxle)
+- Issues: [github.com/pyxle-dev/pyxle/issues](https://github.com/pyxle-dev/pyxle/issues)
 - Install: `pip install pyxle-framework`
 - PyPI: [pypi.org/project/pyxle-framework](https://pypi.org/project/pyxle-framework/)

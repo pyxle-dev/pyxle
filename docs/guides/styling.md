@@ -62,8 +62,10 @@ export default function RootLayout({ children }) {
 tags from your `<Head>` blocks.** Vite owns the link now.
 
 **5. (Optional) remove the now-inert `dev:css` and `build:css` scripts from
-`package.json`.** Since Pyxle skips the standalone watcher when PostCSS is
-configured, those scripts never run on their own anymore.
+`package.json`.** Only relevant when upgrading an older project that defined
+them — the current scaffold's `package.json` ships just `dev`/`build`/`lint`,
+so a fresh project has nothing to remove. When PostCSS is configured, Pyxle
+skips the standalone watcher, so those scripts never run on their own anyway.
 
 ### Verifying the setup
 
@@ -172,7 +174,7 @@ imports.
 ## Global stylesheets (config-driven)
 
 For CSS that should be **inlined** on every page (no separate request, no
-hashing — embedded directly in the SSR HTML), register it in `pyxle.toml`:
+hashing — embedded directly in the SSR HTML), register it in `pyxle.config.json`:
 
 ```json
 {

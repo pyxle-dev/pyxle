@@ -248,8 +248,8 @@ JSON message to the next available SSR worker:
 {"id": "uuid-...", "componentPath": ".../index.jsx", "props": {"data": {...}}}
 ```
 
-Inside the worker (a long-running Node.js process), `render_component.mjs`
-does:
+Inside the worker (a long-running Node.js process running `ssr_worker.mjs`),
+each render does:
 
 1. **Bundle the component with esbuild.** All imports get inlined into a
    single JS string. esbuild is *fast* — typically under 30ms per file

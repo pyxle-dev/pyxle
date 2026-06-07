@@ -1,10 +1,10 @@
 # The runtime
 
 The "runtime" of Pyxle is the **smallest module in the framework**.
-It contains exactly two decorators (`@server` and `@action`), two
-exception classes (`LoaderError` and `ActionError`), and nothing
-else. The whole file is **83 lines** long including blank lines and
-docstrings.
+It contains two decorators (`@server` and `@action`), two
+exception classes (`LoaderError` and `ActionError`), and one small
+helper (`invalidate_routes`) — and nothing else. The whole file is
+about **150 lines** including blank lines and docstrings.
 
 This is on purpose. The runtime is what your application code
 imports — it's the *contract* between your code and the framework.
@@ -17,13 +17,13 @@ isn't much code to explain. But the *design decisions* behind the
 runtime are some of the most important in Pyxle, and they're worth
 understanding.
 
-**File:** `pyxle/runtime.py` (83 lines)
+**File:** `pyxle/runtime.py` (~150 lines)
 
 ---
 
 ## What's in `pyxle/runtime.py`
 
-The entire file is small enough to reproduce here:
+The core contract is small enough to reproduce here:
 
 ```python
 """Runtime helpers exposed to compiled Pyxle artifacts."""
@@ -75,11 +75,15 @@ class LoaderError(Exception):
         self.data = data or {}
 
 
-__all__ = ["server", "action", "ActionError", "LoaderError"]
+__all__ = ["server", "action", "ActionError", "LoaderError", "invalidate_routes"]
 ```
 
-That's it. That's the runtime. Two decorators, two exceptions, one
-`__all__`.
+That's the core. The one remaining export is
+`invalidate_routes(response, *urls)` — a small helper that tags a
+response with an `x-pyxle-invalidate` header so the client router drops
+its cached navigation payloads for the given URLs after a mutation (see
+[Server Actions](../core-concepts/server-actions.md)). Two decorators,
+two exceptions, one helper, one `__all__`.
 
 ---
 

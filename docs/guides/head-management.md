@@ -62,7 +62,7 @@ The `<Head>` component:
 - **Renders nothing in the DOM** (it returns `null`).
 - During SSR, Pyxle extracts its children at compile time and registers them as head elements for the response.
 - **Works in any component**, including nested ones. A reusable component can inject its own head metadata.
-- **Supports any head-valid element**: `<title>`, `<meta>`, `<link>`, `<script>`, `<base>`.
+- **Supports common head elements**: `<title>`, `<meta>`, `<link>`, `<script>`. (`<base>` is intentionally rejected — a stray `<base href>` can rewrite every relative URL on the page, so the head sanitizer strips it as an XSS/redirection vector.)
 - **Normalises multi-part `<title>` children** since 0.3.0. `<title>{name} — My Blog</title>` compiles to multiple children — `[name, " — My Blog"]` — which React warns about. `<Head>` joins string and number children into a single text node so the warning is silenced and the rendered HTML is unchanged. You don't need template literals or `{ \`${name} — My Blog\` }` workarounds.
 
 ### Multiple `<Head>` blocks in one tree
