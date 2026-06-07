@@ -20,9 +20,6 @@ import './styles/tailwind.css';
 import React from 'react';
 import { Head } from 'pyxle/client';
 
-export const slots = {};
-export const createSlots = () => slots;
-
 export default function HomePage({ data }) {
     return (
         <main className="flex min-h-screen flex-col items-center justify-center bg-slate-50 p-6 text-slate-900">
@@ -58,7 +55,7 @@ export default function HomePage({ data }) {
                     <a href="https://pyxle.dev" target="_blank" rel="noreferrer" className="text-emerald-600 hover:underline">
                         Homepage
                     </a>
-                    <a href="https://github.com/pyxle-framework/pyxle" target="_blank" rel="noreferrer" className="text-emerald-600 hover:underline">
+                    <a href="https://github.com/pyxle-dev/pyxle" target="_blank" rel="noreferrer" className="text-emerald-600 hover:underline">
                         GitHub
                     </a>
                     <a href="/api/pulse" target="_blank" rel="noreferrer" className="text-emerald-600 hover:underline">

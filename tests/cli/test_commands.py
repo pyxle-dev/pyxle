@@ -1817,3 +1817,737 @@ def test_find_tsc_falls_back_to_npx(tmp_path: Path, monkeypatch) -> None:
     result = _find_tsc(tmp_path)
     assert result is not None
     assert "npx" in result[0]
+
+
+# ---------------------------------------------------------------------------
+# version callback / --version (lines 52-53)
+# ---------------------------------------------------------------------------
+
+
+def test_version_callback_true_echoes_and_exits(capsys) -> None:
+    """version_callback(True) prints the version then raises typer.Exit."""
+    with pytest.raises(typer.Exit):
+        version_callback(True)
+
+    captured = capsys.readouterr()
+    assert __version__ in captured.out
+
+
+def test_version_callback_false_returns_none() -> None:
+    """version_callback(False) is a no-op and returns None."""
+    assert version_callback(False) is None
+
+
+def test_cli_version_flag_displays_version_and_exits() -> None:
+    """The global --version flag prints the version and exits 0."""
+    result = runner.invoke(app, ["--version"], catch_exceptions=False)
+    assert result.exit_code == 0
+    assert __version__ in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# dev: lazy import of create_starlette_app (lines 324-328)
+# ---------------------------------------------------------------------------
+
+
+def test_dev_command_lazy_imports_create_starlette_app(monkeypatch) -> None:
+    """When create_starlette_app is unset, ``dev`` lazily imports it."""
+    with runner.isolated_filesystem():
+        project = Path("demo")
+        (project / "pages").mkdir(parents=True)
+        (project / "public").mkdir(parents=True)
+
+        # Force the lazy-import guard at lines 322-328 to execute by
+        # resetting the cached module-level reference to None.
+        monkeypatch.setattr("pyxle.cli.create_starlette_app", None)
+
+        captured: dict[str, object] = {}
+
+        class StubDevServer:
+            def __init__(self, settings, logger, **kwargs):
+                captured["settings"] = settings
+
+            async def start(self) -> None:
+                captured["started"] = True
+
+        monkeypatch.setattr("pyxle.cli.DevServer", StubDevServer)
+        monkeypatch.setattr("pyxle.cli.asyncio.run", lambda coro: coro.close())
+
+        result = runner.invoke(app, ["dev", "demo"], catch_exceptions=False)
+
+        assert result.exit_code == 0, result.stdout
+        # The guard imported the real symbol back into the module global.
+        assert cli.create_starlette_app is not None
+
+
+# ---------------------------------------------------------------------------
+# dev: global style/script config error (lines 379-381)
+# ---------------------------------------------------------------------------
+
+
+def test_dev_command_global_style_config_error_exits(monkeypatch) -> None:
+    """A GlobalStyleConfigError from settings construction exits with 1."""
+    with runner.isolated_filesystem():
+        project = Path("demo")
+        (project / "pages").mkdir(parents=True)
+        (project / "public").mkdir(parents=True)
+
+        from pyxle.devserver.styles import GlobalStyleConfigError
+
+        def boom(*_a, **_kw):
+            raise GlobalStyleConfigError("global stylesheet 'missing.css' not found")
+
+        monkeypatch.setattr("pyxle.cli.DevServerSettings.from_project_root", boom)
+
+        result = runner.invoke(app, ["dev", "demo"], catch_exceptions=False)
+
+        assert result.exit_code == 1
+        assert "global stylesheet 'missing.css' not found" in result.stdout
+
+
+def test_dev_command_global_script_config_error_exits(monkeypatch) -> None:
+    """A GlobalScriptConfigError from settings construction exits with 1."""
+    with runner.isolated_filesystem():
+        project = Path("demo")
+        (project / "pages").mkdir(parents=True)
+        (project / "public").mkdir(parents=True)
+
+        from pyxle.devserver.scripts import GlobalScriptConfigError
+
+        def boom(*_a, **_kw):
+            raise GlobalScriptConfigError("global script 'track.js' not found")
+
+        monkeypatch.setattr("pyxle.cli.DevServerSettings.from_project_root", boom)
+
+        result = runner.invoke(app, ["dev", "demo"], catch_exceptions=False)
+
+        assert result.exit_code == 1
+        assert "global script 'track.js' not found" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# build: lazy import of DevServerSettings (lines 431-433)
+# ---------------------------------------------------------------------------
+
+
+def test_build_command_lazy_imports_devserver_settings(monkeypatch) -> None:
+    """When DevServerSettings is unset, ``build`` lazily imports it."""
+    with runner.isolated_filesystem():
+        project = Path("demo")
+        (project / "pages").mkdir(parents=True)
+        (project / "public").mkdir(parents=True)
+
+        # Reset the cached reference so the guard at 429-433 runs.
+        monkeypatch.setattr("pyxle.cli.DevServerSettings", None)
+
+        def fake_run_build(settings, *, logger, dist_dir=None, force_rebuild=True):
+            from pyxle.build.pipeline import BuildResult
+            from pyxle.devserver.builder import BuildSummary
+            from pyxle.devserver.registry import MetadataRegistry
+
+            result_dist = settings.project_root / "dist"
+            (result_dist / "client").mkdir(parents=True, exist_ok=True)
+            (result_dist / "server").mkdir(parents=True, exist_ok=True)
+            (result_dist / "metadata").mkdir(parents=True, exist_ok=True)
+            (result_dist / "public").mkdir(parents=True, exist_ok=True)
+            client_manifest_path = result_dist / "client" / "manifest.json"
+            client_manifest_path.write_text("{}", encoding="utf-8")
+            page_manifest_path = result_dist / "page-manifest.json"
+            page_manifest_path.write_text("{}", encoding="utf-8")
+            return BuildResult(
+                dist_dir=result_dist,
+                client_dir=result_dist / "client",
+                server_dir=result_dist / "server",
+                metadata_dir=result_dist / "metadata",
+                public_dir=result_dist / "public",
+                client_manifest_path=client_manifest_path,
+                page_manifest={},
+                page_manifest_path=page_manifest_path,
+                summary=BuildSummary(),
+                registry=MetadataRegistry(pages=[], apis=[]),
+            )
+
+        monkeypatch.setattr("pyxle.cli.run_build", fake_run_build)
+
+        result = runner.invoke(app, ["build", "demo"], catch_exceptions=False)
+
+        assert result.exit_code == 0, result.stdout
+        assert cli.DevServerSettings is not None
+
+
+# ---------------------------------------------------------------------------
+# build: config error (lines 451-453)
+# ---------------------------------------------------------------------------
+
+
+def test_build_command_reports_config_error() -> None:
+    """An invalid config makes ``build`` exit with code 1."""
+    with runner.isolated_filesystem():
+        project = Path("demo")
+        (project / "pages").mkdir(parents=True)
+        (project / "public").mkdir(parents=True)
+        (project / "pyxle.config.json").write_text("[]", encoding="utf-8")
+
+        result = runner.invoke(app, ["build", "demo"], catch_exceptions=False)
+
+        assert result.exit_code == 1
+        assert "Configuration file" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# build: global style/script config error (lines 466-468)
+# ---------------------------------------------------------------------------
+
+
+def test_build_command_global_style_config_error_exits(monkeypatch) -> None:
+    """A GlobalStyleConfigError during settings construction exits build."""
+    with runner.isolated_filesystem():
+        project = Path("demo")
+        (project / "pages").mkdir(parents=True)
+        (project / "public").mkdir(parents=True)
+
+        from pyxle.devserver.styles import GlobalStyleConfigError
+
+        def boom(*_a, **_kw):
+            raise GlobalStyleConfigError("bad stylesheet reference")
+
+        monkeypatch.setattr("pyxle.cli.DevServerSettings.from_project_root", boom)
+
+        result = runner.invoke(app, ["build", "demo"], catch_exceptions=False)
+
+        assert result.exit_code == 1
+        assert "bad stylesheet reference" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# build: absolute --out-dir (line 476)
+# ---------------------------------------------------------------------------
+
+
+def test_build_command_accepts_absolute_out_dir(monkeypatch, tmp_path: Path) -> None:
+    """An absolute --out-dir is resolved as-is (not joined to project root)."""
+    with runner.isolated_filesystem():
+        project = Path("demo")
+        (project / "pages").mkdir(parents=True)
+        (project / "public").mkdir(parents=True)
+
+        absolute_out = tmp_path / "abs-dist"
+        captured: dict[str, object] = {}
+
+        def fake_run_build(settings, *, logger, dist_dir=None, force_rebuild=True):
+            captured["dist_dir"] = dist_dir
+            from pyxle.build.pipeline import BuildResult
+            from pyxle.devserver.builder import BuildSummary
+            from pyxle.devserver.registry import MetadataRegistry
+
+            result_dist = dist_dir
+            (result_dist / "client").mkdir(parents=True, exist_ok=True)
+            (result_dist / "server").mkdir(parents=True, exist_ok=True)
+            (result_dist / "metadata").mkdir(parents=True, exist_ok=True)
+            (result_dist / "public").mkdir(parents=True, exist_ok=True)
+            client_manifest_path = result_dist / "client" / "manifest.json"
+            client_manifest_path.write_text("{}", encoding="utf-8")
+            page_manifest_path = result_dist / "page-manifest.json"
+            page_manifest_path.write_text("{}", encoding="utf-8")
+            return BuildResult(
+                dist_dir=result_dist,
+                client_dir=result_dist / "client",
+                server_dir=result_dist / "server",
+                metadata_dir=result_dist / "metadata",
+                public_dir=result_dist / "public",
+                client_manifest_path=client_manifest_path,
+                page_manifest={},
+                page_manifest_path=page_manifest_path,
+                summary=BuildSummary(),
+                registry=MetadataRegistry(pages=[], apis=[]),
+            )
+
+        monkeypatch.setattr("pyxle.cli.run_build", fake_run_build)
+
+        result = runner.invoke(
+            app,
+            ["build", "demo", "--out-dir", str(absolute_out)],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0, result.stdout
+        assert captured["dist_dir"] == absolute_out.resolve()
+
+
+# ---------------------------------------------------------------------------
+# build: client/page manifest paths absent (branches 504->506, 506->508)
+# ---------------------------------------------------------------------------
+
+
+def test_build_command_skips_manifest_steps_when_paths_absent(monkeypatch) -> None:
+    """When the build result has no client/page manifest paths, the
+    corresponding step lines are skipped (branches 504->506 and 506->508)."""
+    with runner.isolated_filesystem():
+        project = Path("demo")
+        (project / "pages").mkdir(parents=True)
+        (project / "public").mkdir(parents=True)
+
+        def fake_run_build(settings, *, logger, dist_dir=None, force_rebuild=True):
+            from pyxle.build.pipeline import BuildResult
+            from pyxle.devserver.builder import BuildSummary
+            from pyxle.devserver.registry import MetadataRegistry
+
+            result_dist = settings.project_root / "dist"
+            (result_dist / "client").mkdir(parents=True, exist_ok=True)
+            (result_dist / "server").mkdir(parents=True, exist_ok=True)
+            (result_dist / "metadata").mkdir(parents=True, exist_ok=True)
+            (result_dist / "public").mkdir(parents=True, exist_ok=True)
+            return BuildResult(
+                dist_dir=result_dist,
+                client_dir=result_dist / "client",
+                server_dir=result_dist / "server",
+                metadata_dir=result_dist / "metadata",
+                public_dir=result_dist / "public",
+                client_manifest_path=None,
+                page_manifest={},
+                page_manifest_path=None,
+                summary=BuildSummary(),
+                registry=MetadataRegistry(pages=[], apis=[]),
+            )
+
+        monkeypatch.setattr("pyxle.cli.run_build", fake_run_build)
+
+        result = runner.invoke(app, ["build", "demo"], catch_exceptions=False)
+
+        assert result.exit_code == 0, result.stdout
+        assert "Build completed" in result.stdout
+        # Neither manifest step is emitted when its path is None.
+        assert "Client manifest" not in result.stdout
+        assert "Page manifest" not in result.stdout
+        # The unconditional steps are still emitted.
+        assert "Server modules" in result.stdout
+        assert "Artifacts" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# serve: config error (lines 594-596)
+# ---------------------------------------------------------------------------
+
+
+def test_serve_command_reports_config_error() -> None:
+    """An invalid config makes ``serve`` exit with code 1."""
+    with runner.isolated_filesystem():
+        project = Path("demo")
+        project.mkdir()
+        (project / "pyxle.config.json").write_text("[]", encoding="utf-8")
+
+        result = runner.invoke(app, ["serve", "demo"], catch_exceptions=False)
+
+        assert result.exit_code == 1
+        assert "Configuration file" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# serve: global style/script config error (lines 618-620)
+# ---------------------------------------------------------------------------
+
+
+def test_serve_command_global_script_config_error_exits(monkeypatch) -> None:
+    """A GlobalScriptConfigError during settings construction exits serve."""
+    with runner.isolated_filesystem():
+        project = Path("demo")
+        project.mkdir()
+
+        from pyxle.devserver.scripts import GlobalScriptConfigError
+
+        def boom(*_a, **_kw):
+            raise GlobalScriptConfigError("missing global script entry")
+
+        monkeypatch.setattr("pyxle.cli.DevServerSettings.from_project_root", boom)
+
+        result = runner.invoke(app, ["serve", "demo"], catch_exceptions=False)
+
+        assert result.exit_code == 1
+        assert "missing global script entry" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# serve: static fallback warnings + negative ssr_workers
+# (lines 663-667, 673-676, 689-691, branch 692->701)
+# ---------------------------------------------------------------------------
+
+
+def _serve_with_stubbed_runtime(monkeypatch, captured: dict) -> None:
+    """Stub create_starlette_app + uvicorn so ``serve`` doesn't really run."""
+
+    def fake_create_app(settings, route_table, **kwargs):
+        captured["settings"] = settings
+        captured["create_kwargs"] = kwargs
+        from starlette.applications import Starlette
+
+        app_obj = Starlette()
+        app_obj.state.pyxle_ready = False
+        return app_obj
+
+    monkeypatch.setattr("pyxle.cli.create_starlette_app", fake_create_app)
+    monkeypatch.setattr("pyxle.cli.build_metadata_registry", lambda s: {})
+    monkeypatch.setattr("pyxle.cli.build_route_table", lambda r: [])
+    monkeypatch.setattr("pyxle.cli.load_manifest", lambda p: {"pages": {}})
+
+    async def _noop_serve(self):
+        return None
+
+    monkeypatch.setattr(
+        cli.uvicorn,
+        "Server",
+        lambda cfg: type("S", (), {"serve": _noop_serve})(),
+    )
+
+
+def test_serve_command_falls_back_when_dist_public_and_client_missing(monkeypatch) -> None:
+    """With --skip-build and a dist that lacks public/ and client/, serve
+    warns and falls back to the source public dir while disabling /client."""
+    with runner.isolated_filesystem():
+        project = Path("demo")
+        (project / "pages").mkdir(parents=True)
+        (project / "public").mkdir(parents=True)
+        dist = project / "dist"
+        dist.mkdir()
+        (dist / "page-manifest.json").write_text('{"pages": {}}', encoding="utf-8")
+        # Intentionally no dist/public and no dist/client.
+
+        captured: dict[str, object] = {}
+        _serve_with_stubbed_runtime(monkeypatch, captured)
+        monkeypatch.setattr("pyxle.cli.asyncio.run", lambda coro: coro.close())
+
+        result = runner.invoke(
+            app, ["serve", "demo", "--skip-build"], catch_exceptions=False
+        )
+
+        assert result.exit_code == 0, result.stdout
+        assert "Public assets directory" in result.stdout
+        assert "does not exist" in result.stdout
+        assert "Client asset directory" in result.stdout
+        assert "/client requests will 404" in result.stdout
+        # Fallback: public served from source dir, client disabled.
+        kwargs = captured["create_kwargs"]
+        assert kwargs["public_static_dir"] == (project / "public").resolve()
+        assert kwargs["client_static_dir"] is None
+
+
+def test_serve_command_zero_ssr_workers_uses_cpu_count(monkeypatch) -> None:
+    """--ssr-workers 0 derives the pool size from the CPU count and builds
+    a worker pool (lines 689-691)."""
+    with runner.isolated_filesystem():
+        project = Path("demo")
+        (project / "pages").mkdir(parents=True)
+        (project / "public").mkdir(parents=True)
+        dist = project / "dist"
+        dist.mkdir()
+        (dist / "page-manifest.json").write_text('{"pages": {}}', encoding="utf-8")
+        (dist / "public").mkdir()
+        (dist / "client").mkdir()
+
+        pool_args: dict[str, object] = {}
+
+        class StubPool:
+            def __init__(self, *, size, project_root, client_root):
+                pool_args["size"] = size
+
+        monkeypatch.setattr("pyxle.ssr.worker_pool.SsrWorkerPool", StubPool)
+
+        captured: dict[str, object] = {}
+        _serve_with_stubbed_runtime(monkeypatch, captured)
+        monkeypatch.setattr("pyxle.cli.asyncio.run", lambda coro: coro.close())
+
+        result = runner.invoke(
+            app,
+            ["serve", "demo", "--skip-build", "--ssr-workers", "0"],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0, result.stdout
+        # cpu_count fallback yields min(cpu_count or 2, 4) -> between 2 and 4.
+        assert 2 <= pool_args["size"] <= 4
+        assert captured["create_kwargs"]["pool"] is not None
+        # The derived pool size is echoed in the serving banner.
+        assert f"ssr_workers: {pool_args['size']}" in result.stdout
+
+
+def test_serve_command_non_positive_worker_count_skips_pool(monkeypatch) -> None:
+    """A non-positive ssr_workers count on the resolved settings means no
+    SSR pool is created (branch 692->701) and pool=None is passed through.
+
+    ``DevServerSettings.from_project_root`` clamps negatives to 0 (which
+    would then trigger the cpu_count fallback), so we instead force the
+    value on the settings object that ``serve`` produces via its internal
+    ``dataclasses.replace`` call at the manifest-merge step. This models a
+    defensive guard: if the effective worker count is ever non-positive,
+    no SSR pool is spun up.
+    """
+    from dataclasses import replace as _real_replace
+
+    with runner.isolated_filesystem():
+        project = Path("demo")
+        (project / "pages").mkdir(parents=True)
+        (project / "public").mkdir(parents=True)
+        dist = project / "dist"
+        dist.mkdir()
+        (dist / "page-manifest.json").write_text('{"pages": {}}', encoding="utf-8")
+        (dist / "public").mkdir()
+        (dist / "client").mkdir()
+
+        def replace_with_negative_workers(obj, **changes):
+            changes.setdefault("ssr_workers", -1)
+            return _real_replace(obj, **changes)
+
+        # serve() rebuilds settings via replace() right after loading the
+        # manifest; inject a non-positive worker count there.
+        monkeypatch.setattr("pyxle.cli.replace", replace_with_negative_workers)
+
+        # A non-positive size must never reach the pool constructor.
+        def explode(*_a, **_kw):
+            raise AssertionError("SsrWorkerPool must not be built for ssr_workers<=0")
+
+        monkeypatch.setattr("pyxle.ssr.worker_pool.SsrWorkerPool", explode)
+
+        captured: dict[str, object] = {}
+        _serve_with_stubbed_runtime(monkeypatch, captured)
+        monkeypatch.setattr("pyxle.cli.asyncio.run", lambda coro: coro.close())
+
+        result = runner.invoke(
+            app, ["serve", "demo", "--skip-build"], catch_exceptions=False
+        )
+
+        assert result.exit_code == 0, result.stdout
+        assert captured["create_kwargs"]["pool"] is None
+        assert "ssr_workers: -1" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# typecheck: lazy import + settings/build failures + missing tsconfig
+# (lines 868-870, 883-885, 892-894, 899-900)
+# ---------------------------------------------------------------------------
+
+
+def test_typecheck_command_lazy_imports_devserver_settings(monkeypatch) -> None:
+    """``typecheck`` lazily imports DevServerSettings when it is unset."""
+    with runner.isolated_filesystem():
+        project = Path("demo")
+        (project / "pages").mkdir(parents=True)
+        (project / "public").mkdir(parents=True)
+        (project / "pages" / "index.pyxl").write_text(
+            "import React from 'react';\n"
+            "export default function P() { return <div />; }\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setattr("pyxle.cli.DevServerSettings", None)
+        # Stop before tsc: a missing tsconfig short-circuits after the
+        # lazy import + build, which is enough to exercise lines 868-870.
+        monkeypatch.setattr("pyxle.devserver.builder.build_once", lambda s: None)
+
+        result = runner.invoke(app, ["typecheck", "demo"], catch_exceptions=False)
+
+        assert result.exit_code == 1
+        assert cli.DevServerSettings is not None
+        assert "tsconfig.json not found" in result.stdout
+
+
+def test_typecheck_command_settings_failure_exits(monkeypatch) -> None:
+    """A failure constructing settings makes ``typecheck`` exit with 1."""
+    with runner.isolated_filesystem():
+        project = Path("demo")
+        (project / "pages").mkdir(parents=True)
+        (project / "public").mkdir(parents=True)
+
+        def boom(*_a, **_kw):
+            raise ValueError("settings exploded")
+
+        monkeypatch.setattr("pyxle.cli.DevServerSettings.from_project_root", boom)
+
+        result = runner.invoke(app, ["typecheck", "demo"], catch_exceptions=False)
+
+        assert result.exit_code == 1
+        assert "Failed to create settings" in result.stdout
+        assert "settings exploded" in result.stdout
+
+
+def test_typecheck_command_build_failure_exits(monkeypatch) -> None:
+    """A failure during the pre-typecheck build exits with code 1."""
+    with runner.isolated_filesystem():
+        project = Path("demo")
+        (project / "pages").mkdir(parents=True)
+        (project / "public").mkdir(parents=True)
+
+        def boom(_settings):
+            raise RuntimeError("build blew up")
+
+        monkeypatch.setattr("pyxle.devserver.builder.build_once", boom)
+
+        result = runner.invoke(app, ["typecheck", "demo"], catch_exceptions=False)
+
+        assert result.exit_code == 1
+        assert "Build failed" in result.stdout
+        assert "build blew up" in result.stdout
+
+
+def test_typecheck_command_errors_when_tsconfig_missing(monkeypatch) -> None:
+    """``typecheck`` aborts when the generated tsconfig.json is absent."""
+    with runner.isolated_filesystem():
+        project = Path("demo")
+        (project / "pages").mkdir(parents=True)
+        (project / "public").mkdir(parents=True)
+
+        # build_once is stubbed so no real tsconfig.json is produced.
+        monkeypatch.setattr("pyxle.devserver.builder.build_once", lambda s: None)
+        # _find_tsc should never be consulted; the missing tsconfig wins first.
+        monkeypatch.setattr(
+            "pyxle.cli._find_tsc",
+            lambda root: (_ for _ in ()).throw(AssertionError("tsc lookup too early")),
+        )
+
+        result = runner.invoke(app, ["typecheck", "demo"], catch_exceptions=False)
+
+        assert result.exit_code == 1
+        assert "tsconfig.json not found" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# _find_tsc: local tsc.cmd and global tsc (lines 974, 979)
+# ---------------------------------------------------------------------------
+
+
+def test_find_tsc_prefers_local_tsc_cmd(tmp_path: Path) -> None:
+    """On Windows-style installs, node_modules/.bin/tsc.cmd is used."""
+    from pyxle.cli import _find_tsc
+
+    bin_dir = tmp_path / "node_modules" / ".bin"
+    bin_dir.mkdir(parents=True)
+    tsc_cmd = bin_dir / "tsc.cmd"
+    tsc_cmd.write_text("@echo off")
+
+    result = _find_tsc(tmp_path)
+    assert result == [str(tsc_cmd)]
+
+
+def test_find_tsc_uses_global_tsc(tmp_path: Path, monkeypatch) -> None:
+    """When no local binary exists, a global tsc on PATH is used."""
+    from pyxle.cli import _find_tsc
+
+    monkeypatch.setattr(
+        "shutil.which",
+        lambda cmd: "/usr/local/bin/tsc" if cmd == "tsc" else None,
+    )
+
+    result = _find_tsc(tmp_path)
+    assert result == ["/usr/local/bin/tsc"]
+
+
+# ---------------------------------------------------------------------------
+# routes: lazy import + settings/build failures (lines 1014-1016, 1033-1035, 1041-1043)
+# ---------------------------------------------------------------------------
+
+
+def test_routes_command_lazy_imports_devserver_settings(monkeypatch) -> None:
+    """``routes`` lazily imports DevServerSettings when it is unset."""
+    with runner.isolated_filesystem():
+        project = Path("demo")
+        (project / "pages").mkdir(parents=True)
+        (project / "public").mkdir(parents=True)
+        (project / "pages" / "index.pyxl").write_text(
+            "import React from 'react';\n"
+            "export default function P() { return <div />; }\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setattr("pyxle.cli.DevServerSettings", None)
+
+        result = runner.invoke(app, ["routes", "demo"], catch_exceptions=False)
+
+        assert result.exit_code == 0, result.stdout
+        assert cli.DevServerSettings is not None
+        assert "route(s) found" in result.stdout
+
+
+def test_routes_command_settings_failure_exits(monkeypatch) -> None:
+    """A failure constructing settings makes ``routes`` exit with 1."""
+    with runner.isolated_filesystem():
+        project = Path("demo")
+        (project / "pages").mkdir(parents=True)
+        (project / "public").mkdir(parents=True)
+
+        def boom(*_a, **_kw):
+            raise ValueError("routes settings exploded")
+
+        monkeypatch.setattr("pyxle.cli.DevServerSettings.from_project_root", boom)
+
+        result = runner.invoke(app, ["routes", "demo"], catch_exceptions=False)
+
+        assert result.exit_code == 1
+        assert "Failed to create settings" in result.stdout
+        assert "routes settings exploded" in result.stdout
+
+
+def test_routes_command_build_failure_exits(monkeypatch) -> None:
+    """A failure during the route-discovery build exits with code 1."""
+    with runner.isolated_filesystem():
+        project = Path("demo")
+        (project / "pages").mkdir(parents=True)
+        (project / "public").mkdir(parents=True)
+
+        def boom(_settings):
+            raise RuntimeError("routes build blew up")
+
+        monkeypatch.setattr("pyxle.devserver.builder.build_once", boom)
+
+        result = runner.invoke(app, ["routes", "demo"], catch_exceptions=False)
+
+        assert result.exit_code == 1
+        assert "Build failed" in result.stdout
+        assert "routes build blew up" in result.stdout
+
+
+def test_routes_text_output_with_no_pages_only_apis() -> None:
+    """An API-only project produces text output that skips the Pages block
+    (branch 1074->1088) but still lists API routes."""
+    with runner.isolated_filesystem():
+        project = Path("demo")
+        (project / "pages" / "api").mkdir(parents=True)
+        (project / "public").mkdir()
+        # No .pyxl page files at all — only an API endpoint.
+        (project / "pages" / "api" / "ping.py").write_text(
+            "async def endpoint(request):\n    return {'ok': True}\n",
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(app, ["routes", "demo"], catch_exceptions=False)
+
+        assert result.exit_code == 0, result.stdout
+        assert "API Routes:" in result.stdout
+        # No page rows were emitted because there are no pages.
+        assert "Pages:" not in result.stdout
+        assert "route(s) found" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# check: package.json present skips the "No package.json" warning
+# (branch 776->787)
+# ---------------------------------------------------------------------------
+
+
+def test_check_command_with_package_json_skips_warning() -> None:
+    """When package.json exists, ``check`` does not warn about it
+    (branch 776->787 is taken)."""
+    with runner.isolated_filesystem():
+        project = Path("demo")
+        (project / "pages").mkdir(parents=True)
+        (project / "public").mkdir()
+        (project / "node_modules").mkdir()
+        (project / "package.json").write_text('{"name": "demo"}', encoding="utf-8")
+        (project / "pages" / "index.pyxl").write_text(
+            "import React from 'react';\n"
+            "export default function P() { return <div />; }\n",
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(app, ["check", "demo"], catch_exceptions=False)
+
+        assert result.exit_code == 0, result.stdout
+        assert "No package.json found" not in result.stdout
+        assert "passed" in result.stdout

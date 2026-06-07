@@ -20,6 +20,7 @@ SUPPORTED_TEMPLATES = {"default"}
 def build_template_registry() -> TemplateRegistry:
     registry = TemplateRegistry()
     registry.register(".gitignore", ScaffoldingTemplate(".gitignore"))
+    registry.register("AGENTS.md", ScaffoldingTemplate("AGENTS.md"))
     registry.register("package.json", ScaffoldingTemplate("package.json"))
     registry.register("requirements.txt", ScaffoldingTemplate("requirements.txt"))
     registry.register("pyxle.config.json", ScaffoldingTemplate("pyxle.config.json"))
