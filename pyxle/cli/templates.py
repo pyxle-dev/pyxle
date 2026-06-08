@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from importlib import resources
-from importlib.resources.abc import Traversable
+try:  # ``importlib.resources.abc`` exists on Python 3.11+; 3.10 keeps it on ``importlib.abc``.
+    from importlib.resources.abc import Traversable
+except ModuleNotFoundError:  # Python 3.10
+    from importlib.abc import Traversable
 from pathlib import Path
 from string import Template
 from typing import Any, Mapping
