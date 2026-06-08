@@ -502,13 +502,16 @@ async def test_pool_render_includes_request_pathname(tmp_path: Path) -> None:
     component.touch()
 
     captured_payloads: list[dict[str, Any]] = []
-    responses: list[bytes] = []
+    # A real worker's stdout blocks until it emits a line and only returns EOF
+    # when the process exits. Model that with a queue (instead of returning b""
+    # when idle) so the read loop can't observe a premature EOF and mark the
+    # worker dead before the first render — a race that surfaced only under the
+    # asyncio scheduling on Python 3.10/3.11. stop() cancels the reader task, so
+    # leaving the queue empty at teardown is fine.
+    read_queue: asyncio.Queue = asyncio.Queue()
 
     async def fake_read(n: int = -1) -> bytes:
-        await asyncio.sleep(0)
-        if responses:
-            return responses.pop(0)
-        return b""
+        return await read_queue.get()
 
     mock_proc = MagicMock()
     mock_proc.stdin = MagicMock()
@@ -522,7 +525,7 @@ async def test_pool_render_includes_request_pathname(tmp_path: Path) -> None:
     def capture_write(data: bytes) -> None:
         payload = json.loads(data.decode().strip())
         captured_payloads.append(payload)
-        responses.append(
+        read_queue.put_nowait(
             (json.dumps({"id": payload["id"], "ok": True, "html": "<x/>", "styles": [], "headElements": []}) + "\n").encode()
         )
 
