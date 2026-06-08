@@ -85,9 +85,37 @@ Templates are useful for authentication flows, wizards, or any section where you
 | Can nest | Yes | Yes |
 | Typical use | Nav bars, sidebars | Auth flows, wizards |
 
-## Layouts are JSX-only
+## Layout data loaders
 
-Layout files typically contain only JSX -- no `@server` loader or `@action` functions. If you need shared data across pages, fetch it in each page's loader or use a shared Python utility.
+A layout (or template) can declare its own `@server` loader, just like a page. This is the clean way to load data the layout itself needs on **every** page it wraps -- a nav bar, a signed-in user/session banner, the current theme, the framework version, etc. -- without repeating it in every page's loader.
+
+```python
+# pages/layout.pyxl
+from pyxle import __version__
+
+@server
+async def load(request):
+    return {"version": __version__, "year": 2026}
+```
+
+```jsx
+export default function RootLayout({ children, data }) {
+    return (
+        <>
+            <nav>Pyxle v{data.version}</nav>
+            {children}
+            <footer>© {data.year}</footer>
+        </>
+    );
+}
+```
+
+The layout component receives its loader's result on the **`data`** prop -- exactly like a page receives its loader's data. Details:
+
+- The loader runs **once per request**, before the page renders, and must be `async` (same rules as a page loader).
+- In a nesting chain, every layout/template loader runs and their results are **merged** into one dict (on a key conflict, the outermost layout wins).
+- A layout **without** a loader receives the wrapped page's `data` instead, so existing JSX-only layouts are unchanged.
+- The merged layout data is also exposed to the **page** component as a `layoutData` prop, if a page ever needs to read what its layouts loaded.
 
 ## How it works
 

@@ -57,6 +57,31 @@ def test_compose_layout_templates_generates_wrapped_module(tmp_path: Path) -> No
     ]
 
 
+def test_composed_module_exposes_layout_loader_data_as_data_prop(tmp_path: Path) -> None:
+    """A layout/template that declares its own ``@server`` loader receives that
+    loader's result on the intuitive ``data`` prop (same as a page), not only
+    the ``layoutData`` prop. The composition overrides ``data`` for wrapper
+    components when layout-loader data is present, and falls back to the page's
+    data for loader-less layouts (back-compat)."""
+    settings = create_project(tmp_path)
+
+    write(
+        settings.pages_dir / "layout.pyxl",
+        "import React from 'react';\nexport default function Layout({ children }) { return <div>{children}</div>; }\n",
+    )
+    write(
+        settings.pages_dir / "blog" / "post.pyxl",
+        "import React from 'react';\nexport default function BlogPost() { return <article>Post</article>; }\n",
+    )
+
+    build_once(settings, force_rebuild=True)
+
+    composed = (settings.client_build_dir / "routes" / "blog" / "post.jsx").read_text(encoding="utf-8")
+    # Wrapper components receive the layout-loader data on `data` when present.
+    assert "props.layoutData !== undefined" in composed
+    assert "wrapperProps.data = props.layoutData" in composed
+
+
 def test_compose_layout_templates_handles_pages_without_slots(tmp_path: Path) -> None:
     settings = create_project(tmp_path)
 
