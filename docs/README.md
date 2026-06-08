@@ -9,6 +9,7 @@ Pyxle is a Python-first full-stack web framework that brings the Next.js develop
 - **Edge caching.** Declare cacheable routes in [`pyxle.config.json::cache`](reference/configuration.md#edge-caching) and pages are served `Cache-Control: public, s-maxage=N` (plus `stale-while-revalidate`) so a CDN or reverse proxy can absorb traffic instead of your origin — Pyxle's config-driven take on per-route revalidation. The per-user CSRF cookie is automatically omitted from cacheable responses. See [Deployment → CDN and edge caching](guides/deployment.md#cdn-and-edge-caching).
 - **Hardened production errors.** SSR render failures — including the SPA-navigation JSON path — are sanitized in the response (no exception type, message, or path leaks to the client) while the full error is written to the server log for operators.
 - **Faster static serving.** The static-asset middleware indexes public/client paths up front, skipping a per-request filesystem `stat` + exception on every dynamic request.
+- **Layout & template loaders.** A `layout.pyxl` or `template.pyxl` can declare its own `@server` loader; its result lands on the component's `data` prop, just like a page — so shared UI (nav bars, the signed-in user, the framework version) loads once per request without repeating the loader in every page. See [Layouts → Layout data loaders](core-concepts/layouts.md#layout-data-loaders).
 
 ## What's new in 0.3.0
 
