@@ -192,8 +192,8 @@ that you want to understand Pyxle well enough to:
 - Send a pull request that fits the existing architecture.
 - Build your own framework that learns from Pyxle's choices.
 
-If you just want to ship a feature, the [core-concepts](../core-concepts/)
-and [guides](../guides/) directories are friendlier starting points. Come
+If you just want to ship a feature, the [Core Concepts](../core-concepts/pyxl-files.md)
+and [Guides](../guides/comparison.md) sections are friendlier starting points. Come
 back here when you're curious.
 
 Welcome aboard. Let's take a tour.

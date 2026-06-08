@@ -86,7 +86,7 @@ See the [Middleware contribution](../guides/plugins.md#middleware-contribution) 
 
 ## `PluginContext`
 
-Per-process lifecycle context shared across plugins. Plugins register named services here; loaders / actions retrieve them via `request.app.state.pyxle_plugins` or the module-level [`plugin(name)`](#pluginname-default) helper.
+Per-process lifecycle context shared across plugins. Plugins register named services here; loaders / actions retrieve them via `request.app.state.pyxle_plugins` or the module-level [`plugin(name)`](#pluginname-defaultmissing) helper.
 
 ### Constructor
 
@@ -100,7 +100,7 @@ PluginContext(*, settings: Any = None)
 
 #### `register(name: str, service: Any) -> None`
 
-Register a service under `name`. Raises `PluginServiceError` if the name is already registered or empty. Use [`replace`](#replacename-str-service-any---none) to deliberately overwrite.
+Register a service under `name`. Raises `PluginServiceError` if the name is already registered or empty. Use [`replace`](#replacename-str-service-any-none) to deliberately overwrite.
 
 ```python
 ctx.register("db.database", database)
@@ -157,7 +157,7 @@ async def load(request):
     telemetry = plugin("telemetry", None)  # returns None if absent
 ```
 
-Resolves via the module-level active context that the devserver installs at ASGI startup. For use **inside** an ASGI request (loader, action, API endpoint). For use **outside** an ASGI context (tests, scripts), install a context manually via [`set_active_context`](#set_active_contextctx).
+Resolves via the module-level active context that the devserver installs at ASGI startup. For use **inside** an ASGI request (loader, action, API endpoint). For use **outside** an ASGI context (tests, scripts), install a context manually via [`set_active_context`](#set_active_contextctx-plugincontext-none-none).
 
 Raises `PluginServiceError` if:
 - No active context has been installed (typical cause: calling from outside an ASGI request).
@@ -171,7 +171,7 @@ Prefer [plugin-provided helpers](../guides/plugins.md#option-1-plugin-provided-i
 
 Return the currently-installed module-level context. Raises `PluginServiceError` if none has been installed.
 
-Most app code uses [`plugin(name)`](#pluginname-default) instead of touching the context directly. Reach for `active_context()` when you need the full `PluginContext` object (e.g. to iterate `names()` for a diagnostics page).
+Most app code uses [`plugin(name)`](#pluginname-defaultmissing) instead of touching the context directly. Reach for `active_context()` when you need the full `PluginContext` object (e.g. to iterate `names()` for a diagnostics page).
 
 ---
 
