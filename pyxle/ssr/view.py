@@ -93,6 +93,20 @@ def _error_response(
     return HTMLResponse(fallback, status_code=status_code)
 
 
+def _resolve_nav_cache_ttl(settings: DevServerSettings, path: str) -> int | None:
+    """Return the configured edge-cache TTL (seconds) for ``path``, if any.
+
+    The client navigation cache reuses this per-page value so a page's
+    prefetch/seed freshness matches its declared edge-cache lifetime. Pages
+    with no ``cache`` entry return ``None`` and fall back to the client's
+    default navigation-cache lifetime.
+    """
+    cache = getattr(settings, "cache", None)
+    if cache is None:
+        return None
+    return cache.max_age_for(path)
+
+
 async def build_page_response(
     *,
     request: Request,
@@ -117,6 +131,7 @@ async def build_page_response(
             loader_breadcrumb=loader_breadcrumb,
         )
         script_nonce = secrets.token_urlsafe(24)
+        nav_cache_ttl = _resolve_nav_cache_ttl(settings, request.url.path)
         try:
             shell = build_document_shell(
                 settings=settings,
@@ -125,6 +140,7 @@ async def build_page_response(
                 script_nonce=script_nonce,
                 head_elements=artifacts.head_elements,
                 inline_styles=artifacts.inline_styles,
+                nav_cache_ttl=nav_cache_ttl,
             )
         except ManifestLookupError:
             document = render_document(
@@ -135,6 +151,7 @@ async def build_page_response(
                 script_nonce=script_nonce,
                 head_elements=artifacts.head_elements,
                 inline_styles=artifacts.inline_styles,
+                nav_cache_ttl=nav_cache_ttl,
             )
             if overlay is not None:
                 await overlay.notify_clear(route_path=page.path)
@@ -288,6 +305,10 @@ async def build_page_navigation_response(
             },
             "props": artifacts.component_props,
             "headMarkup": artifacts.head_markup,
+            # Per-page client navigation-cache lifetime (seconds). Mirrors the
+            # page's edge-cache TTL so prefetched data stays fresh exactly as
+            # long as the CDN would serve it; ``None`` → client default.
+            "navCacheTtlSeconds": _resolve_nav_cache_ttl(settings, request.url.path),
         }
         return JSONResponse(payload, status_code=artifacts.status_code)
     except LoaderError as exc:

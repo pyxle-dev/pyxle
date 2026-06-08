@@ -57,6 +57,81 @@ def test_render_document_injects_expected_scripts(page_route: PageRoute, tmp_pat
     assert 'nonce="test-nonce"' in html
 
 
+def test_render_document_embeds_nav_seed(page_route: PageRoute, tmp_path: Path) -> None:
+    settings = DevServerSettings.from_project_root(tmp_path)
+
+    html = render_document(
+        settings=settings,
+        page=page_route,
+        body_html="<p>Hi</p>",
+        props={"data": {}},
+        script_nonce="seed-nonce",
+        head_elements=page_route.head_elements,
+        nav_cache_ttl=300,
+    )
+
+    # The seed blob lets the client cache the page it landed on (so the active
+    # self-link's prefetch is a hit) and carries the per-page nav-cache TTL.
+    assert 'id="__PYXLE_NAV_SEED__"' in html
+    assert '"navCacheTtlSeconds":300' in html
+    assert '"headMarkup":' in html
+
+
+def test_render_document_nav_seed_defaults_to_null_ttl(page_route: PageRoute, tmp_path: Path) -> None:
+    settings = DevServerSettings.from_project_root(tmp_path)
+
+    html = render_document(
+        settings=settings,
+        page=page_route,
+        body_html="<p>Hi</p>",
+        props={},
+        script_nonce="n",
+        head_elements=page_route.head_elements,
+    )
+
+    assert 'id="__PYXLE_NAV_SEED__"' in html
+    # No TTL passed → null, so the client applies its default lifetime.
+    assert '"navCacheTtlSeconds":null' in html
+
+
+def test_render_document_embeds_configured_nav_stale_default(
+    page_route: PageRoute, tmp_path: Path
+) -> None:
+    from pyxle.config import NavigationConfig
+
+    settings = DevServerSettings.from_project_root(
+        tmp_path, navigation=NavigationConfig(default_prefetch_ttl=90)
+    )
+    html = render_document(
+        settings=settings,
+        page=page_route,
+        body_html="<p>Hi</p>",
+        props={},
+        script_nonce="n",
+        head_elements=page_route.head_elements,
+    )
+
+    # The configured default (seconds) is exposed to the client in milliseconds.
+    assert "window.__PYXLE_NAV_STALE_MS__ = 90000" in html
+
+
+def test_render_document_omits_nav_stale_when_unconfigured(
+    page_route: PageRoute, tmp_path: Path
+) -> None:
+    settings = DevServerSettings.from_project_root(tmp_path)
+    html = render_document(
+        settings=settings,
+        page=page_route,
+        body_html="<p>Hi</p>",
+        props={},
+        script_nonce="n",
+        head_elements=page_route.head_elements,
+    )
+
+    # No config → no override embedded; the client keeps its built-in default.
+    assert "__PYXLE_NAV_STALE_MS__" not in html
+
+
 def test_render_document_inlines_global_styles(page_route: PageRoute, tmp_path: Path) -> None:
     style_path = tmp_path / "styles" / "base.css"
     style_path.parent.mkdir(parents=True, exist_ok=True)

@@ -46,6 +46,8 @@ class DevServerSettings:
     csrf: Any = None
     # Edge-cache policy (CacheConfig). None / empty = no shared caching.
     cache: Any = None
+    # Client navigation/prefetch cache policy (NavigationConfig). None = default.
+    navigation: Any = None
     # Plugin entries from pyxle.config.json::plugins — raw payload
     # (strings or dicts), resolved to PluginSpec/PyxlePlugin instances
     # by the starlette app at startup. Empty tuple = no plugins.
@@ -74,6 +76,7 @@ class DevServerSettings:
         cors: Any = None,
         csrf: Any = None,
         cache: Any = None,
+        navigation: Any = None,
         plugins: Sequence[Any] | None = None,
     ) -> "DevServerSettings":
         """Create settings derived from a project root directory."""
@@ -131,6 +134,7 @@ class DevServerSettings:
             cors=cors,
             csrf=csrf,
             cache=cache,
+            navigation=navigation,
             plugins=tuple(plugins) if plugins else (),
         )
 

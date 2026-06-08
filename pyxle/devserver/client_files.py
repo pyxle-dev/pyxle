@@ -716,39 +716,54 @@ def _render_client_entry(settings: DevServerSettings) -> str:
 
             // ---- Navigation cache with TTL ------------------------------
             //
-            // Every cached payload carries a ``cachedAt`` timestamp so we
-            // can treat entries older than ``navStaleMs`` as misses. This
-            // mirrors Next.js's Router Cache: cached enough to keep
-            // back/forward navigation instant, but stale-after-N so the
-            // user doesn't stare at 10-minute-old data.
+            // Every cached payload carries a ``cachedAt`` timestamp and a
+            // per-entry ``ttlMs`` lifetime, so entries older than their own
+            // window count as misses. A page's lifetime mirrors its edge-cache
+            // TTL from ``pyxle.config.json::cache``: the server tags each nav
+            // payload (and the SSR seed) with ``navCacheTtlSeconds``, so the
+            // client navigation cache stays fresh exactly as long as a CDN
+            // would serve that page — cached enough to keep back/forward and
+            // prefetched navigation instant, stale after the page's window.
             //
-            // Default: 30s (Next 14's heuristic). Configurable via
-            // ``pyxle.config.json::navigation.staleTimeMs`` and bundled
-            // into the client via ``__PYXLE_NAV_STALE_MS__``. Pass 0 for
-            // "never cache", Infinity (or any very large number) for
-            // "cache forever".
-            const navStaleMs = (() => {
+            // Pages with no ``cache`` entry fall back to ``DEFAULT_NAV_STALE_MS``
+            // below — 2 minutes: enough to reuse prefetched/seeded data across a
+            // quick read-then-navigate without holding dynamic data for long. The
+            // default is overridable via ``__PYXLE_NAV_STALE_MS__``
+            // (``pyxle.config.json::navigation.defaultPrefetchTtl``); ``0`` means
+            // "never cache".
+            const DEFAULT_NAV_STALE_MS = (() => {
               const configured = window.__PYXLE_NAV_STALE_MS__;
               if (typeof configured === 'number' && configured >= 0) {
                 return configured;
               }
-              return 30_000;
+              return 120_000;
             })();
+
+            // Resolve a payload's cache lifetime (ms). The server attaches the
+            // page's configured edge-cache TTL as ``navCacheTtlSeconds`` (in
+            // seconds) when one is set; otherwise fall back to the default.
+            function navTtlFromPayload(payload) {
+              const ttl = payload && payload.navCacheTtlSeconds;
+              if (typeof ttl === 'number' && ttl >= 0) {
+                return ttl * 1000;
+              }
+              return DEFAULT_NAV_STALE_MS;
+            }
 
             const _navStorage = new Map();
             const navigationCache = {
               get(key) {
                 const entry = _navStorage.get(key);
                 if (!entry) return undefined;
-                if (navStaleMs === 0) return undefined;
-                if (Date.now() - entry.cachedAt > navStaleMs) {
+                if (entry.ttlMs === 0 || Date.now() - entry.cachedAt > entry.ttlMs) {
                   _navStorage.delete(key);
                   return undefined;
                 }
                 return entry.payload;
               },
-              set(key, payload) {
-                _navStorage.set(key, { payload, cachedAt: Date.now() });
+              set(key, payload, ttlMs) {
+                const lifetime = typeof ttlMs === 'number' ? ttlMs : navTtlFromPayload(payload);
+                _navStorage.set(key, { payload, cachedAt: Date.now(), ttlMs: lifetime });
               },
               has(key) {
                 return this.get(key) !== undefined;
@@ -1481,6 +1496,14 @@ def _render_client_entry(settings: DevServerSettings) -> str:
               if (!url || url.origin !== window.location.origin) {
                 return Promise.resolve(false);
               }
+              // Never prefetch the page we're already on. Its data came down
+              // with the SSR render (and is seeded into the cache at bootstrap),
+              // so a prefetch would just re-run the loader — and any side
+              // effects — for no benefit. Guards the window after the seed's
+              // TTL lapses, when the cache check below would otherwise miss.
+              if (url.pathname === window.location.pathname && url.search === window.location.search) {
+                return Promise.resolve(false);
+              }
               const cacheKey = getCacheKey(url);
               if (navigationCache.has(cacheKey)) {
                 return Promise.resolve(true);
@@ -1637,8 +1660,44 @@ def _render_client_entry(settings: DevServerSettings) -> str:
               prefetchNavigation(url).catch(() => {});
             }
 
+            // Read the ``__PYXLE_NAV_SEED__`` blob the server embeds alongside
+            // the props: the page's head markup and its navigation-cache TTL.
+            function parseNavSeed() {
+              try {
+                const tag = document.getElementById('__PYXLE_NAV_SEED__');
+                return tag && tag.textContent ? JSON.parse(tag.textContent) : null;
+              } catch (error) {
+                return null;
+              }
+            }
+
+            // Seed the navigation cache with the page the user landed on, built
+            // from data the server already rendered (props + the seed blob). The
+            // active self-link's prefetch and any back/forward navigation to this
+            // page then resolve from cache, so the loader never re-runs for the
+            // page already on screen. Best-effort: a miss just costs a refetch.
+            function seedCurrentPage(initialProps) {
+              try {
+                const seed = parseNavSeed();
+                const url = new URL(window.location.href);
+                navigationCache.set(getCacheKey(url), {
+                  ok: true,
+                  routePath: url.pathname,
+                  requestedPath: url.pathname,
+                  statusCode: 200,
+                  page: { clientAssetPath: currentPagePath },
+                  props: initialProps,
+                  headMarkup: (seed && seed.headMarkup) || '',
+                  navCacheTtlSeconds: seed ? seed.navCacheTtlSeconds : null,
+                });
+              } catch (error) {
+                /* ignore — seeding is an optimisation, not a requirement */
+              }
+            }
+
             async function bootstrap() {
               const initialProps = parseInitialProps();
+              seedCurrentPage(initialProps);
               await renderPage(currentPagePath, initialProps);
               if (!window.history.state || !window.history.state.pyxle) {
                 window.history.replaceState({ pyxle: true, pagePath: currentPagePath }, '', window.location.href);

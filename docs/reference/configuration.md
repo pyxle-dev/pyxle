@@ -43,6 +43,7 @@ Pyxle is configured via `pyxle.config.json` in the project root. All fields are 
     "exemptPaths": []
   },
   "cache": {},
+  "navigation": {},
   "plugins": []
 }
 ```
@@ -210,6 +211,25 @@ Each key is a route pattern; each value is the shared-cache lifetime in seconds:
 | `cache."<pattern>"` | `integer` \| `{ "sMaxage": integer }` | -- | Lifetime in seconds (≥ 0) for the matched route. |
 
 > **Turning it on at the edge.** These headers make a response *eligible* for shared caching, but some CDNs don't cache HTML by default. On Cloudflare, you must also add a Cache Rule ("Cache Everything") for the cached paths -- the headers alone are necessary but not sufficient. See [Deployment → CDN and edge caching](../guides/deployment.md#cdn-and-edge-caching).
+
+## Navigation
+
+Pyxle's client keeps an in-memory **navigation cache** so client-side navigation -- and the data prefetched when a `<Link>` scrolls into view or is hovered -- resolves instantly instead of refetching the loader. The page you land on is seeded into this cache from the server render, so its loader never runs a second time on the initial load.
+
+```json
+{
+  "navigation": {
+    "defaultPrefetchTtl": 120
+  }
+}
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `navigation` | `object` | `{}` | Client navigation/prefetch cache settings. |
+| `navigation.defaultPrefetchTtl` | `integer` | `120` | Lifetime in seconds (≥ 0) that a prefetched or seeded page stays fresh in the client navigation cache, for routes **without** a `cache` entry. `0` disables navigation caching. |
+
+A route listed in the [`cache`](#edge-caching) block **reuses its edge-cache TTL** as its navigation-cache lifetime, overriding `defaultPrefetchTtl` for that route -- so a page's client freshness matches how long a CDN would serve it. (Consequence: raising a route's `cache` TTL also lengthens its edge cache, so purge the CDN on deploy -- which you should do regardless.) After a mutation, the client router's `invalidate(href)` drops a cached entry so the next navigation refetches.
 
 ## Plugins
 

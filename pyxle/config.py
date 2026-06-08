@@ -83,6 +83,20 @@ class CacheConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class NavigationConfig:
+    """Client-side navigation (prefetch) cache policy.
+
+    ``default_prefetch_ttl`` is the lifetime (seconds) the client navigation
+    cache keeps a prefetched or SSR-seeded page that has *no* per-route
+    ``cache`` entry. ``None`` uses the framework default (2 minutes). Routes
+    listed in :class:`CacheConfig` reuse their edge-cache TTL as their
+    navigation-cache lifetime, overriding this default for those routes.
+    """
+
+    default_prefetch_ttl: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class PyxleConfig:
     """Resolved configuration values for a Pyxle project."""
 
@@ -102,6 +116,7 @@ class PyxleConfig:
     cors: CorsConfig = CorsConfig()
     csrf: CsrfConfig = CsrfConfig()
     cache: CacheConfig = CacheConfig()
+    navigation: NavigationConfig = NavigationConfig()
     # Plugin entries as the raw payload from ``pyxle.config.json`` —
     # either a bare string (``"pyxle-auth"``) or an object
     # (``{"name": "pyxle-auth", "settings": {...}}``). Resolved into
@@ -128,6 +143,7 @@ class PyxleConfig:
             "cors": self.cors,
             "csrf": self.csrf,
             "cache": self.cache,
+            "navigation": self.navigation,
             "plugins": self.plugins,
         }
 
@@ -232,6 +248,7 @@ def _parse_config_dict(data: Dict[str, Any], *, source: Path) -> PyxleConfig:
         "cors",
         "csrf",
         "cache",
+        "navigation",
         "plugins",
     }
     unknown_keys = set(data) - allowed_top_keys
@@ -264,6 +281,7 @@ def _parse_config_dict(data: Dict[str, Any], *, source: Path) -> PyxleConfig:
     cors_config = _parse_cors_block(data.get("cors"), source=source)
     csrf_config = _parse_csrf_block(data.get("csrf"), source=source)
     cache_config = _parse_cache_block(data.get("cache"), source=source)
+    navigation_config = _parse_navigation_block(data.get("navigation"), source=source)
     plugins = _parse_plugins_block(data.get("plugins"), source=source)
 
     return PyxleConfig(
@@ -283,6 +301,7 @@ def _parse_config_dict(data: Dict[str, Any], *, source: Path) -> PyxleConfig:
         cors=cors_config,
         csrf=csrf_config,
         cache=cache_config,
+        navigation=navigation_config,
         plugins=plugins,
     )
 
@@ -503,6 +522,38 @@ def _parse_cache_block(value: Any, *, source: Path) -> CacheConfig:
             )
         routes.append((pattern, max_age))
     return CacheConfig(routes=tuple(routes))
+
+
+def _parse_navigation_block(value: Any, *, source: Path) -> NavigationConfig:
+    """Parse the ``navigation`` block — client prefetch/nav-cache settings.
+
+    Supports ``defaultPrefetchTtl`` (seconds): the lifetime the client
+    navigation cache keeps a prefetched or SSR-seeded page that has no
+    per-route ``cache`` entry. Omitted / ``null`` uses the framework default
+    (2 minutes).
+    """
+    if value is None:
+        return NavigationConfig()
+    if not isinstance(value, Mapping):
+        raise ConfigError(
+            f"Invalid value for 'navigation' in '{source}': expected an object, "
+            f"got {type(value).__name__}."
+        )
+    unknown = set(value) - {"defaultPrefetchTtl"}
+    if unknown:
+        formatted = ", ".join(sorted(str(key) for key in unknown))
+        raise ConfigError(
+            f"Unknown keys in 'navigation' block in '{source}': {formatted}."
+        )
+    ttl = value.get("defaultPrefetchTtl")
+    if ttl is None:
+        return NavigationConfig()
+    if isinstance(ttl, bool) or not isinstance(ttl, int) or ttl < 0:
+        raise ConfigError(
+            f"Invalid value for 'navigation.defaultPrefetchTtl' in '{source}': "
+            f"expected a non-negative integer number of seconds."
+        )
+    return NavigationConfig(default_prefetch_ttl=ttl)
 
 
 def _parse_csrf_block(value: Any, *, source: Path) -> CsrfConfig:

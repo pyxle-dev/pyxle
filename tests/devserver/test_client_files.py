@@ -55,6 +55,26 @@ def test_write_client_bootstrap_files_generates_expected_artifacts(tmp_path: Pat
     assert slot_types == _render_slot_runtime_types()
 
 
+def test_client_entry_seeds_nav_cache_and_guards_self_prefetch(tmp_path: Path) -> None:
+    settings = DevServerSettings.from_project_root(tmp_path)
+    client_entry = _render_client_entry(settings)
+
+    # Per-entry navigation-cache TTL with a 2-minute default (replacing the
+    # old global 30s), resolved from the payload's edge-cache TTL.
+    assert "DEFAULT_NAV_STALE_MS" in client_entry
+    assert "120_000" in client_entry
+    assert "navTtlFromPayload" in client_entry
+    assert "navCacheTtlSeconds" in client_entry
+
+    # The page the user landed on is seeded into the cache from the SSR blob,
+    # so its own prefetch is a hit instead of a second loader run.
+    assert "seedCurrentPage" in client_entry
+    assert "__PYXLE_NAV_SEED__" in client_entry
+
+    # Belt-and-suspenders: prefetch never re-fetches the current page.
+    assert "Never prefetch the page we're already on" in client_entry
+
+
 def test_write_client_bootstrap_files_is_idempotent(tmp_path: Path) -> None:
     settings = create_project(tmp_path)
 

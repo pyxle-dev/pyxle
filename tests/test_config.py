@@ -43,6 +43,49 @@ def test_load_config_parses_custom_values(tmp_path: Path) -> None:
     assert config.debug is False
 
 
+def test_load_config_parses_navigation_block(tmp_path: Path) -> None:
+    write_config(tmp_path, {"navigation": {"defaultPrefetchTtl": 120}})
+
+    config = load_config(tmp_path)
+    assert config.navigation.default_prefetch_ttl == 120
+
+
+def test_load_config_navigation_defaults_to_none(tmp_path: Path) -> None:
+    # No navigation block at all → framework default.
+    assert load_config(tmp_path).navigation.default_prefetch_ttl is None
+    # Empty navigation block → still the framework default.
+    write_config(tmp_path, {"navigation": {}})
+    assert load_config(tmp_path).navigation.default_prefetch_ttl is None
+
+
+@pytest.mark.parametrize("bad", [-5, "x", True, 1.5])
+def test_load_config_rejects_invalid_navigation_ttl(tmp_path: Path, bad: object) -> None:
+    write_config(tmp_path, {"navigation": {"defaultPrefetchTtl": bad}})
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(tmp_path)
+
+    assert "defaultPrefetchTtl" in str(excinfo.value)
+
+
+def test_load_config_rejects_non_object_navigation_block(tmp_path: Path) -> None:
+    write_config(tmp_path, {"navigation": "nope"})
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(tmp_path)
+
+    assert "navigation" in str(excinfo.value)
+
+
+def test_load_config_rejects_unknown_navigation_keys(tmp_path: Path) -> None:
+    write_config(tmp_path, {"navigation": {"staleTime": 60}})
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(tmp_path)
+
+    assert "navigation" in str(excinfo.value)
+
+
 def test_load_config_rejects_unknown_keys(tmp_path: Path) -> None:
     write_config(tmp_path, {"unknown": "value"})
 

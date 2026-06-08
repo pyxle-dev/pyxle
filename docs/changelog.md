@@ -2,6 +2,11 @@
 
 Release notes for Pyxle. While we're in beta (`0.x`), minor versions may include breaking changes — those are called out explicitly here. To upgrade, run `pip install --upgrade pyxle-framework`.
 
+## 0.4.1
+
+- **No more double loader run on first load.** The page you land on is now seeded into the client navigation cache from the server render, so the active nav link's prefetch (a `<Link>` pointing at the current route) resolves from cache instead of re-fetching. The loader runs **once**, not twice — halving origin work on cold loads and stopping non-idempotent loaders (view counters, analytics) from firing twice. Back/forward navigation to the page is instant for the same reason.
+- **Per-route navigation-cache TTL.** A route's [`cache`](reference/configuration.md#edge-caching) TTL now also governs how long its prefetched/seeded data stays fresh in the client navigation cache, so client freshness matches how long a CDN would serve the page. Routes without a `cache` entry use a default of **2 minutes** (raised from 30s), tunable via the new [`navigation.defaultPrefetchTtl`](reference/configuration.md#navigation) option.
+
 ## 0.4.0
 
 - **Edge caching.** Declare cacheable routes in [`pyxle.config.json::cache`](reference/configuration.md#edge-caching) and pages are served `Cache-Control: public, s-maxage=N` (plus `stale-while-revalidate`) so a CDN or reverse proxy can absorb traffic instead of your origin — Pyxle's config-driven take on per-route revalidation. The per-user CSRF cookie is automatically omitted from cacheable responses. See [Deployment → CDN and edge caching](guides/deployment.md#cdn-and-edge-caching).

@@ -188,7 +188,31 @@ async def test_build_page_navigation_response_returns_payload(
     assert payload["page"]["clientAssetPath"] == page.client_asset_path
     assert payload["props"] == {"data": {}}
     assert "<title>Home</title>" in payload["headMarkup"]
+    # No cache config for "/" in the default settings → client default TTL.
+    assert payload["navCacheTtlSeconds"] is None
     assert overlay.events == [("clear", "/")]
+
+
+def test_resolve_nav_cache_ttl_matches_cache_config() -> None:
+    from types import SimpleNamespace
+
+    from pyxle.config import CacheConfig
+    from pyxle.ssr.view import _resolve_nav_cache_ttl
+
+    settings = SimpleNamespace(cache=CacheConfig(routes=(("/docs/*", 300), ("/", 60))))
+    assert _resolve_nav_cache_ttl(settings, "/") == 60
+    assert _resolve_nav_cache_ttl(settings, "/docs/intro") == 300
+    # A path with no matching cache route falls back to the client default.
+    assert _resolve_nav_cache_ttl(settings, "/playground") is None
+
+
+def test_resolve_nav_cache_ttl_without_cache_config() -> None:
+    from types import SimpleNamespace
+
+    from pyxle.ssr.view import _resolve_nav_cache_ttl
+
+    assert _resolve_nav_cache_ttl(SimpleNamespace(), "/") is None
+    assert _resolve_nav_cache_ttl(SimpleNamespace(cache=None), "/") is None
 
 
 @pytest.mark.anyio

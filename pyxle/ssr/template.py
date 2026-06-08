@@ -48,6 +48,7 @@ def render_document(
   script_nonce: str,
   head_elements: tuple[str, ...],
   inline_styles: tuple[InlineStyleFragment, ...] = tuple(),
+  nav_cache_ttl: int | None = None,
 ) -> str:
   """Compose the HTML document for a rendered page."""
   try:
@@ -58,6 +59,7 @@ def render_document(
       script_nonce=script_nonce,
       head_elements=head_elements,
       inline_styles=inline_styles,
+      nav_cache_ttl=nav_cache_ttl,
     )
   except ManifestLookupError:
     return _render_manifest_error(page)
@@ -72,10 +74,19 @@ def build_document_shell(
   script_nonce: str,
   head_elements: tuple[str, ...],
   inline_styles: tuple[InlineStyleFragment, ...] = tuple(),
+  nav_cache_ttl: int | None = None,
 ) -> DocumentShell:
   props_payload = _serialize_props(props)
   page_path_literal = json.dumps(page.client_asset_path)
   head_injections = render_head_markup(head_elements)
+  # Seed payload for the client navigation cache. Lets the page the user
+  # landed on satisfy its own prefetch (the active self-link) from cache
+  # instead of re-running the loader, and powers instant back/forward nav.
+  # ``navCacheTtlSeconds`` mirrors the page's edge-cache TTL (``None`` →
+  # client default lifetime).
+  nav_seed_payload = _serialize_props(
+    {"headMarkup": head_injections, "navCacheTtlSeconds": nav_cache_ttl}
+  )
   head_block = (
     "\n  <meta data-pyxle-head-start=\"1\" />"
     + head_injections
@@ -84,6 +95,10 @@ def build_document_shell(
   nonce_attr = _format_nonce_attr(script_nonce)
   global_styles = _render_global_styles_markup(settings)
   inline_styles_markup = _render_inline_styles_markup(inline_styles)
+  # When the app configures a default nav-cache lifetime
+  # (``navigation.defaultPrefetchTtl``), expose it to the client as
+  # ``__PYXLE_NAV_STALE_MS__`` (ms). Absent → the client's 2-minute default.
+  nav_stale_script = _render_nav_stale_script(settings, nonce_attr)
 
   if not settings.debug and settings.page_manifest is not None:
     manifest_entry = settings.page_manifest.get(page.path)
@@ -124,7 +139,8 @@ def build_document_shell(
     suffix = """
   </div>
   <script id=\"__PYXLE_PROPS__\" type=\"application/json\"{nonce_attr}>{props_payload}</script>
-  <script{nonce_attr}>window.__PYXLE_PAGE_PATH__ = {page_path_literal};</script>
+  <script id=\"__PYXLE_NAV_SEED__\" type=\"application/json\"{nonce_attr}>{nav_seed_payload}</script>
+  <script{nonce_attr}>window.__PYXLE_PAGE_PATH__ = {page_path_literal};</script>{nav_stale_script}
   <script{nonce_attr}>window.__PYXLE_SCRIPTS__ = {scripts_metadata};</script>
   <script type=\"module\" src=\"{js_src}\"></script>
   </body>
@@ -132,8 +148,10 @@ def build_document_shell(
 """.format(
       nonce_attr=nonce_attr,
       props_payload=props_payload,
+      nav_seed_payload=nav_seed_payload,
       page_path_literal=page_path_literal,
       scripts_metadata=scripts_metadata,
+      nav_stale_script=nav_stale_script,
       js_src=js_src,
     )
     return DocumentShell(prefix=prefix, suffix=suffix)
@@ -163,7 +181,8 @@ def build_document_shell(
   suffix = """
   </div>
   <script id=\"__PYXLE_PROPS__\" type=\"application/json\"{nonce_attr}>{props_payload}</script>
-  <script{nonce_attr}>window.__PYXLE_PAGE_PATH__ = {page_path_literal};</script>
+  <script id=\"__PYXLE_NAV_SEED__\" type=\"application/json\"{nonce_attr}>{nav_seed_payload}</script>
+  <script{nonce_attr}>window.__PYXLE_PAGE_PATH__ = {page_path_literal};</script>{nav_stale_script}
   <script{nonce_attr}>window.__PYXLE_SCRIPTS__ = {scripts_metadata};</script>
   <script type=\"module\" src=\"{vite_origin}/client-entry.js\"></script>
   </body>
@@ -171,11 +190,28 @@ def build_document_shell(
 """.format(
     nonce_attr=nonce_attr,
     props_payload=props_payload,
+    nav_seed_payload=nav_seed_payload,
     page_path_literal=page_path_literal,
     scripts_metadata=scripts_metadata,
+    nav_stale_script=nav_stale_script,
     vite_origin=vite_origin,
   )
   return DocumentShell(prefix=prefix, suffix=suffix)
+
+
+def _render_nav_stale_script(settings: DevServerSettings, nonce_attr: str) -> str:
+    """Render the ``__PYXLE_NAV_STALE_MS__`` bootstrap script, or ``""``.
+
+    Bundles ``navigation.defaultPrefetchTtl`` (seconds) into the client as a
+    millisecond default for the navigation cache. Returns an empty string when
+    no default is configured, so the client keeps its built-in 2-minute
+    fallback.
+    """
+    navigation = getattr(settings, "navigation", None)
+    ttl_seconds = getattr(navigation, "default_prefetch_ttl", None)
+    if ttl_seconds is None:
+        return ""
+    return f"\n  <script{nonce_attr}>window.__PYXLE_NAV_STALE_MS__ = {int(ttl_seconds) * 1000};</script>"
 
 
 def _serialize_props(props: dict[str, Any]) -> str:
