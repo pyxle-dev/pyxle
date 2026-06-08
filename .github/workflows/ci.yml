@@ -43,24 +43,44 @@ jobs:
       matrix:
         python-version: ["3.10", "3.11", "3.12", "3.13"]
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout pyxle
+        uses: actions/checkout@v4
+        with:
+          path: pyxle
+
+      # The JSX component extractor (Script / Image / <Head> detection) lives in
+      # the sibling pyxle-langkit repo and is resolved relative to the pyxle
+      # checkout (../pyxle-langkit). Checking it out as a sibling — and npm
+      # installing its @babel deps — is what lets the compiler/SSR head tests run
+      # (otherwise the extractor isn't found and returns no declarations).
+      - name: Checkout pyxle-langkit (sibling, for the JSX extractor)
+        uses: actions/checkout@v4
+        with:
+          repository: pyxle-dev/pyxle-langkit
+          path: pyxle-langkit
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
 
-      # Node is required: the SSR renderer tests shell out to esbuild + React
-      # (tests/ssr/utils.py installs react/react-dom/esbuild into a local cache).
+      # Node is required: the JSX extractor runs Babel, and the SSR renderer
+      # tests shell out to esbuild + React (provisioned into a local cache).
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: "20"
 
+      - name: Install JSX extractor deps (Babel)
+        run: npm install
+        working-directory: pyxle-langkit
+
       - name: Install dev dependencies
         run: pip install -e ".[dev]"
+        working-directory: pyxle
 
       # pytest config in pyproject.toml runs the suite with coverage and
       # enforces the 95% gate (--cov-fail-under). No extra flags needed.
       - name: Run test suite (with coverage gate)
         run: pytest
+        working-directory: pyxle
