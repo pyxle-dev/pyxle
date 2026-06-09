@@ -146,6 +146,75 @@ def test_install_dependencies_executes_commands(monkeypatch, tmp_path) -> None:
     assert calls[1][1] == tmp_path
 
 
+def test_scaffold_requirements_declares_pyxle_framework() -> None:
+    """The scaffolded requirements.txt must list pyxle-framework itself, so a
+    fresh clone + `pip install -r requirements.txt` pulls the runtime."""
+    from importlib import resources
+
+    content = (
+        resources.files("pyxle.templates.scaffold")
+        .joinpath("requirements.txt")
+        .read_text(encoding="utf-8")
+    )
+    assert "pyxle-framework" in content
+
+
+def test_in_virtualenv_detects_environments(monkeypatch) -> None:
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+    monkeypatch.delenv("CONDA_PREFIX", raising=False)
+    # Diverging prefixes → venv / virtualenv.
+    monkeypatch.setattr(cli.sys, "prefix", "/proj/.venv")
+    monkeypatch.setattr(cli.sys, "base_prefix", "/usr")
+    assert cli._in_virtualenv() is True
+    # Same prefix, no env markers → system Python.
+    monkeypatch.setattr(cli.sys, "base_prefix", "/proj/.venv")
+    assert cli._in_virtualenv() is False
+    # VIRTUAL_ENV set → venv even when prefixes match.
+    monkeypatch.setenv("VIRTUAL_ENV", "/proj/.venv")
+    assert cli._in_virtualenv() is True
+
+
+def test_install_dependencies_warns_outside_virtualenv(monkeypatch, tmp_path) -> None:
+    """Outside a venv, install warns about PEP 668 with venv guidance instead of
+    letting pip throw its raw 'externally-managed-environment' wall."""
+    monkeypatch.setattr(cli, "_in_virtualenv", lambda: False)
+    monkeypatch.setattr(cli.subprocess, "run", lambda *a, **k: None)
+    warnings: list[str] = []
+
+    class _Logger:
+        def step(self, *a, **k) -> None: ...
+        def warning(self, msg) -> None:
+            warnings.append(msg)
+        def success(self, *a, **k) -> None: ...
+
+    cli._install_dependencies(tmp_path, logger=_Logger(), install_node=False)
+    assert any("virtual environment" in w.lower() for w in warnings)
+    assert any("PEP 668" in w for w in warnings)
+
+
+def test_init_generates_dev_secret_key(tmp_path, monkeypatch) -> None:
+    """`pyxle init` writes a gitignored .env.local with a random PYXLE_SECRET_KEY
+    so CSRF HMAC is enabled out of the box (no 'secret unset' warning)."""
+    from pyxle.cli.init import run_init
+
+    monkeypatch.chdir(tmp_path)
+    run_init("demo", force=False, template="default", logger=cli.ConsoleLogger(), log_steps=False)
+
+    env_local = tmp_path / "demo" / ".env.local"
+    assert env_local.exists()
+    content = env_local.read_text(encoding="utf-8")
+    assert "PYXLE_SECRET_KEY=" in content
+    # The key is a real random hex value, not a left-in placeholder.
+    key = next(
+        ln.split("=", 1)[1] for ln in content.splitlines() if ln.startswith("PYXLE_SECRET_KEY=")
+    )
+    assert len(key) >= 32 and all(c in "0123456789abcdef" for c in key)
+
+    # And it's gitignored, so the secret is never committed.
+    gitignore = (tmp_path / "demo" / ".gitignore").read_text(encoding="utf-8")
+    assert ".env.local" in gitignore
+
+
 def test_run_subprocess_handles_missing_binary(monkeypatch, tmp_path) -> None:
     def fake_run(*_, **__):
         raise FileNotFoundError("missing binary")

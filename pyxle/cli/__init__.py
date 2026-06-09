@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import subprocess
 import sys
 from dataclasses import replace
@@ -168,6 +169,17 @@ def _ensure_directory(directory: Path, logger: ConsoleLogger) -> Path:
     return resolved
 
 
+def _in_virtualenv() -> bool:
+    """Return ``True`` when running inside a virtual environment.
+
+    Covers ``venv``/``virtualenv`` (``sys.prefix`` diverges from the base
+    interpreter prefix) and Conda environments.
+    """
+    if os.environ.get("VIRTUAL_ENV") or os.environ.get("CONDA_PREFIX"):
+        return True
+    return sys.prefix != getattr(sys, "base_prefix", sys.prefix)
+
+
 def _run_subprocess(command: list[str], *, cwd: Path, label: str, logger: ConsoleLogger) -> None:
     logger.step(label, " ".join(command))
     try:
@@ -192,6 +204,14 @@ def _install_dependencies(
         return
 
     if install_python:
+        if not _in_virtualenv():
+            logger.warning(
+                "No virtual environment detected. Installing into the system "
+                "Python can fail on modern Linux (PEP 668 'externally-managed-"
+                "environment'). Recommended: create one first — "
+                "`python -m venv .venv && source .venv/bin/activate` "
+                "(Windows: `.venv\\Scripts\\activate`) — then run `pyxle install`."
+            )
         python_cmd = [sys.executable, "-m", "pip", "install", "-r", "requirements.txt"]
         _run_subprocess(
             python_cmd,

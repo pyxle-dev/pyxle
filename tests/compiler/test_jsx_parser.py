@@ -62,6 +62,7 @@ def test_invalid_json_output_returns_error_diagnostic():
     ``JSONDecodeError``."""
 
     class _FakeProc:
+        returncode = 0
         stdout = "this is not valid JSON {{{"
         stderr = ""
 
@@ -74,6 +75,31 @@ def test_invalid_json_output_returns_error_diagnostic():
     assert result.components == ()
     assert result.error is not None
     assert "invalid output" in result.error
+
+
+def test_missing_babel_deps_returns_actionable_error():
+    """When the extractor's parser deps aren't installed, Node exits with
+    ERR_MODULE_NOT_FOUND; the parser names the missing packages instead of
+    degrading into an opaque 'invalid output' message."""
+
+    class _FakeProc:
+        returncode = 1
+        stdout = ""
+        stderr = (
+            "node:internal/process/esm_loader ...\n"
+            "Error [ERR_MODULE_NOT_FOUND]: Cannot find package '@babel/parser'"
+        )
+
+    with patch("pyxle.compiler.jsx_parser.subprocess.run") as mock_run:
+        mock_run.return_value = _FakeProc()
+        result = parse_jsx_components(
+            "import React from 'react';\nexport default function P() { return <div />; }",
+            target_components={"Script"},
+        )
+    assert result.components == ()
+    assert result.error is not None
+    assert "@babel/parser" in result.error
+    assert "npm install" in result.error
 
 
 def test_script_not_found_returns_error_diagnostic():

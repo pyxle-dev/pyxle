@@ -3,8 +3,12 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-# Virtual environments
+# Environment — local/secret overrides (never commit secrets)
 .env
+.env.local
+.env.*.local
+
+# Virtual environments
 .venv
 venv/
 ENV/

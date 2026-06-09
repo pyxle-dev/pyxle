@@ -170,6 +170,18 @@ POST /api/__actions/blog/new/create_post
 
 You do not need to know these URLs -- `<Form>` and `useAction` resolve them automatically.
 
+### Calling an action directly (scripts and tests)
+
+App code never needs the URL, but a script or test can POST to it directly. Send a JSON body; the response is the action's return dict (with `ok: true`), or `{ "ok": false, "error": "..." }` when it raises an `ActionError`:
+
+```bash
+curl -X POST http://localhost:8000/api/__actions/blog/new/create_post \
+  -H "Content-Type: application/json" \
+  -d '{"title": "Hello"}'
+```
+
+CSRF protection is on by default, so a raw `curl` like this is rejected with `403` unless you either exempt the action path in [`pyxle.config.json`](../reference/configuration.md#csrf) (`"csrf": { "exemptPaths": ["/api/__actions/"] }`) or send a valid `X-CSRF-Token` header matching the `pyxle-csrf` cookie.
+
 ## CSRF protection
 
 Actions are protected by CSRF middleware by default. The `<Form>` component and `useAction` hook handle token management automatically. See [Security](../guides/security.md) for details.

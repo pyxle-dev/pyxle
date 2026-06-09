@@ -55,21 +55,38 @@ def parse_jsx_components(jsx_code: str, *, target_components: set[str] | None = 
 
 def _run_babel_parser(source_path: str, target_components: set[str] | None) -> JSXParseResult:
     """Run the Node.js Babel parser script."""
-    # Find the parser script in pyxle_langkit
-    script_path = Path(__file__).parent.parent / "pyxle_langkit" / "js" / "jsx_component_extractor.mjs"
+    # Resolve the extractor script. Prefer the self-contained bundle
+    # (``*.bundle.mjs`` — Babel inlined, so it works with zero npm setup on a
+    # clean ``pip install``); fall back to the source ``.mjs`` (which needs
+    # @babel/* in node_modules — the dev/CI layout). Each location, in order:
+    #   1. nested in the installed pyxle package
+    #   2. installed pyxle_langkit sibling (the real ``pip install`` location)
+    #   3. a sibling pyxle-langkit checkout (workspace dev)
+    _js_bases = (
+        Path(__file__).parent.parent / "pyxle_langkit" / "js",
+        Path(__file__).parent.parent.parent / "pyxle_langkit" / "js",
+        Path(__file__).resolve().parent.parent.parent.parent / "pyxle-langkit" / "pyxle_langkit" / "js",
+    )
+    script_path: Path | None = None
+    for _base in _js_bases:
+        for _candidate in (
+            _base / "jsx_component_extractor.bundle.mjs",
+            _base / "jsx_component_extractor.mjs",
+        ):
+            if _candidate.exists():
+                script_path = _candidate
+                break
+        if script_path is not None:
+            break
 
-    if not script_path.exists():
-        # Fallback: try relative to package root
-        script_path = Path(__file__).parent.parent.parent / "pyxle_langkit" / "js" / "jsx_component_extractor.mjs"
-
-    if not script_path.exists():
-        # Fallback: try sibling repo (pyxle-langkit alongside pyxle in workspace)
-        script_path = Path(__file__).resolve().parent.parent.parent.parent / "pyxle-langkit" / "pyxle_langkit" / "js" / "jsx_component_extractor.mjs"
-
-    if not script_path.exists():
+    if script_path is None:
         return JSXParseResult(
             components=(),
-            error="JSX parser script not found. Install pyxle[langkit] dependencies.",
+            error=(
+                "JSX checker unavailable: the language toolkit isn't installed. "
+                "Install it with `pip install 'pyxle-framework[langkit]'` (it also "
+                "needs @babel/parser and @babel/traverse available to Node)."
+            ),
         )
 
     # Prepare command
@@ -92,13 +109,30 @@ def _run_babel_parser(source_path: str, target_components: set[str] | None) -> J
     except subprocess.TimeoutExpired:
         return JSXParseResult(components=(), error="JSX parser timed out.")
 
-    # Parse JSON output
-    try:
-        payload = json.loads(proc.stdout.strip() or proc.stderr.strip() or "{}")
-    except json.JSONDecodeError:
+    # Surface a clear message when the extractor's parser dependencies
+    # (@babel/parser, @babel/traverse) aren't installed — the most common
+    # clean-install failure. Node exits non-zero with ERR_MODULE_NOT_FOUND and an
+    # empty stdout, which would otherwise degrade into an opaque "invalid output".
+    stderr = (proc.stderr or "").strip()
+    if proc.returncode != 0 and ("ERR_MODULE_NOT_FOUND" in stderr or "@babel/" in stderr):
         return JSXParseResult(
             components=(),
-            error=f"JSX parser produced invalid output: {proc.stdout[:200]}",
+            error=(
+                "The JSX checker could not load its parser dependencies "
+                "(@babel/parser, @babel/traverse). Install them where the extractor "
+                "lives — e.g. `npm install @babel/parser @babel/traverse` in the "
+                "pyxle-langkit package — then re-run."
+            ),
+        )
+
+    # Parse JSON output
+    try:
+        payload = json.loads(proc.stdout.strip() or stderr or "{}")
+    except json.JSONDecodeError:
+        detail = (stderr or proc.stdout or "(no output)").strip()
+        return JSXParseResult(
+            components=(),
+            error=f"JSX parser produced invalid output: {detail[:200]}",
         )
 
     # Check for errors

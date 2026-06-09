@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import secrets
 from pathlib import Path
 from typing import Mapping
 
@@ -105,6 +106,18 @@ def run_init(
     }
     render_templates(writer, build_template_registry(), context, overwrite=force)
     writer.write("public/favicon.ico", default_favicon_bytes(), binary=True, overwrite=force)
+
+    # Generate a per-project development secret in .env.local (gitignored) so
+    # CSRF token HMAC is enabled out of the box — no "PYXLE_SECRET_KEY unset"
+    # warning on first `pyxle dev`. Production supplies its own via the
+    # environment; this file is never committed.
+    env_local = (
+        "# Local development overrides — gitignored, never commit secrets.\n"
+        "# A unique dev key so CSRF token HMAC is enabled in `pyxle dev`.\n"
+        "# In production, set PYXLE_SECRET_KEY in the environment instead.\n"
+        f"PYXLE_SECRET_KEY={secrets.token_hex(32)}\n"
+    )
+    writer.write(".env.local", env_local, overwrite=force)
 
     logger.success(f"Project scaffolded at {target_path.as_posix()}")
     if log_steps:
