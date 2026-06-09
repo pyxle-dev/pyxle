@@ -331,7 +331,15 @@ export default entry.contents;
       ],
     });
 
-    const moduleUrl = pathToFileURL(outfile).href;
+    // esbuild rewrites this fixed-name outfile (hashed from the entry PATH, not
+    // its content) on every rebuild, but Node's ESM loader caches modules by URL.
+    // Re-importing the same URL after a hot-reload rebuild therefore returns the
+    // STALE module — the cached compile, not the file esbuild just rewrote. Bust
+    // the cache with a hash of the bundled output so a changed bundle is always
+    // re-imported, while an unchanged one still reuses Node's module cache.
+    const bundledSource = await fs.promises.readFile(outfile, 'utf8');
+    const cacheBuster = crypto.createHash('sha1').update(bundledSource).digest('hex');
+    const moduleUrl = `${pathToFileURL(outfile).href}?v=${cacheBuster}`;
     moduleExports = await import(moduleUrl);
 
     // Store in cache for subsequent requests.

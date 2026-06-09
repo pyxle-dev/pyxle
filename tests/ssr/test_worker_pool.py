@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from pyxle.ssr.worker_pool import SsrWorkerPool, WorkerPoolError, _WorkerState
+from tests.ssr.utils import ensure_test_node_modules
 
 
 @pytest.fixture
@@ -1084,3 +1085,50 @@ def _setup_dynamic_invalidation_response(
         return b""
 
     proc.stdout.read = _read
+
+
+@pytest.mark.anyio
+async def test_pool_rerenders_after_source_change(tmp_path: Path) -> None:
+    """Regression: a real worker must serve FRESH output after a component's source
+    changes and the cache is invalidated.
+
+    The worker writes each (re)bundle to a fixed file named from the entry PATH, so
+    re-importing the same file URL returns Node's cached (stale) ESM module even
+    after esbuild rewrote it — which froze every ``pyxle dev`` edit (title, body,
+    anything SSR'd through the worker pool) until restart. The worker now busts
+    Node's import cache with a hash of the bundled output. Requires Node.js.
+    """
+    project_root = tmp_path / "project"
+    client_root = project_root / ".pyxle-build" / "client"
+    (client_root / "routes").mkdir(parents=True)
+    ensure_test_node_modules(project_root)
+
+    component = client_root / "routes" / "page.jsx"
+    component.write_text(
+        "import React from 'react';\n"
+        "export default function Page() { return <main>VERSION_ALPHA</main>; }\n",
+        encoding="utf-8",
+    )
+
+    pool = SsrWorkerPool(size=1, project_root=project_root, client_root=client_root)
+    try:
+        await pool.start()
+        first = await pool.render(component, {})
+        assert "VERSION_ALPHA" in first["html"]
+
+        # Simulate a hot-reload recompile: SAME path, new content.
+        component.write_text(
+            "import React from 'react';\n"
+            "export default function Page() { return <main>VERSION_BETA</main>; }\n",
+            encoding="utf-8",
+        )
+        await pool.invalidate()
+
+        second = await pool.render(component, {})
+        assert "VERSION_BETA" in second["html"], (
+            "worker served the stale compile after invalidate "
+            f"(Node ESM import cache not busted): {second['html']!r}"
+        )
+        assert "VERSION_ALPHA" not in second["html"]
+    finally:
+        await pool.stop()
