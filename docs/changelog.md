@@ -2,6 +2,14 @@
 
 Release notes for Pyxle. While we're in beta (`0.x`), minor versions may include breaking changes — those are called out explicitly here. To upgrade, run `pip install --upgrade pyxle-framework`.
 
+## 0.4.2
+
+- **Live dev-server reconciliation.** Editing a `.pyxl` in `pyxle dev` now applies route-*shape* changes without a restart — rename/add/remove a `@server` loader or `@action`, add or delete a page, wrap a page in a layout, change the head. The route table is rebuilt and hot-swapped on every change (these previously needed `rm -rf .pyxle-build` + a restart). Editing `pyxle.config.json` prints a clear "restart to apply" warning instead of being silently ignored.
+- **`pyxle check` works on a clean install.** The JSX checker's parser dependencies are bundled into a self-contained extractor (shipped via `pyxle-langkit`), so `pyxle check` runs after `pip install 'pyxle-framework[langkit]'` with no extra npm setup. A missing-dependency failure now names the exact packages instead of an opaque error.
+- **Locale-independent SSR.** The Python↔Node SSR transport pins UTF-8, so emoji and other non-BMP characters in components or loader data no longer crash rendering under a non-UTF-8 locale (e.g. `LANG=C`).
+- **Smoother first run.** `pyxle init` generates a gitignored `.env.local` with a random dev `PYXLE_SECRET_KEY` (CSRF HMAC on out of the box); the scaffold `requirements.txt` now declares `pyxle-framework` itself; and `pyxle install` warns about PEP 668 externally-managed environments with venv guidance instead of letting pip throw a raw wall.
+- **Docs:** documented calling an `@action` endpoint directly for scripts and tests.
+
 ## 0.4.1
 
 - **No more double loader run on first load.** The page you land on is now seeded into the client navigation cache from the server render, so the active nav link's prefetch (a `<Link>` pointing at the current route) resolves from cache instead of re-fetching. The loader runs **once**, not twice — halving origin work on cold loads and stopping non-idempotent loaders (view counters, analytics) from firing twice. Back/forward navigation to the page is instant for the same reason.
