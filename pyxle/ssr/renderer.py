@@ -229,6 +229,11 @@ class _NodeComponentRuntime:
                 cwd=str(self._project_root),
                 capture_output=True,
                 text=True,
+                # Pin UTF-8 so the SSR transport never depends on the system
+                # locale: under a non-UTF-8 locale (LANG=C, common on minimal
+                # Linux/CI) the default codec is ASCII and any astral character
+                # (an emoji in a component or prop) crashes decode/encode.
+                encoding="utf-8",
                 check=False,
                 env=env,
                 timeout=30,

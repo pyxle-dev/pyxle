@@ -124,7 +124,76 @@ def test_project_watcher_start_is_idempotent(project: DevServerSettings) -> None
     watcher.start()
     watcher.start()  # second invocation should be a no-op
 
-    assert len(observer.scheduled) == 2
+    # pages/, public/, and the project root (for pyxle.config.json).
+    assert len(observer.scheduled) == 3
+
+
+def test_project_watcher_watches_config_file(project: DevServerSettings) -> None:
+    """start() schedules a dedicated single-file watch for pyxle.config.json on
+    the project root (non-recursive)."""
+    from pyxle.devserver.watcher import _SingleFileEventHandler
+
+    observer = DummyObserver()
+    logger, _ = make_logger()
+    watcher = ProjectWatcher(
+        project,
+        logger=logger,
+        observer_factory=lambda: observer,
+        timer_factory=lambda delay, callback: ManualTimerHandle(callback),
+        build_function=lambda settings, **_: BuildSummary(),
+    )
+
+    watcher.start()
+
+    config_watches = [
+        (handler, Path(path), recursive)
+        for handler, path, recursive in observer.scheduled
+        if isinstance(handler, _SingleFileEventHandler)
+    ]
+    assert len(config_watches) == 1
+    _, path, recursive = config_watches[0]
+    assert path == project.project_root
+    assert recursive is False
+
+
+def test_config_change_warns_to_restart(project: DevServerSettings, timer_factory) -> None:
+    """A pyxle.config.json change emits one debounced 'restart' warning."""
+    factory, handles = timer_factory
+    logger, messages = make_logger()
+    watcher = ProjectWatcher(
+        project,
+        logger=logger,
+        observer_factory=DummyObserver,
+        timer_factory=factory,
+        build_function=lambda settings, **_: BuildSummary(),
+    )
+
+    watcher._handle_config_change()
+    # Debounced — nothing surfaced until the timer fires.
+    assert not any("pyxle.config.json" in m for m in messages)
+    handles[-1].trigger()
+    assert any("pyxle.config.json changed" in m and "restart" in m.lower() for m in messages)
+
+
+def test_single_file_handler_fires_only_for_target(tmp_path: Path) -> None:
+    from watchdog.events import FileModifiedEvent
+
+    from pyxle.devserver.watcher import _SingleFileEventHandler
+
+    target = tmp_path / "pyxle.config.json"
+    target.write_text("{}", encoding="utf-8")
+    sibling = tmp_path / "package.json"
+    sibling.write_text("{}", encoding="utf-8")
+
+    fired: list[bool] = []
+    handler = _SingleFileEventHandler(target.resolve(), lambda: fired.append(True))
+
+    handler.on_any_event(FileModifiedEvent(str(target)))
+    assert fired == [True]
+
+    fired.clear()
+    handler.on_any_event(FileModifiedEvent(str(sibling)))
+    assert fired == []
 
 
 def test_project_watcher_watches_global_styles(tmp_path: Path) -> None:

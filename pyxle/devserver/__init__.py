@@ -78,12 +78,32 @@ class DevServer:
 
         def _handle_rebuild(stats: WatcherStatistics) -> None:
             _maybe_schedule_reload(overlay, loop, stats)
-            # Invalidate SSR bundle caches in worker pool when files change.
-            if _pool is not None and stats.summary is not None and stats.summary.any_changes():
+            if stats.summary is None or not stats.summary.any_changes():
+                return
+            # Invalidate SSR bundle caches in the worker pool when files change.
+            if _pool is not None:
                 try:
                     asyncio.run_coroutine_threadsafe(_pool.invalidate(), loop)
                 except RuntimeError:
                     pass
+            # Refresh the live route table so route-*shape* changes (a renamed/
+            # added/removed loader or @action, a new or deleted page, head
+            # changes, a layout wrapping a page) take effect without restarting
+            # ``pyxle dev``. The build runs here on the watcher thread and may
+            # raise on a mid-edit syntax error — never crash the watcher; the
+            # single atomic swap is marshaled onto the event loop so it never
+            # races in-flight request routing.
+            if settings.debug:
+                try:
+                    new_routes, error_boundaries = _rebuild_app_routes(app, settings)
+                except Exception as exc:
+                    logger.warning(
+                        f"Live route refresh failed; restart `pyxle dev` to apply changes: {exc}"
+                    )
+                else:
+                    loop.call_soon_threadsafe(
+                        _apply_refreshed_routes, app, new_routes, error_boundaries
+                    )
         config = uvicorn.Config(
             app,
             host=settings.starlette_host,
@@ -257,6 +277,41 @@ def _resolve_overlay(app: object):
     if state is None:
         return None
     return getattr(state, "overlay", None)
+
+
+def _rebuild_app_routes(app, settings: DevServerSettings):
+    """Build a fresh Starlette route list + error-boundary registry from the
+    current on-disk metadata, reusing the live app's renderer, overlay, and
+    config-derived route hooks.
+
+    Powers the dev-server hot route-table refresh — route-*shape* changes apply
+    without a restart. File I/O + object construction only, so it is safe to
+    call off the event loop (e.g. on the watcher thread). Returns
+    ``(routes_list, error_boundaries)``.
+    """
+    from pyxle.devserver.starlette_app import _build_app_routes  # noqa: PLC0415
+
+    new_table = build_route_table(build_metadata_registry(settings))
+    return _build_app_routes(
+        settings=settings,
+        routes=new_table,
+        renderer=app.state.ssr_renderer,
+        overlay=getattr(app.state, "overlay", None),
+        api_route_hooks=app.state.pyxle_route_hooks[0],
+        page_route_hooks=app.state.pyxle_route_hooks[1],
+    )
+
+
+def _apply_refreshed_routes(app, new_routes, error_boundaries) -> None:
+    """Swap a freshly built route list into the live app and drop the SSR
+    render cache. Must run on the event-loop thread — the list swap is a single
+    atomic assignment relative to (synchronous) request route-matching.
+    """
+    app.router.routes[:] = new_routes
+    app.state.error_boundaries = error_boundaries
+    renderer = getattr(app.state, "ssr_renderer", None)
+    if renderer is not None:
+        renderer.clear()
 
 
 def _maybe_schedule_reload(overlay, loop, stats: WatcherStatistics) -> bool:

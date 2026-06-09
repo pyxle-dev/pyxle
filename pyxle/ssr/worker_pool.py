@@ -74,7 +74,9 @@ class _WorkerState:
         future: asyncio.Future[dict[str, Any]] = loop.create_future()
         self.pending[request_id] = future
 
-        line = (json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
+        # Explicit UTF-8 so the worker transport never depends on the locale
+        # (astral chars like emoji must survive the Python↔Node round-trip).
+        line = (json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
         assert self.process.stdin is not None  # guaranteed by _spawn_worker
         self.process.stdin.write(line)
         try:

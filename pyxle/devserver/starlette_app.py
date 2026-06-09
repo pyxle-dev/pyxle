@@ -19,7 +19,7 @@ from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
-from starlette.routing import Mount, Router, WebSocketRoute
+from starlette.routing import Mount, Route, Router, WebSocketRoute
 from starlette.staticfiles import StaticFiles
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -771,6 +771,59 @@ def build_client_assets_mount(directory: Path, *, mount_path: str = "/client") -
 
 
 
+def _build_app_routes(
+    *,
+    settings: DevServerSettings,
+    routes: RouteTable,
+    renderer: ComponentRenderer,
+    overlay: OverlayManager | None,
+    api_route_hooks: Sequence[RouteHookCallable],
+    page_route_hooks: Sequence[RouteHookCallable],
+) -> tuple[list[Any], ErrorBoundaryRegistry]:
+    """Build the ordered Starlette route list for a route table.
+
+    Shared by initial app construction and the dev-server hot route-table
+    refresh so both produce an identical route set (API, action, page, the
+    overlay WebSocket, health probes, and the not-found catch-all, in that
+    order). Returns the route list plus the freshly built error-boundary
+    registry.
+    """
+    error_boundaries = build_error_boundary_registry(list(routes.error_boundary_pages))
+    api_router = build_api_router(
+        routes.apis,
+        route_hooks=[*DEFAULT_API_POLICIES, *api_route_hooks],
+    )
+    page_router = build_page_router(
+        routes.pages,
+        settings=settings,
+        renderer=renderer,
+        overlay=overlay,
+        route_hooks=[*DEFAULT_PAGE_POLICIES, *page_route_hooks],
+        error_boundaries=error_boundaries,
+    )
+    action_router = build_action_router(routes.actions, debug=settings.debug)
+
+    built: list[Any] = []
+    built.extend(api_router.routes)
+    built.extend(action_router.routes)
+    built.extend(page_router.routes)
+    if overlay is not None:
+        built.append(WebSocketRoute("/__pyxle__/overlay", overlay.websocket_endpoint))
+    built.append(Route("/healthz", _healthz_endpoint, methods=["GET"]))
+    built.append(Route("/readyz", _readyz_endpoint, methods=["GET"]))
+    # Catch-all 404 handler from not-found.pyxl boundaries — registered last so
+    # it only matches when no concrete route does.
+    if error_boundaries.has_not_found_pages:
+        not_found_handler = _make_not_found_handler(
+            settings=settings,
+            renderer=renderer,
+            overlay=overlay,
+            error_boundaries=error_boundaries,
+        )
+        built.append(Route("/{path:path}", not_found_handler, methods=["GET"]))
+    return built, error_boundaries
+
+
 def create_starlette_app(
     settings: DevServerSettings,
     routes: RouteTable,
@@ -1060,47 +1113,24 @@ def create_starlette_app(
     app.state.pyxle_started_at = time.time()
     app.state.pyxle_ready = False
 
-    error_boundaries = build_error_boundary_registry(
-        list(routes.error_boundary_pages),
-    )
-
-    api_router = build_api_router(
-        routes.apis,
-        route_hooks=[*DEFAULT_API_POLICIES, *api_route_hooks],
-    )
-    page_router = build_page_router(
-        routes.pages,
+    app_routes, error_boundaries = _build_app_routes(
         settings=settings,
+        routes=routes,
         renderer=renderer,
         overlay=overlay,
-        route_hooks=[*DEFAULT_PAGE_POLICIES, *page_route_hooks],
-        error_boundaries=error_boundaries,
+        api_route_hooks=api_route_hooks,
+        page_route_hooks=page_route_hooks,
     )
-    action_router = build_action_router(routes.actions, debug=settings.debug)
-    app.router.routes.extend(api_router.routes)
-    app.router.routes.extend(action_router.routes)
-    app.router.routes.extend(page_router.routes)
-    if overlay is not None:
-        app.router.routes.append(
-            WebSocketRoute("/__pyxle__/overlay", overlay.websocket_endpoint)
-        )
-    app.router.add_route("/healthz", _healthz_endpoint, methods=["GET"])
-    app.router.add_route("/readyz", _readyz_endpoint, methods=["GET"])
-
-    # Register the catch-all 404 handler using not-found.pyxl boundaries.
-    if error_boundaries.has_not_found_pages:
-        not_found_handler = _make_not_found_handler(
-            settings=settings,
-            renderer=renderer,
-            overlay=overlay,
-            error_boundaries=error_boundaries,
-        )
-        app.router.add_route("/{path:path}", not_found_handler, methods=["GET"])
+    app.router.routes.extend(app_routes)
 
     app.state.vite_proxy = vite_proxy
     app.state.ssr_renderer = renderer
     app.state.overlay = overlay
     app.state.error_boundaries = error_boundaries
+    # The dev-server hot route-table refresh reuses these to rebuild routes live
+    # on a source change (see ``DevServer._handle_rebuild``). Config-derived
+    # hooks are stable across rebuilds — config changes still need a restart.
+    app.state.pyxle_route_hooks = (api_route_hooks, page_route_hooks)
 
     return app
 

@@ -88,6 +88,31 @@ class _ProjectEventHandler(FileSystemEventHandler):
         self._sink(target_path)
 
 
+class _SingleFileEventHandler(FileSystemEventHandler):
+    """Watchdog handler that fires ``on_change`` only when one specific file
+    changes, ignoring every sibling in the watched directory."""
+
+    def __init__(self, target: Path, on_change: Callable[[], None]) -> None:
+        super().__init__()
+        self._target = target
+        self._on_change = on_change
+
+    def on_any_event(self, event: FileSystemEvent) -> None:
+        if event.is_directory:
+            return
+        candidates = [event.src_path]
+        dest = getattr(event, "dest_path", "")
+        if dest:
+            candidates.append(dest)
+        for raw in candidates:
+            try:
+                if Path(raw).resolve() == self._target:
+                    self._on_change()
+                    return
+            except OSError:  # pragma: no cover - path vanished mid-event
+                continue
+
+
 @dataclass(slots=True)
 class WatcherStatistics:
     """Outcome details for a rebuild triggered by the watcher."""
@@ -128,6 +153,7 @@ class ProjectWatcher:
         )
         self._handler = _ProjectEventHandler(self._buffer.enqueue)
         self._latest_stats: WatcherStatistics | None = None
+        self._config_warn_handle: _TimerHandle | None = None
 
     @property
     def running(self) -> bool:
@@ -175,6 +201,15 @@ class ProjectWatcher:
                 continue
             observer.schedule(self._handler, str(resolved), recursive=True)
             watched_extras.add(resolved)
+        # Watch pyxle.config.json (at the project root) on a dedicated handler.
+        # Config is wired into the app at startup, so a change can't hot-reload
+        # — but silently ignoring it is worse than a clear "restart" nudge.
+        config_path = (self._settings.project_root / "pyxle.config.json").resolve()
+        observer.schedule(
+            _SingleFileEventHandler(config_path, self._handle_config_change),
+            str(self._settings.project_root),
+            recursive=False,
+        )
         observer.start()
         self._observer = observer
 
@@ -281,6 +316,26 @@ class ProjectWatcher:
             self._on_rebuild(stats)
         except Exception as error:  # pragma: no cover - defensive logging
             self._logger.warning(f"Rebuild listener raised error: {error}")
+
+    def _handle_config_change(self) -> None:
+        """Debounce ``pyxle.config.json`` events into one 'restart' warning.
+
+        Editors emit several events per save, so coalesce them before warning.
+        Config is never rebuilt — it's wired into the app at startup.
+        """
+        if self._config_warn_handle is not None:
+            self._config_warn_handle.cancel()
+        self._config_warn_handle = self._timer_factory(
+            self._debounce_seconds, self._emit_config_warning
+        )
+
+    def _emit_config_warning(self) -> None:
+        self._config_warn_handle = None
+        self._logger.warning(
+            "pyxle.config.json changed — restart `pyxle dev` to apply. "
+            "Configuration (middleware, plugins, ports, CORS/CSRF, cache) is "
+            "wired at startup and is not hot-reloaded."
+        )
 
 
 def _invalidate_python_modules(paths: Sequence[Path], project_root: Path) -> None:
