@@ -215,6 +215,20 @@ def test_init_generates_dev_secret_key(tmp_path, monkeypatch) -> None:
     assert ".env.local" in gitignore
 
 
+def test_scaffold_gitignore_excludes_build_dirs(tmp_path, monkeypatch) -> None:
+    """`pyxle init` must gitignore BOTH build outputs — the dev cache
+    (.pyxle-build/) and the production build dir (dist/) — so generated,
+    regenerable artifacts never get committed."""
+    from pyxle.cli.init import run_init
+
+    monkeypatch.chdir(tmp_path)
+    run_init("demo", force=False, template="default", logger=cli.ConsoleLogger(), log_steps=False)
+
+    gitignore = (tmp_path / "demo" / ".gitignore").read_text(encoding="utf-8").splitlines()
+    assert ".pyxle-build/" in gitignore  # dev incremental-build cache
+    assert "dist/" in gitignore  # `pyxle build` production output
+
+
 def test_run_subprocess_handles_missing_binary(monkeypatch, tmp_path) -> None:
     def fake_run(*_, **__):
         raise FileNotFoundError("missing binary")
