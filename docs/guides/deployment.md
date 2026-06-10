@@ -214,6 +214,26 @@ pyxle serve --ssr-workers 4
 
 Workers stay running between requests, avoiding subprocess startup overhead. Set to `0` for subprocess-per-request mode (simpler but slower).
 
+## Multi-core (worker processes)
+
+By default `pyxle serve` runs a **single** async server process, which uses one
+CPU core. To use every core on a multi-core server, run one server worker
+process per core with `--workers`:
+
+```bash
+pyxle serve --workers $(nproc)
+```
+
+Each worker is an independent server process with its own SSR worker pool, and
+the operating system load-balances incoming connections across them — no reverse
+proxy required. `--ssr-workers` then applies **per worker**, so the total number
+of Node.js render processes is `workers × ssr-workers`. For an SSR-heavy app,
+`--workers $(nproc) --ssr-workers 1` is a good starting point.
+
+`pyxle serve` builds the project once before the workers start, so the build is
+never duplicated. Combine `--workers` with `--skip-build` only when `dist/`
+already exists.
+
 ## Checklist
 
 Before deploying:

@@ -7,7 +7,6 @@ import json
 import os
 import subprocess
 import sys
-from dataclasses import replace
 from pathlib import Path
 from typing import Optional
 
@@ -15,11 +14,9 @@ import typer
 import uvicorn
 
 from pyxle import __version__
-from pyxle.build.manifest import load_manifest
 from pyxle.compiler import CompilationResult, compile_file
 from pyxle.compiler.exceptions import CompilationError
 from pyxle.config import ConfigError, PyxleConfig, apply_env_overrides, load_config
-from pyxle.devserver.registry import build_metadata_registry
 from pyxle.devserver.routes import build_route_table
 from pyxle.devserver.scripts import GlobalScriptConfigError
 from pyxle.devserver.styles import GlobalStyleConfigError
@@ -582,6 +579,16 @@ def serve(
         show_default=False,
         min=0,
     ),
+    workers: int = typer.Option(
+        1,
+        "--workers",
+        "-w",
+        help="Number of server worker processes, one per CPU core. >1 serves the "
+        "build across that many uvicorn worker processes (multi-core); --ssr-workers "
+        "then applies per worker. Default 1 = single process.",
+        show_default=True,
+        min=1,
+    ),
 ) -> None:
     """Entry-point for the ``pyxle serve`` command."""
 
@@ -593,14 +600,6 @@ def serve(
         from pyxle.devserver import DevServerSettings as _DevServerSettings
 
         DevServerSettings = _DevServerSettings
-
-    global create_starlette_app
-    if create_starlette_app is None:  # noqa: PLC0206 - module-level caching
-        from pyxle.devserver.starlette_app import (
-            create_starlette_app as _create_starlette_app,
-        )
-
-        create_starlette_app = _create_starlette_app
 
     try:
         load_env_files(project_root, mode="production")
@@ -652,82 +651,36 @@ def serve(
     else:
         logger.warning("Skipping production build; using existing dist artifacts.")
 
-    manifest_path = resolved_dist / "page-manifest.json"
-    if not manifest_path.exists():
-        logger.error(
-            f"page-manifest.json not found at '{manifest_path}'. Run `pyxle build` first or remove --skip-build."
+    # Multi-process serving: hand uvicorn an importable app factory and let it
+    # supervise ``workers`` worker subprocesses. Each rebuilds its own app (and
+    # SSR pool) from environment variables — see pyxle.build.production.
+    if workers > 1:
+        _serve_multiworker(
+            project_root,
+            config_path=config_file,
+            dist_dir=dist_dir,
+            resolved_dist=resolved_dist,
+            host=settings.starlette_host,
+            port=settings.starlette_port,
+            ssr_workers=ssr_workers,
+            serve_static=serve_static,
+            workers=workers,
+            logger=logger,
         )
-        raise typer.Exit(code=1)
+        return
 
-    try:
-        manifest_data = load_manifest(manifest_path)
-    except Exception as exc:  # pragma: no cover - defensive logging
-        logger.error(f"Failed to load page-manifest.json: {exc}")
-        raise typer.Exit(code=1) from exc
-
-    settings = replace(settings, debug=False, page_manifest=manifest_data)
-
-    try:
-        registry = build_metadata_registry(settings)
-        route_table = build_route_table(registry)
-    except Exception as exc:  # pragma: no cover - unexpected runtime errors
-        logger.error(f"Failed to prepare routes: {exc}")
-        raise typer.Exit(code=1) from exc
-
-    public_static_dir: Path | None
-    client_mount_dir: Path | None
-
-    if serve_static:
-        public_dir = resolved_dist / "public"
-        if not public_dir.exists():
-            logger.warning(
-                f"Public assets directory '{public_dir}' does not exist — did you run 'pyxle build' first? "
-                f"Falling back to source directory '{settings.public_dir}'."
-            )
-            public_static_dir = settings.public_dir
-        else:
-            public_static_dir = public_dir
-
-        client_static_dir = resolved_dist / "client"
-        if not client_static_dir.exists():
-            logger.warning(
-                f"Client asset directory '{client_static_dir}' does not exist; /client requests will 404."
-            )
-            client_mount_dir = None
-        else:
-            client_mount_dir = client_static_dir
-    else:
-        logger.info("Static asset serving disabled; ensure your CDN or reverse proxy hosts / and /client assets.")
-        public_static_dir = None
-        client_mount_dir = None
-
-    # Create SSR worker pool for production (persistent Node.js processes
-    # with bundle caching eliminate per-request esbuild cost).
-    _pool = None
-    pool_size = settings.ssr_workers
-    if pool_size == 0:
-        import os as _os  # noqa: PLC0415
-
-        pool_size = min(_os.cpu_count() or 2, 4)
-    if pool_size > 0:
-        from pyxle.ssr.worker_pool import SsrWorkerPool  # noqa: PLC0415
-
-        _pool = SsrWorkerPool(
-            size=pool_size,
-            project_root=settings.project_root,
-            client_root=settings.client_build_dir,
-        )
-
-    app = create_starlette_app(
-        settings,
-        route_table,
-        logger=logger,
-        pool=_pool,
-        public_static_dir=public_static_dir,
-        client_static_dir=client_mount_dir,
-        serve_static=serve_static,
+    from pyxle.build.production import (  # noqa: PLC0415 - heavy import deferred to runtime
+        ProductionServeError,
+        build_production_app,
     )
-    app.state.pyxle_ready = True
+
+    try:
+        app, pool_size = build_production_app(
+            settings, resolved_dist, serve_static=serve_static, logger=logger
+        )
+    except ProductionServeError as exc:
+        logger.error(str(exc))
+        raise typer.Exit(code=1) from exc
 
     logger.info(
         f"Serving Pyxle build on http://{settings.starlette_host}:{settings.starlette_port} "
@@ -752,6 +705,67 @@ def serve(
     except Exception as exc:  # pragma: no cover - unexpected runtime errors
         logger.error(f"Production server encountered an error: {exc}")
         raise typer.Exit(code=1) from exc
+
+
+def _serve_multiworker(
+    project_root: Path,
+    *,
+    config_path: Optional[Path],
+    dist_dir: Optional[Path],
+    resolved_dist: Path,
+    host: str,
+    port: int,
+    ssr_workers: Optional[int],
+    serve_static: bool,
+    workers: int,
+    logger: ConsoleLogger,
+) -> None:
+    """Serve a production build across ``workers`` uvicorn worker processes.
+
+    uvicorn's multi-worker mode spawns subprocesses that re-import the app via an
+    import string, so the build must already exist (the caller built it once).
+    Each worker re-imports :func:`pyxle.build.production.create_app`, which
+    rebuilds the app — and its own SSR worker pool — from the ``PYXLE_SERVE_*``
+    environment variables set here.
+    """
+    from pyxle.build.production import (  # noqa: PLC0415 - heavy import deferred to runtime
+        FACTORY_IMPORT_STRING,
+        serve_worker_env,
+    )
+
+    os.environ.update(
+        serve_worker_env(
+            project_root,
+            config_path=config_path,
+            dist_dir=dist_dir,
+            host=host,
+            port=port,
+            ssr_workers=ssr_workers,
+            serve_static=serve_static,
+        )
+    )
+    logger.info(
+        f"Serving Pyxle build on http://{host}:{port} across {workers} worker "
+        f"process(es) (dist: {resolved_dist})"
+    )
+    try:
+        # loop is left at uvicorn's default ("auto" → uvloop). Forcing the pure
+        # asyncio loop here adds a ~40-50ms per-request stall on Linux when
+        # multiple worker processes share the listening socket (epoll wakeup
+        # behaviour; reproduced on uvicorn 0.42 and 0.49, absent on macOS and
+        # absent with workers=1). uvloop does not exhibit it.
+        uvicorn.run(
+            FACTORY_IMPORT_STRING,
+            factory=True,
+            host=host,
+            port=port,
+            workers=workers,
+            lifespan="auto",
+            log_config=None,
+        )
+    except KeyboardInterrupt:  # pragma: no cover - handled manually during runtime
+        logger.warning("Keyboard interrupt received; stopping production server")
+
 
 @app.command(help="Validate .pyxl files, configuration, and project dependencies.")
 def check(

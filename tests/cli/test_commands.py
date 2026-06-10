@@ -267,8 +267,8 @@ def test_serve_command_runs_build_and_uvicorn(monkeypatch) -> None:
         registry_sentinel = object()
         route_table_sentinel = object()
 
-        monkeypatch.setattr(cli, "build_metadata_registry", lambda settings: registry_sentinel)
-        monkeypatch.setattr(cli, "build_route_table", lambda registry: route_table_sentinel)
+        monkeypatch.setattr("pyxle.build.production.build_metadata_registry",lambda settings: registry_sentinel)
+        monkeypatch.setattr("pyxle.build.production.build_route_table",lambda registry: route_table_sentinel)
 
         app_instance = SimpleNamespace(state=SimpleNamespace(pyxle_ready=False))
 
@@ -278,7 +278,7 @@ def test_serve_command_runs_build_and_uvicorn(monkeypatch) -> None:
             captured["create_kwargs"] = kwargs
             return app_instance
 
-        monkeypatch.setattr(cli, "create_starlette_app", fake_create_app)
+        monkeypatch.setattr("pyxle.build.production.create_starlette_app", fake_create_app)
 
         class StubServer:
             def __init__(self, config):
@@ -332,8 +332,8 @@ def test_serve_command_can_disable_static_mounts(monkeypatch) -> None:
         (dist_root / "page-manifest.json").write_text('{}', encoding="utf-8")
 
         monkeypatch.setattr(cli, "run_build", lambda *_, **__: None)
-        monkeypatch.setattr(cli, "build_metadata_registry", lambda settings: object())
-        monkeypatch.setattr(cli, "build_route_table", lambda registry: object())
+        monkeypatch.setattr("pyxle.build.production.build_metadata_registry",lambda settings: object())
+        monkeypatch.setattr("pyxle.build.production.build_route_table",lambda registry: object())
 
         captured: dict[str, object] = {}
 
@@ -342,7 +342,7 @@ def test_serve_command_can_disable_static_mounts(monkeypatch) -> None:
             app_instance = SimpleNamespace(state=SimpleNamespace(pyxle_ready=False))
             return app_instance
 
-        monkeypatch.setattr(cli, "create_starlette_app", fake_create_app)
+        monkeypatch.setattr("pyxle.build.production.create_starlette_app", fake_create_app)
 
         class StubServer:
             def __init__(self, config):
@@ -1128,10 +1128,10 @@ def test_serve_command_ssr_workers_flag(monkeypatch) -> None:
             app_obj.state.pyxle_ready = False
             return app_obj
 
-        monkeypatch.setattr("pyxle.cli.create_starlette_app", fake_create_app)
-        monkeypatch.setattr("pyxle.cli.load_manifest", lambda p: {"pages": {}, "generated_at": "2024-01-01"})
-        monkeypatch.setattr("pyxle.cli.build_metadata_registry", lambda s: {})
-        monkeypatch.setattr("pyxle.cli.build_route_table", lambda r: [])
+        monkeypatch.setattr("pyxle.build.production.create_starlette_app", fake_create_app)
+        monkeypatch.setattr("pyxle.build.production.load_manifest", lambda p: {"pages": {}, "generated_at": "2024-01-01"})
+        monkeypatch.setattr("pyxle.build.production.build_metadata_registry", lambda s: {})
+        monkeypatch.setattr("pyxle.build.production.build_route_table", lambda r: [])
         monkeypatch.setattr("pyxle.cli.asyncio.run", lambda coro: coro.close())
 
         async def _noop_serve(self):
@@ -1146,6 +1146,54 @@ def test_serve_command_ssr_workers_flag(monkeypatch) -> None:
 
         assert result.exit_code == 0, result.stdout
         assert captured["settings"].ssr_workers == 3  # type: ignore[union-attr]
+
+
+def test_serve_command_workers_runs_multiprocess_factory(monkeypatch) -> None:
+    """`serve --workers N` (N>1) hands uvicorn the importable app factory in
+    multi-worker mode and exports the PYXLE_SERVE_* env, instead of building the
+    app in-process."""
+    with runner.isolated_filesystem():
+        project = Path("demo")
+        project.mkdir(parents=True)
+        dist = project / "dist"
+        dist.mkdir()
+        (dist / "page-manifest.json").write_text(
+            '{"pages": {}, "generated_at": "2024-01-01"}'
+        )
+
+        # Isolate os.environ so the worker env we export doesn't leak to other tests.
+        monkeypatch.setattr(cli.os, "environ", dict(cli.os.environ))
+
+        def _no_single_process(*_a, **_k):  # pragma: no cover - must not run for N>1
+            raise AssertionError("single-process build_production_app should not run")
+
+        monkeypatch.setattr(
+            "pyxle.build.production.build_production_app", _no_single_process
+        )
+
+        captured: dict = {}
+
+        def fake_run(import_string, **kwargs):
+            captured["import_string"] = import_string
+            captured.update(kwargs)
+
+        monkeypatch.setattr(cli.uvicorn, "run", fake_run)
+
+        result = runner.invoke(
+            app, ["serve", "demo", "--skip-build", "--workers", "4"], catch_exceptions=False
+        )
+
+        assert result.exit_code == 0, result.output
+        assert captured["import_string"] == "pyxle.build.production:create_app"
+        assert captured["factory"] is True
+        assert captured["workers"] == 4
+        # The event loop must stay at uvicorn's default ("auto" → uvloop):
+        # forcing loop="asyncio" causes a ~40-50ms per-request stall on Linux
+        # multi-worker (shared listening socket + epoll wakeup behaviour).
+        assert captured.get("loop") is None
+        # Worker subprocesses rebuild the app from these exported variables.
+        assert cli.os.environ.get("PYXLE_SERVE_PROJECT_ROOT", "").endswith("demo")
+        assert cli.os.environ.get("PYXLE_SERVE_SERVE_STATIC") == "1"
 
 
 def test_resolve_global_style_entries_auto_detects_global_css(tmp_path: Path) -> None:
@@ -2267,10 +2315,10 @@ def _serve_with_stubbed_runtime(monkeypatch, captured: dict) -> None:
         app_obj.state.pyxle_ready = False
         return app_obj
 
-    monkeypatch.setattr("pyxle.cli.create_starlette_app", fake_create_app)
-    monkeypatch.setattr("pyxle.cli.build_metadata_registry", lambda s: {})
-    monkeypatch.setattr("pyxle.cli.build_route_table", lambda r: [])
-    monkeypatch.setattr("pyxle.cli.load_manifest", lambda p: {"pages": {}})
+    monkeypatch.setattr("pyxle.build.production.create_starlette_app", fake_create_app)
+    monkeypatch.setattr("pyxle.build.production.build_metadata_registry", lambda s: {})
+    monkeypatch.setattr("pyxle.build.production.build_route_table", lambda r: [])
+    monkeypatch.setattr("pyxle.build.production.load_manifest", lambda p: {"pages": {}})
 
     async def _noop_serve(self):
         return None
@@ -2381,7 +2429,7 @@ def test_serve_command_non_positive_worker_count_skips_pool(monkeypatch) -> None
 
         # serve() rebuilds settings via replace() right after loading the
         # manifest; inject a non-positive worker count there.
-        monkeypatch.setattr("pyxle.cli.replace", replace_with_negative_workers)
+        monkeypatch.setattr("pyxle.build.production.replace", replace_with_negative_workers)
 
         # A non-positive size must never reach the pool constructor.
         def explode(*_a, **_kw):
