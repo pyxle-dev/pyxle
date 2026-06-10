@@ -62,6 +62,58 @@ class Users(HTTPEndpoint):
         return JSONResponse({"created": True}, status_code=201)
 ```
 
+## Sync endpoints and blocking calls
+
+`endpoint` can also be a plain synchronous function. Pyxle dispatches sync
+endpoints through Starlette's threadpool, so a blocking body — a database
+driver, a sync SDK — occupies a worker thread instead of freezing the event
+loop:
+
+```python
+import sqlite3
+import threading
+
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+
+_local = threading.local()
+
+def _db() -> sqlite3.Connection:
+    # One persistent connection per worker thread: avoids paying the
+    # connect/teardown cost (and SQLite WAL churn) on every request.
+    conn = getattr(_local, "conn", None)
+    if conn is None:
+        conn = _local.conn = sqlite3.connect("app.db")
+        conn.row_factory = sqlite3.Row
+    return conn
+
+def endpoint(request: Request) -> JSONResponse:
+    row = _db().execute("SELECT * FROM items WHERE id = ?", (1,)).fetchone()
+    return JSONResponse(dict(row) if row else {"error": "not found"})
+```
+
+The same applies to sync `get`/`post`/… methods on `HTTPEndpoint` classes —
+Starlette threadpools those natively.
+
+Inside an `async def` endpoint, never call blocking libraries directly — that
+stalls every request on the worker's event loop. Either make the endpoint
+sync (above) or wrap the call:
+
+```python
+import asyncio
+
+async def endpoint(request: Request) -> JSONResponse:
+    rows = await asyncio.to_thread(blocking_query, "SELECT ...")
+    return JSONResponse({"rows": rows})
+```
+
+For sub-millisecond calls the sync-endpoint form is usually faster — one
+threadpool hop per request instead of a hop per wrapped call.
+
+Note: route hooks (and the default API policies) wrap function endpoints.
+`HTTPEndpoint` classes are dispatched natively by Starlette and bypass route
+hooks — the same rationale as WebSocket routes.
+
 ## WebSocket endpoints
 
 Since 0.3.0, an API module can export `async def websocket(ws)` to register a WebSocket handler at the same path. The file can export both `endpoint` (HTTP) and `websocket` — they bind to the same URL and Pyxle dispatches based on the protocol of the incoming request.

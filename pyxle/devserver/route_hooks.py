@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import functools
 import importlib
 import inspect
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Awaitable, Callable, Iterable, List, Literal, Sequence
 
+from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
@@ -198,16 +200,56 @@ DEFAULT_PAGE_POLICIES: Sequence[RouteHookCallable] = (attach_route_metadata,)
 DEFAULT_API_POLICIES: Sequence[RouteHookCallable] = (attach_route_metadata, enforce_allowed_methods)
 
 
+def is_async_callable(obj: object) -> bool:
+    """Return ``True`` when *obj* is awaited directly by the route chain.
+
+    Mirrors Starlette's own detection: unwraps ``functools.partial`` and
+    accepts both coroutine functions and instances with an async
+    ``__call__``.
+    """
+
+    while isinstance(obj, functools.partial):
+        obj = obj.func
+    return inspect.iscoroutinefunction(obj) or (
+        callable(obj) and inspect.iscoroutinefunction(getattr(obj, "__call__", None))
+    )
+
+
+def ensure_async_handler(handler):
+    """Normalize *handler* into an awaitable request→response callable.
+
+    Synchronous handlers are dispatched through Starlette's threadpool so a
+    blocking body (a DB driver, a sync SDK call) occupies a worker thread
+    instead of freezing the event loop — the same semantics Starlette
+    applies to sync endpoints registered without route hooks.
+    """
+
+    if is_async_callable(handler):
+        return handler
+
+    async def threadpool_handler(request: Request) -> Response:
+        return await run_in_threadpool(handler, request)
+
+    threadpool_handler.__name__ = getattr(handler, "__name__", "endpoint")
+    return threadpool_handler
+
+
 def wrap_with_route_hooks(
     handler,
     *,
     hooks: Sequence[RouteHookCallable],
     context: RouteContext,
 ):
-    """Wrap a Starlette handler with the provided route hook chain."""
+    """Wrap a Starlette handler with the provided route hook chain.
+
+    Synchronous handlers are normalized once at wrap time (see
+    :func:`ensure_async_handler`) so the per-request chain stays branch-free.
+    """
 
     if not hooks:
         return handler
+
+    handler = ensure_async_handler(handler)
 
     async def run_chain(request: Request):
         async def call_next(index: int, current_request: Request):
@@ -218,7 +260,7 @@ def wrap_with_route_hooks(
 
         return await call_next(0, request)
 
-    run_chain.__name__ = handler.__name__
+    run_chain.__name__ = getattr(handler, "__name__", "endpoint")
     return run_chain
 
 
@@ -229,6 +271,8 @@ __all__ = [
     "RouteHook",
     "RouteHookCallable",
     "RouteHookError",
+    "ensure_async_handler",
+    "is_async_callable",
     "load_route_hooks",
     "wrap_with_route_hooks",
 ]

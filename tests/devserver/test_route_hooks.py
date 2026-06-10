@@ -575,3 +575,94 @@ def test_default_policy_tuples_expose_expected_hooks():
     # allowed methods.
     assert DEFAULT_PAGE_POLICIES == (attach_route_metadata,)
     assert DEFAULT_API_POLICIES == (attach_route_metadata, enforce_allowed_methods)
+
+
+# ---------------------------------------------------------------------------
+# Sync handler support — is_async_callable / ensure_async_handler
+# ---------------------------------------------------------------------------
+
+
+def test_is_async_callable_detects_handler_shapes():
+    import functools
+
+    from pyxle.devserver.route_hooks import is_async_callable
+
+    async def async_fn(request):
+        return PlainTextResponse("ok")
+
+    def sync_fn(request):
+        return PlainTextResponse("ok")
+
+    class AsyncCallable:
+        async def __call__(self, request):
+            return PlainTextResponse("ok")
+
+    class SyncCallable:
+        def __call__(self, request):
+            return PlainTextResponse("ok")
+
+    assert is_async_callable(async_fn) is True
+    assert is_async_callable(sync_fn) is False
+    assert is_async_callable(functools.partial(async_fn)) is True
+    assert is_async_callable(functools.partial(sync_fn)) is False
+    assert is_async_callable(AsyncCallable()) is True
+    assert is_async_callable(SyncCallable()) is False
+
+
+def test_ensure_async_handler_returns_async_handler_unchanged():
+    from pyxle.devserver.route_hooks import ensure_async_handler
+
+    async def handler(request):
+        return PlainTextResponse("ok")
+
+    assert ensure_async_handler(handler) is handler
+
+
+def test_wrap_with_route_hooks_threadpools_sync_handler():
+    """A sync handler behind a hook chain runs in a worker thread, not on
+    the event loop — the response still flows back through the chain."""
+
+    seen: dict[str, object] = {}
+
+    def handler(request):
+        try:
+            asyncio.get_running_loop()
+            seen["on_loop"] = True
+        except RuntimeError:
+            seen["on_loop"] = False
+        return PlainTextResponse("sync-ok")
+
+    wrapped = wrap_with_route_hooks(
+        handler,
+        hooks=[attach_route_metadata],
+        context=_make_context(target="api", allowed_methods=("GET",)),
+    )
+
+    response = asyncio.run(wrapped(_make_request()))
+
+    assert response.status_code == 200
+    assert bytes(response.body) == b"sync-ok"
+    assert seen["on_loop"] is False
+    assert wrapped.__name__ == "handler"
+
+
+def test_wrap_with_route_hooks_accepts_partial_without_name():
+    """functools.partial handlers (no __name__) wrap cleanly and fall back
+    to a generic chain name instead of raising AttributeError."""
+
+    import functools
+
+    def handler(request, *, suffix):
+        return PlainTextResponse(f"partial-{suffix}")
+
+    wrapped = wrap_with_route_hooks(
+        functools.partial(handler, suffix="ok"),
+        hooks=[attach_route_metadata],
+        context=_make_context(target="api", allowed_methods=("GET",)),
+    )
+
+    response = asyncio.run(wrapped(_make_request()))
+
+    assert response.status_code == 200
+    assert bytes(response.body) == b"partial-ok"
+    assert wrapped.__name__ == "endpoint"

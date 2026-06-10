@@ -2,6 +2,12 @@
 
 Release notes for Pyxle. While we're in beta (`0.x`), minor versions may include breaking changes — those are called out explicitly here. To upgrade, run `pip install --upgrade pyxle-framework`.
 
+## 0.4.3
+
+- **Multi-core serving: `pyxle serve --workers N`.** Production serving can now run N independent server processes on one port (each with its own SSR pool and event loop) — throughput scales with cores, no load balancer or shared state to configure. See [Deployment → Multi-core (worker processes)](guides/deployment.md#multi-core-worker-processes).
+- **Sync API endpoints.** A plain `def endpoint(request)` in `pages/api/` now runs in Starlette's threadpool instead of failing at request time — blocking database drivers and sync SDKs no longer require manual `asyncio.to_thread` wrapping. Sync `get`/`post`/… methods on `HTTPEndpoint` classes are threadpooled too, and `HTTPEndpoint` classes dispatch correctly alongside route hooks. See [API Routes → Sync endpoints and blocking calls](guides/api-routes.md#sync-endpoints-and-blocking-calls).
+- **In-memory static asset cache.** When serving a production build, small static files (≤1 MB each, 32 MB total per process) are loaded into memory at startup and served without filesystem I/O or threadpool hops — several-fold higher static throughput. Conditional requests (`ETag`/`If-Modified-Since` → 304) and cache headers behave exactly as before; larger files keep streaming from disk.
+
 ## 0.4.2
 
 - **Live dev-server reconciliation.** Editing a `.pyxl` in `pyxle dev` now applies route-*shape* changes without a restart — rename/add/remove a `@server` loader or `@action`, add or delete a page, wrap a page in a layout, change the head. The route table is rebuilt and hot-swapped on every change (these previously needed `rm -rf .pyxle-build` + a restart). Editing `pyxle.config.json` prints a clear "restart to apply" warning instead of being silently ignored.

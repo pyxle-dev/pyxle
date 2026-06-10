@@ -113,6 +113,30 @@ export default function PostsPage({ data }) {
 }
 ```
 
+## Calling blocking libraries
+
+Loaders are async and run on the server's event loop. Calling a blocking
+library directly — a sync database driver, `requests`, a sync SDK — stalls
+every other request handled by that worker while the call runs. Wrap
+blocking calls in `asyncio.to_thread()` so they execute on a worker thread:
+
+```python
+import asyncio
+
+@server
+async def load_data(request):
+    rows = await asyncio.to_thread(blocking_query, "SELECT ...")
+    return {"rows": rows}
+```
+
+If the blocking work is a database read, keep one persistent connection per
+worker thread (for example in a `threading.local()`) instead of connecting
+per request -- connection setup usually costs more than the query itself.
+
+For API routes there is a second option: a plain `def endpoint(request)` is
+dispatched through Starlette's threadpool automatically. See
+[Sync endpoints and blocking calls](../guides/api-routes.md).
+
 ## Pages without loaders
 
 If a page has no `@server` function, `data` is an empty object:

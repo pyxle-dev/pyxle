@@ -2346,3 +2346,307 @@ def test_healthz_payload_without_start_time_uptime_zero(
     assert payload["status"] == "ok"
     assert payload["ready"] is False
     assert payload["uptime"] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Sync API endpoints — threadpool dispatch through the route-hook chain
+# ---------------------------------------------------------------------------
+
+
+def test_sync_function_endpoint_runs_in_threadpool_with_default_policies(
+    project: DevServerSettings,
+    monkeypatch,
+) -> None:
+    """A plain ``def endpoint(request)`` API module must work through the
+    real app assembly (default API policies installed) and must execute off
+    the event loop. Regression: this used to 500 with ``TypeError`` because
+    the hook chain awaited the sync return value."""
+
+    write_file(
+        project.pages_dir / "api/sync_info.py",
+        """import asyncio\nfrom starlette.responses import JSONResponse\n\ndef endpoint(request):\n    try:\n        asyncio.get_running_loop()\n        on_loop = True\n    except RuntimeError:\n        on_loop = False\n    route = request.scope.get(\"pyxle\", {}).get(\"route\", {})\n    return JSONResponse({\"onLoop\": on_loop, \"target\": route.get(\"target\")})\n""",
+    )
+
+    build_once(project)
+    registry = load_metadata_registry(project)
+    table = build_route_table(registry)
+
+    monkeypatch.setattr(
+        "pyxle.devserver.starlette_app.ComponentRenderer",
+        lambda: object(),
+    )
+
+    app = create_starlette_app(project, table)
+    client = TestClient(app)
+
+    response = client.get("/api/sync_info")
+    assert response.status_code == 200
+    payload = response.json()
+    # Ran in a worker thread (no running loop there) …
+    assert payload["onLoop"] is False
+    # … and the default attach_route_metadata policy still ran around it.
+    assert payload["target"] == "api"
+
+
+def test_http_endpoint_class_dispatches_through_default_api_policies(
+    project: DevServerSettings,
+) -> None:
+    """HTTPEndpoint-class API modules must dispatch natively even when route
+    hooks are installed. Regression: the class used to be wrapped into the
+    request→response chain and crashed with ``TypeError`` on every request."""
+
+    from pyxle.devserver.route_hooks import DEFAULT_API_POLICIES
+
+    build_once(project)
+    registry = load_metadata_registry(project)
+    table = build_route_table(registry)
+
+    router = build_api_router(table.apis, route_hooks=list(DEFAULT_API_POLICIES))
+
+    app = Starlette()
+    app.router.routes.extend(router.routes)
+    client = TestClient(app)
+
+    response = client.get("/api/posts/42")
+    assert response.status_code == 200
+    assert response.json() == {"id": "42"}
+
+    # Starlette's native HTTPEndpoint dispatch supplies the 405 handling.
+    response = client.post("/api/posts/42")
+    assert response.status_code == 405
+
+
+def test_sync_http_endpoint_method_runs_in_threadpool(
+    project: DevServerSettings,
+) -> None:
+    """Sync methods on HTTPEndpoint classes are threadpooled by Starlette's
+    own dispatch once the class is routed natively."""
+
+    from pyxle.devserver.route_hooks import DEFAULT_API_POLICIES
+
+    write_file(
+        project.pages_dir / "api/sync_class.py",
+        """import asyncio\nfrom starlette.endpoints import HTTPEndpoint\nfrom starlette.responses import JSONResponse\n\nclass SyncEndpoint(HTTPEndpoint):\n    def get(self, request):\n        try:\n            asyncio.get_running_loop()\n            on_loop = True\n        except RuntimeError:\n            on_loop = False\n        return JSONResponse({\"onLoop\": on_loop})\n""",
+    )
+
+    build_once(project)
+    registry = load_metadata_registry(project)
+    table = build_route_table(registry)
+
+    router = build_api_router(table.apis, route_hooks=list(DEFAULT_API_POLICIES))
+
+    app = Starlette()
+    app.router.routes.extend(router.routes)
+    client = TestClient(app)
+
+    response = client.get("/api/sync_class")
+    assert response.status_code == 200
+    assert response.json() == {"onLoop": False}
+
+
+# ---------------------------------------------------------------------------
+# StaticAssetsMiddleware — in-memory cache (production serve)
+# ---------------------------------------------------------------------------
+
+
+def _cached_static_app(
+    *,
+    public_directory: Path | None = None,
+    client_directory: Path | None = None,
+    **cache_kwargs,
+) -> Starlette:
+    """Like _static_assets_app but with the in-memory cache enabled."""
+    from starlette.middleware import Middleware
+
+    from pyxle.devserver.starlette_app import StaticAssetsMiddleware
+
+    async def fallthrough(request):  # noqa: ANN001
+        return PlainTextResponse("FELL-THROUGH")
+
+    app = Starlette(
+        middleware=[
+            Middleware(
+                StaticAssetsMiddleware,
+                public_directory=public_directory,
+                client_directory=client_directory,
+                cache_in_memory=True,
+                **cache_kwargs,
+            )
+        ],
+    )
+    app.router.add_route("/{path:path}", fallthrough, methods=["GET", "POST"])
+    return app
+
+
+def test_static_memory_cache_serves_after_file_deleted(tmp_path: Path) -> None:
+    """Cached assets are served entirely from memory: deleting the file on
+    disk after startup must not affect responses."""
+    public_dir = tmp_path / "public"
+    public_dir.mkdir()
+    asset = public_dir / "benchmark.json"
+    asset.write_text('{"hello": "world"}', encoding="utf-8")
+
+    app = _cached_static_app(public_directory=public_dir)
+    client = TestClient(app)
+
+    first = client.get("/benchmark.json")
+    assert first.status_code == 200
+    assert first.json() == {"hello": "world"}
+    assert first.headers["content-type"] == "application/json"
+    assert first.headers["cache-control"] == "public, max-age=3600"
+    assert first.headers["etag"].startswith('"')
+    assert "last-modified" in first.headers
+
+    asset.unlink()
+
+    second = client.get("/benchmark.json")
+    assert second.status_code == 200
+    assert second.json() == {"hello": "world"}
+
+
+def test_static_memory_cache_conditional_requests_return_304(tmp_path: Path) -> None:
+    public_dir = tmp_path / "public"
+    public_dir.mkdir()
+    (public_dir / "styles.css").write_text("body { margin: 0 }", encoding="utf-8")
+
+    app = _cached_static_app(public_directory=public_dir)
+    client = TestClient(app)
+
+    base = client.get("/styles.css")
+    assert base.status_code == 200
+    assert base.headers["content-type"] == "text/css; charset=utf-8"
+    etag = base.headers["etag"]
+    last_modified = base.headers["last-modified"]
+
+    not_modified = client.get("/styles.css", headers={"if-none-match": etag})
+    assert not_modified.status_code == 304
+    assert not_modified.content == b""
+    assert not_modified.headers["etag"] == etag
+
+    by_date = client.get("/styles.css", headers={"if-modified-since": last_modified})
+    assert by_date.status_code == 304
+
+
+def test_static_memory_cache_head_preserves_content_length(tmp_path: Path) -> None:
+    public_dir = tmp_path / "public"
+    public_dir.mkdir()
+    body = b'{"k": 1}'
+    (public_dir / "data.json").write_bytes(body)
+
+    app = _cached_static_app(public_directory=public_dir)
+    client = TestClient(app)
+
+    response = client.head("/data.json")
+    assert response.status_code == 200
+    assert response.content == b""
+    assert response.headers["content-length"] == str(len(body))
+
+
+def test_static_memory_cache_skips_oversized_files(tmp_path: Path) -> None:
+    """Files above the per-file budget keep streaming from disk."""
+    public_dir = tmp_path / "public"
+    public_dir.mkdir()
+    big = public_dir / "big.txt"
+    big.write_text("X" * 64, encoding="utf-8")
+
+    app = _cached_static_app(public_directory=public_dir, cache_max_file_bytes=8)
+    client = TestClient(app)
+
+    served = client.get("/big.txt")
+    assert served.status_code == 200
+    assert served.text == "X" * 64
+
+    # Not cached: once the file is gone the request falls through.
+    big.unlink()
+    fallen = client.get("/big.txt")
+    assert fallen.text == "FELL-THROUGH"
+
+
+def test_static_memory_cache_respects_total_budget(tmp_path: Path) -> None:
+    """The startup walk stops caching once the total budget is consumed
+    (sorted order, so a.txt wins the budget over b.txt)."""
+    public_dir = tmp_path / "public"
+    public_dir.mkdir()
+    (public_dir / "a.txt").write_text("AAAA", encoding="utf-8")
+    (public_dir / "b.txt").write_text("BBBB", encoding="utf-8")
+
+    app = _cached_static_app(public_directory=public_dir, cache_max_total_bytes=4)
+    client = TestClient(app)
+
+    # Starlette builds the middleware stack lazily — issue a request first so
+    # the startup walk runs while the files still exist on disk.
+    assert client.get("/a.txt").text == "AAAA"
+    assert client.get("/b.txt").text == "BBBB"
+
+    (public_dir / "a.txt").unlink()
+    (public_dir / "b.txt").unlink()
+
+    cached = client.get("/a.txt")
+    assert cached.status_code == 200
+    assert cached.text == "AAAA"
+
+    uncached = client.get("/b.txt")
+    assert uncached.text == "FELL-THROUGH"
+
+
+def test_static_memory_cache_hashed_client_assets_stay_immutable(tmp_path: Path) -> None:
+    client_dir = tmp_path / "client"
+    hashed_dir = client_dir / "dist" / "assets"
+    hashed_dir.mkdir(parents=True)
+    (hashed_dir / "index-a1b2c3d4.js").write_text("export const x = 1;", encoding="utf-8")
+
+    app = _cached_static_app(client_directory=client_dir)
+    client = TestClient(app)
+
+    response = client.get("/client/dist/assets/index-a1b2c3d4.js")
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "public, max-age=31536000, immutable"
+    assert response.headers["content-type"] == "text/javascript; charset=utf-8"
+
+    (hashed_dir / "index-a1b2c3d4.js").unlink()
+    assert client.get("/client/dist/assets/index-a1b2c3d4.js").status_code == 200
+
+
+def test_static_cache_disabled_reads_live_from_disk(tmp_path: Path) -> None:
+    """Without cache_in_memory (dev), edits to public files are visible."""
+    public_dir = tmp_path / "public"
+    public_dir.mkdir()
+    (public_dir / "live.txt").write_text("before", encoding="utf-8")
+
+    app = _static_assets_app(public_directory=public_dir)
+    client = TestClient(app)
+
+    assert client.get("/live.txt").text == "before"
+    (public_dir / "live.txt").write_text("after", encoding="utf-8")
+    assert client.get("/live.txt").text == "after"
+
+
+def test_create_starlette_app_enables_static_cache_only_in_production(
+    project: DevServerSettings,
+    monkeypatch,
+) -> None:
+    """The app assembly memory-caches static assets only when not in debug
+    mode — dev keeps serving public/ straight from disk."""
+
+    from pyxle.devserver.starlette_app import StaticAssetsMiddleware
+
+    build_once(project)
+    registry = load_metadata_registry(project)
+    table = build_route_table(registry)
+
+    monkeypatch.setattr(
+        "pyxle.devserver.starlette_app.ComponentRenderer",
+        lambda: object(),
+    )
+
+    def _static_kwargs(app):
+        for mw in app.user_middleware:
+            if mw.cls is StaticAssetsMiddleware:
+                return mw.kwargs
+        raise AssertionError("StaticAssetsMiddleware not installed")
+
+    dev_app = create_starlette_app(project, table)
+    assert _static_kwargs(dev_app)["cache_in_memory"] is False
+
+    prod_app = create_starlette_app(replace(project, debug=False), table)
+    assert _static_kwargs(prod_app)["cache_in_memory"] is True

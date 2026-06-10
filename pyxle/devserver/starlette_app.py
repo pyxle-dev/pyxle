@@ -4,15 +4,19 @@ from __future__ import annotations
 
 import importlib.util
 import inspect
+import mimetypes
 import sys
 import time
 from contextlib import asynccontextmanager
-from dataclasses import replace
+from dataclasses import dataclass, replace
+from email.utils import formatdate, parsedate
+from hashlib import md5
 from pathlib import Path
 from types import ModuleType
 from typing import Any, Iterable, Sequence
 
 from starlette.applications import Starlette
+from starlette.datastructures import Headers
 from starlette.endpoints import HTTPEndpoint
 from starlette.exceptions import HTTPException
 from starlette.middleware import Middleware
@@ -20,7 +24,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Mount, Route, Router, WebSocketRoute
-from starlette.staticfiles import StaticFiles
+from starlette.staticfiles import NotModifiedResponse, StaticFiles
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from pyxle.cli.logger import ConsoleLogger
@@ -166,8 +170,130 @@ def _index_static_files(directory: Path | None, *, prefix: str = "") -> frozense
     return frozenset(paths)
 
 
+# Per-file and per-process budgets for the in-memory static cache. Both are
+# enforced once at startup (the production build is immutable, so the cache
+# never grows afterwards — bounded by construction, no runtime eviction).
+_STATIC_CACHE_MAX_FILE_BYTES = 1024 * 1024
+_STATIC_CACHE_MAX_TOTAL_BYTES = 32 * 1024 * 1024
+
+
+def _static_cache_control(path: str, *, is_client: bool) -> bytes:
+    """Cache-Control value for a static asset URL path.
+
+    Vite content-hashed bundles (``/client/.../dist/assets/...``) are
+    immutable and cacheable forever; everything else revalidates hourly.
+    """
+
+    if is_client and "/dist/assets/" in path:
+        return b"public, max-age=31536000, immutable"
+    return b"public, max-age=3600"
+
+
+@dataclass(frozen=True, slots=True)
+class _CachedAsset:
+    """A small static file fully loaded into memory at startup."""
+
+    body: bytes
+    raw_headers: tuple[tuple[bytes, bytes], ...]
+    headers: Headers
+
+
+def _is_not_modified(response_headers: Headers, request_headers: Headers) -> bool:
+    """Return ``True`` when a 304 can be served for a cached asset.
+
+    Mirrors ``StaticFiles.is_not_modified`` from the pinned Starlette
+    release (``If-None-Match`` etag list first, ``If-Modified-Since``
+    fallback) so memory-cached and disk-served responses negotiate
+    conditionals identically.
+    """
+
+    try:
+        if_none_match = request_headers["if-none-match"]
+        etag = response_headers["etag"]
+        if etag in [tag.strip(" W/") for tag in if_none_match.split(",")]:
+            return True
+    except KeyError:
+        pass
+
+    try:
+        if_modified_since = parsedate(request_headers["if-modified-since"])
+        last_modified = parsedate(response_headers["last-modified"])
+        if (
+            if_modified_since is not None
+            and last_modified is not None
+            and if_modified_since >= last_modified
+        ):
+            return True
+    except KeyError:
+        pass
+
+    return False
+
+
+def _load_static_memory_cache(
+    directory: Path | None,
+    *,
+    prefix: str = "",
+    max_file_bytes: int,
+    budget: int,
+) -> tuple[dict[str, _CachedAsset], int]:
+    """Load files from ``directory`` into memory, returning the remaining budget.
+
+    Files larger than ``max_file_bytes`` and files that would exceed the
+    remaining ``budget`` are skipped — they keep streaming from disk via
+    ``StaticFiles``. Walk order is sorted for determinism. Headers mirror
+    ``FileResponse`` (content-length, last-modified, mtime/size etag,
+    guessed content-type) plus the Cache-Control value the disk path adds.
+    """
+
+    cache: dict[str, _CachedAsset] = {}
+    if directory is None:
+        return cache, budget
+    base = Path(directory)
+    if not base.is_dir():
+        return cache, budget
+
+    for entry in sorted(base.rglob("*")):
+        if not entry.is_file():
+            continue
+        stat_result = entry.stat()
+        size = stat_result.st_size
+        if size > max_file_bytes or size > budget:
+            continue
+        url_path = f"{prefix}/{entry.relative_to(base).as_posix()}"
+        body = entry.read_bytes()
+        budget -= size
+
+        media_type = mimetypes.guess_type(entry.name)[0] or "text/plain"
+        if media_type.startswith("text/"):
+            media_type += "; charset=utf-8"
+        etag_base = f"{stat_result.st_mtime}-{size}"
+        etag = f'"{md5(etag_base.encode(), usedforsecurity=False).hexdigest()}"'
+        raw_headers = (
+            (b"content-length", str(size).encode("latin-1")),
+            (b"content-type", media_type.encode("latin-1")),
+            (b"last-modified", formatdate(stat_result.st_mtime, usegmt=True).encode("latin-1")),
+            (b"etag", etag.encode("latin-1")),
+            (b"cache-control", _static_cache_control(url_path, is_client=bool(prefix))),
+        )
+        cache[url_path] = _CachedAsset(
+            body=body,
+            raw_headers=raw_headers,
+            headers=Headers(raw=list(raw_headers)),
+        )
+    return cache, budget
+
+
 class StaticAssetsMiddleware:
-    """Serve client + public assets ahead of dynamic catch-all routes."""
+    """Serve client + public assets ahead of dynamic catch-all routes.
+
+    When ``cache_in_memory`` is enabled (production serve — the build output
+    is immutable), small files are fully loaded into memory at startup and
+    served without touching the filesystem or hopping to a worker thread.
+    The cache is bounded by construction: per-file and total-byte budgets
+    are enforced during the startup walk and the cache never grows after.
+    Oversized files keep streaming from disk through ``StaticFiles``.
+    """
 
     def __init__(
         self,
@@ -175,6 +301,9 @@ class StaticAssetsMiddleware:
         *,
         public_directory: Path | None = None,
         client_directory: Path | None = None,
+        cache_in_memory: bool = False,
+        cache_max_file_bytes: int = _STATIC_CACHE_MAX_FILE_BYTES,
+        cache_max_total_bytes: int = _STATIC_CACHE_MAX_TOTAL_BYTES,
     ) -> None:
         self.app = app
         self._public_static = (
@@ -193,6 +322,22 @@ class StaticAssetsMiddleware:
         self._public_paths = _index_static_files(public_directory)
         self._client_paths = _index_static_files(client_directory, prefix="/client")
 
+        self._memory_cache: dict[str, _CachedAsset] = {}
+        if cache_in_memory:
+            budget = cache_max_total_bytes
+            self._memory_cache, budget = _load_static_memory_cache(
+                public_directory,
+                max_file_bytes=cache_max_file_bytes,
+                budget=budget,
+            )
+            client_cache, budget = _load_static_memory_cache(
+                client_directory,
+                prefix="/client",
+                max_file_bytes=cache_max_file_bytes,
+                budget=budget,
+            )
+            self._memory_cache.update(client_cache)
+
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope.get("type") != "http":
             await self.app(scope, receive, send)
@@ -204,6 +349,11 @@ class StaticAssetsMiddleware:
             return
 
         path = scope.get("path", "")
+
+        cached = self._memory_cache.get(path)
+        if cached is not None:
+            await self._send_cached(cached, scope, receive, send, method=method)
+            return
 
         if self._client_static is not None and path.startswith("/client"):
             # O(1) membership check first: only touch the filesystem for a path
@@ -227,6 +377,35 @@ class StaticAssetsMiddleware:
         await self.app(scope, receive, send)
 
     @staticmethod
+    async def _send_cached(
+        asset: _CachedAsset,
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+        *,
+        method: str,
+    ) -> None:
+        """Send a memory-cached asset, honouring conditional request headers."""
+
+        request_headers = Headers(scope=scope)
+        if _is_not_modified(asset.headers, request_headers):
+            response = NotModifiedResponse(asset.headers)
+            await response(scope, receive, send)
+            return
+
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": list(asset.raw_headers),
+            }
+        )
+        # Mirror FileResponse: HEAD responses carry the full content-length
+        # but an empty body.
+        body = b"" if method == "HEAD" else asset.body
+        await send({"type": "http.response.body", "body": body, "more_body": False})
+
+    @staticmethod
     async def _try_static(
         static_app: HttpOnlyStaticFiles,
         scope: Scope,
@@ -248,25 +427,16 @@ class StaticAssetsMiddleware:
                 candidate["raw_path"] = stripped.encode("utf-8")
             selected_scope = candidate
 
-        # Determine cache header based on path pattern.
         # Vite hashed assets (e.g. /client/dist/assets/index-a1b2c3d4.js)
-        # are immutable and can be cached forever.
-        is_hashed_asset = (
-            prefix == "/client"
-            and "/dist/assets/" in original_path
+        # are immutable and can be cached forever; see _static_cache_control.
+        cache_control = _static_cache_control(
+            original_path, is_client=prefix == "/client"
         )
 
         async def _send_with_cache_headers(message):
             if message.get("type") == "http.response.start":
                 headers = list(message.get("headers", []))
-                if is_hashed_asset:
-                    headers.append(
-                        (b"cache-control", b"public, max-age=31536000, immutable")
-                    )
-                else:
-                    headers.append(
-                        (b"cache-control", b"public, max-age=3600")
-                    )
+                headers.append((b"cache-control", cache_control))
                 message = {**message, "headers": headers}
             await send(message)
 
@@ -303,10 +473,19 @@ def build_api_router(
         )
 
         if http_handler is not None:
-            wrapped = wrap_with_route_hooks(http_handler, hooks=hooks, context=context)
-            if inspect.isclass(wrapped) and issubclass(wrapped, HTTPEndpoint):
-                router.add_route(route.path, wrapped)  # type: ignore[arg-type]
+            if inspect.isclass(http_handler) and issubclass(http_handler, HTTPEndpoint):
+                # HTTPEndpoint classes are ASGI applications — Starlette
+                # dispatches them natively (including threadpool dispatch
+                # for sync methods and built-in 405 handling). Route hooks
+                # wrap request→response callables and don't match that
+                # shape, so class endpoints bypass them — same rationale
+                # as WebSocket routes below.
+                router.add_route(route.path, http_handler)  # type: ignore[arg-type]
             else:
+                # Function endpoints (async or sync — sync ones are
+                # threadpooled by ensure_async_handler inside the wrapper)
+                # run through the route hook chain.
+                wrapped = wrap_with_route_hooks(http_handler, hooks=hooks, context=context)
                 router.add_route(route.path, wrapped, methods=list(_API_HTTP_METHODS))  # type: ignore[arg-type]
 
         if ws_handler is not None:
@@ -370,8 +549,10 @@ def _resolve_api_handlers(module: ModuleType) -> "tuple[Any, Any]":
 
     An API module may export any combination of:
 
-    * ``endpoint`` — async callable or :class:`HTTPEndpoint` subclass
-      that handles HTTP requests.
+    * ``endpoint`` — async or sync callable, or :class:`HTTPEndpoint`
+      subclass that handles HTTP requests. Sync callables are dispatched
+      through Starlette's threadpool so blocking bodies don't stall the
+      event loop.
     * ``websocket`` — async callable ``(ws)`` or
       :class:`WebSocketEndpoint` subclass that handles the WS protocol.
     * An :class:`HTTPEndpoint` subclass somewhere in the module (picked
@@ -1054,6 +1235,10 @@ def create_starlette_app(
             StaticAssetsMiddleware,
             public_directory=public_directory if public_directory.exists() else None,
             client_directory=client_static_dir if client_static_dir and client_static_dir.exists() else None,
+            # Memory-cache small assets only when serving an immutable
+            # production build; dev keeps reading from disk so edits to
+            # public/ files show up without a restart.
+            cache_in_memory=not settings.debug,
         )
 
     middleware_stack: list[Middleware] = []
