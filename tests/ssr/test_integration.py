@@ -45,7 +45,9 @@ def test_ssr_integration_renders_pages_with_loader(tmp_path: Path) -> None:
 
     html = response.text
     assert "<title>SSR Integration</title>" in html
-    assert '<meta name="description" content="SSR integration test" />' in html
+    # The HEAD sanitiser reconstructs each element from a strict allowlist
+    # (XSS hardening), canonicalising the self-closing meta to ``/>``.
+    assert '<meta name="description" content="SSR integration test"/>' in html
     assert '<main data-query="pytest">' in html
     assert '<h1>Hello from SSR</h1>' in html
     assert 'window.__PYXLE_PAGE_PATH__ = "/pages/index.jsx";' in html

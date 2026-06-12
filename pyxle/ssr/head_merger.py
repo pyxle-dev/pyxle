@@ -203,75 +203,217 @@ _BASE_TAG_RE = re.compile(r"^<base\b", re.IGNORECASE)
 _TITLE_OPEN_RE = re.compile(r"<title[^>]*>", re.IGNORECASE)
 _TITLE_CLOSE_RE = re.compile(r"</title\s*>", re.IGNORECASE)
 
+# Tags permitted in the document <head> when a head element is built from a
+# raw string (the Python ``HEAD`` variable / callable path, which — unlike the
+# React ``<Head>`` JSX path — does not benefit from React's escaping). Anything
+# outside this set (``<iframe>``, ``<object>``, ``<base>``, …) is dropped.
+# ``script`` and ``style`` are allowed because inline init scripts / critical
+# CSS in the head are a supported, trusted-author feature; their *inner*
+# content is the developer's own code and is preserved verbatim.
+_ALLOWED_HEAD_TAGS = frozenset({"meta", "link", "script", "style"})
+_VOID_HEAD_TAGS = frozenset({"meta", "link"})
+_URL_ATTRS = frozenset({"href", "src", "action"})
+_DANGEROUS_URL_SCHEMES = ("javascript:", "vbscript:", "data:")
+_SCHEME_NOISE_RE = re.compile(r"\s")
+# A valid HTML attribute name excludes whitespace, quotes, and the ``> / =``
+# delimiters (and control chars). Names with anything else are dropped so a
+# crafted name can't break out of the tag's attribute quoting.
+_VALID_ATTR_NAME_RE = re.compile(r"^[^\s\"'>/=\x00-\x1f]+$")
+
+
+class _SingleHeadElementParser(HTMLParser):
+    """Capture the first tag, its attributes, and (for paired tags) its inner
+    content from a head-element string — discarding any trailing markup an
+    attacker may have injected after a quote breakout."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=False)
+        self.tag: str | None = None
+        self.attrs: list[tuple[str, str | None]] = []
+        self._inner: list[str] = []
+        self._closed = False
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if self.tag is None:
+            self.tag = tag.lower()
+            self.attrs = attrs
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if self.tag is None:
+            self.tag = tag.lower()
+            self.attrs = attrs
+            self._closed = True
+
+    def handle_data(self, data: str) -> None:
+        if self.tag is not None and not self._closed:
+            self._inner.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if self.tag is not None and not self._closed and tag.lower() == self.tag:
+            self._closed = True
+
+    @property
+    def inner(self) -> str:
+        return "".join(self._inner)
+
+
+def _has_dangerous_url_scheme(value: str) -> bool:
+    """True if ``value`` resolves to a javascript:/vbscript:/data: URL.
+
+    Entity-decodes and strips whitespace/control characters first so that
+    obfuscations like ``java&#9;script:`` or ``  JavaScript:`` are caught.
+    """
+    from html import unescape as html_unescape
+
+    collapsed = _SCHEME_NOISE_RE.sub("", html_unescape(value)).lower()
+    return collapsed.startswith(_DANGEROUS_URL_SCHEMES)
+
+
+def _render_safe_attributes(attrs: list[tuple[str, str | None]]) -> str:
+    """Re-serialise attributes safely: drop ``on*`` handlers, neutralise
+    dangerous URL schemes, and HTML-escape every value (quote=True) so a value
+    can never break out of its quotes and inject markup."""
+    from html import escape as html_escape
+
+    parts: list[str] = []
+    for name, value in attrs:
+        if not _VALID_ATTR_NAME_RE.match(name):
+            continue  # structurally-unsafe attribute name
+        lname = name.lower()
+        if lname.startswith("on"):
+            continue  # event-handler attribute
+        if value is None:
+            parts.append(name)  # boolean attribute (e.g. ``defer``)
+            continue
+        if lname in _URL_ATTRS and _has_dangerous_url_scheme(value):
+            value = ""
+        parts.append(f'{name}="{html_escape(value, quote=True)}"')
+    return " ".join(parts)
+
+
+def _reconstruct_head_element(html: str, tag: str) -> str:
+    """Rebuild a non-title head element from a strict tag allowlist with every
+    attribute value escaped. Returns ``""`` for disallowed tags, meta-refresh
+    redirects, or unparseable input (fail closed)."""
+    if tag not in _ALLOWED_HEAD_TAGS:
+        return ""
+
+    parser = _SingleHeadElementParser()
+    try:
+        parser.feed(html)
+        parser.close()
+    except Exception:
+        return ""
+    if parser.tag != tag:
+        return ""
+
+    # Reject <meta http-equiv="refresh"> — a data-controlled value is an
+    # open-redirect / refresh-based injection vector.
+    if tag == "meta":
+        for name, value in parser.attrs:
+            if name.lower() == "http-equiv" and (value or "").strip().lower() == "refresh":
+                return ""
+
+    attrs_str = _render_safe_attributes(parser.attrs)
+    spacer = f" {attrs_str}" if attrs_str else ""
+    if tag in _VOID_HEAD_TAGS:
+        return f"<{tag}{spacer}/>"
+    # Paired tag (script/style): inner content is trusted author code and is
+    # preserved verbatim; any markup injected after the matching close tag was
+    # dropped by the parser.
+    return f"<{tag}{spacer}>{parser.inner}</{tag}>"
+
 
 def sanitize_head_element(html: str) -> str:
     """Sanitize a single HEAD element to prevent XSS injection.
 
-    Applies four layers of protection:
+    The raw-string HEAD path (the Python ``HEAD`` variable / callable) does
+    not pass through React's escaping, so a developer who interpolates loader
+    data into a head string — the documented dynamic-meta-tags recipe — could
+    otherwise inject markup. Protection:
 
-    0. **Base-tag rejection** — ``<base>`` elements are stripped entirely
-       because they re-route every relative asset on the page.
-    1. **Title text escaping** — escapes ``<`` and ``>`` inside
-       ``<title>…</title>`` so that injected closing tags and script tags
-       become inert text.
-    2. **Event-handler stripping** — removes ``on*`` attributes
-       (``onclick``, ``onerror``, ``onload``, …).  Also detects
-       entity-encoded event handlers.
-    3. **Dangerous URL neutralisation** — replaces ``javascript:``,
-       ``vbscript:``, and ``data:`` protocol URLs in ``href`` / ``src``
-       / ``action`` attributes with an empty string.
+    * ``<base>`` and any tag outside the head allowlist
+      (``title``/``meta``/``link``/``script``/``style``) are dropped.
+    * ``<title>`` text content has ``<``/``>`` escaped so injected tags become
+      inert text.
+    * Every other element is parsed and rebuilt from the first tag only, with
+      all attribute values HTML-escaped (closing the quote-breakout vector),
+      ``on*`` handlers removed, ``javascript:``/``vbscript:``/``data:`` URLs
+      neutralised, and ``<meta http-equiv=refresh>`` rejected. Trailing markup
+      injected after a breakout is discarded.
+
+    Inline ``<script>``/``<style>`` *content* is treated as trusted author
+    code and preserved verbatim — do not interpolate untrusted data into it.
     """
     html = html.strip()
     if not html:
         return html
 
-    # Layer 0: reject <base> elements entirely.
+    # Reject <base> outright — it re-roots every relative asset on the page.
     if _BASE_TAG_RE.match(html):
         return ""
 
-    # Layer 1: escape angle brackets inside <title> text content
+    tag, _ = HeadElementAttributeParser().get_tag_and_attributes(html)
+    if not tag:
+        return ""
+
+    if tag == "title":
+        return _sanitize_title_element(html)
+
+    return _reconstruct_head_element(html, tag)
+
+
+def _sanitize_title_element(html: str) -> str:
+    """Sanitise a ``<title>`` element: escape its text content, strip ``on*``
+    handlers, and neutralise dangerous URL schemes (kept as a regex pass so an
+    injected early ``</title>`` is escaped into inert text rather than parsed
+    as a real close tag)."""
+    # Escape angle brackets inside the title text content.
     html = _escape_title_text_content(html)
 
-    # Layer 2: strip event-handler attributes.
-    # First pass: strip handlers visible in the raw markup.
+    # Strip event-handler attributes (raw, then entity-decoded re-check).
     html = _EVENT_HANDLER_ATTR_RE.sub("", html)
-    # Second pass: entity-decode and re-check so that ``&#111;nclick``
-    # style bypasses are caught.
     from html import unescape as html_unescape
 
     decoded = html_unescape(html)
     if _EVENT_HANDLER_ATTR_RE.search(decoded):
         html = _EVENT_HANDLER_ATTR_RE.sub("", decoded)
 
-    # Layer 3: neutralise dangerous protocol URLs
-    html = _DANGEROUS_URL_ATTR_RE.sub(r"\1", html)
-
-    return html
+    # Neutralise dangerous protocol URLs in any attributes.
+    return _DANGEROUS_URL_ATTR_RE.sub(r"\1", html)
 
 
 def _escape_title_text_content(html: str) -> str:
-    """Escape ``<`` and ``>`` between ``<title>`` and ``</title>``.
+    """Escape ``<`` and ``>`` inside a ``<title>`` and drop trailing markup.
 
-    Uses the *last* ``</title>`` occurrence so that an injected early
-    ``</title>`` is captured and escaped rather than treated as the real
-    closing tag.
+    Everything between the opening ``<title>`` and the *last* ``</title>`` is
+    treated as title text and angle-bracket-escaped; the title is then closed
+    with a single clean ``</title>`` and **anything after that close tag is
+    discarded**. This is the key XSS guard: a single injected ``</title>``
+    followed by, say, ``<script>`` would otherwise end the title's RCDATA and
+    leave the script live in ``<head>`` — returning the suffix verbatim (the
+    previous behaviour) leaked exactly that. Dropping the suffix mirrors how
+    the non-title path discards markup injected after a quote breakout.
     """
     open_match = _TITLE_OPEN_RE.search(html)
     if open_match is None:
         return html
 
-    close_matches = list(_TITLE_CLOSE_RE.finditer(html))
-    if not close_matches:
-        return html
-
-    last_close = close_matches[-1]
     prefix = html[: open_match.end()]
-    content = html[open_match.end() : last_close.start()]
-    suffix = html[last_close.start() :]
+    close_matches = list(_TITLE_CLOSE_RE.finditer(html))
+    if close_matches:
+        # Title text runs up to the last </title>; anything after it is
+        # discarded (injected markup) and a single clean close is emitted.
+        content = html[open_match.end() : close_matches[-1].start()]
+    else:
+        # No close tag at all: treat the remainder as title text, escape it,
+        # and append a clean close so the title can never swallow the rest of
+        # the document (or leave attacker markup unescaped) as RCDATA.
+        content = html[open_match.end() :]
 
-    # Only escape angle brackets — preserve existing character entities
+    # Only escape angle brackets — preserve existing character entities.
     escaped = content.replace("<", "&lt;").replace(">", "&gt;")
-    return prefix + escaped + suffix
+    return prefix + escaped + "</title>"
 
 
 def merge_head_elements(

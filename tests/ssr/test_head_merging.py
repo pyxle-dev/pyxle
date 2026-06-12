@@ -14,14 +14,21 @@ def test_merge_empty_sources():
 
 
 def test_merge_only_head_variable():
-    """Should return head variable elements when no JSX blocks."""
+    """Should return head variable elements when no JSX blocks.
+
+    Each element is reconstructed from a strict allowlist by the sanitiser
+    (the XSS-hardening pass), which canonicalises self-closing tags to ``/>``.
+    """
     head_var = ("<title>From HEAD</title>", '<meta name="description" content="test" />')
     result = merge_head_elements(
         head_variable=head_var,
         head_jsx_blocks=(),
         layout_head_jsx_blocks=(),
     )
-    assert result == head_var
+    assert result == (
+        "<title>From HEAD</title>",
+        '<meta name="description" content="test"/>',
+    )
 
 
 def test_merge_only_jsx_blocks():
