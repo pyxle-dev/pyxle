@@ -2,6 +2,10 @@
 
 Release notes for Pyxle. While we're in beta (`0.x`), minor versions may include breaking changes — those are called out explicitly here. To upgrade, run `pip install --upgrade pyxle-framework`.
 
+## 0.4.4
+
+- **Fix: cross-page hash links scroll to their anchor.** Client-side navigation to `/page#section` changed the page but stayed pinned to the top (only the URL carried the hash); a full load scrolled correctly. The router now jumps to the top and then scrolls to the anchor as soon as the next page's DOM commits, matching native behaviour — including for unknown anchors, which stay at the top.
+
 ## 0.4.3
 
 - **Security: hardened HEAD sanitisation (XSS).** Dynamic `HEAD` values/callables that interpolate loader data into raw head strings — the documented dynamic-meta-tags recipe — could previously inject markup because attribute values weren't escaped (a `"` in a `<meta content>` broke out of the attribute). Head elements are now parsed and rebuilt from a strict tag allowlist with every attribute value HTML-escaped, `on*` handlers dropped, `javascript:`/`vbscript:`/`data:` URLs neutralised, `<meta http-equiv="refresh">` and non-head tags rejected, and any markup injected after a breakout discarded. Inline `<script>`/`<style>` head content remains supported as trusted author code. Self-closing head tags now serialise canonically as `/>`.
