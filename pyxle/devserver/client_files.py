@@ -713,6 +713,11 @@ def _render_client_entry(settings: DevServerSettings) -> str:
             let reactRoot = null;
             let currentPagePath = window.__PYXLE_PAGE_PATH__ || '';
             let navigationController = null;
+            // Monotonic token: each navigateTo() claims the next value, so a
+            // navigation that awaited an in-flight prefetch can detect it was
+            // superseded by a newer click and bail out instead of rendering a
+            // stale page (the abort controller can't cancel a shared prefetch).
+            let navigationSequence = 0;
 
             // ---- Navigation cache with TTL ------------------------------
             //
@@ -1556,10 +1561,25 @@ def _render_client_entry(settings: DevServerSettings) -> str:
                 return false;
               }
 
+              const navToken = ++navigationSequence;
               markNavigating(true);
               try {
                 const cacheKey = getCacheKey(url);
                 let payload = navigationCache.get(cacheKey);
+                if (!payload && navigationPromises.has(cacheKey)) {
+                  // A hover/viewport prefetch for this exact URL is already in
+                  // flight. Reuse it instead of racing a duplicate request —
+                  // otherwise every hover-then-click runs the page's @server
+                  // loader twice. The settled prefetch leaves its payload in
+                  // navigationCache; on prefetch failure we fall through to a
+                  // normal (abortable) fetch below.
+                  await navigationPromises.get(cacheKey).catch(() => {});
+                  if (navToken !== navigationSequence) {
+                    // A newer navigation started while we waited — let it win.
+                    return false;
+                  }
+                  payload = navigationCache.get(cacheKey);
+                }
                 if (!payload) {
                   payload = await requestNavigationPayload(url, { useController: true });
                 }
@@ -1653,8 +1673,11 @@ def _render_client_entry(settings: DevServerSettings) -> str:
                 return;
               }
               // Skip API routes and static files — only prefetch page routes.
+              // (The dot is written [.], not backslash-escaped: this JS lives
+              // in a non-raw Python string, where a backslash escape here is
+              // a SyntaxWarning on every compile and an error in future Python.)
               const p = url.pathname;
-              if (p.startsWith('/api/') || /\.[a-zA-Z0-9]+$/.test(p)) {
+              if (p.startsWith('/api/') || /[.][a-zA-Z0-9]+$/.test(p)) {
                 return;
               }
               prefetchNavigation(url).catch(() => {});
@@ -2692,6 +2715,24 @@ def _render_use_action_component() -> str:
             import { useState, useCallback, useRef } from 'react';
             import { invalidate } from './index.js';
 
+            // Cookie / header names honour ``csrf.cookieName`` and
+            // ``csrf.headerName`` from pyxle.config.json. The document
+            // shell injects non-default names as window globals; absent
+            // globals mean the framework defaults are in effect.
+            function csrfCookieName() {
+              if (typeof globalThis !== 'undefined' && typeof globalThis.__PYXLE_CSRF_COOKIE__ === 'string' && globalThis.__PYXLE_CSRF_COOKIE__) {
+                return globalThis.__PYXLE_CSRF_COOKIE__;
+              }
+              return 'pyxle-csrf';
+            }
+
+            function csrfHeaderName() {
+              if (typeof globalThis !== 'undefined' && typeof globalThis.__PYXLE_CSRF_HEADER__ === 'string' && globalThis.__PYXLE_CSRF_HEADER__) {
+                return globalThis.__PYXLE_CSRF_HEADER__;
+              }
+              return 'x-csrf-token';
+            }
+
             // Resolve the active CSRF token. Three sources, in order:
             //   1. ``document.cookie`` — the live value on the client.
             //   2. ``globalThis.__PYXLE_CSRF_TOKEN__`` — set by the SSR
@@ -2700,8 +2741,14 @@ def _render_use_action_component() -> str:
             //   3. ``""`` — CSRF disabled or token unknown.
             function getCsrfToken() {
               if (typeof document !== 'undefined') {
-                const match = document.cookie.match(/(?:^|;\\s*)pyxle-csrf=([^;]*)/);
-                if (match) return decodeURIComponent(match[1]);
+                const cookieName = csrfCookieName();
+                for (const part of document.cookie.split(';')) {
+                  const eq = part.indexOf('=');
+                  if (eq === -1) continue;
+                  if (part.slice(0, eq).trim() === cookieName) {
+                    return decodeURIComponent(part.slice(eq + 1));
+                  }
+                }
               }
               if (typeof globalThis !== 'undefined' && typeof globalThis.__PYXLE_CSRF_TOKEN__ === 'string') {
                 return globalThis.__PYXLE_CSRF_TOKEN__;
@@ -2773,7 +2820,7 @@ def _render_use_action_component() -> str:
                     const url = resolveActionUrl(actionName, pagePath);
                     const csrfToken = getCsrfToken();
                     const headers = { 'Content-Type': 'application/json' };
-                    if (csrfToken) headers['x-csrf-token'] = csrfToken;
+                    if (csrfToken) headers[csrfHeaderName()] = csrfToken;
                     const response = await fetch(url, {
                       method: 'POST',
                       headers,
@@ -2834,6 +2881,24 @@ def _render_form_component() -> str:
             import React, { useRef, useState, useCallback } from 'react';
             import { invalidate } from './index.js';
 
+            // Cookie / header names honour ``csrf.cookieName`` and
+            // ``csrf.headerName`` from pyxle.config.json. The document
+            // shell injects non-default names as window globals; absent
+            // globals mean the framework defaults are in effect.
+            function csrfCookieName() {
+              if (typeof globalThis !== 'undefined' && typeof globalThis.__PYXLE_CSRF_COOKIE__ === 'string' && globalThis.__PYXLE_CSRF_COOKIE__) {
+                return globalThis.__PYXLE_CSRF_COOKIE__;
+              }
+              return 'pyxle-csrf';
+            }
+
+            function csrfHeaderName() {
+              if (typeof globalThis !== 'undefined' && typeof globalThis.__PYXLE_CSRF_HEADER__ === 'string' && globalThis.__PYXLE_CSRF_HEADER__) {
+                return globalThis.__PYXLE_CSRF_HEADER__;
+              }
+              return 'x-csrf-token';
+            }
+
             // Resolve the active CSRF token. Three sources, in order:
             //   1. ``document.cookie`` — the live value on the client.
             //   2. ``globalThis.__PYXLE_CSRF_TOKEN__`` — set by the SSR
@@ -2843,8 +2908,14 @@ def _render_form_component() -> str:
             //   3. ``""`` — CSRF disabled or token unknown.
             function getCsrfToken() {
               if (typeof document !== 'undefined') {
-                const match = document.cookie.match(/(?:^|;\\s*)pyxle-csrf=([^;]*)/);
-                if (match) return decodeURIComponent(match[1]);
+                const cookieName = csrfCookieName();
+                for (const part of document.cookie.split(';')) {
+                  const eq = part.indexOf('=');
+                  if (eq === -1) continue;
+                  if (part.slice(0, eq).trim() === cookieName) {
+                    return decodeURIComponent(part.slice(eq + 1));
+                  }
+                }
               }
               if (typeof globalThis !== 'undefined' && typeof globalThis.__PYXLE_CSRF_TOKEN__ === 'string') {
                 return globalThis.__PYXLE_CSRF_TOKEN__;
@@ -2923,7 +2994,7 @@ def _render_form_component() -> str:
                   try {
                     const csrfToken = getCsrfToken();
                     const headers = { 'Content-Type': 'application/json' };
-                    if (csrfToken) headers['x-csrf-token'] = csrfToken;
+                    if (csrfToken) headers[csrfHeaderName()] = csrfToken;
                     const response = await fetch(actionUrl, {
                       method: 'POST',
                       headers,

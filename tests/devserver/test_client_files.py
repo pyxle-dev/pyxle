@@ -376,6 +376,42 @@ def test_client_entry_dispatches_route_change_event(tmp_path: Path) -> None:
     assert entry.count("pyxle:routechange") >= 2
 
 
+def test_client_entry_navigation_reuses_inflight_prefetch(tmp_path: Path) -> None:
+    """A hover/viewport prefetch and the click that follows it must share ONE
+    network request.
+
+    ``navigateTo()`` has to consult the in-flight ``navigationPromises`` map
+    (not just the settled ``navigationCache``) before issuing its own fetch.
+    Otherwise every hover-then-click that lands inside the prefetch's flight
+    time fetches the page payload twice — visible as duplicate rows in the
+    network tab, and dangerous because the page's ``@server`` loader (which
+    may have side effects) runs twice per navigation.
+
+    Awaiting the shared prefetch is not abortable the way the
+    controller-owned fetch is, so the navigation also carries a monotonic
+    sequence token and bails out when a newer navigation supersedes it
+    mid-wait — a rapid second click must win, not render a stale page.
+    """
+    settings = create_project(tmp_path)
+    entry = _render_client_entry(settings)
+
+    nav_to = entry.split("async function navigateTo", 1)[1].split(
+        "async function refreshCurrentPage", 1
+    )[0]
+
+    # Consult the in-flight prefetch BEFORE falling back to a fresh fetch.
+    assert "navigationPromises.has(cacheKey)" in nav_to
+    assert "await navigationPromises.get(cacheKey).catch(() => {});" in nav_to
+    assert nav_to.index("navigationPromises.has(cacheKey)") < nav_to.index(
+        "requestNavigationPayload(url, { useController: true })"
+    )
+
+    # Supersede guard: a newer navigation invalidates the waiting one.
+    assert "let navigationSequence = 0;" in entry
+    assert "const navToken = ++navigationSequence;" in nav_to
+    assert "navToken !== navigationSequence" in nav_to
+
+
 def test_use_pathname_component_is_ssr_safe() -> None:
     """The generated usePathname hook must guard window access for SSR."""
     source = _render_use_pathname_component()
@@ -493,6 +529,36 @@ def test_resolve_action_url_reads_ssr_pathname_global() -> None:
         # The window-branch still comes first — we only hit the SSR branch
         # when there's no window (true SSR path).
         assert "typeof window !== 'undefined'" in source
+
+
+def test_csrf_runtime_honours_configured_names() -> None:
+    """useAction and Form must resolve the CSRF cookie/header names from the
+    document-shell globals (``csrf.cookieName`` / ``csrf.headerName`` in
+    pyxle.config.json) instead of hardwiring the defaults.
+
+    Regression: the runtime used to match a literal ``pyxle-csrf`` cookie and
+    always send ``x-csrf-token``, so any app with a custom cookie name had
+    every action POST rejected with 403 — "CSRF token missing" in a clean
+    browser, or "CSRF token mismatch" when a stale default-named cookie from
+    another localhost app was still around (cookies ignore ports).
+    """
+    from pyxle.devserver.client_files import (
+        _render_form_component,
+        _render_use_action_component,
+    )
+
+    for source in (_render_use_action_component(), _render_form_component()):
+        # Configured names come from the document-shell globals…
+        assert "globalThis.__PYXLE_CSRF_COOKIE__" in source
+        assert "globalThis.__PYXLE_CSRF_HEADER__" in source
+        # …with the framework defaults as fallback.
+        assert "return 'pyxle-csrf';" in source
+        assert "return 'x-csrf-token';" in source
+        # The fetch header key is resolved, never hardwired.
+        assert "headers[csrfHeaderName()] = csrfToken" in source
+        assert "headers['x-csrf-token']" not in source
+        # No hardcoded cookie-name lookup remains.
+        assert "pyxle-csrf=" not in source
 
 
 def test_script_component_is_real_runtime_not_stub() -> None:

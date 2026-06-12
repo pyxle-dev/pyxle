@@ -132,6 +132,109 @@ def test_render_document_omits_nav_stale_when_unconfigured(
     assert "__PYXLE_NAV_STALE_MS__" not in html
 
 
+def test_render_document_embeds_custom_csrf_names(
+    page_route: PageRoute, tmp_path: Path
+) -> None:
+    """Custom ``csrf.cookieName`` / ``csrf.headerName`` must reach the client.
+
+    The client runtime reads the CSRF cookie and sends the CSRF header by
+    name; without these globals a custom-configured app gets every action
+    POST rejected with 403 (the middleware uses the configured names while
+    the client keeps the defaults).
+    """
+    from pyxle.config import CsrfConfig
+
+    settings = DevServerSettings.from_project_root(
+        tmp_path,
+        csrf=CsrfConfig(cookie_name="cloud-csrf", header_name="x-cloud-csrf"),
+    )
+
+    html = render_document(
+        settings=settings,
+        page=page_route,
+        body_html="<p>Hi</p>",
+        props={},
+        script_nonce="n",
+        head_elements=page_route.head_elements,
+    )
+
+    assert 'window.__PYXLE_CSRF_COOKIE__ = "cloud-csrf";' in html
+    assert 'window.__PYXLE_CSRF_HEADER__ = "x-cloud-csrf";' in html
+    # The bootstrap script must carry the CSP nonce like every other script.
+    assert '<script nonce="n">window.__PYXLE_CSRF_COOKIE__' in html
+
+
+def test_render_document_embeds_custom_csrf_names_in_production(
+    page_route: PageRoute, tmp_path: Path
+) -> None:
+    """The manifest-backed production shell carries the globals too."""
+    from pyxle.config import CsrfConfig
+
+    settings = DevServerSettings.from_project_root(
+        tmp_path,
+        debug=False,
+        csrf=CsrfConfig(cookie_name="cloud-csrf", header_name="x-cloud-csrf"),
+        page_manifest={"/": {"client": {"file": "assets/index.js", "css": []}}},
+    )
+
+    html = render_document(
+        settings=settings,
+        page=page_route,
+        body_html="<div>Prod</div>",
+        props={},
+        script_nonce="secure",
+        head_elements=page_route.head_elements,
+    )
+
+    assert "/client/assets/index.js" in html
+    assert 'window.__PYXLE_CSRF_COOKIE__ = "cloud-csrf";' in html
+    assert 'window.__PYXLE_CSRF_HEADER__ = "x-cloud-csrf";' in html
+
+
+def test_render_document_embeds_only_non_default_csrf_names(
+    page_route: PageRoute, tmp_path: Path
+) -> None:
+    """A custom cookie name with the default header emits one global only."""
+    from pyxle.config import CsrfConfig
+
+    settings = DevServerSettings.from_project_root(
+        tmp_path, csrf=CsrfConfig(cookie_name="cloud-csrf")
+    )
+
+    html = render_document(
+        settings=settings,
+        page=page_route,
+        body_html="<p>Hi</p>",
+        props={},
+        script_nonce="n",
+        head_elements=page_route.head_elements,
+    )
+
+    assert 'window.__PYXLE_CSRF_COOKIE__ = "cloud-csrf";' in html
+    assert "__PYXLE_CSRF_HEADER__" not in html
+
+
+def test_render_document_omits_csrf_names_for_defaults(
+    page_route: PageRoute, tmp_path: Path
+) -> None:
+    """Default names (or no CSRF config at all) embed nothing — the client
+    falls back to ``pyxle-csrf`` / ``x-csrf-token`` on its own."""
+    from pyxle.config import CsrfConfig
+
+    for csrf in (None, CsrfConfig(), CsrfConfig(header_name="X-CSRF-Token")):
+        settings = DevServerSettings.from_project_root(tmp_path, csrf=csrf)
+        html = render_document(
+            settings=settings,
+            page=page_route,
+            body_html="<p>Hi</p>",
+            props={},
+            script_nonce="n",
+            head_elements=page_route.head_elements,
+        )
+        assert "__PYXLE_CSRF_COOKIE__" not in html
+        assert "__PYXLE_CSRF_HEADER__" not in html
+
+
 def test_render_document_inlines_global_styles(page_route: PageRoute, tmp_path: Path) -> None:
     style_path = tmp_path / "styles" / "base.css"
     style_path.parent.mkdir(parents=True, exist_ok=True)

@@ -99,6 +99,9 @@ def build_document_shell(
   # (``navigation.defaultPrefetchTtl``), expose it to the client as
   # ``__PYXLE_NAV_STALE_MS__`` (ms). Absent → the client's 2-minute default.
   nav_stale_script = _render_nav_stale_script(settings, nonce_attr)
+  # When the app customises ``csrf.cookieName`` / ``csrf.headerName``, expose
+  # the names to the client runtime. Absent → the framework defaults.
+  csrf_names_script = _render_csrf_names_script(settings, nonce_attr)
 
   if not settings.debug and settings.page_manifest is not None:
     manifest_entry = settings.page_manifest.get(page.path)
@@ -140,7 +143,7 @@ def build_document_shell(
   </div>
   <script id=\"__PYXLE_PROPS__\" type=\"application/json\"{nonce_attr}>{props_payload}</script>
   <script id=\"__PYXLE_NAV_SEED__\" type=\"application/json\"{nonce_attr}>{nav_seed_payload}</script>
-  <script{nonce_attr}>window.__PYXLE_PAGE_PATH__ = {page_path_literal};</script>{nav_stale_script}
+  <script{nonce_attr}>window.__PYXLE_PAGE_PATH__ = {page_path_literal};</script>{nav_stale_script}{csrf_names_script}
   <script{nonce_attr}>window.__PYXLE_SCRIPTS__ = {scripts_metadata};</script>
   <script type=\"module\" src=\"{js_src}\"></script>
   </body>
@@ -152,6 +155,7 @@ def build_document_shell(
       page_path_literal=page_path_literal,
       scripts_metadata=scripts_metadata,
       nav_stale_script=nav_stale_script,
+      csrf_names_script=csrf_names_script,
       js_src=js_src,
     )
     return DocumentShell(prefix=prefix, suffix=suffix)
@@ -182,7 +186,7 @@ def build_document_shell(
   </div>
   <script id=\"__PYXLE_PROPS__\" type=\"application/json\"{nonce_attr}>{props_payload}</script>
   <script id=\"__PYXLE_NAV_SEED__\" type=\"application/json\"{nonce_attr}>{nav_seed_payload}</script>
-  <script{nonce_attr}>window.__PYXLE_PAGE_PATH__ = {page_path_literal};</script>{nav_stale_script}
+  <script{nonce_attr}>window.__PYXLE_PAGE_PATH__ = {page_path_literal};</script>{nav_stale_script}{csrf_names_script}
   <script{nonce_attr}>window.__PYXLE_SCRIPTS__ = {scripts_metadata};</script>
   <script type=\"module\" src=\"{vite_origin}/client-entry.js\"></script>
   </body>
@@ -194,6 +198,7 @@ def build_document_shell(
     page_path_literal=page_path_literal,
     scripts_metadata=scripts_metadata,
     nav_stale_script=nav_stale_script,
+    csrf_names_script=csrf_names_script,
     vite_origin=vite_origin,
   )
   return DocumentShell(prefix=prefix, suffix=suffix)
@@ -212,6 +217,49 @@ def _render_nav_stale_script(settings: DevServerSettings, nonce_attr: str) -> st
     if ttl_seconds is None:
         return ""
     return f"\n  <script{nonce_attr}>window.__PYXLE_NAV_STALE_MS__ = {int(ttl_seconds) * 1000};</script>"
+
+
+# Framework defaults baked into the generated client runtime
+# (``pyxle/devserver/client_files.py``). Names matching these need no
+# bootstrap script — the client falls back to them on its own.
+_CSRF_DEFAULT_COOKIE_NAME = "pyxle-csrf"
+_CSRF_DEFAULT_HEADER_NAME = "x-csrf-token"
+
+
+def _render_csrf_names_script(settings: DevServerSettings, nonce_attr: str) -> str:
+    """Render the ``__PYXLE_CSRF_COOKIE__`` / ``__PYXLE_CSRF_HEADER__``
+    bootstrap script, or ``""``.
+
+    The client runtime (``useAction`` / ``Form``) resolves the CSRF cookie
+    and header names from these globals, falling back to the framework
+    defaults. Without this script a customised ``csrf.cookieName`` /
+    ``csrf.headerName`` never reaches the browser: the middleware sets the
+    cookie under the configured name while the client keeps looking for
+    ``pyxle-csrf``, so every action POST is rejected with 403. Only
+    non-default names are emitted, keeping default-config pages unchanged.
+    """
+    csrf = getattr(settings, "csrf", None)
+    assignments: list[str] = []
+    cookie_name = getattr(csrf, "cookie_name", None)
+    if isinstance(cookie_name, str) and cookie_name and cookie_name != _CSRF_DEFAULT_COOKIE_NAME:
+        assignments.append(f"window.__PYXLE_CSRF_COOKIE__ = {_serialize_js_string(cookie_name)};")
+    header_name = getattr(csrf, "header_name", None)
+    if (
+        isinstance(header_name, str)
+        and header_name
+        and header_name.lower() != _CSRF_DEFAULT_HEADER_NAME
+    ):
+        assignments.append(f"window.__PYXLE_CSRF_HEADER__ = {_serialize_js_string(header_name)};")
+    if not assignments:
+        return ""
+    return f"\n  <script{nonce_attr}>{' '.join(assignments)}</script>"
+
+
+def _serialize_js_string(value: str) -> str:
+    """Serialize a string as a JS literal safe for an inline ``<script>``."""
+    from pyxle.ssr._escape import escape_inline_json
+
+    return escape_inline_json(json.dumps(value, ensure_ascii=False))
 
 
 def _serialize_props(props: dict[str, Any]) -> str:
