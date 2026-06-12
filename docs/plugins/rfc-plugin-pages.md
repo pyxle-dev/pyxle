@@ -42,10 +42,23 @@ Plugins shipping real `.pyxl` pages — sign-in screens, admin panels. The hard 
 4. **Layouts & theming.** Plugin pages render inside the host's root layout by default (they should look like *your* app, not the plugin author's). Styling contract — tokens/CSS variables vs. utility classes — is an open question; this is where founding-author input matters most.
 5. **Security.** A plugin page runs the plugin's loaders/actions in your process; B2 doesn't change the trust model (installing a plugin always meant running its code at startup), but route-owning plugins make the audit surface more visible. The directory's review bar (see [standards](standards.md)) tightens for page-shipping plugins.
 
+## Capability contracts (the bigger principle)
+
+Routes and pages are the *how*; this is the *why*. [`pyxle-db`](pyxle-db.md) didn't just ship a database — it shipped `DatabaseLike`, a protocol [pyxle-auth](pyxle-auth.md) and any other plugin build against, so the concrete database is swappable. That pattern is the ecosystem's real differentiator, and the intent is to generalise it: framework-defined (or thin-contract-package) interfaces for the capabilities the [ideas list](ideas.md) keeps circling —
+
+```
+mail.send(...)        # MailLike  — Postmark, SES, Mailgun, SMTP
+storage.put(...)      # StorageLike — S3, R2, GCS, local
+cache.get(...)        # CacheLike  — in-memory, Redis
+```
+
+— so an app writes `mail.send(...)` and swaps the provider **by config, not code**. Pyxle ships the interface; the community ships the adapters. The directory then organises by *capability* with one recommended provider and alternatives behind it, instead of by package name. This is design intent, not a shipped API; the contracts land alongside the plugins that need them, and `DatabaseLike` is the template for all of them.
+
 ## Sequencing
 
 - **B1** is targeted for an upcoming minor; it's mostly registry plumbing plus the CSRF-posture mechanism.
 - **B2** lands after the founding cohort's feedback and a bundling prototype — a wrong API here would be very expensive to walk back, and we'd rather be slow than stuck.
+- **Capability contracts** are incremental — each interface ships with its first real consumer, the way `DatabaseLike` already did.
 
 ## Open questions (comment on these)
 
