@@ -78,11 +78,18 @@ class ArtifactWriter:
 
         # Convert script/image declarations from dicts to dataclass instances
         def to_bool(value):
-            """Convert attribute value to boolean, handling both string and bool types."""
+            """Coerce an extracted JSX attribute value to a boolean.
+
+            Babel hands us real booleans for ``defer`` / ``defer={true}`` and
+            strings for quoted forms (``defer="false"``). A bare/expression
+            ``true`` is True; an explicit falsy string (``"false"``, ``"0"``,
+            ``"no"``, ``"off"``, ``""``) is False; any other present value is
+            True (HTML-attribute-presence semantics).
+            """
             if isinstance(value, bool):
                 return value
             if isinstance(value, str):
-                return value.lower() in ("true", value.lower())  # "async" == "async" is True
+                return value.strip().lower() not in ("", "false", "0", "no", "off")
             return False
 
         scripts = tuple(

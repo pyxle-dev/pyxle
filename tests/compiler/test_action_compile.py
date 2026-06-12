@@ -156,8 +156,67 @@ def test_writer_to_bool_handles_string_attributes(tmp_path: Path) -> None:
     assert len(result.metadata.scripts) == 1
     assert result.metadata.scripts[0].async_ is True
     assert result.metadata.scripts[0].defer is True
+    # QUAL-TOBOOL-1: explicit falsy strings must coerce to False (the old
+    # `in ("true", value.lower())` check returned True for every non-empty
+    # string, so these silently flipped to True).
+    assert result.metadata.scripts[0].module is False
+    assert result.metadata.scripts[0].no_module is False
     assert len(result.metadata.images) == 1
     assert result.metadata.images[0].priority is True
+    assert result.metadata.images[0].lazy is False
+
+
+def test_writer_to_bool_falsy_string_forms(tmp_path: Path) -> None:
+    """QUAL-TOBOOL-1: ``defer="false"``, ``async="no"``, ``noModule="off"``,
+    ``priority="0"`` etc. must all coerce to False, while a bare-presence
+    string keeps HTML truthy semantics."""
+    source = tmp_path / "pages" / "falsy.pyxl"
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        "export default function P() { return <div />; }\n", encoding="utf-8"
+    )
+
+    parse_result = PyxParseResult(
+        python_code="",
+        jsx_code="export default function P() { return <div />; }\n",
+        loader=None,
+        python_line_numbers=(),
+        jsx_line_numbers=(1,),
+        head_elements=(),
+        head_is_dynamic=False,
+        script_declarations=(
+            {
+                "src": "https://example.com/a.js",
+                "async": "no",
+                "defer": "false",
+                "module": "0",
+                "noModule": "off",
+            },
+            {"src": "https://example.com/b.js", "defer": "defer"},  # bare presence
+        ),
+        image_declarations=(
+            {"src": "/x.png", "priority": "0", "lazy": "false"},
+        ),
+    )
+
+    writer = _make_writer(tmp_path)
+    result = writer.write(
+        source_path=source,
+        page_relative_path=Path("falsy.pyxl"),
+        route_path="/falsy",
+        alternate_route_paths=None,
+        parse_result=parse_result,
+    )
+
+    first = result.metadata.scripts[0]
+    assert first.async_ is False
+    assert first.defer is False
+    assert first.module is False
+    assert first.no_module is False
+    # A non-falsy string (HTML attribute presence) is still True.
+    assert result.metadata.scripts[1].defer is True
+    assert result.metadata.images[0].priority is False
+    assert result.metadata.images[0].lazy is False
 
 
 def test_writer_multiple_actions_in_metadata_json(tmp_path: Path) -> None:
