@@ -49,6 +49,8 @@ class TestTokenHelpers:
 def _build_app(
     *,
     secret: str = "test-secret",
+    cookie_name: str = "pyxle-csrf",
+    header_name: str = "x-csrf-token",
     exempt_paths: tuple[str, ...] = (),
 ) -> Starlette:
     async def get_handler(request: Request) -> PlainTextResponse:
@@ -62,11 +64,15 @@ def _build_app(
             Route("/page", get_handler, methods=["GET"]),
             Route("/action", post_handler, methods=["POST"]),
             Route("/webhook", post_handler, methods=["POST"]),
+            Route("/webhook/sub", post_handler, methods=["POST"]),
+            Route("/webhook-admin", post_handler, methods=["POST"]),
         ],
         middleware=[
             Middleware(
                 CsrfMiddleware,
                 secret=secret,
+                cookie_name=cookie_name,
+                header_name=header_name,
                 exempt_paths=exempt_paths,
             ),
         ],
@@ -141,6 +147,25 @@ class TestCsrfMiddleware:
         response = client.post("/action")
         assert response.status_code == 403
 
+    def test_exempt_is_segment_boundary_not_substring(self):
+        """SEC-CSRF-EXEMPT-PREFIX-1: an exempt entry must not exempt an
+        adjacently-named sibling (``/webhook`` must NOT exempt
+        ``/webhook-admin``)."""
+        client = TestClient(_build_app(exempt_paths=("/webhook",)))
+        response = client.post("/webhook-admin")
+        assert response.status_code == 403
+
+    def test_exempt_covers_subpaths_at_boundary(self):
+        """An exempt prefix still covers paths beneath it at a ``/`` boundary."""
+        client = TestClient(_build_app(exempt_paths=("/webhook",)))
+        assert client.post("/webhook/sub").status_code == 200
+
+    def test_exempt_trailing_slash_entry_matches_exact(self):
+        """A trailing-slash exempt entry still matches the exact base path."""
+        client = TestClient(_build_app(exempt_paths=("/webhook/",)))
+        assert client.post("/webhook").status_code == 200
+        assert client.post("/webhook/sub").status_code == 200
+
     def test_cookie_has_samesite_and_no_httponly(self):
         client = TestClient(_build_app())
         response = client.get("/page")
@@ -154,6 +179,105 @@ class TestCsrfMiddleware:
         client = TestClient(_build_app())
         assert client.get("/page").status_code == 200
         assert client.head("/page").status_code == 200
+
+
+class TestCustomCookieAndHeaderNames:
+    """Round-trip coverage for ``csrf.cookieName`` / ``csrf.headerName``.
+
+    The middleware must set and validate the cookie under the configured
+    name and accept the token via the configured header — and nothing
+    must still answer to the defaults when custom names are configured
+    (the client runtime resolves the same names from the document-shell
+    globals, so a drift here is exactly the silent 403 trap that hit
+    pyxle-cloud).
+    """
+
+    def test_get_sets_cookie_under_configured_name(self):
+        client = TestClient(
+            _build_app(cookie_name="cloud-csrf", header_name="x-cloud-csrf")
+        )
+        response = client.get("/page")
+        assert response.status_code == 200
+        assert "cloud-csrf" in response.cookies
+        assert "pyxle-csrf" not in response.cookies
+
+    def test_round_trip_with_custom_names_succeeds(self):
+        client = TestClient(
+            _build_app(cookie_name="cloud-csrf", header_name="x-cloud-csrf")
+        )
+        token = client.get("/page").cookies["cloud-csrf"]
+
+        response = client.post("/action", headers={"x-cloud-csrf": token})
+        assert response.status_code == 200
+        assert response.json()["ok"] is True
+
+    def test_default_header_rejected_when_custom_configured(self):
+        client = TestClient(
+            _build_app(cookie_name="cloud-csrf", header_name="x-cloud-csrf")
+        )
+        token = client.get("/page").cookies["cloud-csrf"]
+
+        # A client still sending the default header name never satisfies a
+        # middleware configured with a custom one.
+        response = client.post("/action", headers={"x-csrf-token": token})
+        assert response.status_code == 403
+        assert response.json()["error"] == "CSRF token missing"
+
+    def test_stale_default_cookie_is_ignored(self):
+        """A leftover ``pyxle-csrf`` cookie from another localhost app must
+        not be consulted — only the configured cookie name counts."""
+        client = TestClient(_build_app(cookie_name="cloud-csrf"))
+        token = client.get("/page").cookies["cloud-csrf"]
+        client.cookies.set("pyxle-csrf", "stale-token-from-another-app")
+
+        # Echoing the stale default-named cookie's value fails…
+        response = client.post(
+            "/action", headers={"x-csrf-token": "stale-token-from-another-app"}
+        )
+        assert response.status_code == 403
+
+        # …while the configured cookie's token still round-trips.
+        response = client.post("/action", headers={"x-csrf-token": token})
+        assert response.status_code == 200
+
+
+class TestExemptPathNormalization:
+    """Defence-in-depth: a non-canonical request path (``..`` / ``//``) must
+    not dodge the canonical exemption decision. Tested against ``_is_exempt``
+    directly because TestClient/httpx canonicalises the path before it reaches
+    the middleware."""
+
+    @staticmethod
+    def _mw(exempt: tuple[str, ...]) -> CsrfMiddleware:
+        async def downstream(scope, receive, send):  # pragma: no cover
+            return None
+
+        return CsrfMiddleware(downstream, secret="s", exempt_paths=exempt)
+
+    def test_canonical_path_resolves_dotdot_and_double_slash(self):
+        from pyxle.devserver.csrf import _canonical_path
+
+        assert _canonical_path("/api/webhooks/../action") == "/api/action"
+        assert _canonical_path("/api/webhooks//run") == "/api/webhooks/run"
+        assert _canonical_path("//api/x") == "/api/x"
+        assert _canonical_path("") == "/"
+
+    def test_dotdot_cannot_dodge_into_exemption(self):
+        mw = self._mw(("/api/webhooks",))
+        # Resolves to /api/webhooks-admin (a sibling) — must NOT be exempt.
+        assert mw._is_exempt("/api/webhooks/../webhooks-admin") is False
+        assert mw._is_exempt("/api/webhooks-admin") is False
+
+    def test_double_slash_under_prefix_still_exempt(self):
+        mw = self._mw(("/api/webhooks",))
+        assert mw._is_exempt("/api/webhooks//run") is True
+        assert mw._is_exempt("/api/webhooks") is True
+        assert mw._is_exempt("/api/webhooks/run") is True
+
+    def test_root_exempt_entry_is_ignored(self):
+        # An exempt entry of "/" must not silently disable CSRF site-wide.
+        mw = self._mw(("/",))
+        assert mw._is_exempt("/anything") is False
 
 
 # ---------------------------------------------------------------------------
@@ -221,6 +345,38 @@ class TestProgressiveEnhancement:
         response = client.post("/action", data={"name": "x"})
         assert response.status_code == 403
         assert response.json()["error"] == "CSRF token missing"
+
+    def test_oversize_form_body_returns_413_not_truncated(self, monkeypatch):
+        """QUAL-CSRF-BODY-TRUNC-1: a no-header form POST whose body exceeds the
+        buffer cap is rejected with 413 rather than silently replaying a
+        truncated body to the inner app."""
+        from pyxle.devserver import csrf as csrf_mod
+
+        monkeypatch.setattr(csrf_mod, "_MAX_BUFFERED_BODY_BYTES", 16)
+        client = TestClient(_build_app())
+        client.get("/page")  # mint a cookie
+        big = "name=" + ("A" * 200)
+        response = client.post(
+            "/action",
+            content=big.encode(),
+            headers={"content-type": "application/x-www-form-urlencoded"},
+        )
+        assert response.status_code == 413
+
+    def test_header_token_path_unaffected_by_body_cap(self, monkeypatch):
+        """A header-token (fetch / useAction) caller never drains the body, so
+        a large payload above the form-path cap still succeeds."""
+        from pyxle.devserver import csrf as csrf_mod
+
+        monkeypatch.setattr(csrf_mod, "_MAX_BUFFERED_BODY_BYTES", 16)
+        client = TestClient(_build_app())
+        token = client.get("/page").cookies["pyxle-csrf"]
+        response = client.post(
+            "/action",
+            content=b'{"name":"' + b"A" * 200 + b'"}',
+            headers={"content-type": "application/json", "x-csrf-token": token},
+        )
+        assert response.status_code == 200
 
     def test_inner_app_can_still_read_body_after_csrf_check(self):
         """The middleware drains the body to validate the form-field
@@ -422,8 +578,9 @@ class TestBodyBuffering:
         async def receive():
             return next(frames)
 
-        result = asyncio.run(_drain_body(receive))
-        assert result == b"hello world"
+        body, truncated = asyncio.run(_drain_body(receive))
+        assert body == b"hello world"
+        assert truncated is False
 
     def test_drain_body_caps_oversize_payload(self):
         import asyncio
@@ -445,10 +602,11 @@ class TestBodyBuffering:
             async def receive():
                 return next(frames)
 
-            result = asyncio.run(csrf._drain_body(receive))
+            body, truncated = asyncio.run(csrf._drain_body(receive))
             # First 5 bytes + first 3 of the second chunk = cap of 8.
             # Remaining frames are drained but their bytes are dropped.
-            assert result == b"AAAAABBB"
+            assert body == b"AAAAABBB"
+            assert truncated is True
         finally:
             csrf._MAX_BUFFERED_BODY_BYTES = original
 
@@ -460,8 +618,9 @@ class TestBodyBuffering:
         async def receive():
             return {"type": "http.disconnect"}
 
-        result = asyncio.run(_drain_body(receive))
-        assert result == b""
+        body, truncated = asyncio.run(_drain_body(receive))
+        assert body == b""
+        assert truncated is False
 
     def test_replay_receive_yields_body_then_blocks(self):
         """First call to the replay receive returns the buffered body.
@@ -511,8 +670,9 @@ class TestBodyBuffering:
             async def receive():
                 return next(frames)
 
-            result = asyncio.run(csrf._drain_body(receive))
-            assert result == b"AAAA"
+            body, truncated = asyncio.run(csrf._drain_body(receive))
+            assert body == b"AAAA"
+            assert truncated is True
         finally:
             csrf._MAX_BUFFERED_BODY_BYTES = original
 
@@ -533,8 +693,9 @@ class TestBodyBuffering:
         async def receive():
             return next(frames)
 
-        result = asyncio.run(_drain_body(receive))
-        assert result == b"final"
+        body, truncated = asyncio.run(_drain_body(receive))
+        assert body == b"final"
+        assert truncated is False
 
     def test_drain_body_terminates_after_cap_when_more_body_false(self):
         """When the cap is hit on a frame where ``more_body`` is False,
@@ -556,10 +717,11 @@ class TestBodyBuffering:
             async def receive():
                 return next(frames)
 
-            result = asyncio.run(csrf._drain_body(receive))
+            body, truncated = asyncio.run(csrf._drain_body(receive))
             # First chunk fills the cap; second chunk's bytes are dropped
             # but its more_body=False signals the stream ended cleanly.
-            assert result == b"AAAA"
+            assert body == b"AAAA"
+            assert truncated is True
         finally:
             csrf._MAX_BUFFERED_BODY_BYTES = original
 

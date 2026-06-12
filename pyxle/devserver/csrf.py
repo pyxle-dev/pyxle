@@ -20,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import logging
+import posixpath
 import secrets
 from email.parser import BytesParser
 from email.policy import default as _email_default_policy
@@ -121,7 +122,25 @@ class CsrfMiddleware:
                     or "multipart/form-data" in content_type
                 )
                 if is_form_body:
-                    body_bytes = await _drain_body(receive)
+                    body_bytes, truncated = await _drain_body(receive)
+                    if truncated:
+                        # The body exceeded the buffer cap, so we can neither
+                        # trust the CSRF field nor safely replay the payload
+                        # (replaying a truncated body silently corrupts the
+                        # submission). Fail loud: large no-JS submissions must
+                        # carry the token in the X-CSRF-Token header instead.
+                        response = JSONResponse(
+                            {
+                                "ok": False,
+                                "error": (
+                                    "Request body too large for form CSRF validation; "
+                                    "send the CSRF token via the X-CSRF-Token header."
+                                ),
+                            },
+                            status_code=413,
+                        )
+                        await response(scope, receive, send)
+                        return
                     submitted_token = _extract_csrf_form_field(
                         body_bytes,
                         content_type=content_type,
@@ -192,7 +211,46 @@ class CsrfMiddleware:
         await self.app(scope, downstream_receive, send_with_cookie)
 
     def _is_exempt(self, path: str) -> bool:
-        return any(path.startswith(prefix) for prefix in self._exempt_paths)
+        """Return ``True`` when ``path`` is CSRF-exempt.
+
+        Matches on path-segment boundaries, not arbitrary string prefixes: an
+        exempt entry ``/api/webhooks`` covers ``/api/webhooks`` and
+        ``/api/webhooks/<anything>`` but NOT an adjacently-named sibling such
+        as ``/api/webhooks-admin`` (which a bare ``startswith`` would wrongly
+        exempt, silently widening the CSRF hole).
+
+        The request path is canonicalised first (``..``/``.`` resolved,
+        repeated slashes collapsed) so a non-canonical path like
+        ``/api/webhooks/../action`` cannot dodge the canonical exemption
+        decision; the check fails closed (CSRF enforced) on the resolved path.
+        """
+        norm_path = _canonical_path(path)
+        for prefix in self._exempt_paths:
+            base = _canonical_path(prefix).rstrip("/")
+            if not base:
+                # An exempt entry of "/" (or empty) would exempt everything;
+                # ignore it rather than silently disabling CSRF site-wide.
+                continue
+            if norm_path == base or norm_path.startswith(base + "/"):
+                return True
+        return False
+
+
+def _canonical_path(path: str) -> str:
+    """Canonicalise a URL path for exemption matching.
+
+    Resolves ``.``/``..`` segments and collapses repeated slashes via
+    ``posixpath.normpath``, always returning an absolute path. ``normpath``
+    preserves a leading ``//`` (a POSIX quirk), so that is collapsed too.
+    """
+    if not path:
+        return "/"
+    normalized = posixpath.normpath(path)
+    while normalized.startswith("//"):
+        normalized = normalized[1:]
+    if not normalized.startswith("/"):
+        normalized = "/" + normalized
+    return normalized
 
 
 def _is_public_cacheable(headers: list[tuple[bytes, bytes]]) -> bool:
@@ -268,17 +326,19 @@ def _tokens_match(cookie_token: str, submitted_token: str, secret: str) -> bool:
     return True
 
 
-async def _drain_body(receive: Receive) -> bytes:
-    """Buffer the entire ASGI request body, stopping at the size cap.
+async def _drain_body(receive: Receive) -> tuple[bytes, bool]:
+    """Buffer the ASGI request body, stopping at the size cap.
 
-    Returns the raw bytes (possibly empty). Bodies above
-    :data:`_MAX_BUFFERED_BODY_BYTES` are truncated to that cap — at that
-    point the caller is expected to send the CSRF token via the header
-    instead of the form field, so we never hold a giant upload in memory
-    just to hunt for ``_csrf_token``.
+    Returns ``(body, truncated)`` where ``truncated`` is ``True`` if the body
+    exceeded :data:`_MAX_BUFFERED_BODY_BYTES` and bytes were dropped. The
+    caller must not replay a truncated body to the inner app (it would be
+    silently corrupted); instead it rejects the request with ``413`` and asks
+    for the CSRF token via the header, so we never hold a giant upload in
+    memory just to hunt for ``_csrf_token``.
     """
     chunks: list[bytes] = []
     total = 0
+    truncated = False
     while True:
         message = await receive()
         if message["type"] != "http.request":
@@ -287,19 +347,22 @@ async def _drain_body(receive: Receive) -> bytes:
         if chunk:
             remaining = _MAX_BUFFERED_BODY_BYTES - total
             if remaining <= 0:
-                # Drain remaining frames so receive() doesn't block downstream.
+                # Over the cap already — record loss and drain remaining
+                # frames so receive() doesn't block downstream.
+                truncated = True
                 if not message.get("more_body"):
                     break
                 continue
             if len(chunk) > remaining:
                 chunks.append(chunk[:remaining])
                 total = _MAX_BUFFERED_BODY_BYTES
+                truncated = True
             else:
                 chunks.append(chunk)
                 total += len(chunk)
         if not message.get("more_body"):
             break
-    return b"".join(chunks)
+    return b"".join(chunks), truncated
 
 
 def _replay_receive(body: bytes) -> Receive:
