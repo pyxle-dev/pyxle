@@ -301,7 +301,7 @@ def dev(
     ssr_workers: Optional[int] = typer.Option(
         None,
         "--ssr-workers",
-        help="Number of persistent Node.js SSR worker processes (0 = legacy subprocess mode, default: 1).",
+        help="Number of persistent Node.js SSR worker processes (0 = per-request subprocess mode, default: 1).",
         show_default=False,
         min=0,
     ),
@@ -575,7 +575,8 @@ def serve(
     ssr_workers: Optional[int] = typer.Option(
         None,
         "--ssr-workers",
-        help="Number of persistent Node.js SSR worker processes (0 = legacy subprocess mode, default: 1).",
+        help="Number of persistent Node.js SSR worker processes per server worker "
+        "(0 = auto-size to CPU cores, capped at 4; default: 1).",
         show_default=False,
         min=0,
     ),

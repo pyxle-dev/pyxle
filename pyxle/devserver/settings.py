@@ -35,7 +35,9 @@ class DevServerSettings:
     custom_middlewares: tuple[str, ...] = ()
     page_route_hooks: tuple[str, ...] = ()
     api_route_hooks: tuple[str, ...] = ()
-    # Number of persistent Node.js SSR worker processes (0 = legacy subprocess mode)
+    # Number of persistent Node.js SSR worker processes. 0 means per-request
+    # subprocess rendering in the dev server, but auto-sizes the pool in
+    # production serve (pyxle.build.production._resolve_pool_size).
     ssr_workers: int = 1
     # Optional: loaded page manifest for production asset resolution
     page_manifest: dict[str, Any] | None = None
