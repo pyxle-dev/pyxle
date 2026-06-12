@@ -137,7 +137,7 @@ The client receives:
 
 ## Invalidating client caches after a mutation
 
-Pyxle's client router caches loader payloads for 30 seconds by default so back/forward navigation is instant. A mutation that changes data the user might navigate back to should invalidate the stale route so the next visit refetches:
+Pyxle's client router caches loader payloads (for 2 minutes by default, or the route's configured `cache` TTL) so back/forward navigation is instant. A mutation that changes data the user might navigate back to should invalidate the stale route so the next visit refetches:
 
 ```python
 from pyxle.runtime import invalidate_routes

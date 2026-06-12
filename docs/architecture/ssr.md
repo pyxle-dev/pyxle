@@ -214,25 +214,39 @@ Source: `ssr/head_merger.py:123-280`.
 ### Sanitization
 
 Every element passes through `sanitize_head_element()`
-(`head_merger.py:197`), which:
+(`head_merger.py:327`), which parses the element and rebuilds it
+through a strict allowlist:
 
-1. **Escapes `<` and `>` inside `<title>...</title>`.** The HTML spec
+1. **Enforces a tag allowlist.** Only `<title>`, `<meta>`, `<link>`,
+   `<script>`, and `<style>` may appear in the head; anything else
+   (`<base>`, `<iframe>`, `<object>`, ...) is dropped entirely.
+2. **HTML-escapes every attribute value.** Elements are rebuilt from
+   their parsed attributes with values escaped, so a quote inside
+   interpolated data can't break out of its attribute and inject
+   markup. Trailing markup injected after a breakout is discarded.
+3. **Escapes `<` and `>` inside `<title>...</title>`.** The HTML spec
    says title content shouldn't contain raw HTML, but if a user
    ships dynamic title content from a loader, an attacker could try
    to inject a closing `</title>` tag and break out of the title
-   element. Pyxle escapes both characters defensively.
-2. **Strips event handler attributes.** Any attribute starting with
+   element. Pyxle escapes both characters defensively and discards
+   anything after the closing `</title>`.
+4. **Strips event handler attributes.** Any attribute starting with
    `on` (`onclick`, `onerror`, `onload`, etc.) is removed. Head
    elements don't run JavaScript, so these are pure XSS vectors.
-3. **Neutralizes `javascript:` and `vbscript:` URLs in `href`,
-   `src`, and `action` attributes.** A `<link rel="stylesheet"
-   href="javascript:alert(1)">` would actually execute that script
-   in some browsers; Pyxle replaces the URL with `about:blank`.
+5. **Neutralizes `javascript:`, `vbscript:`, and `data:` URLs in
+   `href`, `src`, and `action` attributes.** A `<link
+   rel="stylesheet" href="javascript:alert(1)">` would actually
+   execute that script in some browsers; Pyxle replaces the URL with
+   an empty string.
+6. **Rejects `<meta http-equiv="refresh">`** — a data-controlled
+   refresh target is an open-redirect vector.
 
-The sanitization is **always on** — there's no opt-out, even for
-trusted content. If you have a legitimate need for inline script in
-the head, use a `<Script>` component (which has its own validation
-path), not a raw `<script>` element.
+Void tags (`<meta>`, `<link>`) are re-serialized self-closing
+(`<meta ... />`), so output markup may differ cosmetically from the
+input. The sanitization is **always on** — there's no opt-out.
+Inline `<script>`/`<style>` content is the one deliberate
+pass-through: it is treated as trusted author code and preserved
+verbatim, so it must never contain interpolated user data.
 
 ---
 

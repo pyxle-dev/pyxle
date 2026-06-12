@@ -50,6 +50,8 @@ Route hooks run before and after specific route handlers. Configure them per rou
 }
 ```
 
+> **Note:** Route hooks wrap function endpoints (`endpoint` in `pages/api/`) and page handlers. [`HTTPEndpoint` classes](api-routes.md#using-httpendpoint-classes) are dispatched natively by Starlette and bypass route hooks — as do WebSocket handlers — so auth or rate-limiting for class-based endpoints must live in the endpoint methods themselves or in application-level middleware.
+
 ### Writing a route hook (function style)
 
 ```python
@@ -126,7 +128,7 @@ From outermost to innermost:
 3. CSRF middleware (if enabled)
 4. Vite proxy (dev mode)
 5. Static file serving
-6. Route hooks (from `routeMiddleware` config)
+6. Route hooks (from `routeMiddleware` config) — skipped for `HTTPEndpoint` classes and WebSocket handlers, which Starlette dispatches natively
 7. Page/API handler
 
 ## Next steps

@@ -9,11 +9,13 @@ CSRF (Cross-Site Request Forgery) protection is **enabled by default** using a d
 ### How it works
 
 1. Pyxle sets a `pyxle-csrf` cookie on every response
-2. State-changing requests (`POST`, `PUT`, `PATCH`, `DELETE`) must include the cookie value in the `x-csrf-token` header
-3. The framework validates that the header matches the cookie using constant-time comparison
+2. State-changing requests (`POST`, `PUT`, `PATCH`, `DELETE`) must echo the cookie value back, either in the `x-csrf-token` header or — for form-encoded submissions, such as a `<Form>` post before hydration — in a hidden `_csrf_token` form field
+3. The framework validates that the submitted token matches the cookie using constant-time comparison
 4. If they do not match, a `403 Forbidden` response is returned
 
 The `<Form>` component and `useAction` hook handle this automatically.
+
+Pyxle buffers at most 1 MB of a form-encoded body to find `_csrf_token`. A larger `application/x-www-form-urlencoded` or `multipart/form-data` body that doesn't carry the header token is rejected with `413` — for large uploads, send the token via the `x-csrf-token` header instead.
 
 ### Configuration
 
@@ -37,7 +39,7 @@ The `<Form>` component and `useAction` hook handle this automatically.
 | `headerName` | `string` | `"x-csrf-token"` | Header name |
 | `cookieSecure` | `boolean` | `false` | Set `Secure` flag (enable in production with HTTPS) |
 | `cookieSameSite` | `string` | `"lax"` | `SameSite` attribute (`"strict"`, `"lax"`, or `"none"`) |
-| `exemptPaths` | `string[]` | `[]` | Path prefixes exempt from CSRF checks |
+| `exemptPaths` | `string[]` | `[]` | Paths exempt from CSRF checks; an entry matches its exact path and anything beneath it at a `/` boundary (`/api/webhooks` does not exempt `/api/webhooks-admin`) — see [matching details](../reference/configuration.md#csrf) |
 
 ### Disabling CSRF
 
@@ -77,6 +79,8 @@ await fetch('/api/data', {
 });
 ```
 
+If you've customised `csrf.cookieName` or `csrf.headerName`, use your configured names instead — Pyxle also injects non-default names into every page as `window.__PYXLE_CSRF_COOKIE__` and `window.__PYXLE_CSRF_HEADER__`, so custom code can read those globals (falling back to `pyxle-csrf` / `x-csrf-token`) rather than hardcoding.
+
 ## CORS configuration
 
 Configure Cross-Origin Resource Sharing for API access from other domains:
@@ -107,9 +111,14 @@ CORS is **disabled by default** (no `origins` configured). It is only active whe
 
 Dynamic head content (whether from a `<Head>` JSX block or the lower-level `HEAD` variable) is automatically sanitised to prevent XSS:
 
-- **Title text escaping**: `<` and `>` inside `<title>` elements are escaped to `&lt;` and `&gt;`
+- **Tag allowlist**: only `<title>`, `<meta>`, `<link>`, `<script>`, and `<style>` may appear; any other tag (`<base>`, `<iframe>`, `<object>`, …) is dropped
+- **Attribute escaping**: elements are parsed and rebuilt with every attribute value HTML-escaped, so a quote in dynamic data cannot break out of its attribute and inject markup
+- **Title text escaping**: `<` and `>` inside `<title>` elements are escaped to `&lt;` and `&gt;`, and markup injected after a closing `</title>` is discarded
 - **Event handler stripping**: `onclick`, `onerror`, `onload`, and all `on*` attributes are removed
-- **Dangerous URL removal**: `javascript:` and `vbscript:` protocol URLs in `href`, `src`, and `action` attributes are stripped
+- **Dangerous URL neutralisation**: `javascript:`, `vbscript:`, and `data:` URLs in `href`, `src`, and `action` attributes are emptied
+- **Meta refresh rejected**: `<meta http-equiv="refresh">` is dropped as an open-redirect vector
+
+The text content of inline `<script>`/`<style>` head elements is trusted author code and is **not** sanitised. Never interpolate user-supplied data into inline script or style content.
 
 This sanitisation is applied to all head elements from every source — layout `<Head>` blocks, page `<Head>` blocks, and the legacy `HEAD` Python variable.
 

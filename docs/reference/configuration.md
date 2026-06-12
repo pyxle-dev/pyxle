@@ -175,7 +175,9 @@ Route-level hooks applied to specific route types.
 | `csrf.headerName` | `string` | `"x-csrf-token"` | CSRF header name |
 | `csrf.cookieSecure` | `boolean` | `false` | Set `Secure` flag on cookie |
 | `csrf.cookieSameSite` | `string` | `"lax"` | `SameSite` attribute (`"strict"`, `"lax"`, `"none"`) |
-| `csrf.exemptPaths` | `string[]` | `[]` | Path prefixes exempt from CSRF checks |
+| `csrf.exemptPaths` | `string[]` | `[]` | Paths exempt from CSRF checks (matched on segment boundaries) |
+
+**Exemption matching.** An entry matches its exact path and anything beneath it at a `/` segment boundary: `/api/webhooks` exempts `/api/webhooks` and `/api/webhooks/stripe`, but not `/api/webhooks-admin`. Request paths are normalised first (`.`/`..` resolved, repeated slashes collapsed), so `/api/webhooks/../other` is checked as `/api/other`. An entry of `/` (or an empty string) is ignored rather than disabling CSRF site-wide — use `"csrf": false` to disable CSRF entirely.
 
 Shorthand to disable: `"csrf": false`
 

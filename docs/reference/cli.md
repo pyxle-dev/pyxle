@@ -71,7 +71,7 @@ pyxle dev [directory] [options]
 | `--vite-host` | `127.0.0.1` | Vite dev server bind address |
 | `--vite-port` | `5173` | Vite dev server port |
 | `--debug` / `--no-debug` | `true` | Enable debug mode |
-| `--ssr-workers` | `1` | Number of persistent SSR worker processes (0 = subprocess mode) |
+| `--ssr-workers` | `1` | Number of persistent SSR worker processes (`0` = per-request subprocess mode) |
 | `--config` | -- | Path to `pyxle.config.json` |
 | `--print-config` / `--no-print-config` | `false` | Print merged configuration before starting |
 | `--tailwind` / `--no-tailwind` | `true` | Auto-start Tailwind CSS watcher |
@@ -133,7 +133,7 @@ pyxle serve [directory] [options]
 | `--skip-build` / `--no-skip-build` | `false` | Skip running build first |
 | `--config` | -- | Path to `pyxle.config.json` |
 | `--serve-static` / `--no-serve-static` | `true` | Serve static assets directly from Pyxle |
-| `--ssr-workers` | `1` | Number of persistent SSR worker processes (per server worker) |
+| `--ssr-workers` | `1` | Number of persistent SSR worker processes, per server worker (`0` = auto-size to CPU cores, capped at 4) |
 | `--workers` / `-w` | `1` | Number of server worker processes (one per CPU core); `>1` enables multi-core serving |
 
 **Examples:**
@@ -142,13 +142,14 @@ pyxle serve [directory] [options]
 pyxle serve
 pyxle serve --host 0.0.0.0 --port 8000 --skip-build
 pyxle serve --ssr-workers 4
-pyxle serve --workers 16   # use all 16 cores (one server process each)
+pyxle serve --workers $(nproc)   # one server process per CPU core
 ```
 
 With `--workers N` (N > 1), Pyxle serves the build across `N` uvicorn worker
 processes. Each is an independent server with its own SSR pool, so `--ssr-workers`
 applies per worker (total render processes = `workers × ssr-workers`). See the
-[deployment guide](../guides/deployment.md) for tuning guidance.
+[deployment guide](../guides/deployment.md#multi-core-worker-processes) for
+sizing guidance.
 
 ## `pyxle check`
 

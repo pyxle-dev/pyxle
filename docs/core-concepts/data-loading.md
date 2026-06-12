@@ -135,7 +135,7 @@ per request -- connection setup usually costs more than the query itself.
 
 For API routes there is a second option: a plain `def endpoint(request)` is
 dispatched through Starlette's threadpool automatically. See
-[Sync endpoints and blocking calls](../guides/api-routes.md).
+[Sync endpoints and blocking calls](../guides/api-routes.md#sync-endpoints-and-blocking-calls).
 
 ## Pages without loaders
 

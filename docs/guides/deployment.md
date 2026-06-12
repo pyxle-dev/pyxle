@@ -34,16 +34,22 @@ This starts a production Starlette server without Vite (static assets are served
 pyxle serve --host 0.0.0.0 --port 8000
 ```
 
+In production mode (`debug=false`) the server also compresses responses larger
+than 500 bytes with gzip automatically — no reverse-proxy configuration needed
+for that.
+
 ### Serve options
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--host` | `127.0.0.1` | Bind address |
 | `--port` | `8000` | Port number |
+| `--workers` / `-w` | `1` | Server worker processes — one per CPU core ([multi-core](#multi-core-worker-processes)) |
+| `--ssr-workers` | `1` | Persistent Node.js SSR processes, **per server worker** (`0` = auto-size to CPU cores, capped at 4) |
 | `--dist-dir` | `dist/` | Directory with production artifacts |
 | `--skip-build` | `false` | Skip running build first |
-| `--serve-static/--no-serve-static` | `true` | Serve static assets directly |
-| `--ssr-workers` | `1` | Number of persistent SSR worker processes |
+| `--serve-static/--no-serve-static` | `true` | Serve static assets directly (disable when a CDN hosts them) |
+| `--config` | `pyxle.config.json` | Path to an alternate config file |
 
 ### Build + serve in one step
 
@@ -54,6 +60,51 @@ By default, `pyxle serve` runs `pyxle build` first. Skip this with `--skip-build
 pyxle build
 pyxle serve --skip-build
 ```
+
+## Multi-core (worker processes)
+
+By default `pyxle serve` runs a **single** async server process, which uses one
+CPU core. To use every core on a multi-core server, run one server worker
+process per core with `--workers` (requires Pyxle 0.4.3+):
+
+```bash
+pyxle serve --workers $(nproc)
+```
+
+Each worker is an independent server process with its own SSR worker pool, all
+sharing one listening socket — incoming connections are balanced across them
+with no load balancer and no shared state to configure. Throughput on
+CPU-bound endpoints scales near-linearly with the worker count.
+
+`pyxle serve` builds the project once before the workers start, so the build is
+never duplicated. Combine `--workers` with `--skip-build` only when `dist/`
+already exists. Workers reconstruct their configuration from `PYXLE_SERVE_*`
+environment variables exported by the parent process — these are internal;
+don't set them yourself.
+
+### SSR workers
+
+Server-side rendering runs in persistent Node.js processes that stay warm
+between requests:
+
+```bash
+pyxle serve --ssr-workers 2
+```
+
+`--ssr-workers` applies **per server worker**, so the total number of Node.js
+render processes is `workers × ssr-workers`. For an SSR-heavy app,
+`--workers $(nproc) --ssr-workers 1` is a good starting point — scale
+`--ssr-workers` up only if profiling shows render queueing. Passing `0`
+auto-sizes the pool to the machine's CPU count (capped at 4) per server worker.
+
+### Sizing guidance
+
+| Workload | Suggestion |
+|----------|------------|
+| API-heavy, little SSR | `--workers $(nproc)` |
+| SSR-heavy pages | `--workers $(nproc) --ssr-workers 1`, raise SSR workers if renders queue |
+| Small VPS (1–2 cores) | Defaults (`--workers 1`) are fine |
+| Memory-constrained | Each worker is a full process — reduce `--workers` before reducing `--ssr-workers` |
 
 ## Environment configuration
 
@@ -74,6 +125,19 @@ PYXLE_PORT=8000
 PYXLE_DEBUG=false
 PYXLE_PUBLIC_API_URL=https://api.production.com
 ```
+
+| Variable | Overrides |
+|----------|-----------|
+| `PYXLE_HOST` | Bind address |
+| `PYXLE_PORT` | Port number |
+| `PYXLE_DEBUG` | Debug mode (`true`/`1` or `false`/`0`) |
+| `PYXLE_PAGES_DIR` | Pages directory |
+| `PYXLE_PUBLIC_DIR` | Static assets directory |
+| `PYXLE_BUILD_DIR` | Build output directory |
+
+CLI flags win over environment variables, which win over `pyxle.config.json`.
+Variables prefixed `PYXLE_PUBLIC_` are exposed to client code — never put
+secrets in them.
 
 ## Reverse proxy setup
 
@@ -193,6 +257,11 @@ EXPOSE 8000
 CMD ["pyxle", "serve", "--host", "0.0.0.0", "--skip-build"]
 ```
 
+Match `--workers` to the container's CPU allocation — e.g.
+`CMD ["pyxle", "serve", "--host", "0.0.0.0", "--skip-build", "--workers", "4"]`
+for a 4-vCPU container. If you scale by running more single-worker containers
+behind a load balancer instead, keep the default.
+
 ## Health checks
 
 The scaffold includes a health endpoint at `/api/pulse`:
@@ -204,35 +273,32 @@ curl http://localhost:8000/api/pulse
 
 Use this for load balancer health checks and monitoring.
 
-## SSR workers
+## Process management (systemd)
 
-For production SSR performance, configure persistent Node.js workers:
+On a VM, run `pyxle serve` under a process supervisor so it restarts on
+failure and starts on boot:
 
-```bash
-pyxle serve --ssr-workers 4
+```ini
+# /etc/systemd/system/myapp.service
+[Unit]
+Description=My Pyxle app
+After=network.target
+
+[Service]
+User=app
+WorkingDirectory=/srv/myapp
+Environment=PYXLE_DEBUG=false
+ExecStart=/srv/myapp/.venv/bin/pyxle serve --skip-build --workers 4 \
+    --host 127.0.0.1 --port 8000
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
 ```
 
-Workers stay running between requests, avoiding subprocess startup overhead. Set to `0` for subprocess-per-request mode (simpler but slower).
-
-## Multi-core (worker processes)
-
-By default `pyxle serve` runs a **single** async server process, which uses one
-CPU core. To use every core on a multi-core server, run one server worker
-process per core with `--workers`:
-
-```bash
-pyxle serve --workers $(nproc)
-```
-
-Each worker is an independent server process with its own SSR worker pool, and
-the operating system load-balances incoming connections across them — no reverse
-proxy required. `--ssr-workers` then applies **per worker**, so the total number
-of Node.js render processes is `workers × ssr-workers`. For an SSR-heavy app,
-`--workers $(nproc) --ssr-workers 1` is a good starting point.
-
-`pyxle serve` builds the project once before the workers start, so the build is
-never duplicated. Combine `--workers` with `--skip-build` only when `dist/`
-already exists.
+Build during deployment (`pyxle build`), then `systemctl restart myapp` —
+with `--skip-build` the restart is fast because the unit only boots the
+server. Node.js must be on the service's `PATH` for SSR.
 
 ## Checklist
 
@@ -241,9 +307,11 @@ Before deploying:
 - [ ] `pyxle check` passes with no errors
 - [ ] `pyxle build` completes successfully
 - [ ] Set `PYXLE_DEBUG=false` in production
+- [ ] Size `--workers` to the machine's CPU cores (multi-core serving)
 - [ ] Configure CSRF `cookieSecure: true` if using HTTPS
 - [ ] Add CORS origins if serving APIs to other domains
 - [ ] Set up a reverse proxy for TLS
+- [ ] Declare publicly-cacheable routes in the `cache` block (and opt your CDN in)
 - [ ] Configure health check monitoring on `/api/pulse`
 - [ ] Add `.env.local` to `.gitignore`
 

@@ -160,6 +160,20 @@ Client-side navigation link that prevents full page reloads.
 
 Imported from `pyxle/client`. Renders an `<a>` tag that intercepts clicks for client-side navigation.
 
+**Props:**
+
+| Prop | Type | Default | Description |
+|------|------|---------|-------------|
+| `href` | `string` | -- | Target path (required) |
+| `prefetch` | `boolean` | `true` | Prefetch the target page's data and module before the click |
+| `replace` | `boolean` | `false` | Replace the current history entry instead of pushing |
+
+**Behaviour:**
+- With `prefetch` enabled (the default), the target page's data (its `@server` loader) and component module are prefetched when the link scrolls into view (within 200px) or is hovered — before any click
+- A subsequent click reuses the prefetched or in-flight result instead of refetching, so the loader runs once per hover-then-click
+- Pass `prefetch={false}` for pages whose loaders are expensive or have side effects
+- Prefetched payloads obey the [navigation cache TTL](#navigation-cache-ttl) below
+
 ---
 
 ## Hooks
@@ -300,18 +314,28 @@ async function handleDelete(id) {
 
 ### Navigation cache TTL
 
-Client-side loader payloads are cached per URL for 30 seconds by default so back/forward navigation is instant while data stays reasonably fresh. Tune the cap by setting a global on the window before Pyxle's client runtime boots (e.g. in a `<Script strategy="beforeInteractive">` block):
+Client-side loader payloads are cached per URL so back/forward navigation is instant while data stays reasonably fresh. A route listed in the `cache` block of `pyxle.config.json` reuses its edge-cache TTL as its navigation-cache lifetime; all other routes default to **2 minutes**. Tune the default with [`navigation.defaultPrefetchTtl`](configuration.md#navigation) (seconds) in `pyxle.config.json`:
+
+```json
+{
+  "navigation": {
+    "defaultPrefetchTtl": 60
+  }
+}
+```
+
+Useful values:
+
+- `0` — disable caching for routes without a `cache` entry; every navigation hits the server.
+- `120` (default) — keep prefetched and seeded payloads fresh for 2 minutes.
+- a large number — cache for the lifetime of the tab.
+
+As a runtime escape hatch, the default can also be overridden by setting a global (in milliseconds) before Pyxle's client runtime boots (e.g. in a `<Script strategy="beforeInteractive">` block) — note it does not affect routes with a `cache` entry:
 
 ```jsx
 <Script strategy="beforeInteractive">
   {`window.__PYXLE_NAV_STALE_MS__ = 60000;`}  {/* 60s */}
 </Script>
 ```
-
-Useful values:
-
-- `0` — never cache; every navigation hits the server.
-- `30000` (default) — matches Next.js App Router's heuristic.
-- a large number — cache for the lifetime of the tab.
 
 For per-mutation control, prefer [`invalidate(url)`](#invalidateurl) or the `x-pyxle-invalidate` response header over global TTL tuning.

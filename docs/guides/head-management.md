@@ -62,7 +62,7 @@ The `<Head>` component:
 - **Renders nothing in the DOM** (it returns `null`).
 - During SSR, Pyxle extracts its children at compile time and registers them as head elements for the response.
 - **Works in any component**, including nested ones. A reusable component can inject its own head metadata.
-- **Supports common head elements**: `<title>`, `<meta>`, `<link>`, `<script>`. (`<base>` is intentionally rejected — a stray `<base href>` can rewrite every relative URL on the page, so the head sanitizer strips it as an XSS/redirection vector.)
+- **Supports head elements**: `<title>`, `<meta>`, `<link>`, `<script>`, `<style>`. Anything outside this allowlist is dropped by the head sanitiser — notably `<base>`, which is rejected because a stray `<base href>` can rewrite every relative URL on the page (an XSS/redirection vector).
 - **Normalises multi-part `<title>` children** since 0.3.0. `<title>{name} — My Blog</title>` compiles to multiple children — `[name, " — My Blog"]` — which React warns about. `<Head>` joins string and number children into a single text node so the warning is silenced and the rendered HTML is unchanged. You don't need template literals or `{ \`${name} — My Blog\` }` workarounds.
 
 ### Multiple `<Head>` blocks in one tree
@@ -176,11 +176,16 @@ Unless one of these applies, reach for `<Head>`.
 
 ### XSS safety
 
-Both `<Head>` children and `HEAD` strings are automatically sanitised:
+Both `<Head>` children and `HEAD` strings are parsed and rebuilt through a sanitising allowlist before they reach the document:
 
-- Angle brackets (`<`, `>`) inside `<title>` text are escaped
+- Only `<title>`, `<meta>`, `<link>`, `<script>`, and `<style>` are permitted in the head — anything else (`<base>`, `<iframe>`, …) is dropped
+- Every attribute value is HTML-escaped, so a quote inside interpolated data cannot break out of its attribute — building `<meta>`/`<link>`/`<title>` values from loader data (as in the `HEAD` callable above) is safe
+- Angle brackets (`<`, `>`) inside `<title>` text are escaped, and any markup injected after a closing `</title>` is discarded
 - Event handler attributes (`onclick`, `onerror`, etc.) are stripped
-- `javascript:` and `vbscript:` URLs in `href`/`src` attributes are removed
+- `javascript:`, `vbscript:`, and `data:` URLs in `href`/`src`/`action` attributes are neutralised
+- `<meta http-equiv="refresh">` is rejected
+
+One deliberate exception: the text content of inline `<script>` and `<style>` elements is treated as trusted author code and preserved verbatim — never interpolate user-supplied data into inline script or style content. Note that `<meta>` and `<link>` elements are re-serialised self-closing (`<meta … />`), so the output markup may differ cosmetically from the input string.
 
 This protects against XSS when interpolating user-provided data into head elements. You should still escape user input as a best practice.
 
