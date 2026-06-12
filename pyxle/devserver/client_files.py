@@ -1551,6 +1551,25 @@ def _render_client_entry(settings: DevServerSettings) -> str:
               }
             }
 
+            // Cross-page hash navigation: the anchor target only exists once
+            // the NEXT page's DOM commits, which can trail renderPage by a
+            // frame. Poll on animation frames (bounded) so /guide#section
+            // scrolls like a native load; an unknown anchor leaves the page
+            // at the top, matching browser behaviour for full loads.
+            function scrollToHashWhenReady(hash, attempt = 0) {
+              let id = hash.startsWith('#') ? hash.slice(1) : hash;
+              try { id = decodeURIComponent(id); } catch (error) {}
+              if (!id) return;
+              const el = document.getElementById(id) || document.getElementsByName(id)[0];
+              if (el) {
+                el.scrollIntoView({ block: 'start' });
+                return;
+              }
+              if (attempt < 30) {
+                requestAnimationFrame(() => scrollToHashWhenReady(hash, attempt + 1));
+              }
+            }
+
             async function navigateTo(target, options = {}) {
               const url = normalizeUrl(target);
               if (!url) {
@@ -1605,6 +1624,9 @@ def _render_client_entry(settings: DevServerSettings) -> str:
 
                 if (options.scroll !== 'preserve') {
                   window.scrollTo(0, 0);
+                  if (url.hash) {
+                    scrollToHashWhenReady(url.hash);
+                  }
                 }
 
                 return true;

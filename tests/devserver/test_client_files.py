@@ -653,3 +653,21 @@ def test_write_client_bootstrap_files_generates_use_pathname(tmp_path: Path) -> 
 
     types = (settings.client_build_dir / "pyxle" / "use-pathname.d.ts").read_text(encoding="utf-8")
     assert "usePathname" in types
+
+
+def test_navigation_scrolls_to_hash_after_cross_page_commit(tmp_path: Path) -> None:
+    """Navigating to /page#anchor must scroll to the anchor once the next
+    page's DOM commits — previously only same-page hash links scrolled and
+    cross-page navigations were pinned to the top."""
+    settings = create_project(tmp_path)
+    entry = _render_client_entry(settings)
+
+    # The bounded animation-frame poller exists…
+    assert "function scrollToHashWhenReady" in entry
+    assert "requestAnimationFrame(() => scrollToHashWhenReady" in entry
+    # …and the navigation commit invokes it for hash URLs, after the
+    # native-like jump to top, respecting scroll: 'preserve'.
+    assert "if (url.hash) {" in entry
+    assert "scrollToHashWhenReady(url.hash);" in entry
+    commit = entry.index("window.scrollTo(0, 0);")
+    assert entry.index("scrollToHashWhenReady(url.hash);", commit) > commit
