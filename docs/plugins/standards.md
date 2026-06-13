@@ -6,9 +6,9 @@ The bar a plugin must clear to be listed in the [pyxle.dev plugin directory](/pl
 
 ## Naming
 
-- The bare `pyxle-<name>` namespace is **reserved for official plugins**. The canonical names from the [ideas list](ideas.md) (`pyxle-mail`, `pyxle-storage`, …) are registered on PyPI as openly-documented placeholders — see any of them on PyPI for the policy text.
+- The bare `pyxle-<name>` namespace is the **official** namespace. We don't pre-register or squat names — an official plugin is published when it actually ships, with real code behind it. The namespace is protected by PyPI's [name-dispute process (PEP 541)](https://peps.python.org/pep-0541/): if someone uploads a confusing or malicious `pyxle-*` package, we dispute it on brand grounds, not by parking empty packages ahead of time.
 - Community plugins ship under **your own PyPI name** — `acme-mail`, `mailpyx`, anything honest. The directory lists you under the name you chose; the name has no bearing on review.
-- A Founding Plugin that meets the bar **may be granted the canonical `pyxle-<name>`**, at the team's discretion — the reservation exists so the obvious name goes to the plugin that cleared the standards, not to whoever uploaded first.
+- A founding-cohort plugin that clears the bar **may be granted a canonical `pyxle-<name>`** at the team's discretion — fulfilled by publishing your (real, working) plugin under that name, not by us holding it empty for you.
 - Whatever you pick, don't imply officialness (`pyxle-core-*`, `pyxle-official-*` will be asked to rename).
 - One plugin, one job. "Auth plus storage plus cron" is three plugins.
 

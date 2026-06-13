@@ -4,7 +4,7 @@ Plugins the ecosystem needs, scoped to what the plugin API supports **today** �
 
 Sizes are honest estimates for a working, standards-meeting v0.1: **S** ≈ a weekend, **M** ≈ a week of evenings, **L** ≈ a real project.
 
-> **On the names:** the canonical `pyxle-<name>` titles below are [reserved on PyPI](standards.md) as documented placeholders. Build under **your own package name**; a plugin accepted into the Founding Program may be granted the canonical name along with the badge.
+> **On the names:** the `pyxle-<name>` titles below are shorthand for the *capability*, not packages to grab — `pyxle-*` is the [official namespace](standards.md). Build under **your own package name**; a founding-cohort plugin may later be granted the canonical name by publishing under it. We don't park empty placeholders to hold them.
 
 ## pyxle-mail — *the most wanted one* (M)
 
