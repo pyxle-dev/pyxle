@@ -76,7 +76,7 @@ packages = ["pyxle"]
 
 [tool.coverage.run]
 branch = true
-source = ["pyxle/cli", "pyxle/compiler", "pyxle/devserver", "pyxle/ssr"]
+source = ["pyxle/cli", "pyxle/compiler", "pyxle/devserver", "pyxle/ssr", "pyxle/security.py"]
 
 [tool.coverage.report]
 fail_under = 95
@@ -84,6 +84,6 @@ show_missing = true
 skip_covered = true
 
 [tool.pytest.ini_options]
-addopts = "--strict-markers --strict-config --cov=pyxle.cli --cov=pyxle.compiler --cov=pyxle.devserver --cov=pyxle.ssr --cov-report=term-missing"
+addopts = "--strict-markers --strict-config --cov=pyxle.cli --cov=pyxle.compiler --cov=pyxle.devserver --cov=pyxle.ssr --cov=pyxle.security --cov-report=term-missing"
 testpaths = ["tests"]
 pythonpath = ["."]

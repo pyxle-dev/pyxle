@@ -81,6 +81,35 @@ await fetch('/api/data', {
 
 If you've customised `csrf.cookieName` or `csrf.headerName`, use your configured names instead — Pyxle also injects non-default names into every page as `window.__PYXLE_CSRF_COOKIE__` and `window.__PYXLE_CSRF_HEADER__`, so custom code can read those globals (falling back to `pyxle-csrf` / `x-csrf-token`) rather than hardcoding.
 
+## Signed cookies and tokens
+
+`sign_cookie` and `verify_cookie` (importable from `pyxle`) attach a tamper-proof signature to a string and verify it later — the building block for a signed session id, a "remember me" cookie, or a stateless link such as an unsubscribe or password-reset URL. This is **signing, not encryption**: the value stays readable; a valid signature only proves it was produced by a holder of the secret.
+
+```python
+from pyxle import sign_cookie, verify_cookie
+
+token = sign_cookie("user-42")          # "user-42.<hmac>"  (signs with PYXLE_SECRET_KEY)
+verify_cookie(token)                    # "user-42"
+verify_cookie("user-42.deadbeef")       # None  (bad signature → reject)
+```
+
+The signature is a full HMAC-SHA256 digest, compared in constant time. The secret is read from the `PYXLE_SECRET_KEY` environment variable, or passed explicitly as `secret_key=`. Signing is meaningless without a secret, so a missing one raises `MissingSecretKeyError` rather than returning an unprotected value — it **fails closed**.
+
+Use `salt=` to namespace signatures by purpose, so a token signed for one flow can't be replayed in another even under the same secret:
+
+```python
+reset = sign_cookie(email, salt="password-reset")
+verify_cookie(reset, salt="login")      # None  (wrong salt → reject)
+```
+
+`verify_cookie` returns `None` on any signature or format failure. Because a validly-signed empty string is itself falsy, test the result with `is not None`, not truthiness:
+
+```python
+value = verify_cookie(token)
+if value is not None:
+    ...  # trust `value`
+```
+
 ## CORS configuration
 
 Configure Cross-Origin Resource Sharing for API access from other domains:
