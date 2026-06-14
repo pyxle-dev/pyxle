@@ -2,6 +2,12 @@
 
 Release notes for Pyxle. While we're in beta (`0.x`), minor versions may include breaking changes — those are called out explicitly here. To upgrade, run `pip install --upgrade pyxle-framework`.
 
+## 0.4.5
+
+- **Signed cookies & tokens — `sign_cookie` / `verify_cookie`.** New stdlib-only helpers (importable from `pyxle`) attach a tamper-proof HMAC-SHA256 signature to any string — a session id, a "remember me" token, a stateless unsubscribe or password-reset link — and verify it later in constant time. The secret comes from `PYXLE_SECRET_KEY` (or an explicit `secret_key=`), and a `salt=` namespaces signatures so a token minted for one purpose can't be replayed for another. Signing without a secret raises `MissingSecretKeyError` rather than returning an unprotected value — it fails closed. See [Security → Signed cookies and tokens](guides/security.md#signed-cookies-and-tokens).
+- **Fix: `PYXLE_PUBLIC_*` client env vars now work in `pyxle dev` and no longer break `pyxle build`.** The generated Vite `define` emitted each value as a bare expression, so a non-identifier value (an API URL, a `0x…` Turnstile key) was silently dropped in dev and crashed `vite build` with esbuild's "Invalid define value". Values are now emitted as quoted JS string literals, so `import.meta.env.PYXLE_PUBLIC_*` resolves correctly in both dev and production builds. See [Environment variables → Client-side variables](guides/environment-variables.md).
+- **Fix: web fonts and other CSS `url()` assets no longer 404 in `pyxle dev`.** Vite rewrites `@font-face`/`url(...)` references to root-relative `/@fs/…` paths, which the browser resolved against Pyxle's origin instead of Vite's and 404'd — so `@fontsource` `.woff2` files silently failed to load in development (production builds were unaffected, as their assets are hashed and served by Pyxle). Pyxle now sets Vite's `server.origin`, so dev assets load from Vite directly.
+
 ## 0.4.4
 
 - **Fix: cross-page hash links scroll to their anchor.** Client-side navigation to `/page#section` changed the page but stayed pinned to the top (only the URL carried the hash); a full load scrolled correctly. The router now jumps to the top and then scrolls to the anchor as soon as the next page's DOM commits, matching native behaviour — including for unknown anchors, which stay at the top.
