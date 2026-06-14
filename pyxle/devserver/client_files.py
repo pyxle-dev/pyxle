@@ -401,6 +401,22 @@ def _render_vite_config(settings: DevServerSettings) -> str:
             const pyxleClientDir = path.resolve(clientRoot, 'pyxle');
             const base = process.env.PYXLE_VITE_BASE ?? '/';
 
+            // Pyxle serves the HTML document from its own origin while the dev
+            // assets come from Vite. Vite rewrites CSS `url(...)` references
+            // (fonts, background images) to ROOT-RELATIVE paths like
+            // `/@fs/...woff2`, which the browser resolves against the document's
+            // origin (Pyxle) — not Vite — so they 404. Declaring Vite's public
+            // `server.origin` makes it emit ABSOLUTE asset URLs against its own
+            // origin instead. The bind host is normalised to a
+            // browser-connectable host the same way `ssr/template.py` does for
+            // the <script> origin, so assets and scripts always share one origin.
+            const viteHost = '{vite_host}';
+            const browserHost =
+              viteHost === '0.0.0.0' || viteHost === '::' || viteHost === ''
+                ? 'localhost'
+                : viteHost;
+            const vitePort = Number(process.env.PYXLE_VITE_PORT ?? {vite_port});
+
             export default defineConfig({{
               base,
               root: clientRoot,
@@ -415,9 +431,10 @@ def _render_vite_config(settings: DevServerSettings) -> str:
                 ],
               }},
               server: {{
-                host: '{vite_host}',
-                port: Number(process.env.PYXLE_VITE_PORT ?? {vite_port}),
+                host: viteHost,
+                port: vitePort,
                 strictPort: false,
+                origin: `http://${{browserHost}}:${{vitePort}}`,
                 fs: {{
                   allow: [projectRoot],
                 }},
@@ -461,7 +478,13 @@ def _build_public_env_defines() -> str:
         if not SAFE_IDENTIFIER_RE.match(key):
             _logger.warning("Skipping PYXLE_PUBLIC_ key with invalid name: %r", key)
             continue
-        entries.append(f"    'import.meta.env.{key}': {json.dumps(value)}")
+        # Vite/esbuild treat `define` VALUES as raw expressions, so a string
+        # constant must be emitted as a quoted JS string literal (JSON.stringify).
+        # A bare value is silently dropped in dev and crashes `vite build`
+        # ("Invalid define value") for any non-identifier value (URLs, 0x… keys).
+        entries.append(
+            f"    'import.meta.env.{key}': JSON.stringify({json.dumps(value)})"
+        )
 
     if not entries:
         return ""

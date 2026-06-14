@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 from pyxle.devserver.client_files import (
@@ -281,6 +282,44 @@ def test_vite_config_respects_base_environment(tmp_path: Path) -> None:
     assert "base," in vite_config
 
 
+def test_vite_config_sets_browser_origin_for_assets(tmp_path: Path) -> None:
+    """Vite must emit ABSOLUTE asset URLs against its own origin.
+
+    Regression: Pyxle serves the HTML document from its own origin, but Vite
+    rewrites CSS ``url(...)`` references (web fonts, background images) to
+    root-relative ``/@fs/...`` paths. Without ``server.origin`` those resolve
+    against Pyxle's origin and 404 — e.g. ``@fontsource`` ``.woff2`` files never
+    load in ``pyxle dev`` even though Vite serves them fine on its own port.
+    """
+
+    settings = create_project(tmp_path)
+    vite_config = _render_vite_config(settings)
+
+    # A single browser-connectable origin drives server.host/port AND origin.
+    assert "const viteHost = '127.0.0.1';" in vite_config
+    assert "const vitePort = Number(process.env.PYXLE_VITE_PORT ?? 5173);" in vite_config
+    assert "origin: `http://${browserHost}:${vitePort}`" in vite_config
+    assert "host: viteHost," in vite_config
+    assert "port: vitePort," in vite_config
+
+
+def test_vite_config_origin_normalises_wildcard_bind_host(tmp_path: Path) -> None:
+    """A wildcard bind host (0.0.0.0 / ::) is normalised to a connectable host.
+
+    Browsers cannot connect to ``0.0.0.0``/``::``, so the emitted asset origin
+    falls back to ``localhost`` — mirroring ``ssr/template.py``'s <script>
+    origin so scripts and assets always share one origin.
+    """
+
+    settings = replace(create_project(tmp_path), vite_host="0.0.0.0")
+    vite_config = _render_vite_config(settings)
+
+    assert "const viteHost = '0.0.0.0';" in vite_config
+    # browserHost falls back to localhost for wildcard binds.
+    assert "? 'localhost'" in vite_config
+    assert "origin: `http://${browserHost}:${vitePort}`" in vite_config
+
+
 def test_build_public_env_defines_empty(monkeypatch) -> None:
     """No PYXLE_PUBLIC_ vars means no define block."""
 
@@ -300,8 +339,27 @@ def test_build_public_env_defines_injects_vars(monkeypatch) -> None:
 
     result = _build_public_env_defines()
     assert "define:" in result
-    assert "'import.meta.env.PYXLE_PUBLIC_API_URL': \"https://api.example.com\"" in result
-    assert "'import.meta.env.PYXLE_PUBLIC_APP_NAME': \"MyApp\"" in result
+    assert (
+        "'import.meta.env.PYXLE_PUBLIC_API_URL': JSON.stringify(\"https://api.example.com\")"
+        in result
+    )
+    assert "'import.meta.env.PYXLE_PUBLIC_APP_NAME': JSON.stringify(\"MyApp\")" in result
+
+
+def test_build_public_env_defines_wraps_values_in_json_stringify(monkeypatch) -> None:
+    """Regression: define VALUES must be emitted as quoted JS string literals (via
+    JSON.stringify), never spliced in raw. A bare value is invalid JS — it is
+    silently dropped in `pyxle dev` and crashes `vite build` with esbuild's
+    "Invalid define value" for any non-identifier value (a URL, a 0x… key)."""
+
+    for key in list(k for k in __import__("os").environ if k.startswith("PYXLE_PUBLIC_")):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("PYXLE_PUBLIC_TURNSTILE_KEY", "0x4AAAAAADkljWFuoy5AWuHN")
+
+    result = _build_public_env_defines()
+    assert 'JSON.stringify("0x4AAAAAADkljWFuoy5AWuHN")' in result
+    # never spliced in as a bare (unquoted) value — that is what esbuild rejects
+    assert "': 0x4AAAAAADkljWFuoy5AWuHN" not in result
 
 
 def test_vite_config_includes_public_env_defines(tmp_path: Path, monkeypatch) -> None:
@@ -314,7 +372,7 @@ def test_vite_config_includes_public_env_defines(tmp_path: Path, monkeypatch) ->
 
     assert "define:" in vite_config
     assert "import.meta.env.PYXLE_PUBLIC_SITE_NAME" in vite_config
-    assert '"TestSite"' in vite_config
+    assert 'JSON.stringify("TestSite")' in vite_config
 
 
 def test_vite_config_no_define_block_without_public_vars(tmp_path: Path, monkeypatch) -> None:
