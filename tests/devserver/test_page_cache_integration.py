@@ -91,10 +91,14 @@ def _patch_render(monkeypatch, *, body: bytes = b"<html>page</html>", status: in
     return calls
 
 
-async def _call(page_cache, *, settings=None, request=None):
+def _route(*, cache_revalidate: float | None = None) -> SimpleNamespace:
+    return SimpleNamespace(path="/", cache_revalidate=cache_revalidate)
+
+
+async def _call(page_cache, *, settings=None, request=None, route=None):
     return await _build_cached_page_response(
         request=request or _request(),
-        route=SimpleNamespace(path="/"),
+        route=route or _route(),
         settings=settings or _settings(),
         renderer=object(),
         overlay=None,
@@ -200,6 +204,31 @@ async def test_edge_config_makes_route_cacheable(monkeypatch) -> None:
     second = await _call(cache, settings=settings)
     assert second.headers[_CACHE_STATUS_HEADER] == "HIT"
     assert len(calls) == 1
+
+
+@pytest.mark.anyio
+async def test_compile_time_directive_makes_route_cacheable(monkeypatch) -> None:
+    # No loader envelope and no edge config — only a CACHE = {"revalidate": N}
+    # directive (e.g. a loader-less static page).
+    calls = _patch_render(monkeypatch, revalidate=None)
+    cache = PageCache()
+    route = _route(cache_revalidate=45.0)
+
+    first = await _call(cache, route=route)
+    assert first.headers[_CACHE_STATUS_HEADER] == "MISS"
+    assert first.headers["Cache-Control"] == _public_cache_control(45)
+
+    second = await _call(cache, route=route)
+    assert second.headers[_CACHE_STATUS_HEADER] == "HIT"
+    assert len(calls) == 1
+
+
+@pytest.mark.anyio
+async def test_loader_revalidate_wins_over_directive(monkeypatch) -> None:
+    _patch_render(monkeypatch, revalidate=30)  # loader envelope = 30s
+    cache = PageCache()
+    first = await _call(cache, route=_route(cache_revalidate=999.0))
+    assert first.headers["Cache-Control"] == _public_cache_control(30)
 
 
 @pytest.mark.anyio

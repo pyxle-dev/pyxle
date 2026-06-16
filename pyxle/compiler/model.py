@@ -78,6 +78,7 @@ class PageMetadata:
     images: tuple[ImageDeclaration, ...] = ()
     head_jsx_blocks: tuple[str, ...] = ()
     actions: tuple[ActionDeclaration, ...] = ()
+    cache_revalidate: float | None = None
 
     def to_json(self) -> Dict[str, Any]:
         return {
@@ -93,6 +94,7 @@ class PageMetadata:
             "images": [i.to_json() for i in self.images],
             "head_jsx_blocks": list(self.head_jsx_blocks),
             "actions": [a.to_json() for a in self.actions],
+            "cache_revalidate": self.cache_revalidate,
         }
 
     @property

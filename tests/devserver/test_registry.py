@@ -129,6 +129,21 @@ def test_registry_recovers_from_invalid_loader_metadata(project: DevServerSettin
     assert entry.loader_name is None
 
 
+def test_registry_carries_cache_revalidate_from_metadata(project: DevServerSettings) -> None:
+    build_once(project)
+    metadata_path = project.metadata_build_dir / "pages" / "index.json"
+    payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+    payload["cache_revalidate"] = 60
+    metadata_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    metadata = load_build_metadata(project.build_root)
+    registry = build_metadata_registry(project, metadata)
+
+    entry = registry.find_page("/")
+    assert entry is not None
+    assert entry.cache_revalidate == 60.0
+
+
 def test_module_key_sanitizes_segments() -> None:
     from pyxle.devserver import registry as registry_module
 

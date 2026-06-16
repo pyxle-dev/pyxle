@@ -42,6 +42,27 @@ The envelope is recognised only in its exact two-key shape (`data` **and**
 `revalidate`, nothing else). A normal loader that happens to return keys named
 `data` or `revalidate` is never mistaken for a cache directive.
 
+### Pages without a loader
+
+A page with no `@server` loader can still opt into caching with a module-level
+`CACHE` directive in its Python section:
+
+```python
+CACHE = {"revalidate": 3600}   # cache this static page for an hour
+```
+
+```jsx
+export default function About() {
+  return <main><h1>About Us</h1></main>;
+}
+```
+
+`revalidate` is the freshness window in seconds, exactly as in the loader
+envelope (`0` means "serve cached but re-render every request"). It is validated
+at compile time — a non-numeric or negative value is a build error. If a page
+declares *both* a loader envelope and a `CACHE` directive, the loader's
+`revalidate` wins.
+
 ## Incremental regeneration (stale-while-revalidate)
 
 When a cached page passes its `revalidate` window, the **next** request still

@@ -95,6 +95,7 @@ class PyxParseResult:
     image_declarations: tuple[dict, ...] = ()
     head_jsx_blocks: tuple[str, ...] = ()
     actions: tuple[ActionDetails, ...] = ()
+    cache_revalidate: float | None = None
     diagnostics: tuple[PyxDiagnostic, ...] = ()
 
 
@@ -917,6 +918,68 @@ def _collect_head_elements(
     return tuple(elements), head_is_dynamic
 
 
+def _extract_cache_revalidate(
+    value: ast.AST, line: int | None, collector: _DiagnosticCollector
+) -> float | None:
+    """Pull the ``revalidate`` seconds out of a ``CACHE = {...}`` value."""
+    if not isinstance(value, ast.Dict):
+        collector.emit(
+            'CACHE must be a dict literal, e.g. CACHE = {"revalidate": 60}', line
+        )
+        return None
+
+    found: float | None = None
+    for key_node, val_node in zip(value.keys, value.values):
+        if not (isinstance(key_node, ast.Constant) and key_node.value == "revalidate"):
+            continue
+        if (
+            isinstance(val_node, ast.Constant)
+            and isinstance(val_node.value, (int, float))
+            and not isinstance(val_node.value, bool)
+            and val_node.value >= 0
+        ):
+            found = float(val_node.value)
+        else:
+            collector.emit(
+                "CACHE 'revalidate' must be a non-negative number of seconds", line
+            )
+            return None
+
+    if found is None:
+        collector.emit('CACHE must contain a "revalidate" key', line)
+        return None
+    return found
+
+
+def _detect_cache_directive(
+    tree: ast.Module | None,
+    python_line_numbers: Sequence[int],
+    *,
+    collector: _DiagnosticCollector,
+) -> float | None:
+    """Extract a module-level ``CACHE = {"revalidate": N}`` page-cache directive.
+
+    Returns the revalidate window in seconds, or ``None`` when no (valid)
+    directive is present. An invalid directive is reported as a compile
+    diagnostic and otherwise ignored (the page is treated as uncached).
+    """
+    if tree is None:
+        return None
+
+    revalidate: float | None = None
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(
+            isinstance(target, ast.Name) and target.id == "CACHE"
+            for target in node.targets
+        ):
+            continue
+        line = _map_lineno(node.lineno, python_line_numbers)
+        revalidate = _extract_cache_revalidate(node.value, line, collector)
+    return revalidate
+
+
 # ---------------------------------------------------------------------------
 # JSX metadata extraction (Babel-backed)
 # ---------------------------------------------------------------------------
@@ -1096,6 +1159,9 @@ class PyxParser:
         head_elements, head_is_dynamic = _collect_head_elements(
             tree, python_line_numbers, collector=collector
         )
+        cache_revalidate = _detect_cache_directive(
+            tree, python_line_numbers, collector=collector
+        )
 
         # Layer 5: JSX metadata + optional Babel validation.
         script_declarations = _detect_script_declarations(jsx_code)
@@ -1136,6 +1202,7 @@ class PyxParser:
             image_declarations=image_declarations,
             head_jsx_blocks=head_jsx_blocks,
             actions=actions,
+            cache_revalidate=cache_revalidate,
             diagnostics=diagnostics,
         )
 

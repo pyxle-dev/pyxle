@@ -38,6 +38,7 @@ class PageRegistryEntry:
     images: tuple[dict, ...] = ()
     head_jsx_blocks: tuple[str, ...] = ()
     actions: tuple[dict, ...] = ()
+    cache_revalidate: float | None = None
 
     @property
     def has_loader(self) -> bool:
@@ -99,6 +100,7 @@ class MetadataRegistry:
                     "images": list(entry.images),
                     "head_jsx_blocks": list(entry.head_jsx_blocks),
                     "actions": list(entry.actions),
+                    "cache_revalidate": entry.cache_revalidate,
                 }
                 for entry in self.pages
             ],
@@ -190,6 +192,7 @@ def _build_page_entry(
         images=metadata.images,
         head_jsx_blocks=metadata.head_jsx_blocks,
         actions=metadata.actions,
+        cache_revalidate=metadata.cache_revalidate,
     )
 
 
@@ -293,6 +296,15 @@ def _load_page_metadata(path: Path) -> Optional[PageMetadata]:
     else:
         actions = tuple()
 
+    cache_revalidate_payload = payload.get("cache_revalidate")
+    cache_revalidate: float | None
+    if isinstance(cache_revalidate_payload, (int, float)) and not isinstance(
+        cache_revalidate_payload, bool
+    ):
+        cache_revalidate = float(cache_revalidate_payload)
+    else:
+        cache_revalidate = None
+
     return PageMetadata(
         route_path=route_path,
         alternate_route_paths=alternate_route_paths,
@@ -306,6 +318,7 @@ def _load_page_metadata(path: Path) -> Optional[PageMetadata]:
         images=images,
         head_jsx_blocks=head_jsx_blocks,
         actions=actions,
+        cache_revalidate=cache_revalidate,
     )
 
 

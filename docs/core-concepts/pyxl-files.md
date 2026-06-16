@@ -66,6 +66,7 @@ async def delete_user(request):
 - **The `@server` function must be `async`.** Pyxle enforces this at compile time.
 - **Use any Python imports.** Standard `import` / `from` statements stay in the Python section because they parse as valid Python. (A JavaScript import such as `import React from 'react'` isn't valid Python, so it is correctly treated as part of the JSX section — the split is by what parses, not by the leading keyword.)
 - **The `@server` and `@action` decorators are available globally** -- you do not need to import them (the compiler injects the import automatically).
+- **An optional `CACHE = {"revalidate": N}` directive** caches the rendered page for `N` seconds (server-side, with incremental regeneration). See [Caching](../guides/caching.md).
 
 ## The JSX section
 

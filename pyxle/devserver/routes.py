@@ -33,6 +33,7 @@ class PageRoute:
     images: tuple[dict, ...] = ()
     head_jsx_blocks: tuple[str, ...] = ()
     actions: tuple[dict, ...] = ()
+    cache_revalidate: float | None = None
 
     @property
     def has_loader(self) -> bool:
@@ -181,6 +182,7 @@ def _page_route(
         images=entry.images,
         head_jsx_blocks=entry.head_jsx_blocks,
         actions=entry.actions,
+        cache_revalidate=entry.cache_revalidate,
     )
 
 

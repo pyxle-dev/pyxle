@@ -698,17 +698,25 @@ def _read_revalidate_header(response: Response) -> float | None:
 
 
 def _effective_cache_ttl(
-    response: Response, request: Request, cache_config: object | None
+    response: Response,
+    request: Request,
+    cache_config: object | None,
+    *,
+    directive_ttl: float | None = None,
 ) -> float | None:
     """Resolve a render's cache TTL.
 
-    A loader ``revalidate`` wins over the edge ``cache`` config; ``None`` means
-    the route is not server-cacheable for this request.
+    Precedence: a loader ``{data, revalidate}`` envelope wins over a page's
+    compile-time ``CACHE = {"revalidate": N}`` directive, which wins over the
+    project's edge ``cache`` config. ``None`` means the route is not
+    server-cacheable for this request.
     """
 
     loader_ttl = _read_revalidate_header(response)
     if loader_ttl is not None:
         return loader_ttl
+    if directive_ttl is not None:
+        return directive_ttl
     if cache_config is not None:
         edge = cache_config.max_age_for(request.url.path)
         if edge is not None:
@@ -790,7 +798,9 @@ def _make_page_revalidator(
         )
         if fresh.status_code != 200:
             return
-        ttl = _effective_cache_ttl(fresh, request, cache_config)
+        ttl = _effective_cache_ttl(
+            fresh, request, cache_config, directive_ttl=route.cache_revalidate
+        )
         if ttl is None:
             return
         body = await _read_response_body(fresh)
@@ -857,7 +867,9 @@ async def _build_cached_page_response(
     # a nav-JSON payload for the same URL knows they are distinct entries.
     response.headers["Vary"] = _NAVIGATION_HEADER
 
-    ttl = _effective_cache_ttl(response, request, cache_config)
+    ttl = _effective_cache_ttl(
+        response, request, cache_config, directive_ttl=route.cache_revalidate
+    )
     if ttl is not None:
         # A route declared cacheable is served `public, s-maxage=N` so a
         # CDN/proxy can absorb the load — the CSRF middleware drops its per-user

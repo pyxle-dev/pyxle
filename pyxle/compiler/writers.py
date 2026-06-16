@@ -133,6 +133,7 @@ class ArtifactWriter:
             images=images,
             head_jsx_blocks=parse_result.head_jsx_blocks,
             actions=actions,
+            cache_revalidate=parse_result.cache_revalidate,
         )
 
         metadata_output.write_text(
