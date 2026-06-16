@@ -17,12 +17,13 @@ needs no configuration at all.
 from __future__ import annotations
 
 import os
-from typing import Mapping, Optional
+from pathlib import Path
+from typing import Iterable, Mapping, Optional
 
 from .backends import FileCacheBackend, InMemoryCacheBackend, RedisCacheBackend
 from .page_cache import PageCache
 
-__all__ = ["build_page_cache", "PageCacheConfigError"]
+__all__ = ["build_page_cache", "warm_page_cache", "PageCacheConfigError"]
 
 _DISABLED = {"off", "none", "disabled"}
 
@@ -89,3 +90,25 @@ def build_page_cache(
         f"Unknown PYXLE_PAGE_CACHE_BACKEND={name!r}; "
         "expected one of: memory, file, redis, off"
     )
+
+
+async def warm_page_cache(
+    cache: PageCache, page_paths: Iterable[str], prerender_dir: Path
+) -> int:
+    """Load build-time pre-rendered entries into ``cache``.
+
+    For each route path, looks up its pre-rendered entry in ``prerender_dir``
+    (written by ``pyxle build --static``) and inserts it into the active cache,
+    so the first request for a static page is a hit. Returns how many entries
+    were warmed. Missing or unreadable entries are skipped silently.
+    """
+
+    backend = FileCacheBackend(prerender_dir)
+    warmed = 0
+    for path in page_paths:
+        key = PageCache.make_key(path)
+        entry = await backend.get(key)
+        if entry is not None:
+            await cache.put_entry(key, entry)
+            warmed += 1
+    return warmed

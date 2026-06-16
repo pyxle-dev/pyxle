@@ -171,3 +171,18 @@ def test_build_route_table_falls_back_to_inferred_path(project: DevServerSetting
     missing = table.find_api("/does-not-exist")
     assert missing is None
 
+
+def test_select_static_pages_filters_loaders_and_dynamic_routes() -> None:
+    from types import SimpleNamespace
+
+    from pyxle.devserver.routes import select_static_pages
+
+    pages = [
+        SimpleNamespace(path="/", has_loader=False),  # static
+        SimpleNamespace(path="/about", has_loader=False),  # static
+        SimpleNamespace(path="/feed", has_loader=True),  # has a loader -> skip
+        SimpleNamespace(path="/posts/{slug}", has_loader=False),  # dynamic -> skip
+    ]
+
+    assert [page.path for page in select_static_pages(pages)] == ["/", "/about"]
+

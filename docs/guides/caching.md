@@ -76,6 +76,23 @@ load).
 request" — useful when you want to absorb bursts without ever serving content
 older than one render.
 
+## Static pre-rendering (`pyxle build --static`)
+
+Pages with no `@server` loader and no dynamic route parameters render the same
+HTML for everyone, every time. `pyxle build --static` renders them **once at
+build time** and stores the result, so the first request after a deploy is
+already a cache hit — no cold SSR render, even for the very first visitor.
+
+```bash
+pyxle build --static
+```
+
+This pre-renders every loader-less, non-dynamic page into `dist/prerendered/`;
+on startup `pyxle serve` warms its page cache from that directory. Pages with a
+loader (or a `{param}` route) are skipped — they still render live and cache at
+runtime as before. Pre-rendered entries have no expiry: they live until the next
+deploy replaces `dist/`, or you `cache.invalidate(...)` the route.
+
 ## Invalidating the cache
 
 When the underlying data changes — you publish a post, edit a page — purge the

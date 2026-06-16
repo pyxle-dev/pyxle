@@ -108,12 +108,14 @@ pyxle build [directory] [options]
 | `--config` | -- | Path to `pyxle.config.json` |
 | `--out-dir` | `dist/` | Output directory for build artifacts |
 | `--incremental` / `--no-incremental` | `false` | Reuse cached artifacts |
+| `--static` / `--no-static` | `false` | Pre-render loader-less, non-dynamic pages to HTML at build time (SSG) — see [Caching](../guides/caching.md#static-pre-rendering-pyxle-build---static) |
 
 **Examples:**
 
 ```bash
 pyxle build
 pyxle build --out-dir ./output --incremental
+pyxle build --static
 ```
 
 ## `pyxle serve`

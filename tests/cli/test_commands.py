@@ -662,6 +662,52 @@ def test_build_command_invokes_pipeline(monkeypatch) -> None:
         assert "Public assets" in result.stdout
 
 
+def test_build_command_static_flag_prerenders(monkeypatch) -> None:
+    with runner.isolated_filesystem():
+        project = Path("demo")
+        (project / "pages").mkdir(parents=True)
+        (project / "public").mkdir(parents=True)
+
+        def fake_run_build(settings, *, logger, dist_dir=None, force_rebuild=True):
+            from pyxle.build.pipeline import BuildResult
+            from pyxle.devserver.builder import BuildSummary
+            from pyxle.devserver.registry import MetadataRegistry
+
+            result_dist = dist_dir or settings.project_root / "dist"
+            for sub in ("client", "server", "metadata", "public"):
+                (result_dist / sub).mkdir(parents=True, exist_ok=True)
+            page_manifest_path = result_dist / "page-manifest.json"
+            page_manifest_path.write_text("{}", encoding="utf-8")
+            return BuildResult(
+                dist_dir=result_dist,
+                client_dir=result_dist / "client",
+                server_dir=result_dist / "server",
+                metadata_dir=result_dist / "metadata",
+                public_dir=result_dist / "public",
+                client_manifest_path=None,
+                page_manifest={},
+                page_manifest_path=page_manifest_path,
+                summary=BuildSummary(),
+                registry=MetadataRegistry(pages=[], apis=[]),
+            )
+
+        captured: dict[str, object] = {}
+
+        def fake_generate(settings, dist_dir, *, logger=None):
+            captured["dist_dir"] = dist_dir
+            return ["/", "/about"]
+
+        monkeypatch.setattr("pyxle.cli.run_build", fake_run_build)
+        monkeypatch.setattr("pyxle.build.static_gen.generate_static_site", fake_generate)
+
+        result = runner.invoke(app, ["build", "demo", "--static"], catch_exceptions=False)
+
+        assert result.exit_code == 0, result.stdout
+        assert captured["dist_dir"] == (project / "dist").resolve()
+        assert "Static pages" in result.stdout
+        assert "2 pre-rendered" in result.stdout
+
+
 def test_build_command_supports_incremental_flag(monkeypatch) -> None:
     with runner.isolated_filesystem():
         project = Path("demo")

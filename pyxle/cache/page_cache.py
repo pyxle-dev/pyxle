@@ -100,6 +100,11 @@ class PageCache:
         await self._backend.set(key, entry)
         return entry
 
+    async def put_entry(self, key: str, entry: CacheEntry) -> None:
+        """Insert a pre-built entry verbatim (used to warm from pre-rendered files)."""
+
+        await self._backend.set(key, entry)
+
     async def invalidate(self, key: str) -> bool:
         return await self._backend.delete(key)
 

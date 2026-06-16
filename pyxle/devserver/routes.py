@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import Iterable, List, Optional
 
 from .error_pages import is_error_boundary_file
 from .path_utils import route_path_from_relative
@@ -184,6 +184,17 @@ def _page_route(
         actions=entry.actions,
         cache_revalidate=entry.cache_revalidate,
     )
+
+
+def select_static_pages(pages: Iterable[PageRoute]) -> list[PageRoute]:
+    """Pages that can be pre-rendered at build time (``pyxle build --static``).
+
+    A page is statically renderable when it has no ``@server`` loader -- so its
+    render is a deterministic function of no per-request data -- and no dynamic
+    route parameters (a ``{param}`` segment would need a value to render).
+    """
+
+    return [page for page in pages if not page.has_loader and "{" not in page.path]
 
 
 def _api_routes(entry: ApiRegistryEntry) -> List[ApiRoute]:

@@ -437,6 +437,12 @@ def build(
         help="Reuse cached artifacts to rebuild only changed files.",
         show_default=True,
     ),
+    static: bool = typer.Option(
+        False,
+        "--static/--no-static",
+        help="Pre-render pages with no per-request data to HTML at build time (SSG).",
+        show_default=True,
+    ),
 ) -> None:
     """Entry-point for the ``pyxle build`` command."""
 
@@ -529,6 +535,16 @@ def build(
         public_detail += " (not generated)"
     logger.step("Public assets", detail=public_detail)
     logger.step("Artifacts", detail=str(result.dist_dir))
+
+    if static:
+        from pyxle.build.static_gen import generate_static_site  # noqa: PLC0415
+
+        try:
+            rendered = generate_static_site(settings, result.dist_dir, logger=logger)
+        except Exception as exc:  # pragma: no cover - prerender boots the Node SSR pool
+            logger.error(f"Static prerender failed: {exc}")
+            raise typer.Exit(code=1) from exc
+        logger.step("Static pages", detail=f"{len(rendered)} pre-rendered")
 
 
 @app.command(help="Serve a production build without starting Vite.")

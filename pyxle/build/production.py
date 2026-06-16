@@ -249,6 +249,10 @@ def build_production_app(
             client_root=settings.client_build_dir,
         )
 
+    # A `pyxle build --static` run leaves pre-rendered pages here; the app warms
+    # its cache from them on startup. Absent for a normal build (None-safe).
+    prerender_dir = resolved_dist / "prerendered"
+
     app = create_starlette_app(
         settings,
         route_table,
@@ -257,6 +261,7 @@ def build_production_app(
         public_static_dir=public_static_dir,
         client_static_dir=client_static_dir,
         serve_static=serve_static,
+        prerender_dir=prerender_dir if prerender_dir.exists() else None,
     )
     app.state.pyxle_ready = True
     return app, pool_size

@@ -33,7 +33,7 @@ from .backends import (
     InMemoryCacheBackend,
     RedisCacheBackend,
 )
-from .factory import PageCacheConfigError, build_page_cache
+from .factory import PageCacheConfigError, build_page_cache, warm_page_cache
 from .page_cache import CacheLookup, PageCache
 
 __all__ = [
@@ -45,6 +45,7 @@ __all__ = [
     "PageCache",
     "CacheLookup",
     "build_page_cache",
+    "warm_page_cache",
     "PageCacheConfigError",
     "set_active_cache",
     "get_active_cache",

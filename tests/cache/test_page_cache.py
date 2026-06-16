@@ -207,3 +207,29 @@ async def test_public_invalidate_all_clears_active_cache() -> None:
         assert await pc.get(PageCache.make_key("/b")) is None
     finally:
         cache_api.set_active_cache(None)
+
+
+@pytest.mark.anyio
+async def test_warm_page_cache_loads_prerendered_entries(tmp_path) -> None:
+    from pyxle.cache import warm_page_cache
+    from pyxle.cache.backends import CacheEntry, FileCacheBackend
+
+    prerender_dir = tmp_path / "prerendered"
+    backend = FileCacheBackend(prerender_dir)
+    entry = CacheEntry(
+        body=b"<html>static</html>",
+        status_code=200,
+        etag='"e"',
+        stored_at=1.0,
+        revalidate=None,
+    )
+    await backend.set(PageCache.make_key("/about"), entry)
+
+    cache = PageCache()
+    warmed = await warm_page_cache(cache, ["/about", "/missing"], prerender_dir)
+
+    assert warmed == 1
+    lookup = await cache.get(PageCache.make_key("/about"))
+    assert lookup is not None
+    assert lookup.entry.body == b"<html>static</html>"
+    assert lookup.is_stale is False  # revalidate=None -> never stale

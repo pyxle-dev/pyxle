@@ -27,7 +27,12 @@ from starlette.routing import Mount, Route, Router, WebSocketRoute
 from starlette.staticfiles import NotModifiedResponse, StaticFiles
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from pyxle.cache import PageCache, build_page_cache, set_active_cache
+from pyxle.cache import (
+    PageCache,
+    build_page_cache,
+    set_active_cache,
+    warm_page_cache,
+)
 from pyxle.cli.logger import ConsoleLogger
 from pyxle.ssr import (
     ComponentRenderer,
@@ -50,7 +55,7 @@ from .route_hooks import (
     load_route_hooks,
     wrap_with_route_hooks,
 )
-from .routes import ActionRoute, ApiRoute, PageRoute, RouteTable
+from .routes import ActionRoute, ApiRoute, PageRoute, RouteTable, select_static_pages
 from .settings import DevServerSettings
 
 _API_HTTP_METHODS: Sequence[str] = ("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS")
@@ -1237,6 +1242,7 @@ def create_starlette_app(
     client_static_dir: Path | None = None,
     serve_static: bool = True,
     pool: object | None = None,
+    prerender_dir: Path | None = None,
 ) -> Starlette:
     """Assemble a Starlette application exposing API/page routes and optional static mounts.
 
@@ -1452,6 +1458,15 @@ def create_starlette_app(
         if page_cache is not None:
             app.state.pyxle_page_cache = page_cache
             set_active_cache(page_cache)
+            # Warm the cache from any build-time pre-rendered pages
+            # (`pyxle build --static`) so their first request is a hit.
+            if prerender_dir is not None and prerender_dir.exists():
+                static_paths = [route.path for route in select_static_pages(routes.pages)]
+                warmed = await warm_page_cache(page_cache, static_paths, prerender_dir)
+                if warmed:
+                    console_logger.info(
+                        f"Warmed {warmed} pre-rendered page(s) from {prerender_dir}"
+                    )
         try:
             yield
         finally:

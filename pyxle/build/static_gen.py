@@ -1,0 +1,155 @@
+"""Static pre-rendering for ``pyxle build --static`` (SSG).
+
+Renders pages that carry no per-request data -- no ``@server`` loader and no
+dynamic route parameters -- to HTML at build time and stores each as a
+page-cache entry under ``dist/prerendered/``. At serve time the page cache is
+warmed from that directory (:func:`pyxle.cache.warm_page_cache`), so the very
+first request for a static page is a cache hit with no cold SSR render.
+
+The render loop (:func:`prerender_pages`) takes an injected renderer so it is
+unit-testable without Node; :func:`generate_static_site` is the build-time glue
+that boots a short-lived SSR worker pool around it.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import time
+from pathlib import Path
+from typing import Callable, Iterable
+
+from starlette.requests import Request
+from starlette.responses import Response
+
+from pyxle.cache import PageCache
+from pyxle.cache.backends import CacheEntry, FileCacheBackend
+from pyxle.cli.logger import ConsoleLogger
+from pyxle.devserver.routes import PageRoute, select_static_pages
+from pyxle.devserver.settings import DevServerSettings
+from pyxle.ssr import build_page_response
+from pyxle.ssr.renderer import ComponentRenderer, pool_render_factory
+
+#: Sub-directory of ``dist`` holding pre-rendered page-cache entries.
+PRERENDER_DIRNAME = "prerendered"
+
+
+def _request_for(path: str) -> Request:
+    async def _receive() -> dict:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    return Request(
+        {
+            "type": "http",
+            "http_version": "1.1",
+            "method": "GET",
+            "path": path,
+            "root_path": "",
+            "query_string": b"",
+            "headers": [],
+        },
+        _receive,
+    )
+
+
+async def _materialize(response: Response) -> bytes:
+    body = getattr(response, "body", None)
+    if body is not None:
+        return bytes(body)
+    chunks: list[bytes] = []
+    async for chunk in response.body_iterator:
+        chunks.append(
+            chunk if isinstance(chunk, (bytes, bytearray)) else str(chunk).encode("utf-8")
+        )
+    return b"".join(chunks)
+
+
+async def prerender_pages(
+    *,
+    settings: DevServerSettings,
+    pages: Iterable[PageRoute],
+    renderer: ComponentRenderer,
+    prerender_dir: Path,
+    clock: Callable[[], float] = time.time,
+) -> list[str]:
+    """Render each page and store it as a page-cache entry under ``prerender_dir``.
+
+    Returns the route paths successfully pre-rendered. A page whose render does
+    not return ``200`` is skipped -- it simply falls back to live SSR (and the
+    runtime cache) at serve time. Entries are stored with no expiry; they live
+    until the deploy is replaced or the route is invalidated.
+    """
+
+    backend = FileCacheBackend(prerender_dir)
+    rendered: list[str] = []
+    for page in pages:
+        response = await build_page_response(
+            request=_request_for(page.path),
+            settings=settings,
+            page=page,
+            renderer=renderer,
+        )
+        if response.status_code != 200:
+            continue
+        body = await _materialize(response)
+        entry = CacheEntry(
+            body=body,
+            status_code=200,
+            etag=PageCache.make_etag(body),
+            stored_at=clock(),
+            revalidate=None,
+        )
+        await backend.set(PageCache.make_key(page.path), entry)
+        rendered.append(page.path)
+    return rendered
+
+
+def generate_static_site(
+    settings: DevServerSettings, dist_dir: Path, *, logger: ConsoleLogger | None = None
+) -> list[str]:  # pragma: no cover - boots the Node SSR pool; core is tested via prerender_pages
+    """Pre-render every statically-renderable page into ``dist/prerendered``.
+
+    Boots a short-lived SSR worker pool, renders each loader-less, non-dynamic
+    page, and writes the results. Assumes ``pyxle build`` already produced
+    ``dist``. Returns the pre-rendered route paths.
+    """
+
+    from dataclasses import replace
+
+    from pyxle.build.manifest import load_manifest
+    from pyxle.build.production import _resolve_pool_size
+    from pyxle.devserver.registry import build_metadata_registry
+    from pyxle.devserver.routes import build_route_table
+    from pyxle.ssr.worker_pool import SsrWorkerPool
+
+    log = logger or ConsoleLogger()
+    manifest = load_manifest(dist_dir / "page-manifest.json")
+    dist_settings = replace(settings, debug=False, page_manifest=manifest)
+    routes = build_route_table(build_metadata_registry(dist_settings))
+    static_pages = select_static_pages(routes.pages)
+    if not static_pages:
+        log.info("No statically-renderable pages found; skipping --static prerender.")
+        return []
+
+    async def _run() -> list[str]:
+        pool = SsrWorkerPool(
+            size=max(1, _resolve_pool_size(dist_settings.ssr_workers)),
+            project_root=dist_settings.project_root,
+            client_root=dist_settings.client_build_dir,
+        )
+        await pool.start()
+        try:
+            renderer = ComponentRenderer(factory=pool_render_factory(pool))
+            return await prerender_pages(
+                settings=dist_settings,
+                pages=static_pages,
+                renderer=renderer,
+                prerender_dir=dist_dir / PRERENDER_DIRNAME,
+            )
+        finally:
+            await pool.stop()
+
+    rendered = asyncio.run(_run())
+    log.success(
+        f"Pre-rendered {len(rendered)} static page(s) into {dist_dir / PRERENDER_DIRNAME}"
+    )
+    return rendered
