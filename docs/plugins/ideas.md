@@ -2,16 +2,11 @@
 
 Capabilities the ecosystem needs, scoped to what the plugin API supports **today** — services and middleware (see [the plugins guide](../guides/plugins.md); page contribution is [Phase B, in RFC](rfc-plugin-pages.md)). Every idea below is buildable right now, and each names the contract it builds against. If you take one on, read the [standards](standards.md) first and check the [directory](/plugins) so two people don't race the same idea blind.
 
+> **The first idea here shipped.** Mail — once *"the most wanted one"* on this list — is now the official [pyxle-mail](pyxle-mail.md) plugin (transactional email over SMTP, Resend, or the console). This list is where official plugins start.
+
 Sizes are honest estimates for a working, standards-meeting v0.1: **S** ≈ a weekend, **M** ≈ a week of evenings, **L** ≈ a real project.
 
 > **On names:** these are *capabilities*, not package names to grab — ship under **your own** PyPI name (`pyxle-*` is the [official namespace](standards.md), and a founding-cohort plugin may later be granted a canonical name by publishing under it). The `service.method` identifiers below are the suggested *API* a plugin registers, not its package.
-
-## Mail — *the most wanted one* (M)
-
-Email delivery as a service: `mail.service` with `send(to, subject, html, text)`, providers behind extras (`[smtp]`, `[resend]`, `[ses]`), per-environment dry-run mode that logs instead of sending.
-
-**Why it matters:** [pyxle-auth](pyxle-auth.md) deliberately never sends email — its password-reset and verification flows return a raw token for *your mailer*. Today every app hand-rolls that mailer. A mail plugin completes the story: pyxle-db + pyxle-auth + a mailer would be a full accounts stack in three config lines.
-**Builds against:** the plugin service registry; consumed alongside pyxle-auth's token flows.
 
 ## Storage (M)
 
