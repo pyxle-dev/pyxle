@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterable, List, Optional
 
 from .error_pages import is_error_boundary_file
-from .loading_pages import is_loading_file
+from .loading_pages import build_loading_boundary_registry, is_loading_file
 from .path_utils import route_path_from_relative
 from .registry import ApiRegistryEntry, MetadataRegistry, PageRegistryEntry
 
@@ -36,6 +36,12 @@ class PageRoute:
     actions: tuple[dict, ...] = ()
     cache_revalidate: float | None = None
     uses_suspense: bool = False
+    #: The nearest ``loading.pyxl`` page route for this route, if any. When set,
+    #: the page is wrapped in ``<Suspense fallback={<Loading/>}>`` on both the
+    #: server (streaming) and the client (hydration) so a route-level loading
+    #: state shows while the render suspends. ``None`` for routes with no
+    #: enclosing loading boundary.
+    loading_boundary: Optional["PageRoute"] = None
 
     @property
     def has_loader(self) -> bool:
@@ -144,6 +150,16 @@ def build_route_table(registry: MetadataRegistry) -> RouteTable:
     action_routes.sort(key=lambda route: route.path)
     error_boundary_routes.sort(key=lambda route: route.path)
     loading_boundary_routes.sort(key=lambda route: route.path)
+
+    # Resolve each page's nearest loading.pyxl (closest-ancestor walk-up) and
+    # stamp it onto the route, so the streaming render + client hydration can
+    # both wrap the page in that loading boundary from a single source of truth.
+    loading_registry = build_loading_boundary_registry(loading_boundary_routes)
+    if loading_registry.has_loading_pages:
+        page_routes = [
+            replace(route, loading_boundary=loading_registry.find_loading_boundary(route.path))
+            for route in page_routes
+        ]
 
     return RouteTable(
         pages=page_routes,

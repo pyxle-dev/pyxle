@@ -378,6 +378,11 @@ async def build_streaming_page_response(
             prelude.component_props,
             request_pathname=request.url.path,
             csrf_token=prelude.csrf_token,
+            fallback_path=(
+                page.loading_boundary.client_module_path
+                if page.loading_boundary is not None
+                else None
+            ),
         )
         first_frame = await _first_stream_frame(frames)
         if first_frame.get("type") == "error":
@@ -440,32 +445,71 @@ async def build_page_navigation_response(
     loader_breadcrumb = _initial_loader_breadcrumb(page)
 
     try:
-        artifacts = await _create_page_artifacts(
-            request=request,
-            settings=settings,
-            page=page,
-            renderer=renderer,
-            loader_breadcrumb=loader_breadcrumb,
-        )
+        if page.uses_suspense or page.loading_boundary is not None:
+            # A streaming-eligible page can't be rendered buffered to extract its
+            # head — renderToString throws on a suspending component — and its
+            # runtime <Head> wouldn't reach the flushed head anyway. Build the nav
+            # payload from the loader + static head only, mirroring the initial
+            # streamed load. The client renders the body itself (wrapping in the
+            # loading boundary via loadingAssetPath), so no server body render is
+            # needed here.
+            from pyxle.ssr.head_merger import merge_head_elements
+
+            prelude = await _create_streaming_prelude(
+                request=request,
+                settings=settings,
+                page=page,
+                loader_breadcrumb=loader_breadcrumb,
+                suppress_per_user=False,
+            )
+            static_head = merge_head_elements(
+                head_variable=prelude.head_elements,
+                head_jsx_blocks=page.head_jsx_blocks,
+                layout_head_jsx_blocks=prelude.layout_head_jsx_blocks,
+                runtime_head_blocks=(),
+            )
+            nav_status_code = prelude.status_code
+            nav_component_props = prelude.component_props
+            nav_head_markup = render_head_markup(static_head)
+        else:
+            artifacts = await _create_page_artifacts(
+                request=request,
+                settings=settings,
+                page=page,
+                renderer=renderer,
+                loader_breadcrumb=loader_breadcrumb,
+            )
+            nav_status_code = artifacts.status_code
+            nav_component_props = artifacts.component_props
+            nav_head_markup = artifacts.head_markup
+
         if overlay is not None:
             await overlay.notify_clear(route_path=page.path)
         payload = {
             "ok": True,
             "routePath": page.path,
             "requestedPath": request.url.path,
-            "statusCode": artifacts.status_code,
+            "statusCode": nav_status_code,
             "page": {
                 "clientAssetPath": page.client_asset_path,
                 "moduleKey": page.module_key,
+                # The nearest loading.pyxl's client asset (or None). Carried
+                # per-route so a client-side navigation wraps the target page in
+                # the same loading boundary the server would — no stale global.
+                "loadingAssetPath": (
+                    page.loading_boundary.client_asset_path
+                    if page.loading_boundary is not None
+                    else None
+                ),
             },
-            "props": artifacts.component_props,
-            "headMarkup": artifacts.head_markup,
+            "props": nav_component_props,
+            "headMarkup": nav_head_markup,
             # Per-page client navigation-cache lifetime (seconds). Mirrors the
             # page's edge-cache TTL so prefetched data stays fresh exactly as
             # long as the CDN would serve it; ``None`` → client default.
             "navCacheTtlSeconds": _resolve_nav_cache_ttl(settings, request.url.path),
         }
-        return JSONResponse(payload, status_code=artifacts.status_code)
+        return JSONResponse(payload, status_code=nav_status_code)
     except LoaderError as exc:
         loader_breadcrumb = _make_loader_breadcrumb(page, status="failed", detail=str(exc))
         return await _navigation_error_response(

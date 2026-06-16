@@ -248,58 +248,28 @@ async function main() {
 }
 
 /**
- * Resolve, compile (or load from the bundle cache), and instantiate the page
- * component for a render request. Installs the per-render SSR globals (style
- * and head registries, request pathname, CSRF token) and returns a
- * ``restoreGlobals`` closure the caller MUST invoke once rendering finishes so
- * the pathname/CSRF globals don't leak into the next request.
+ * Compile (or load from the bundle cache) a single component and return its
+ * module exports plus the inline-style descriptors it registered.
  *
- * Shared by the buffered (``renderRequest``) and streaming
- * (``renderRequestStream``) paths so both compile and cache bundles
- * identically.
+ * Each component is compiled with its OWN ephemeral style registry, so the
+ * cached ``styleDescriptors`` belong to that component alone. This matters for
+ * a ``loading.pyxl`` fallback, which is shared across every page it wraps — its
+ * cache entry must never carry another page's styles. The caller replays the
+ * returned descriptors into the active render's registry.
  */
-async function loadComponentForRender({
-  componentPath,
-  clientRoot,
-  projectRoot: projectRootArg,
-  requestPathname,
-  csrfToken,
-}) {
-  if (!componentPath) {
-    throw new Error('Missing componentPath in render request.');
-  }
-
-  const resolvedComponentPath = path.resolve(componentPath);
-  const workingDir = clientRoot ? path.resolve(clientRoot) : path.dirname(componentPath);
-  const projectRoot = resolveProjectRoot(projectRootArg, workingDir, componentPath);
-  if (!projectRoot) {
-    throw new Error('Unable to determine project root for SSR render.');
-  }
-
-  const { React, ReactDOMServer } = getProjectModules(projectRoot);
-
-  // Fresh registries for each render (head elements depend on props/render).
-  const styleRegistry = createStyleRegistry(projectRoot);
-  globalThis.__PYXLE_REGISTER_SSR_STYLE__ = (entry) => styleRegistry.register(entry);
-  const skipInlineCss = detectPostcssConfig(projectRoot) !== null;
-
-  const headRegistry = createHeadRegistry();
-  globalThis.__PYXLE_HEAD_REGISTRY__ = headRegistry;
-
-  let moduleExports;
-  const cached = _bundleCache.get(resolvedComponentPath);
-
+async function resolveComponentBundle(resolvedPath, componentPath, workingDir, projectRoot, skipInlineCss) {
+  const cached = _bundleCache.get(resolvedPath);
   if (cached) {
-    // CACHE HIT: Skip esbuild entirely. Replay cached style descriptors.
-    moduleExports = cached.moduleExports;
-    for (const descriptor of cached.styleDescriptors) {
-      styleRegistry.register(descriptor);
-    }
-  } else {
-    // CACHE MISS: Run esbuild, then cache the result.
+    return cached;
+  }
+
+  const registry = createStyleRegistry(projectRoot);
+  const previousStyleHook = globalThis.__PYXLE_REGISTER_SSR_STYLE__;
+  globalThis.__PYXLE_REGISTER_SSR_STYLE__ = (entry) => registry.register(entry);
+  try {
     const { esbuild } = getProjectModules(projectRoot);
     const tempDir = getStableTempDir(projectRoot);
-    const bundleHash = crypto.createHash('sha1').update(resolvedComponentPath).digest('hex');
+    const bundleHash = crypto.createHash('sha1').update(resolvedPath).digest('hex');
     const outfile = path.join(tempDir, `${bundleHash}.mjs`);
 
     await esbuild.build({
@@ -352,7 +322,7 @@ async function loadComponentForRender({
                 };
               }
               const contents = await fs.promises.readFile(args.path, 'utf8');
-              const descriptor = styleRegistry.describe(args.path, contents);
+              const descriptor = registry.describe(args.path, contents);
               const moduleCode = `const entry = ${JSON.stringify(descriptor)};
 if (typeof globalThis.__PYXLE_REGISTER_SSR_STYLE__ === 'function') {
   globalThis.__PYXLE_REGISTER_SSR_STYLE__(entry);
@@ -382,16 +352,88 @@ export default entry.contents;
     const bundledSource = await fs.promises.readFile(outfile, 'utf8');
     const cacheBuster = crypto.createHash('sha1').update(bundledSource).digest('hex');
     const moduleUrl = `${pathToFileURL(outfile).href}?v=${cacheBuster}`;
-    moduleExports = await import(moduleUrl);
+    const moduleExports = await import(moduleUrl);
 
-    // Store in cache for subsequent requests.
-    _bundleCache.set(resolvedComponentPath, {
-      moduleExports,
-      styleDescriptors: styleRegistry.list(),
-    });
+    const entry = { moduleExports, styleDescriptors: registry.list() };
+    _bundleCache.set(resolvedPath, entry);
+    return entry;
+  } finally {
+    globalThis.__PYXLE_REGISTER_SSR_STYLE__ = previousStyleHook;
+  }
+}
+
+/**
+ * Resolve, compile (or load from the bundle cache), and instantiate the page
+ * component for a render request. Installs the per-render SSR globals (style
+ * and head registries, request pathname, CSRF token) and returns a
+ * ``restoreGlobals`` closure the caller MUST invoke once rendering finishes so
+ * the pathname/CSRF globals don't leak into the next request.
+ *
+ * When the request carries a ``fallbackPath`` (a compiled ``loading.pyxl``),
+ * its component is loaded too and returned as ``FallbackComponent`` so the
+ * streaming render can wrap the page in ``<Suspense fallback={<Loading/>}>``.
+ *
+ * Shared by the buffered (``renderRequest``) and streaming
+ * (``renderRequestStream``) paths so both compile and cache bundles
+ * identically.
+ */
+async function loadComponentForRender({
+  componentPath,
+  clientRoot,
+  projectRoot: projectRootArg,
+  requestPathname,
+  csrfToken,
+  fallbackPath,
+}) {
+  if (!componentPath) {
+    throw new Error('Missing componentPath in render request.');
   }
 
-  const Component = moduleExports.default ?? moduleExports.Component;
+  const resolvedComponentPath = path.resolve(componentPath);
+  const workingDir = clientRoot ? path.resolve(clientRoot) : path.dirname(componentPath);
+  const projectRoot = resolveProjectRoot(projectRootArg, workingDir, componentPath);
+  if (!projectRoot) {
+    throw new Error('Unable to determine project root for SSR render.');
+  }
+
+  const { React, ReactDOMServer } = getProjectModules(projectRoot);
+
+  // Fresh registries for each render (head/style depend on props/render).
+  const styleRegistry = createStyleRegistry(projectRoot);
+  const skipInlineCss = detectPostcssConfig(projectRoot) !== null;
+
+  const headRegistry = createHeadRegistry();
+  globalThis.__PYXLE_HEAD_REGISTRY__ = headRegistry;
+
+  // Load the page bundle and replay its (isolated) style descriptors into this
+  // render's registry.
+  const pageBundle = await resolveComponentBundle(
+    resolvedComponentPath, componentPath, workingDir, projectRoot, skipInlineCss,
+  );
+  for (const descriptor of pageBundle.styleDescriptors) {
+    styleRegistry.register(descriptor);
+  }
+
+  // Optional loading.pyxl fallback (route-level <Suspense> shell). Loaded the
+  // same way — its own isolated descriptors are merged into this render so the
+  // fallback's styles still ship.
+  let FallbackComponent = null;
+  if (fallbackPath) {
+    const resolvedFallbackPath = path.resolve(fallbackPath);
+    const fallbackBundle = await resolveComponentBundle(
+      resolvedFallbackPath, fallbackPath, workingDir, projectRoot, skipInlineCss,
+    );
+    for (const descriptor of fallbackBundle.styleDescriptors) {
+      styleRegistry.register(descriptor);
+    }
+    FallbackComponent =
+      fallbackBundle.moduleExports.default ?? fallbackBundle.moduleExports.Component ?? null;
+  }
+
+  // Render-time style registration (rare) lands in this render's registry.
+  globalThis.__PYXLE_REGISTER_SSR_STYLE__ = (entry) => styleRegistry.register(entry);
+
+  const Component = pageBundle.moduleExports.default ?? pageBundle.moduleExports.Component;
 
   if (typeof Component !== 'function') {
     throw new Error('Component does not export a default function.');
@@ -427,7 +469,15 @@ export default entry.contents;
     }
   };
 
-  return { React, ReactDOMServer, Component, styleRegistry, headRegistry, restoreGlobals };
+  return {
+    React,
+    ReactDOMServer,
+    Component,
+    FallbackComponent,
+    styleRegistry,
+    headRegistry,
+    restoreGlobals,
+  };
 }
 
 /**
@@ -461,8 +511,15 @@ async function renderRequest(request) {
  * hangs) is aborted after ``streamTimeout`` ms so the worker is never wedged.
  */
 async function renderRequestStream(request, emit) {
-  const { React, ReactDOMServer, Component, styleRegistry, headRegistry, restoreGlobals } =
-    await loadComponentForRender(request);
+  const {
+    React,
+    ReactDOMServer,
+    Component,
+    FallbackComponent,
+    styleRegistry,
+    headRegistry,
+    restoreGlobals,
+  } = await loadComponentForRender(request);
 
   await new Promise((resolve) => {
     let settled = false;
@@ -506,7 +563,18 @@ async function renderRequestStream(request, emit) {
     };
 
     try {
-      const element = React.createElement(Component, request.props);
+      // A loading.pyxl boundary wraps the page in <Suspense fallback={<Loading/>}>
+      // so the loading state streams as the shell while the page render
+      // suspends. The client hydration entry wraps identically (driven by the
+      // same per-route descriptor), so the boundary structure matches.
+      const pageElement = React.createElement(Component, request.props);
+      const element = FallbackComponent
+        ? React.createElement(
+            React.Suspense,
+            { fallback: React.createElement(FallbackComponent) },
+            pageElement,
+          )
+        : pageElement;
       renderer = ReactDOMServer.renderToPipeableStream(element, {
         onShellReady() {
           shellReady = true;

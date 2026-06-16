@@ -197,6 +197,53 @@ def test_loading_pages_are_excluded_from_routing_and_collected(tmp_path: Path) -
     assert loading_sources == {"loading.pyxl", "dashboard/loading.pyxl"}
 
 
+def test_loading_boundary_is_stamped_on_nearest_pages(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    (root / "pages").mkdir(parents=True)
+    (root / "public").mkdir()
+    settings = DevServerSettings.from_project_root(root)
+
+    page = "import React from 'react';\n\nexport default function P() {{ return <main>{0}</main>; }}\n"
+    loading = "import React from 'react';\n\nexport default function L() {{ return <p>loading {0}</p>; }}\n"
+    write_file(settings.pages_dir / "index.pyxl", page.format("home"))
+    write_file(settings.pages_dir / "loading.pyxl", loading.format("root"))
+    write_file(settings.pages_dir / "dashboard/index.pyxl", page.format("dash"))
+    write_file(settings.pages_dir / "dashboard/settings.pyxl", page.format("settings"))
+    write_file(settings.pages_dir / "dashboard/loading.pyxl", loading.format("dash"))
+
+    build_once(settings)
+    table = build_route_table(load_metadata_registry(settings))
+    by_path = {route.path: route for route in table.pages}
+
+    # Root loading.pyxl applies to "/"; the nearer dashboard/loading.pyxl wins
+    # for "/dashboard" and "/dashboard/settings".
+    assert by_path["/"].loading_boundary is not None
+    assert by_path["/"].loading_boundary.source_relative_path.as_posix() == "loading.pyxl"
+    assert (
+        by_path["/dashboard"].loading_boundary.source_relative_path.as_posix()
+        == "dashboard/loading.pyxl"
+    )
+    assert (
+        by_path["/dashboard/settings"].loading_boundary.source_relative_path.as_posix()
+        == "dashboard/loading.pyxl"
+    )
+
+
+def test_no_loading_boundary_leaves_routes_unstamped(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    (root / "pages").mkdir(parents=True)
+    (root / "public").mkdir()
+    settings = DevServerSettings.from_project_root(root)
+    write_file(
+        settings.pages_dir / "index.pyxl",
+        "import React from 'react';\n\nexport default function P() { return <main>home</main>; }\n",
+    )
+
+    build_once(settings)
+    table = build_route_table(load_metadata_registry(settings))
+    assert all(route.loading_boundary is None for route in table.pages)
+
+
 def test_build_route_table_falls_back_to_inferred_path(project: DevServerSettings) -> None:
     build_once(project)
 

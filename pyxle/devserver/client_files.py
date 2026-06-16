@@ -1095,7 +1095,7 @@ def _render_client_entry(settings: DevServerSettings) -> str:
               return promise;
             }
 
-            async function renderPage(pagePath, props) {
+            async function renderPage(pagePath, props, loadingAssetPath) {
               const module = await loadPageModule(pagePath);
               const Page = module.default;
               if (!Page) {
@@ -1106,7 +1106,20 @@ def _render_client_entry(settings: DevServerSettings) -> str:
                 throw new Error("[Pyxle] Hydration container '#root' not found");
               }
 
-              const element = React.createElement(Page, props);
+              // A route with a loading.pyxl boundary is wrapped in the SAME
+              // <Suspense fallback={<Loading/>}> the streaming server emitted, so
+              // the hydration boundary structure matches. The fallback module is
+              // loaded BEFORE hydrateRoot so the boundary is ready immediately.
+              let element = React.createElement(Page, props);
+              if (loadingAssetPath) {
+                const fallbackModule = await loadPageModule(loadingAssetPath);
+                const Fallback = fallbackModule.default;
+                element = React.createElement(
+                  React.Suspense,
+                  { fallback: Fallback ? React.createElement(Fallback) : null },
+                  React.createElement(Page, props),
+                );
+              }
               if (!reactRoot) {
                 const placeholder = container.firstElementChild;
                 const shouldClientRender = placeholder?.hasAttribute('data-pyxle-component');
@@ -1634,7 +1647,7 @@ def _render_client_entry(settings: DevServerSettings) -> str:
                 const nextProps = payload.props ?? {};
                 await prefetchModule(nextPagePath);
                 updateHead(payload.headMarkup ?? '');
-                await renderPage(nextPagePath, nextProps);
+                await renderPage(nextPagePath, nextProps, payload.page?.loadingAssetPath ?? null);
 
                 if (options.updateHistory === false) {
                   window.history.replaceState({ pyxle: true, pagePath: nextPagePath }, '', `${url.pathname}${url.search}${url.hash}`);
@@ -1681,7 +1694,7 @@ def _render_client_entry(settings: DevServerSettings) -> str:
                 const nextPagePath = payload.page?.clientAssetPath ?? currentPagePath;
                 const nextProps = payload.props ?? {};
                 updateHead(payload.headMarkup ?? '');
-                await renderPage(nextPagePath, nextProps);
+                await renderPage(nextPagePath, nextProps, payload.page?.loadingAssetPath ?? null);
 
                 // Replace current history entry with fresh state — no scroll change.
                 window.history.replaceState(
@@ -1766,7 +1779,10 @@ def _render_client_entry(settings: DevServerSettings) -> str:
             async function bootstrap() {
               const initialProps = parseInitialProps();
               seedCurrentPage(initialProps);
-              await renderPage(currentPagePath, initialProps);
+              // The SSR document sets __PYXLE_LOADING_ASSET__ when this route
+              // streamed wrapped in a loading.pyxl <Suspense> boundary; the
+              // client wraps identically so hydration matches.
+              await renderPage(currentPagePath, initialProps, window.__PYXLE_LOADING_ASSET__ || null);
               if (!window.history.state || !window.history.state.pyxle) {
                 window.history.replaceState({ pyxle: true, pagePath: currentPagePath }, '', window.location.href);
               }

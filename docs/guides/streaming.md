@@ -47,6 +47,50 @@ resolves. Pyxle's `@server` loader still runs first and passes its result as
 `data` props, exactly as for a buffered page — streaming governs how the
 **rendered** page is delivered, not how the loader runs.
 
+## Route-level loading states with `loading.pyxl`
+
+A `loading.pyxl` file declares a **route-level** loading state — the React
+component it exports becomes the fallback for the whole route, the way Next.js's
+`loading.js` does:
+
+```
+pages/
+├── loading.pyxl              # fallback for every route
+└── dashboard/
+    ├── loading.pyxl          # fallback for /dashboard and everything under it
+    └── index.pyxl
+```
+
+```jsx
+// pages/dashboard/loading.pyxl
+import React from 'react';
+
+export default function DashboardLoading() {
+  return <p>Loading the dashboard…</p>;
+}
+```
+
+Pyxle wraps the page in `<Suspense fallback={<DashboardLoading/>}>` — on the
+server (so the loading state streams as the shell) **and** on the client (so
+hydration matches). The **nearest** `loading.pyxl` wins, walking up the
+directory tree exactly like [`error.pyxl`](error-handling.md). It composes with
+a page's own inner `<Suspense>`: an inner boundary handles its own subtree, and
+anything it doesn't catch bubbles up to the `loading.pyxl` shell. A
+`loading.pyxl` is compiled but never routable on its own.
+
+> **A `loading.pyxl` only shows if the render actually suspends.** Because the
+> `@server` loader runs *before* the component renders, a page whose data comes
+> entirely from the loader has its props ready by render time and **never
+> suspends** — so the fallback never appears, and the full page streams at once.
+> The loading state shows only when the render itself suspends: a child using
+> `React.lazy`, `use(promise)`, or a thrown promise. This is the honest
+> consequence of Pyxle's loader-first model; if you want a loading state for slow
+> *loader* data, that data isn't what `loading.pyxl` defers.
+
+A `loading.pyxl` should not declare a `<Head>` — like any streamed fallback it
+renders before the head is finalized, and on a client-side navigation the head
+is updated before the fallback renders, so a fallback's `<Head>` is ignored.
+
 ## Hydration
 
 Nothing changes about hydration. The browser hydrates the same component it

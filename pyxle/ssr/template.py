@@ -78,6 +78,16 @@ def build_document_shell(
 ) -> DocumentShell:
   props_payload = _serialize_props(props)
   page_path_literal = json.dumps(page.client_asset_path)
+  # The nearest loading.pyxl's client asset (or null). The client hydration
+  # entry reads this to wrap the page in the SAME <Suspense fallback={<Loading/>}>
+  # the streaming server emitted — one descriptor drives both sides, so the
+  # boundary structure can never diverge.
+  loading_boundary = getattr(page, "loading_boundary", None)
+  loading_asset_literal = (
+    json.dumps(loading_boundary.client_asset_path)
+    if loading_boundary is not None
+    else "null"
+  )
   head_injections = render_head_markup(head_elements)
   # Seed payload for the client navigation cache. Lets the page the user
   # landed on satisfy its own prefetch (the active self-link) from cache
@@ -143,7 +153,8 @@ def build_document_shell(
   </div>
   <script id=\"__PYXLE_PROPS__\" type=\"application/json\"{nonce_attr}>{props_payload}</script>
   <script id=\"__PYXLE_NAV_SEED__\" type=\"application/json\"{nonce_attr}>{nav_seed_payload}</script>
-  <script{nonce_attr}>window.__PYXLE_PAGE_PATH__ = {page_path_literal};</script>{nav_stale_script}{csrf_names_script}
+  <script{nonce_attr}>window.__PYXLE_PAGE_PATH__ = {page_path_literal};</script>
+  <script{nonce_attr}>window.__PYXLE_LOADING_ASSET__ = {loading_asset_literal};</script>{nav_stale_script}{csrf_names_script}
   <script{nonce_attr}>window.__PYXLE_SCRIPTS__ = {scripts_metadata};</script>
   <script type=\"module\" src=\"{js_src}\"></script>
   </body>
@@ -153,6 +164,7 @@ def build_document_shell(
       props_payload=props_payload,
       nav_seed_payload=nav_seed_payload,
       page_path_literal=page_path_literal,
+      loading_asset_literal=loading_asset_literal,
       scripts_metadata=scripts_metadata,
       nav_stale_script=nav_stale_script,
       csrf_names_script=csrf_names_script,
@@ -186,7 +198,8 @@ def build_document_shell(
   </div>
   <script id=\"__PYXLE_PROPS__\" type=\"application/json\"{nonce_attr}>{props_payload}</script>
   <script id=\"__PYXLE_NAV_SEED__\" type=\"application/json\"{nonce_attr}>{nav_seed_payload}</script>
-  <script{nonce_attr}>window.__PYXLE_PAGE_PATH__ = {page_path_literal};</script>{nav_stale_script}{csrf_names_script}
+  <script{nonce_attr}>window.__PYXLE_PAGE_PATH__ = {page_path_literal};</script>
+  <script{nonce_attr}>window.__PYXLE_LOADING_ASSET__ = {loading_asset_literal};</script>{nav_stale_script}{csrf_names_script}
   <script{nonce_attr}>window.__PYXLE_SCRIPTS__ = {scripts_metadata};</script>
   <script type=\"module\" src=\"{vite_origin}/client-entry.js\"></script>
   </body>
@@ -196,6 +209,7 @@ def build_document_shell(
     props_payload=props_payload,
     nav_seed_payload=nav_seed_payload,
     page_path_literal=page_path_literal,
+    loading_asset_literal=loading_asset_literal,
     scripts_metadata=scripts_metadata,
     nav_stale_script=nav_stale_script,
     csrf_names_script=csrf_names_script,

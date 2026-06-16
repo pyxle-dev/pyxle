@@ -2686,3 +2686,76 @@ def test_hot_route_refresh_keeps_streaming_wired(
     )
     devserver_pkg._rebuild_app_routes(app, project)
     assert captured["stream_render"] is _render_stream
+
+
+@pytest.mark.anyio
+async def test_loading_boundary_route_takes_streaming_path(
+    anyio_backend, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A page with a loading.pyxl boundary but NO in-page <Suspense> must still
+    enter the streaming path — otherwise the route-level loading shell is dead."""
+    from starlette.requests import Request
+    from starlette.responses import HTMLResponse
+
+    from pyxle.devserver.routes import PageRoute
+    from pyxle.devserver.starlette_app import ComponentRenderer, _build_cached_page_response
+
+    root = tmp_path / "project"
+    (root / "pages").mkdir(parents=True)
+    (root / "public").mkdir()
+    settings = DevServerSettings.from_project_root(root)
+
+    loading = PageRoute(
+        path="/dashboard/loading",
+        source_relative_path=Path("dashboard/loading.pyxl"),
+        source_absolute_path=root / "pages" / "dashboard" / "loading.pyxl",
+        server_module_path=root / "server" / "dashboard" / "loading.py",
+        client_module_path=root / "client" / "dashboard" / "loading.jsx",
+        metadata_path=root / "meta" / "dashboard" / "loading.json",
+        module_key="pyxle.server.pages.dashboard.loading",
+        client_asset_path="/pages/dashboard/loading.jsx",
+        server_asset_path="/pages/dashboard/loading.py",
+        content_hash="h",
+        loader_name=None,
+        loader_line=None,
+        head_elements=(),
+        head_is_dynamic=False,
+    )
+    route = replace(
+        loading,
+        path="/dashboard",
+        source_relative_path=Path("dashboard/index.pyxl"),
+        client_asset_path="/pages/dashboard/index.jsx",
+        uses_suspense=False,  # NO in-page Suspense — only the loading boundary
+        loading_boundary=loading,
+    )
+
+    called: dict = {}
+
+    async def _fake_streaming(**kwargs):
+        called["yes"] = True
+        return HTMLResponse("streamed")
+
+    monkeypatch.setattr(
+        "pyxle.devserver.starlette_app.build_streaming_page_response", _fake_streaming
+    )
+
+    async def _stream_render(*args, **kwargs):  # pragma: no cover - sentinel
+        yield {"type": "end"}
+
+    request = Request(
+        {"type": "http", "http_version": "1.1", "method": "GET", "path": "/dashboard",
+         "query_string": b"", "root_path": "", "headers": []}
+    )
+    response = await _build_cached_page_response(
+        request=request,
+        route=route,
+        settings=settings,
+        renderer=ComponentRenderer(),
+        overlay=None,
+        error_boundaries=None,
+        page_cache=None,
+        stream_render=_stream_render,
+    )
+    assert called.get("yes") is True
+    assert response.headers["Cache-Control"] == "private, no-cache"

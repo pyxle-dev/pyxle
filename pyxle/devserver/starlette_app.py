@@ -916,14 +916,15 @@ async def _build_cached_page_response(
         and cache_config.max_age_for(request.url.path) is not None
     )
 
-    # Streaming SSR (opt-in): a page that uses <Suspense> streams its shell
-    # before its async boundaries resolve, for a faster TTFB. It only applies to
-    # routes that are NOT publicly cacheable — a cacheable route must materialise
-    # its body to store + ETag it, so streaming would buy nothing and can't be
-    # cached. The buffered path stays the default for everything else.
+    # Streaming SSR (opt-in): a page that uses <Suspense> — or one wrapped in a
+    # route-level loading.pyxl boundary — streams its shell before its async
+    # boundaries resolve, for a faster TTFB. It only applies to routes that are
+    # NOT publicly cacheable — a cacheable route must materialise its body to
+    # store + ETag it, so streaming would buy nothing and can't be cached. The
+    # buffered path stays the default for everything else.
     if (
         stream_render is not None
-        and route.uses_suspense
+        and (route.uses_suspense or route.loading_boundary is not None)
         and not statically_cacheable
     ):
         streamed = await build_streaming_page_response(

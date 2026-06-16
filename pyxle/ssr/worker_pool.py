@@ -373,6 +373,7 @@ class SsrWorkerPool:
         *,
         request_pathname: str | None = None,
         csrf_token: str | None = None,
+        fallback_path: Path | None = None,
     ):
         """Stream a render from the next available worker as a frame sequence.
 
@@ -406,6 +407,10 @@ class SsrWorkerPool:
             payload["requestPathname"] = request_pathname
         if csrf_token is not None:
             payload["csrfToken"] = csrf_token
+        if fallback_path is not None:
+            # The page is wrapped in <Suspense fallback={<Loading/>}> using this
+            # compiled loading.pyxl component.
+            payload["fallbackPath"] = str(fallback_path.resolve())
 
         try:
             async for frame in worker.send_stream(

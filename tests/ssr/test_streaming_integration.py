@@ -123,3 +123,89 @@ def test_suspense_page_streams_while_plain_page_buffers(tmp_path: Path) -> None:
     assert plain.status_code == 200
     assert 'data-testid="plain"' in plain.text
     assert "Plain buffered page" in plain.text
+
+
+_DASHBOARD_LOADING = """
+import React from 'react';
+
+export default function DashboardLoading() {
+  return <p data-testid="dash-loading">Loading dashboard…</p>;
+}
+"""
+
+_DASHBOARD_SUSPENDS = """
+import time
+
+@server
+async def load(request):
+    return {"nonce": f"{time.time()}"}
+
+# --- JavaScript/PSX (Client + Server) ---
+
+import React from 'react';
+
+const _cache = new Map();
+function slow(nonce) {
+  let e = _cache.get(nonce);
+  if (!e) {
+    e = { done: false, value: null };
+    e.promise = new Promise((r) => setTimeout(() => { e.done = true; e.value = 'dash-data'; r(); }, 15));
+    _cache.set(nonce, e);
+  }
+  if (e.done) return e.value;
+  throw e.promise;
+}
+
+function Content({ nonce }) {
+  return <p data-testid="dash-content">Content: {slow(nonce)}</p>;
+}
+
+export default function Dashboard({ data }) {
+  return (
+    <main>
+      <h1 data-testid="dash-shell">Dashboard</h1>
+      <Content nonce={data.nonce} />
+    </main>
+  );
+}
+"""
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js required for streaming SSR")
+def test_loading_pyxl_wraps_page_in_streamed_suspense(tmp_path: Path) -> None:
+    project_root = tmp_path / "project"
+    (project_root / "public").mkdir(parents=True)
+    settings = DevServerSettings.from_project_root(project_root)
+    ensure_test_node_modules(project_root)
+
+    _write(settings.pages_dir / "dashboard/loading.pyxl", _DASHBOARD_LOADING)
+    _write(settings.pages_dir / "dashboard/index.pyxl", _DASHBOARD_SUSPENDS)
+
+    build_once(settings)
+    routes = build_route_table(load_metadata_registry(settings))
+    dash = next(r for r in routes.pages if r.path == "/dashboard")
+    # The route was stamped with its nearest loading.pyxl even though the page
+    # itself declares no <Suspense>.
+    assert dash.uses_suspense is False
+    assert dash.loading_boundary is not None
+
+    pool = SsrWorkerPool(
+        size=1, project_root=settings.project_root, client_root=settings.client_build_dir
+    )
+    app = create_starlette_app(settings, routes, pool=pool)
+
+    with TestClient(app) as client:
+        response = client.get("/dashboard")
+
+    assert response.status_code == 200
+    body = response.text
+    # The worker wrapped the page in <Suspense fallback={<Loading/>}>: the
+    # loading fallback streamed in the shell, the resolved content streamed after.
+    assert "Loading dashboard" in body  # the loading.pyxl fallback
+    # React separates static text from an interpolated value with a comment
+    # marker, so the resolved content is ``Content: <!-- -->dash-data``.
+    assert "dash-data" in body  # the resolved page content streamed in
+    assert "Dashboard" in body  # the page shell (inside the wrapped boundary)
+    # The client descriptor that drives the matching hydration wrap is present.
+    assert 'window.__PYXLE_LOADING_ASSET__ = "/pages/dashboard/loading.jsx"' in body
+    assert response.headers.get("cache-control") == "private, no-cache"

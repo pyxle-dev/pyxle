@@ -24,7 +24,14 @@ from pyxle.ssr.view import (
 def _stream_of(*frames):
     """Build a fake ``render_stream`` async-generator callable yielding *frames*."""
 
-    async def _gen(component_path, props, *, request_pathname=None, csrf_token=None):
+    async def _gen(
+        component_path,
+        props,
+        *,
+        request_pathname=None,
+        csrf_token=None,
+        fallback_path=None,
+    ):
         for frame in frames:
             yield frame
 
@@ -2518,3 +2525,98 @@ async def test_build_streaming_page_response_without_manifest_falls_back_to_buff
     assert response.status_code == 200
     assert "<main>buffered-fallback</main>" in body
     assert "<should-not-appear/>" not in body
+
+
+@pytest.mark.anyio
+async def test_streaming_passes_loading_fallback_path(
+    settings: DevServerSettings, tmp_path: Path
+) -> None:
+    loading_route = replace(
+        _page_route(tmp_path, loader_name=None),
+        client_module_path=tmp_path / "client" / "loading.jsx",
+    )
+    page = replace(
+        _page_route(tmp_path, loader_name=None),
+        uses_suspense=True,
+        loading_boundary=loading_route,
+    )
+    captured: dict = {}
+
+    async def _capturing(component_path, props, *, request_pathname=None, csrf_token=None, fallback_path=None):
+        captured["fallback_path"] = fallback_path
+        yield {"type": "chunk", "html": "<main>x</main>"}
+        yield {"type": "end"}
+
+    request = Request(
+        {"type": "http", "http_version": "1.1", "method": "GET", "path": "/", "root_path": "", "headers": []}
+    )
+    await build_streaming_page_response(
+        request=request,
+        settings=settings,
+        page=page,
+        renderer=StubRenderer(),
+        stream_render=_capturing,
+        overlay=StubOverlay(),
+    )
+    # The page's nearest loading.pyxl is forwarded so the worker can wrap it.
+    assert captured["fallback_path"] == loading_route.client_module_path
+
+
+@pytest.mark.anyio
+async def test_nav_payload_for_streaming_page_uses_static_head_and_carries_loading_asset(
+    settings: DevServerSettings, tmp_path: Path
+) -> None:
+    # A streaming-eligible page's nav payload is built from the loader + static
+    # head WITHOUT a buffered render (renderToString throws on suspension).
+    loading_route = replace(
+        _page_route(tmp_path, loader_name=None),
+        client_asset_path="/pages/loading.jsx",
+    )
+    page = replace(
+        _page_route(tmp_path, loader_name=None),
+        uses_suspense=True,
+        loading_boundary=loading_route,
+    )
+    renderer = StubRenderer()
+    request = Request(
+        {"type": "http", "http_version": "1.1", "method": "GET", "path": "/", "root_path": "", "headers": []}
+    )
+
+    response = await build_page_navigation_response(
+        request=request,
+        settings=settings,
+        page=page,
+        renderer=renderer,
+        overlay=StubOverlay(),
+    )
+
+    body = json.loads((await _read_response_body(response)).decode())
+    assert body["ok"] is True
+    assert body["page"]["loadingAssetPath"] == "/pages/loading.jsx"
+    assert "<title>Home</title>" in body["headMarkup"]  # static HEAD
+    # No buffered render happened for the streaming nav payload.
+    assert renderer.calls == []
+
+
+@pytest.mark.anyio
+async def test_nav_payload_for_plain_page_has_null_loading_asset(
+    settings: DevServerSettings, tmp_path: Path
+) -> None:
+    page = _page_route(tmp_path, loader_name=None)  # no boundary, no suspense
+    renderer = StubRenderer()
+    renderer.responses.append(RenderResult(html="<main>plain</main>"))
+    request = Request(
+        {"type": "http", "http_version": "1.1", "method": "GET", "path": "/", "root_path": "", "headers": []}
+    )
+
+    response = await build_page_navigation_response(
+        request=request,
+        settings=settings,
+        page=page,
+        renderer=renderer,
+        overlay=StubOverlay(),
+    )
+    body = json.loads((await _read_response_body(response)).decode())
+    assert body["page"]["loadingAssetPath"] is None
+    # A plain page's nav payload still renders buffered for its runtime head.
+    assert renderer.calls != []
