@@ -24,6 +24,11 @@ logger = logging.getLogger(__name__)
 
 _WORKER_STOP_TIMEOUT = 5.0  # seconds to wait for graceful shutdown
 
+# Sentinel pushed onto a streaming request's queue when its worker dies, so the
+# stream consumer (send_stream) wakes immediately instead of waiting out the
+# frame timeout.
+_STREAM_TERMINATED = object()
+
 # Environment variables safe to forward to Node.js worker processes.
 # NODE_OPTIONS is explicitly excluded to prevent arbitrary code injection.
 _ALLOWED_ENV_KEYS: frozenset[str] = frozenset({
@@ -61,6 +66,10 @@ class _WorkerState:
 
     process: asyncio.subprocess.Process
     pending: dict[str, asyncio.Future[dict[str, Any]]] = field(default_factory=dict)
+    # Streaming requests (multi-frame): request_id -> queue of NDJSON frames.
+    # Distinct from ``pending`` (single-frame buffered requests) so the two
+    # protocols coexist on one worker connection.
+    streaming: dict[str, "asyncio.Queue[Any]"] = field(default_factory=dict)
     alive: bool = True
     reader_task: asyncio.Task[None] | None = field(default=None, compare=False, repr=False)
 
@@ -89,6 +98,47 @@ class _WorkerState:
             raise WorkerPoolError(f"SSR worker stdin closed: {exc}") from exc
 
         return await future
+
+    async def send_stream(self, payload: dict[str, Any], *, frame_timeout: float):
+        """Write a streaming request and yield its NDJSON frames in order.
+
+        Yields each frame dict until (and including) a terminal ``end``/``error``
+        frame, then stops. Raises :class:`WorkerPoolError` if the worker stdin
+        closes, the worker dies mid-stream, or no frame arrives within
+        ``frame_timeout`` seconds (an inactivity guard — a healthy stream emits
+        chunks steadily, so a long gap means a hung render).
+        """
+        request_id: str = payload["id"]
+        queue: asyncio.Queue[Any] = asyncio.Queue()
+        self.streaming[request_id] = queue
+
+        line = (
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+        ).encode("utf-8")
+        assert self.process.stdin is not None
+        self.process.stdin.write(line)
+        try:
+            await self.process.stdin.drain()
+        except Exception as exc:
+            self.streaming.pop(request_id, None)
+            self.alive = False
+            raise WorkerPoolError(f"SSR worker stdin closed: {exc}") from exc
+
+        try:
+            while True:
+                try:
+                    frame = await asyncio.wait_for(queue.get(), timeout=frame_timeout)
+                except asyncio.TimeoutError as exc:
+                    raise WorkerPoolError(
+                        f"SSR stream stalled (no frame in {frame_timeout}s)"
+                    ) from exc
+                if frame is _STREAM_TERMINATED:
+                    raise WorkerPoolError("SSR worker terminated mid-stream")
+                yield frame
+                if frame.get("type") in ("end", "error"):
+                    return
+        finally:
+            self.streaming.pop(request_id, None)
 
     async def read_loop(self) -> None:
         """Background task: relay stdout lines to waiting futures.
@@ -126,6 +176,11 @@ class _WorkerState:
                 if not future.done():
                     future.set_exception(exc)
             self.pending.clear()
+            # Wake any in-flight streaming consumers so they fail fast instead
+            # of waiting out the frame timeout.
+            for queue in list(self.streaming.values()):
+                queue.put_nowait(_STREAM_TERMINATED)
+            self.streaming.clear()
 
     def _dispatch_line(self, line: bytes) -> None:
         """Parse one NDJSON line and resolve the matching pending future."""
@@ -135,10 +190,16 @@ class _WorkerState:
             logger.debug("SSR worker sent non-JSON line: %r", line[:120])
             return
         request_id = data.get("id")
-        if request_id and request_id in self.pending:
+        if not request_id:
+            return
+        if request_id in self.pending:
             future = self.pending.pop(request_id)
             if not future.done():
                 future.set_result(data)
+        elif request_id in self.streaming:
+            # Multi-frame streaming response: relay every frame to the consumer,
+            # which stops when it sees a terminal ("end"/"error") frame.
+            self.streaming[request_id].put_nowait(data)
 
     async def stop(self) -> None:
         """Send EOF to stdin and wait for the process to exit."""
@@ -304,6 +365,57 @@ class SsrWorkerPool:
             raise
 
         return result
+
+    async def render_stream(
+        self,
+        component_path: Path,
+        props: dict[str, Any],
+        *,
+        request_pathname: str | None = None,
+        csrf_token: str | None = None,
+    ):
+        """Stream a render from the next available worker as a frame sequence.
+
+        Yields NDJSON frame dicts (``{"type": "chunk", "html": ...}``) as they
+        arrive, ending with a terminal ``{"type": "end"}`` or
+        ``{"type": "error", ...}`` frame. The caller interprets the frames
+        (``chunk`` -> body bytes, ``end`` -> done, ``error`` -> fallback). A
+        worker that crashes mid-stream is dropped and replaced. Use
+        :meth:`render` for the buffered single-frame path (cacheable / SSG
+        renders, which must be materialised anyway).
+        """
+        if not self._started:
+            await self.start()
+
+        worker = self._pick_worker()
+        if worker is None:
+            raise WorkerPoolError(
+                "No healthy SSR workers available. The pool may be exhausted or all workers crashed."
+            )
+
+        request_id = str(uuid.uuid4())
+        payload: dict[str, Any] = {
+            "id": request_id,
+            "componentPath": str(component_path.resolve()),
+            "props": props,
+            "clientRoot": str(self._client_root),
+            "projectRoot": str(self._project_root),
+            "stream": True,
+        }
+        if request_pathname is not None:
+            payload["requestPathname"] = request_pathname
+        if csrf_token is not None:
+            payload["csrfToken"] = csrf_token
+
+        try:
+            async for frame in worker.send_stream(
+                payload, frame_timeout=self._render_timeout
+            ):
+                yield frame
+        except WorkerPoolError:
+            self._workers = [w for w in self._workers if w is not worker]
+            asyncio.get_running_loop().create_task(self._replenish())
+            raise
 
     async def invalidate(
         self,
