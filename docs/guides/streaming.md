@@ -54,6 +54,20 @@ always did; React 18 reconciles the streamed markup (including the parts that
 arrived after the shell) natively. A streaming page is hydrated exactly like a
 buffered one.
 
+Hydration is **selective**: React hydrates the shell (and makes its interactive
+parts live) without waiting for a `<Suspense>` boundary to finish — an
+interactive control above the boundary responds to input while the boundary is
+still resolving, and each boundary hydrates as its content arrives.
+
+## Faster time-to-first-byte
+
+The point of streaming is that the browser receives — and can paint — the shell
+before the slow boundary is ready. For a page whose boundary takes, say, 600 ms
+to resolve, the shell's first byte arrives in tens of milliseconds rather than
+after the full ~600 ms a buffered render would wait. The slower the boundary,
+the bigger the win; a page with no slow boundary gains nothing, which is exactly
+why streaming is opt-in.
+
 ## When a page does **not** stream
 
 Streaming is deliberately narrow. A page falls back to the buffered render when:
