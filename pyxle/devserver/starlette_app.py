@@ -14,7 +14,7 @@ from email.utils import formatdate, parsedate
 from hashlib import md5
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 from starlette.applications import Starlette
 from starlette.datastructures import Headers
@@ -41,7 +41,11 @@ from pyxle.ssr import (
     build_page_response,
 )
 from pyxle.ssr.renderer import pool_render_factory
-from pyxle.ssr.view import REVALIDATE_HEADER, build_not_found_response
+from pyxle.ssr.view import (
+    REVALIDATE_HEADER,
+    build_not_found_response,
+    build_streaming_page_response,
+)
 
 from .error_pages import ErrorBoundaryRegistry, build_error_boundary_registry
 from .middleware import MiddlewareHookError, load_custom_middlewares
@@ -637,6 +641,7 @@ def build_page_router(
     route_hooks: Sequence[RouteHookCallable] | None = None,
     error_boundaries: ErrorBoundaryRegistry | None = None,
     page_cache: PageCache | None = None,
+    stream_render: Callable[..., Any] | None = None,
 ) -> Router:
     """Create a router serving compiled pages via server-side rendering."""
 
@@ -651,6 +656,7 @@ def build_page_router(
             overlay=overlay,
             error_boundaries=error_boundaries,
             page_cache=page_cache,
+            stream_render=stream_render,
         )
         context = RouteContext(
             target="page",
@@ -858,6 +864,7 @@ async def _build_cached_page_response(
     overlay: OverlayManager | None,
     error_boundaries: ErrorBoundaryRegistry | None,
     page_cache: PageCache | None,
+    stream_render: Callable[..., Any] | None = None,
 ) -> Response:
     """Render a page, or serve it from the server-side page cache.
 
@@ -908,6 +915,29 @@ async def _build_cached_page_response(
         cache_config is not None
         and cache_config.max_age_for(request.url.path) is not None
     )
+
+    # Streaming SSR (opt-in): a page that uses <Suspense> streams its shell
+    # before its async boundaries resolve, for a faster TTFB. It only applies to
+    # routes that are NOT publicly cacheable — a cacheable route must materialise
+    # its body to store + ETag it, so streaming would buy nothing and can't be
+    # cached. The buffered path stays the default for everything else.
+    if (
+        stream_render is not None
+        and route.uses_suspense
+        and not statically_cacheable
+    ):
+        streamed = await build_streaming_page_response(
+            request=request,
+            settings=settings,
+            page=route,
+            renderer=renderer,
+            stream_render=stream_render,
+            overlay=overlay,
+            error_boundaries=error_boundaries,
+        )
+        streamed.headers["Vary"] = _NAVIGATION_HEADER
+        streamed.headers["Cache-Control"] = "private, no-cache"
+        return streamed
 
     response = await build_page_response(
         request=request,
@@ -979,6 +1009,7 @@ def _make_page_handler(
     overlay: OverlayManager | None,
     error_boundaries: ErrorBoundaryRegistry | None = None,
     page_cache: PageCache | None = None,
+    stream_render: Callable[..., Any] | None = None,
 ):
     async def handler(request: Request):  # pragma: no cover - thin wrapper
         wants_navigation_payload = request.headers.get(_NAVIGATION_HEADER) == "1"
@@ -1010,6 +1041,7 @@ def _make_page_handler(
             overlay=overlay,
             error_boundaries=error_boundaries,
             page_cache=page_cache,
+            stream_render=stream_render,
         )
 
     handler.__name__ = f"page_{route.module_key.replace('.', '_')}"
@@ -1256,6 +1288,7 @@ def _build_app_routes(
     api_route_hooks: Sequence[RouteHookCallable],
     page_route_hooks: Sequence[RouteHookCallable],
     page_cache: PageCache | None = None,
+    stream_render: Callable[..., Any] | None = None,
 ) -> tuple[list[Any], ErrorBoundaryRegistry]:
     """Build the ordered Starlette route list for a route table.
 
@@ -1278,6 +1311,7 @@ def _build_app_routes(
         route_hooks=[*DEFAULT_PAGE_POLICIES, *page_route_hooks],
         error_boundaries=error_boundaries,
         page_cache=page_cache,
+        stream_render=stream_render,
     )
     action_router = build_action_router(routes.actions, debug=settings.debug)
 
@@ -1330,6 +1364,10 @@ def create_starlette_app(
         renderer = ComponentRenderer(factory=pool_render_factory(pool))
     else:
         renderer = ComponentRenderer()
+    # Streaming SSR needs the worker pool's multi-frame render_stream. Without a
+    # pool (single-process fallback) streaming is unavailable and every page
+    # renders buffered.
+    stream_render: Callable[..., Any] | None = getattr(pool, "render_stream", None)
     # Server-side page cache: enabled for production serves, off in debug so a
     # cached render never masks an edit during development. Only routes that
     # declared themselves cacheable (a loader `revalidate` or an edge `cache`
@@ -1628,6 +1666,7 @@ def create_starlette_app(
         api_route_hooks=api_route_hooks,
         page_route_hooks=page_route_hooks,
         page_cache=page_cache,
+        stream_render=stream_render,
     )
     app.router.routes.extend(app_routes)
 

@@ -17,7 +17,18 @@ from pyxle.ssr.view import (
     HeadEvaluationError,
     build_page_navigation_response,
     build_page_response,
+    build_streaming_page_response,
 )
+
+
+def _stream_of(*frames):
+    """Build a fake ``render_stream`` async-generator callable yielding *frames*."""
+
+    async def _gen(component_path, props, *, request_pathname=None, csrf_token=None):
+        for frame in frames:
+            yield frame
+
+    return _gen
 
 
 @pytest.fixture
@@ -2404,3 +2415,106 @@ def test_purge_page_modules_skips_modules_with_unresolvable_file(tmp_path: Path)
         assert "pyxle._test_poisoned_file" in sys.modules
     finally:
         sys.modules.pop("pyxle._test_poisoned_file", None)
+
+
+@pytest.mark.anyio
+async def test_build_streaming_page_response_streams_prefix_body_suffix(
+    settings: DevServerSettings, tmp_path: Path
+) -> None:
+    page = replace(_page_route(tmp_path, loader_name=None), uses_suspense=True)
+    renderer = StubRenderer()  # only used for an error-boundary fallback render
+    overlay = StubOverlay()
+    request = Request(
+        {"type": "http", "http_version": "1.1", "method": "GET", "path": "/", "root_path": "", "headers": []}
+    )
+
+    response = await build_streaming_page_response(
+        request=request,
+        settings=settings,
+        page=page,
+        renderer=renderer,
+        stream_render=_stream_of(
+            {"type": "chunk", "html": "<main>shell</main>"},
+            {"type": "end", "styles": [], "headElements": []},
+        ),
+        overlay=overlay,
+    )
+
+    body = (await _read_response_body(response)).decode()
+    assert response.status_code == 200
+    # Static head flushed in the prefix, the streamed chunk in the body, the
+    # hydration props script in the suffix.
+    assert "<title>Home</title>" in body
+    assert "<main>shell</main>" in body
+    assert "__PYXLE_PROPS__" in body
+    # The buffered renderer was never invoked — the stream produced the body.
+    assert renderer.calls == []
+    assert overlay.events == [("clear", "/")]
+
+
+@pytest.mark.anyio
+async def test_build_streaming_page_response_shell_error_falls_back(
+    settings: DevServerSettings, tmp_path: Path
+) -> None:
+    page = replace(_page_route(tmp_path, loader_name=None), uses_suspense=True)
+    renderer = StubRenderer()
+    overlay = StubOverlay()
+    request = Request(
+        {"type": "http", "http_version": "1.1", "method": "GET", "path": "/", "root_path": "", "headers": []}
+    )
+
+    # The very first frame is an error (renderToPipeableStream onShellError) —
+    # no bytes were sent yet, so it maps to the sanitized error document.
+    response = await build_streaming_page_response(
+        request=request,
+        settings=settings,
+        page=page,
+        renderer=renderer,
+        stream_render=_stream_of({"type": "error", "error": "shell exploded"}),
+        overlay=overlay,
+    )
+
+    assert response.status_code == 500
+    # An error before the first byte must never emit a partial streamed body.
+    body = (await _read_response_body(response)).decode()
+    assert "<main>shell</main>" not in body
+    assert any(event[0] == "error" for event in overlay.events)
+
+
+@pytest.mark.anyio
+async def test_build_streaming_page_response_without_manifest_falls_back_to_buffered(
+    settings: DevServerSettings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # When the streaming shell can't be built (no client manifest to link the
+    # hydration bundle), the request falls back to the buffered builder rather
+    # than emitting a broken document.
+    page = replace(_page_route(tmp_path, loader_name=None), uses_suspense=True)
+    renderer = StubRenderer()
+    renderer.responses.append(RenderResult(html="<main>buffered-fallback</main>"))
+    overlay = StubOverlay()
+    request = Request(
+        {"type": "http", "http_version": "1.1", "method": "GET", "path": "/", "root_path": "", "headers": []}
+    )
+
+    def _raise_manifest(*args, **kwargs):
+        raise ssr_view.ManifestLookupError
+
+    monkeypatch.setattr(ssr_view, "build_document_shell", _raise_manifest)
+
+    # stream_render must never be consumed once we've decided to buffer.
+    async def _never(*args, **kwargs):  # pragma: no cover - must not be called
+        yield {"type": "chunk", "html": "<should-not-appear/>"}
+
+    response = await build_streaming_page_response(
+        request=request,
+        settings=settings,
+        page=page,
+        renderer=renderer,
+        stream_render=_never,
+        overlay=overlay,
+    )
+
+    body = (await _read_response_body(response)).decode()
+    assert response.status_code == 200
+    assert "<main>buffered-fallback</main>" in body
+    assert "<should-not-appear/>" not in body
