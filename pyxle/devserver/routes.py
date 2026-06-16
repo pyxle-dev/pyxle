@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Iterable, List, Optional
 
 from .error_pages import is_error_boundary_file
+from .loading_pages import is_loading_file
 from .path_utils import route_path_from_relative
 from .registry import ApiRegistryEntry, MetadataRegistry, PageRegistryEntry
 
@@ -88,6 +89,7 @@ class RouteTable:
     apis: List[ApiRoute]
     actions: List[ActionRoute] = ()  # type: ignore[assignment]
     error_boundary_pages: List[PageRoute] = ()  # type: ignore[assignment]
+    loading_boundary_pages: List[PageRoute] = ()  # type: ignore[assignment]
 
     def find_page(self, path: str) -> Optional[PageRoute]:
         for entry in self.pages:
@@ -113,12 +115,17 @@ def build_route_table(registry: MetadataRegistry) -> RouteTable:
 
     page_routes: List[PageRoute] = []
     error_boundary_routes: List[PageRoute] = []
+    loading_boundary_routes: List[PageRoute] = []
 
     for entry in registry.pages:
         posix = entry.source_relative_path.as_posix()
         if is_error_boundary_file(posix):
             # Error/not-found pages are compiled but not routed normally.
             error_boundary_routes.extend(_page_routes(entry))
+        elif is_loading_file(posix):
+            # loading.pyxl supplies a Suspense fallback; it is compiled but not
+            # routed as a page.
+            loading_boundary_routes.extend(_page_routes(entry))
         else:
             page_routes.extend(_page_routes(entry))
 
@@ -128,19 +135,22 @@ def build_route_table(registry: MetadataRegistry) -> RouteTable:
 
     action_routes: List[ActionRoute] = []
     for entry in registry.pages:
-        if not is_error_boundary_file(entry.source_relative_path.as_posix()):
+        posix = entry.source_relative_path.as_posix()
+        if not is_error_boundary_file(posix) and not is_loading_file(posix):
             action_routes.extend(_action_routes(entry))
 
     page_routes.sort(key=lambda route: route.path)
     api_routes.sort(key=lambda route: route.path)
     action_routes.sort(key=lambda route: route.path)
     error_boundary_routes.sort(key=lambda route: route.path)
+    loading_boundary_routes.sort(key=lambda route: route.path)
 
     return RouteTable(
         pages=page_routes,
         apis=api_routes,
         actions=action_routes,
         error_boundary_pages=error_boundary_routes,
+        loading_boundary_pages=loading_boundary_routes,
     )
 
 

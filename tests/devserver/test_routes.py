@@ -154,6 +154,49 @@ def test_build_route_table_generates_expected_descriptors(project: DevServerSett
         assert "[" not in route.path and "]" not in route.path
 
 
+def test_loading_pages_are_excluded_from_routing_and_collected(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    (root / "pages").mkdir(parents=True)
+    (root / "public").mkdir()
+    settings = DevServerSettings.from_project_root(root)
+
+    write_file(
+        settings.pages_dir / "index.pyxl",
+        "import React from 'react';\n\n"
+        "export default function Home() {\n  return <div>Home</div>;\n}\n",
+    )
+    write_file(
+        settings.pages_dir / "loading.pyxl",
+        "import React from 'react';\n\n"
+        "export default function Loading() {\n  return <p>Loading…</p>;\n}\n",
+    )
+    write_file(
+        settings.pages_dir / "dashboard/index.pyxl",
+        "import React from 'react';\n\n"
+        "export default function Dashboard() {\n  return <main>Dash</main>;\n}\n",
+    )
+    write_file(
+        settings.pages_dir / "dashboard/loading.pyxl",
+        "import React from 'react';\n\n"
+        "export default function DashLoading() {\n  return <p>Loading dash…</p>;\n}\n",
+    )
+
+    build_once(settings)
+    table = build_route_table(load_metadata_registry(settings))
+
+    # loading.pyxl is compiled but never served as a normal page.
+    page_paths = {route.path for route in table.pages}
+    assert "/loading" not in page_paths
+    assert "/dashboard/loading" not in page_paths
+    assert "/" in page_paths and "/dashboard" in page_paths
+
+    # ...and it is collected into the loading-boundary set instead.
+    loading_sources = {
+        route.source_relative_path.as_posix() for route in table.loading_boundary_pages
+    }
+    assert loading_sources == {"loading.pyxl", "dashboard/loading.pyxl"}
+
+
 def test_build_route_table_falls_back_to_inferred_path(project: DevServerSettings) -> None:
     build_once(project)
 
