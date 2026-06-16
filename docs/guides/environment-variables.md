@@ -93,6 +93,22 @@ From lowest to highest:
 4. `PYXLE_` environment variables
 5. CLI flags (`--host`, `--port`, etc.)
 
+## Page cache backend
+
+These select where the server-side [page cache](caching.md) stores rendered
+HTML. The default needs no configuration.
+
+| Variable | Meaning |
+|----------|---------|
+| `PYXLE_PAGE_CACHE_BACKEND` | `memory` (default), `file`, `redis`, or `off` |
+| `PYXLE_PAGE_CACHE_MAX_ENTRIES` | in-memory: max entries before LRU eviction (default `512`) |
+| `PYXLE_PAGE_CACHE_MAX_BYTES` | in-memory: max total body bytes (default `67108864`, 64 MiB) |
+| `PYXLE_PAGE_CACHE_DIR` | file backend: directory for cache files (required for `file`) |
+| `PYXLE_PAGE_CACHE_REDIS_URL` | redis backend: connection URL (falls back to `REDIS_URL`) |
+
+The cache is active only for production serves (`pyxle serve`); `pyxle dev`
+never caches. The `redis` backend needs `pip install 'pyxle[redis]'`.
+
 ## Using environment variables in loaders
 
 ```python

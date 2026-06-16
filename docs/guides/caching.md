@@ -90,16 +90,29 @@ header reports `HIT`, `STALE`, or `MISS` for debugging.
 
 ## Where the cache lives
 
-The default backend is an in-memory store, **bounded** by entry count and total
-bytes with LRU eviction, so it never grows without limit. The cache is enabled
-automatically for production serves (`pyxle serve`) and disabled in `pyxle dev`
-so a cached render never hides an edit while you're working.
+The cache is enabled automatically for production serves (`pyxle serve`) and
+disabled in `pyxle dev` so a cached render never hides an edit while you work.
+Choose where rendered HTML is stored with the `PYXLE_PAGE_CACHE_BACKEND`
+environment variable:
 
-Under `pyxle serve --workers N` each worker process keeps its own in-memory
-cache, so `cache.invalidate(...)` reaches the worker that handled the action but
-not the others; the entry still expires on its own everywhere via `revalidate`.
-A shared backend (so invalidation fans out across every worker and host) is on
-the roadmap.
+| `PYXLE_PAGE_CACHE_BACKEND` | Stores in | Use when |
+|---|---|---|
+| `memory` *(default)* | bounded in-process memory (LRU) | single process, or any deploy where per-worker caches are fine |
+| `file` | local disk (`PYXLE_PAGE_CACHE_DIR`) | one host, multiple workers sharing a cache that survives restarts |
+| `redis` | shared Redis (`PYXLE_PAGE_CACHE_REDIS_URL`) | multiple hosts, or cross-worker invalidation |
+| `off` | nothing — caching disabled | you want it off in production |
+
+The in-memory backend is **bounded** by entry count (`PYXLE_PAGE_CACHE_MAX_ENTRIES`,
+default 512) and total body bytes (`PYXLE_PAGE_CACHE_MAX_BYTES`, default 64 MiB)
+with LRU eviction, so it never grows without limit. The Redis backend needs the
+optional extra: `pip install 'pyxle[redis]'`.
+
+**Invalidation and workers.** With the in-memory or file backend under
+`pyxle serve --workers N`, each worker keeps its own store, so
+`cache.invalidate(...)` reaches the worker that handled the action; entries
+still expire everywhere on their own via `revalidate`. The **Redis** backend is
+shared across every worker and host, so an invalidation fans out to all of them
+— choose it when you need cross-worker purges.
 
 ## When *not* to cache
 

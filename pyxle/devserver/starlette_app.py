@@ -27,7 +27,7 @@ from starlette.routing import Mount, Route, Router, WebSocketRoute
 from starlette.staticfiles import NotModifiedResponse, StaticFiles
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from pyxle.cache import PageCache, set_active_cache
+from pyxle.cache import PageCache, build_page_cache, set_active_cache
 from pyxle.cli.logger import ConsoleLogger
 from pyxle.ssr import (
     ComponentRenderer,
@@ -1247,8 +1247,9 @@ def create_starlette_app(
     # cached render never masks an edit during development. Only routes that
     # declared themselves cacheable (a loader `revalidate` or an edge `cache`
     # entry) are ever stored, so leaving it on in production is zero-config and
-    # safe. Defaults to the bounded in-memory backend.
-    page_cache: PageCache | None = None if settings.debug else PageCache()
+    # safe. The backend (in-memory default, file, or Redis) is chosen by
+    # PYXLE_PAGE_CACHE_BACKEND; see pyxle.cache.build_page_cache.
+    page_cache: PageCache | None = build_page_cache(debug=settings.debug)
     overlay: OverlayManager | None = None
     vite_proxy: ViteProxy | None = None
     proxy_middleware: Middleware | None = None
