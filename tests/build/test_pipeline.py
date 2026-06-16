@@ -12,6 +12,16 @@ def silent_logger() -> ConsoleLogger:
     return ConsoleLogger(secho=lambda *args, **kwargs: None)
 
 
+def _write_vite_manifest(settings: DevServerSettings, payload: dict) -> Path:
+    """Place a Vite manifest where ``_load_vite_manifest`` / ``_copy_client_manifest``
+    expect it (``<client_build_dir>/dist/.vite/manifest.json``)."""
+
+    manifest_path = settings.client_build_dir / "dist" / ".vite" / "manifest.json"
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+    return manifest_path
+
+
 def test_run_build_invokes_vite_and_copies_artifacts(monkeypatch, tmp_path):
     project = tmp_path / "project"
     pages_dir = project / "pages"
@@ -29,6 +39,14 @@ def test_run_build_invokes_vite_and_copies_artifacts(monkeypatch, tmp_path):
 
     settings = DevServerSettings.from_project_root(project)
 
+    # The Vite step is mocked out (no Node toolchain in tests); instead we drop
+    # the manifest it would have produced so the real ``_load_vite_manifest``
+    # and ``_build_page_manifest`` run against it.
+    _write_vite_manifest(
+        settings,
+        {"pages/index.jsx": {"file": "assets/index-DEADBEEF.js", "imports": []}},
+    )
+
     summary = BuildSummary(compiled_pages=["pages/index.pyxl"])
     registry = MetadataRegistry(
         pages=[
@@ -40,7 +58,7 @@ def test_run_build_invokes_vite_and_copies_artifacts(monkeypatch, tmp_path):
                 server_module_path=server_build / "index.py",
                 client_module_path=settings.client_build_dir / "pages" / "index.jsx",
                 metadata_path=metadata_build / "index.json",
-                client_asset_path="/client/index.js",
+                client_asset_path="/pages/index.jsx",
                 server_asset_path="server/pages/index.py",
                 module_key="pyxle.server.pages.index",
                 content_hash="hash123",
@@ -63,28 +81,20 @@ def test_run_build_invokes_vite_and_copies_artifacts(monkeypatch, tmp_path):
         captured["registry_settings"] = settings_arg
         return registry
 
-    def fake_run_vite_build(*, project_root, client_build_dir, output_dir, logger):
-        captured["vite_args"] = {
-            "project_root": project_root,
-            "client_build_dir": client_build_dir,
-            "output_dir": output_dir,
-        }
-        manifest_path = output_dir / "manifest.json"
-        manifest_path.parent.mkdir(parents=True, exist_ok=True)
-        manifest_path.write_text(
-            '{"pages/index.jsx": {"file": "client/index.js", "imports": []}}',
-            encoding="utf-8",
-        )
-        return manifest_path
+    def fake_run_npm_build(project_root, logger, *, settings):
+        captured["npm_project_root"] = project_root
 
     monkeypatch.setattr("pyxle.build.pipeline.build_once", fake_build_once)
-    monkeypatch.setattr("pyxle.build.pipeline.build_metadata_registry", fake_build_metadata_registry)
-    monkeypatch.setattr("pyxle.build.pipeline.run_vite_build", fake_run_vite_build)
+    monkeypatch.setattr(
+        "pyxle.build.pipeline.build_metadata_registry", fake_build_metadata_registry
+    )
+    monkeypatch.setattr("pyxle.build.pipeline._run_npm_build", fake_run_npm_build)
 
     result = run_build(settings, logger=silent_logger())
 
     assert captured["force_rebuild"] is True
     assert captured["registry_settings"] == settings
+    assert captured["npm_project_root"] == project
 
     dist_root = result.dist_dir
     assert (dist_root / "server" / "pages" / "index.py").exists()
@@ -92,21 +102,24 @@ def test_run_build_invokes_vite_and_copies_artifacts(monkeypatch, tmp_path):
     assert (dist_root / "public" / "robots.txt").exists()
     assert (dist_root / "client" / "manifest.json").exists()
 
-    vite_args = captured["vite_args"]
-    assert vite_args["project_root"] == project
-    assert vite_args["client_build_dir"] == settings.client_build_dir
-    assert vite_args["output_dir"] == dist_root / "client"
-
-    assert result.client_manifest_path == dist_root / "client" / "manifest.json"
     assert result.page_manifest == {
         "/": {
-            "client": {"file": "client/index.js", "imports": []},
-            "metadata": (metadata_build / "index.json").as_posix(),
-            "server": (server_build / "index.py").as_posix(),
+            "client": {
+                "file": "dist/assets/index-DEADBEEF.js",
+                "imports": [],
+                "css": [],
+            },
+            "server": {
+                "file": "server/pages/index.py",
+                "module_key": "pyxle.server.pages.index",
+            },
         }
     }
     assert result.page_manifest_path == dist_root / "page-manifest.json"
-    assert json.loads(result.page_manifest_path.read_text(encoding="utf-8")) == result.page_manifest
+    assert (
+        json.loads(result.page_manifest_path.read_text(encoding="utf-8"))
+        == result.page_manifest
+    )
 
 
 def test_run_build_supports_incremental_mode(monkeypatch, tmp_path):
@@ -124,6 +137,7 @@ def test_run_build_supports_incremental_mode(monkeypatch, tmp_path):
     (metadata_build / "index.json").write_text("{}", encoding="utf-8")
 
     settings = DevServerSettings.from_project_root(project)
+    _write_vite_manifest(settings, {})
 
     summary = BuildSummary()
     registry = MetadataRegistry(pages=[], apis=[])
@@ -134,20 +148,17 @@ def test_run_build_supports_incremental_mode(monkeypatch, tmp_path):
         captured["force_rebuild"] = force_rebuild
         return summary
 
-    def fake_build_metadata_registry(settings_arg):
-        return registry
-
-    def fake_run_vite_build(*, project_root, client_build_dir, output_dir, logger):
-        manifest_path = output_dir / "manifest.json"
-        manifest_path.parent.mkdir(parents=True, exist_ok=True)
-        manifest_path.write_text("{}", encoding="utf-8")
-        return manifest_path
-
     monkeypatch.setattr("pyxle.build.pipeline.build_once", fake_build_once)
-    monkeypatch.setattr("pyxle.build.pipeline.build_metadata_registry", fake_build_metadata_registry)
-    monkeypatch.setattr("pyxle.build.pipeline.run_vite_build", fake_run_vite_build)
+    monkeypatch.setattr(
+        "pyxle.build.pipeline.build_metadata_registry", lambda settings_arg: registry
+    )
+    monkeypatch.setattr(
+        "pyxle.build.pipeline._run_npm_build",
+        lambda project_root, logger, *, settings: None,
+    )
 
     result = run_build(settings, logger=silent_logger(), force_rebuild=False)
 
     assert captured["force_rebuild"] is False
+    assert result.page_manifest == {}
     assert result.client_manifest_path == result.client_dir / "manifest.json"

@@ -87,3 +87,9 @@ skip_covered = true
 addopts = "--strict-markers --strict-config --cov=pyxle.cli --cov=pyxle.compiler --cov=pyxle.devserver --cov=pyxle.ssr --cov=pyxle.security --cov-report=term-missing"
 testpaths = ["tests"]
 pythonpath = ["."]
+# pytest's default ``norecursedirs`` skips any directory literally named
+# ``build`` — which silently drops ``tests/build`` (the test package mirroring
+# the ``pyxle/build`` source package) during recursion. Re-declare the defaults
+# *without* ``build`` so those tests run in CI. Real build artifacts live under
+# dot-dirs (``.pyxle-build``, matched by ``.*``) and ``dist``, still excluded.
+norecursedirs = ["*.egg", ".*", "_darcs", "CVS", "dist", "node_modules", "venv", "{arch}"]

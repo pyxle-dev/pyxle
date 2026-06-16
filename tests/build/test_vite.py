@@ -41,12 +41,13 @@ def test_run_vite_build_success(monkeypatch, tmp_path):
 
     executed: dict[str, object] = {}
 
-    def fake_run(command, *, cwd, capture_output, text, check, env=None):  # noqa: ANN001, ARG001
+    def fake_run(command, *, cwd, capture_output, text, check, env=None, start_new_session=None):  # noqa: ANN001, ARG001
         executed["command"] = command
         executed["cwd"] = cwd
         executed["capture_output"] = capture_output
         executed["text"] = text
         executed["check"] = check
+        executed["start_new_session"] = start_new_session
         assert env is not None
         assert env.get("PYXLE_VITE_BASE") == "/client/"
         manifest_path.write_text("{}", encoding="utf-8")
@@ -76,6 +77,7 @@ def test_run_vite_build_success(monkeypatch, tmp_path):
     assert executed["capture_output"] is True
     assert executed["text"] is True
     assert executed["check"] is False
+    assert executed["start_new_session"] is True
     assert any("Running Vite production build" in message for message in messages)
     assert any("[vite] build ok" in message for message in messages)
     assert any("[vite] warn line" in message for message in messages)
@@ -95,7 +97,7 @@ def test_run_vite_build_failure(monkeypatch, tmp_path):
     monkeypatch.setattr(vite, "_resolve_npm_build_command", lambda *_: None)
     monkeypatch.setattr(vite, "_resolve_vite_command", lambda *_: ["vite"])
 
-    def fake_run(command, *, cwd, capture_output, text, check, env=None):  # noqa: ANN001, ARG001
+    def fake_run(command, *, cwd, capture_output, text, check, env=None, start_new_session=None):  # noqa: ANN001, ARG001
         assert command[0] == "vite"
         return SimpleNamespace(returncode=1, stdout="", stderr="failure")
 
@@ -124,7 +126,7 @@ def test_run_vite_build_manifest_missing(monkeypatch, tmp_path):
     monkeypatch.setattr(vite, "_resolve_npm_build_command", lambda *_: None)
     monkeypatch.setattr(vite, "_resolve_vite_command", lambda *_: ["vite"])
 
-    def fake_run(command, *, cwd, capture_output, text, check, env=None):  # noqa: ANN001, ARG001
+    def fake_run(command, *, cwd, capture_output, text, check, env=None, start_new_session=None):  # noqa: ANN001, ARG001
         return SimpleNamespace(returncode=0, stdout="done", stderr="")
 
     monkeypatch.setattr(vite.subprocess, "run", fake_run)
@@ -161,7 +163,7 @@ def test_run_vite_build_prefers_npm_script(monkeypatch, tmp_path):
 
     recorded: dict[str, object] = {}
 
-    def fake_run(command, *, cwd, capture_output, text, check, env=None):  # noqa: ANN001, ARG001
+    def fake_run(command, *, cwd, capture_output, text, check, env=None, start_new_session=None):  # noqa: ANN001, ARG001
         recorded["command"] = command
         recorded["cwd"] = cwd
         manifest_path.write_text("{}", encoding="utf-8")
@@ -195,8 +197,9 @@ def test_attempt_npm_install_runs_install(monkeypatch, tmp_path):
             return "/usr/bin/npm"
         return None
 
-    def fake_run(command, *, cwd, capture_output, text, check):  # noqa: ANN001
+    def fake_run(command, *, cwd, capture_output, text, check, start_new_session=None):  # noqa: ANN001
         commands.append(command)
+        assert start_new_session is True
         assert cwd == str(project_root)
         assert capture_output is True
         assert text is True
@@ -238,7 +241,7 @@ def test_attempt_npm_install_handles_failure(monkeypatch, tmp_path):
     def fake_which(name: str) -> str | None:
         return "/usr/bin/npm" if name == "npm" else None
 
-    def fake_run(command, *, cwd, capture_output, text, check):  # noqa: ANN001
+    def fake_run(command, *, cwd, capture_output, text, check, start_new_session=None):  # noqa: ANN001
         return SimpleNamespace(returncode=1, stdout="", stderr="fatal")
 
     monkeypatch.setattr(vite.shutil, "which", fake_which)
@@ -280,36 +283,66 @@ def test_resolve_vite_command_prefers_local_vite(monkeypatch, tmp_path):
     assert observed[0] == expected
 
 
-def test_resolve_vite_command_runs_install_then_succeeds(monkeypatch, tmp_path):
+def test_resolve_vite_command_installs_then_prefers_local_vite(monkeypatch, tmp_path):
+    """When ``package.json`` exists but ``node_modules`` is absent, resolution
+    runs ``npm install`` once and then prefers the freshly-installed *pinned*
+    local vite over the unpinned ``npx`` fallback (keeps builds reproducible).
+    """
+
     project_root = tmp_path / "project"
     project_root.mkdir()
+    (project_root / "package.json").write_text("{}", encoding="utf-8")
+
+    node_exec = "/usr/local/bin/node"
+    vite_js = project_root / "node_modules" / "vite" / "bin" / "vite.js"
 
     def fake_which(name: str) -> str | None:
+        # node is on PATH; npx exists too, but must NOT be chosen because the
+        # local install resolves first.
+        if name == "node":
+            return node_exec
         if name == "npx":
             return "/usr/bin/npx"
-        if name == "npm":
-            return "/usr/bin/npm"
         return None
 
-    installed = {"value": False}
-
-    def fake_verify(command, root: Path) -> bool:  # noqa: ARG001
-        return installed["value"]
-
     def fake_attempt(root: Path, logger: ConsoleLogger) -> bool:  # noqa: ARG001
-        installed["value"] = True
+        # Simulate ``npm install`` materialising the pinned local vite.
+        vite_js.parent.mkdir(parents=True, exist_ok=True)
+        vite_js.write_text("", encoding="utf-8")
         return True
 
     monkeypatch.setattr(vite.shutil, "which", fake_which)
-    monkeypatch.setattr(vite, "_verify_command", fake_verify)
+    monkeypatch.setattr(vite, "_verify_command", lambda command, root: True)
     monkeypatch.setattr(vite, "_attempt_npm_install", fake_attempt)
 
     logger, _ = make_logger()
 
     command = _resolve_vite_command(project_root, logger)
 
+    assert command == [node_exec, str(vite_js)]
+
+
+def test_resolve_vite_command_falls_back_to_npx(monkeypatch, tmp_path):
+    """With no local or global vite and nothing installable, ``npx --yes vite``
+    is the last-resort path that keeps zero-config projects buildable."""
+
+    project_root = tmp_path / "project"
+    project_root.mkdir()  # no package.json -> the install tiers are skipped
+
+    def fake_which(name: str) -> str | None:
+        return "/usr/bin/npx" if name == "npx" else None
+
+    monkeypatch.setattr(vite.shutil, "which", fake_which)
+    monkeypatch.setattr(
+        vite, "_verify_command", lambda command, root: command[:1] == ["/usr/bin/npx"]
+    )
+    monkeypatch.setattr(vite, "_attempt_npm_install", lambda *_: False)
+
+    logger, _ = make_logger()
+
+    command = _resolve_vite_command(project_root, logger)
+
     assert command == ["/usr/bin/npx", "--yes", "vite"]
-    assert installed["value"] is True
 
 
 def test_resolve_vite_command_raises_when_unavailable(monkeypatch, tmp_path):
