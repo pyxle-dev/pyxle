@@ -21,6 +21,7 @@ from pyxle.devserver.starlette_app import (
     _CACHE_STATUS_HEADER,
     _build_cached_page_response,
     _effective_cache_ttl,
+    _if_none_match_matches,
     _public_cache_control,
     _read_response_body,
     _read_revalidate_header,
@@ -56,7 +57,13 @@ def _settings(*, cache: object | None = None) -> SimpleNamespace:
     return SimpleNamespace(cache=cache, debug=False)
 
 
-def _request(path: str = "/", *, method: str = "GET", headers: dict[str, str] | None = None) -> Request:
+def _request(
+    path: str = "/",
+    *,
+    method: str = "GET",
+    headers: dict[str, str] | None = None,
+    query: bytes = b"",
+) -> Request:
     raw = [(k.lower().encode(), v.encode()) for k, v in (headers or {}).items()]
     return Request(
         {
@@ -65,7 +72,7 @@ def _request(path: str = "/", *, method: str = "GET", headers: dict[str, str] | 
             "method": method,
             "path": path,
             "root_path": "",
-            "query_string": b"",
+            "query_string": query,
             "headers": raw,
         }
     )
@@ -76,7 +83,9 @@ def _patch_render(monkeypatch, *, body: bytes = b"<html>page</html>", status: in
 
     calls: list[str] = []
 
-    async def _fake(*, request, settings, page, renderer, overlay, error_boundaries):
+    async def _fake(
+        *, request, settings, page, renderer, overlay, error_boundaries, suppress_per_user=False
+    ):
         calls.append(request.url.path)
 
         async def _gen():
@@ -298,3 +307,92 @@ async def test_stale_entry_serves_stale_then_revalidates(monkeypatch) -> None:
     assert calls == ["/"]
     refreshed = await cache.get(key)
     assert refreshed is not None and refreshed.entry.body == b"<html>new</html>"
+
+
+# --------------------------------------------------------------------------- #
+# Security-review fixes: query keying, 304 negotiation, CSRF, ISR hardening
+# --------------------------------------------------------------------------- #
+
+
+def test_if_none_match_matches_handles_list_weak_and_wildcard() -> None:
+    assert _if_none_match_matches('"abc"', '"abc"')
+    assert _if_none_match_matches('"xyz", "abc"', '"abc"')  # comma list
+    assert _if_none_match_matches('W/"abc"', '"abc"')  # weak validator
+    assert _if_none_match_matches("*", '"abc"')  # wildcard
+    assert not _if_none_match_matches('"xyz"', '"abc"')
+    assert not _if_none_match_matches(None, '"abc"')
+
+
+@pytest.mark.anyio
+async def test_query_string_request_is_never_cached(monkeypatch) -> None:
+    calls = _patch_render(monkeypatch, revalidate=60)
+    cache = PageCache()
+    req = _request("/", query=b"q=1")
+
+    first = await _call(cache, request=req)
+    assert _CACHE_STATUS_HEADER not in first.headers  # bypasses the cache entirely
+    await _call(cache, request=req)
+    assert len(calls) == 2  # rendered live each time
+
+
+@pytest.mark.anyio
+async def test_query_request_does_not_read_the_path_entry(monkeypatch) -> None:
+    calls = _patch_render(monkeypatch, body=b"<noquery>", revalidate=60)
+    cache = PageCache()
+
+    await _call(cache, request=_request("/"))  # warm key(/)
+    assert len(calls) == 1
+    resp = await _call(cache, request=_request("/", query=b"q=evil"))
+    assert _CACHE_STATUS_HEADER not in resp.headers  # not served the path entry
+    assert len(calls) == 2
+
+
+@pytest.mark.anyio
+async def test_hit_answers_weak_if_none_match_with_304(monkeypatch) -> None:
+    _patch_render(monkeypatch, body=b"<html>x</html>", revalidate=60)
+    cache = PageCache()
+    etag = (await _call(cache)).headers["ETag"]
+
+    conditional = await _call(cache, request=_request("/", headers={"if-none-match": f"W/{etag}"}))
+    assert conditional.status_code == 304
+
+
+@pytest.mark.anyio
+async def test_csrf_token_in_body_is_never_cached(monkeypatch) -> None:
+    token = "secret-token-123"
+
+    async def _fake(
+        *, request, settings, page, renderer, overlay, error_boundaries, suppress_per_user=False
+    ):
+        async def _gen():
+            yield f'<form><input value="{token}"></form>'.encode()
+
+        response = StreamingResponse(_gen(), status_code=200, media_type="text/html")
+        response.headers[REVALIDATE_HEADER] = "60"  # loader-envelope cacheable
+        return response
+
+    monkeypatch.setattr(app_mod, "build_page_response", _fake)
+    cache = PageCache()
+    req = _request("/")
+    req.scope["pyxle.csrf_token"] = token
+
+    served = await _call(cache, request=req)
+    assert _CACHE_STATUS_HEADER not in served.headers  # per-user token in body -> not stored
+    assert await cache.get(PageCache.make_key("/")) is None
+
+
+def test_synthetic_request_strips_query_and_per_user_headers() -> None:
+    original = _request(
+        "/p",
+        method="POST",
+        query=b"q=1",
+        headers={"cookie": "s=1", "authorization": "Bearer x", "x-keep": "1"},
+    )
+    original.scope["pyxle.csrf_token"] = "tok"
+    clone = _synthetic_get_request(original)
+    assert clone.method == "GET"
+    assert clone.url.query == ""
+    assert "cookie" not in clone.headers
+    assert "authorization" not in clone.headers
+    assert clone.headers.get("x-keep") == "1"
+    assert clone.scope.get("pyxle.csrf_token") is None

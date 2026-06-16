@@ -91,6 +91,12 @@ async def prerender_pages(
         if response.status_code != 200:
             continue
         body = await _materialize(response)
+        # A page missing from page-manifest.json renders the framework's
+        # "Missing Manifest Entry" placeholder at status 200. Never persist that
+        # as a static page — it would be served to every visitor forever; skip it
+        # so the route falls back to live SSR (and surfaces the build problem).
+        if b"Missing Manifest Entry" in body:
+            continue
         entry = CacheEntry(
             body=body,
             status_code=200,

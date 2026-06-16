@@ -233,3 +233,16 @@ async def test_warm_page_cache_loads_prerendered_entries(tmp_path) -> None:
     assert lookup is not None
     assert lookup.entry.body == b"<html>static</html>"
     assert lookup.is_stale is False  # revalidate=None -> never stale
+
+
+@pytest.mark.anyio
+async def test_schedule_revalidation_rejected_after_close() -> None:
+    pc = PageCache()
+    await pc.aclose()  # sets the closing flag
+
+    async def refresh() -> None:  # pragma: no cover - must never run
+        raise AssertionError("should not be scheduled after aclose")
+
+    # A request still draining during shutdown must not orphan a new task.
+    assert pc.schedule_revalidation("k", refresh) is False
+    assert pc._inflight == {}

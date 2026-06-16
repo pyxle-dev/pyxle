@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import inspect
+import math
 import mimetypes
 import sys
 import time
@@ -743,11 +744,32 @@ async def _read_response_body(response: Response) -> bytes:
     return b"".join(chunks)
 
 
+def _if_none_match_matches(header: str | None, etag: str) -> bool:
+    """RFC 7232 §3.2 If-None-Match test for a cached page.
+
+    Handles a comma-separated list of validators, weak (``W/``) comparison
+    (the stored ETag is always strong, so this reduces to comparing the
+    opaque tag), and the ``*`` wildcard. A raw string-equality check would
+    wrongly re-send the full body for any of those forms.
+    """
+
+    if header is None:
+        return False
+    tokens = [token.strip() for token in header.split(",")]
+    if "*" in tokens:
+        return True
+
+    def _strong(tag: str) -> str:
+        return tag[2:] if tag.startswith("W/") else tag
+
+    target = _strong(etag)
+    return any(_strong(token) == target for token in tokens)
+
+
 def _serve_cache_entry(entry, *, request: Request, status_label: str) -> Response:
     """Build a response from a stored render, answering If-None-Match with 304."""
 
-    if_none_match = request.headers.get("if-none-match")
-    if if_none_match is not None and if_none_match == entry.etag:
+    if _if_none_match_matches(request.headers.get("if-none-match"), entry.etag):
         response: Response = Response(status_code=304)
     else:
         response = Response(
@@ -756,7 +778,8 @@ def _serve_cache_entry(entry, *, request: Request, status_label: str) -> Respons
     response.headers["ETag"] = entry.etag
     response.headers["Vary"] = _NAVIGATION_HEADER
     response.headers[_CACHE_STATUS_HEADER] = status_label
-    seconds = int(entry.revalidate) if entry.revalidate is not None else _DEFAULT_CACHE_SECONDS
+    # ceil so a sub-second window never collapses to s-maxage=0.
+    seconds = math.ceil(entry.revalidate) if entry.revalidate is not None else _DEFAULT_CACHE_SECONDS
     response.headers["Cache-Control"] = _public_cache_control(seconds)
     return response
 
@@ -765,12 +788,24 @@ def _synthetic_get_request(request: Request) -> Request:
     """A standalone GET request cloned from ``request`` for background re-render.
 
     ISR revalidation runs after the original response is sent, so it must not
-    reuse the live request's receive channel. The scope is copied (same path,
-    params, app) with a fresh empty body.
+    reuse the live request's receive channel. The clone is also deliberately
+    stripped of per-user / per-request inputs — query string, ``Cookie``,
+    ``Authorization`` — so a background re-render produces the same shared bytes
+    no matter which user happened to observe staleness; it must never bake one
+    user's request into the entry every other user then receives.
     """
 
     scope = dict(request.scope)
     scope["method"] = "GET"
+    scope["query_string"] = b""
+    scope["headers"] = [
+        (name, value)
+        for (name, value) in scope.get("headers", [])
+        if name.lower() not in (b"cookie", b"authorization")
+    ]
+    # Drop the per-user CSRF token so a background re-render never bakes the
+    # triggering user's token into the shared entry.
+    scope.pop("pyxle.csrf_token", None)
 
     async def _receive() -> Message:
         return {"type": "http.request", "body": b"", "more_body": False}
@@ -835,10 +870,14 @@ async def _build_cached_page_response(
     """
 
     cache_config = getattr(settings, "cache", None)
-    is_get = request.method == "GET"
+    # Only GET requests with an empty query string are cacheable: the cache key
+    # is the route path, so a query-varying render (?q=, ?page=) must never share
+    # an entry with a different query. Requests carrying a query fall through to
+    # a live render.
+    cacheable_request = request.method == "GET" and not request.url.query
     cache_key = PageCache.make_key(request.url.path)
 
-    if page_cache is not None and is_get:
+    if page_cache is not None and cacheable_request:
         lookup = await page_cache.get(cache_key)
         if lookup is not None:
             if lookup.is_stale:
@@ -860,6 +899,16 @@ async def _build_cached_page_response(
                 status_label="STALE" if lookup.is_stale else "HIT",
             )
 
+    # A route declared cacheable at compile time (a CACHE directive) or via the
+    # edge `cache` config renders no per-user data, so its per-user CSRF token is
+    # suppressed from the rendered HTML — a shared cached body must not carry one
+    # user's token. (A loader-envelope-only route, whose cacheability isn't known
+    # until after the render, is caught by the store-time guard below instead.)
+    statically_cacheable = route.cache_revalidate is not None or (
+        cache_config is not None
+        and cache_config.max_age_for(request.url.path) is not None
+    )
+
     response = await build_page_response(
         request=request,
         settings=settings,
@@ -867,6 +916,7 @@ async def _build_cached_page_response(
         renderer=renderer,
         overlay=overlay,
         error_boundaries=error_boundaries,
+        suppress_per_user=statically_cacheable and cacheable_request,
     )
     # HTML page responses carry Vary so a browser that cached both the HTML and
     # a nav-JSON payload for the same URL knows they are distinct entries.
@@ -880,12 +930,24 @@ async def _build_cached_page_response(
         # CDN/proxy can absorb the load — the CSRF middleware drops its per-user
         # cookie from such responses. Every other page stays `private,
         # no-cache`, never shared between users.
-        response.headers["Cache-Control"] = _public_cache_control(int(ttl))
+        response.headers["Cache-Control"] = _public_cache_control(math.ceil(ttl))
     else:
         response.headers["Cache-Control"] = "private, no-cache"
 
-    if page_cache is not None and ttl is not None and is_get and response.status_code == 200:
+    if (
+        page_cache is not None
+        and ttl is not None
+        and cacheable_request
+        and response.status_code == 200
+    ):
         body = await _read_response_body(response)
+        # Safety net for a loader-envelope route that also renders a <Form>:
+        # never store a body that still carries the requester's CSRF token — it
+        # is per-user data and must not be shared. Such a page renders live each
+        # request instead of being cached.
+        token = request.scope.get("pyxle.csrf_token")
+        if isinstance(token, str) and token and token.encode("utf-8") in body:
+            return response
         await page_cache.store(
             cache_key, body, status_code=response.status_code, revalidate=ttl
         )
@@ -897,6 +959,13 @@ async def _build_cached_page_response(
                 served.headers[key] = value
         served.headers["ETag"] = PageCache.make_etag(body)
         served.headers[_CACHE_STATUS_HEADER] = "MISS"
+        # Conditional GET: if the client already holds this exact render, 304.
+        if _if_none_match_matches(request.headers.get("if-none-match"), served.headers["ETag"]):
+            not_modified = Response(status_code=304)
+            for key, value in served.headers.items():
+                if key.lower() not in ("content-length", "content-type"):
+                    not_modified.headers[key] = value
+            return not_modified
         return served
 
     return response

@@ -93,3 +93,28 @@ async def test_prerender_materializes_streaming_response(monkeypatch, tmp_path: 
     assert rendered == ["/s"]
     entry = await FileCacheBackend(prerender_dir).get(PageCache.make_key("/s"))
     assert entry is not None and entry.body == b"<html>"
+
+
+@pytest.mark.anyio
+async def test_prerender_skips_missing_manifest_placeholder(monkeypatch, tmp_path: Path) -> None:
+    # A page missing from the manifest renders the framework's 200 placeholder;
+    # it must never be persisted as a static page.
+    async def _fake(*, request, settings, page, renderer):
+        return Response(
+            content=b"<title>Pyxle - Missing Manifest Entry</title><h1>...</h1>",
+            status_code=200,
+            media_type="text/html",
+        )
+
+    monkeypatch.setattr(static_gen, "build_page_response", _fake)
+    prerender_dir = tmp_path / "prerendered"
+
+    rendered = await static_gen.prerender_pages(
+        settings=object(),
+        pages=[_page("/x")],
+        renderer=object(),
+        prerender_dir=prerender_dir,
+    )
+
+    assert rendered == []
+    assert await FileCacheBackend(prerender_dir).get(PageCache.make_key("/x")) is None

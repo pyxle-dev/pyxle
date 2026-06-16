@@ -55,6 +55,7 @@ class PageCache:
         self._backend: CacheBackend = backend or InMemoryCacheBackend()
         self._clock = clock
         self._inflight: Dict[str, asyncio.Task] = {}
+        self._closing = False
 
     @property
     def backend(self) -> CacheBackend:
@@ -122,6 +123,12 @@ class PageCache:
         served until a later refresh succeeds or it is invalidated.
         """
 
+        # Once shutdown has begun, never schedule a new task: aclose() has
+        # already snapshotted the in-flight set, so a task added now would be
+        # orphaned (neither awaited nor cancelled).
+        if self._closing:
+            return False
+
         existing = self._inflight.get(key)
         if existing is not None and not existing.done():
             return False
@@ -141,6 +148,7 @@ class PageCache:
     async def aclose(self) -> None:
         """Cancel any in-flight background revalidations (called on shutdown)."""
 
+        self._closing = True
         tasks = [task for task in self._inflight.values() if not task.done()]
         for task in tasks:
             task.cancel()

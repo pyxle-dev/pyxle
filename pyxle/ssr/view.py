@@ -134,6 +134,7 @@ async def build_page_response(
     renderer: ComponentRenderer,
     overlay: OverlayManager | None = None,
     error_boundaries: ErrorBoundaryRegistry | None = None,
+    suppress_per_user: bool = False,
 ) -> Response:
     from pyxle.runtime import LoaderError
 
@@ -148,6 +149,7 @@ async def build_page_response(
             page=page,
             renderer=renderer,
             loader_breadcrumb=loader_breadcrumb,
+            suppress_per_user=suppress_per_user,
         )
         script_nonce = secrets.token_urlsafe(24)
         nav_cache_ttl = _resolve_nav_cache_ttl(settings, request.url.path)
@@ -616,6 +618,7 @@ async def _create_page_artifacts(
     page: PageRoute,
     renderer: ComponentRenderer,
     loader_breadcrumb: dict[str, str],
+    suppress_per_user: bool = False,
 ) -> PageArtifacts:
     module = None
     if page.head_is_dynamic:
@@ -650,11 +653,15 @@ async def _create_page_artifacts(
     )
 
     component_props = _compose_component_props(loader_props, layout_data)
+    # On a publicly-cacheable render, suppress the per-user CSRF token so the
+    # shared cached body never carries one user's token (<Form> falls back to
+    # the cookie/header JS path).
+    csrf_token = None if suppress_per_user else _csrf_token_for_request(request)
     render_result = await renderer.render(
         page.client_module_path,
         component_props,
         request_pathname=request.url.path,
-        csrf_token=_csrf_token_for_request(request),
+        csrf_token=csrf_token,
     )
     body_html = render_result.html
     inline_styles = render_result.inline_styles

@@ -90,8 +90,12 @@ pyxle build --static
 This pre-renders every loader-less, non-dynamic page into `dist/prerendered/`;
 on startup `pyxle serve` warms its page cache from that directory. Pages with a
 loader (or a `{param}` route) are skipped — they still render live and cache at
-runtime as before. Pre-rendered entries have no expiry: they live until the next
-deploy replaces `dist/`, or you `cache.invalidate(...)` the route.
+runtime as before. Pre-rendered entries have no expiry until you
+`cache.invalidate(...)` the route. With the default in-memory backend they are
+re-warmed from the new `dist/prerendered/` on every restart; with a **shared
+file/redis backend**, warmed copies persist in that store, so if a later deploy
+stops passing `--static` (or adds a loader to a previously-static route), flush
+the cache or invalidate those routes — replacing `dist/` does not clear them.
 
 ## Invalidating the cache
 
@@ -160,6 +164,11 @@ shared across every worker and host, so an invalidation fans out to all of them
 - Pages that must always reflect the absolute latest data with zero staleness —
   use a plain loader, or `revalidate: 0` plus `cache.invalidate(...)` on every
   write.
+
+> **Query strings:** the cache keys on the route **path** only, so a request
+> that carries a query string (`/search?q=…`, `?page=2`) is always served live —
+> never cached and never served a cached entry. A page whose content varies by
+> query is therefore never collapsed onto one shared render.
 
 ## Next steps
 
