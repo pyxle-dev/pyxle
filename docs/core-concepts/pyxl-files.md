@@ -101,6 +101,31 @@ export default function MyPage({ data }) {
 - **Can import from `pyxle/client`.** This gives you `<Head>`, `<Script>`, `<Image>`, `<ClientOnly>`, `<Form>`, `useAction`, `<Link>`, `navigate`, and `prefetch`.
 - **Can import from `node_modules`.** Any npm package in your `package.json` is available.
 - **Cannot import Python code.** The Python and JSX sections are compiled separately.
+- **Must be a pure function of its props.** No data fetching, I/O, secrets, Node built-ins, side effects, or non-deterministic values (`Date.now()`, `Math.random()`) in the render body — load in `@server`, mutate in `@action`, and put browser-only or effectful code in `useEffect` / event handlers / `<ClientOnly>`. See [Component purity](#component-purity) below.
+
+## Component purity
+
+A component's **render** is a pure function of its props: given the same `data`, it produces the same HTML, with no side effects. Whatever runs while the page renders on the server must be deterministic.
+
+**Don't, in the render body:**
+
+- fetch data, query a database, or touch the filesystem / network — that's the loader's job
+- read secrets or `process.env`
+- import Node built-ins (`fs`, `path`, `crypto`, `child_process`, …)
+- mutate state or cause other side effects
+- use non-deterministic values like `Date.now()`, `Math.random()`, or `new Date()` — they differ between the server render and the client and cause hydration mismatches
+
+**Do instead:**
+
+| You want to… | Use |
+|---|---|
+| load data for the page | a `@server` loader (runs before render; the result arrives as `data`) |
+| change data | an `@action`, called with `useAction` or `<Form>` |
+| run code after mount, or anything browser-only | `useEffect`, an event handler, or `<ClientOnly>` |
+
+This isn't a stylistic preference — purity is what makes a component **hydration-safe** (server and client render the same thing), **testable** (render is a function you can assert on), and **fast** (no hidden per-render I/O). It also keeps rendering portable to faster, sandboxed SSR backends in the future.
+
+Effects and event handlers are **exempt** — they don't run during the server render. Purity is about the *render pass*, not the whole component.
 
 ## Controlling the document `<head>`
 
