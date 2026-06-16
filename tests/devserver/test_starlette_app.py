@@ -4,6 +4,7 @@ import json
 import sys
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -2650,3 +2651,38 @@ def test_create_starlette_app_enables_static_cache_only_in_production(
 
     prod_app = create_starlette_app(replace(project, debug=False), table)
     assert _static_kwargs(prod_app)["cache_in_memory"] is True
+
+
+def test_hot_route_refresh_keeps_streaming_wired(
+    project: DevServerSettings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: the dev-server hot route refresh must re-thread the pool's
+    render_stream. Without this, a hot reload rebuilt routes without it and every
+    <Suspense> page silently fell back from renderToPipeableStream to the
+    buffered renderToString (which can't stream Suspense)."""
+    import pyxle.devserver as devserver_pkg
+
+    build_once(project)
+    routes = build_route_table(load_metadata_registry(project))
+
+    def _render_stream(*args, **kwargs):  # pragma: no cover - identity sentinel
+        raise AssertionError("not invoked in this test")
+
+    pool = SimpleNamespace(render_stream=_render_stream)
+    app = create_starlette_app(project, routes, pool=pool)
+
+    # create_starlette_app stashes the pool's render_stream for later refreshes.
+    assert app.state.pyxle_stream_render is _render_stream
+
+    # ...and the hot route refresh threads it back into the rebuilt routes.
+    captured: dict = {}
+
+    def _spy_build_app_routes(**kwargs):
+        captured.update(kwargs)
+        return ([], object())
+
+    monkeypatch.setattr(
+        "pyxle.devserver.starlette_app._build_app_routes", _spy_build_app_routes
+    )
+    devserver_pkg._rebuild_app_routes(app, project)
+    assert captured["stream_render"] is _render_stream

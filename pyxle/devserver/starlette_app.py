@@ -1678,6 +1678,9 @@ def create_starlette_app(
     # on a source change (see ``DevServer._handle_rebuild``). Config-derived
     # hooks are stable across rebuilds — config changes still need a restart.
     app.state.pyxle_route_hooks = (api_route_hooks, page_route_hooks)
+    # Streaming SSR's render_stream is bound to the worker pool, which outlives
+    # route-table refreshes — stash it so a hot rebuild keeps streaming wired.
+    app.state.pyxle_stream_render = stream_render
 
     return app
 
