@@ -2,6 +2,10 @@
 
 Release notes for Pyxle. While we're in beta (`0.x`), minor versions may include breaking changes — those are called out explicitly here. To upgrade, run `pip install --upgrade pyxle-framework`.
 
+## Unreleased
+
+- **Server-side page caching with incremental regeneration.** A `@server` loader can now return a `{"data": ..., "revalidate": N}` envelope to cache its rendered HTML for `N` seconds — later requests are served from the cache without re-running the loader or the Node SSR render. Once the window passes, the stale page is served instantly while a single background re-render refreshes it (incremental static regeneration — no thundering herd). Purge a route on demand from an action with `await cache.invalidate("/path")` (or `cache.invalidate_all()`). Routes already declared in the `pyxle.config.json` edge `cache` block are server-cached automatically under the same TTL. Cached responses carry a strong `ETag` (so conditional requests get a `304`) and an `x-pyxle-cache: HIT|STALE|MISS` header. The cache is a bounded in-memory store, enabled for `pyxle serve` and off in `pyxle dev`. Only cache pages that render no per-user data — a cached render is shared with every visitor. See [Caching](guides/caching.md).
+
 ## 0.4.5
 
 - **Signed cookies & tokens — `sign_cookie` / `verify_cookie`.** New stdlib-only helpers (importable from `pyxle`) attach a tamper-proof HMAC-SHA256 signature to any string — a session id, a "remember me" token, a stateless unsubscribe or password-reset link — and verify it later in constant time. The secret comes from `PYXLE_SECRET_KEY` (or an explicit `secret_key=`), and a `salt=` namespaces signatures so a token minted for one purpose can't be replayed for another. Signing without a secret raises `MissingSecretKeyError` rather than returning an unprotected value — it fails closed. See [Security → Signed cookies and tokens](guides/security.md#signed-cookies-and-tokens).

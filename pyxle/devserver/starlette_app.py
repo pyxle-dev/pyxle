@@ -22,11 +22,12 @@ from starlette.exceptions import HTTPException
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, Response
 from starlette.routing import Mount, Route, Router, WebSocketRoute
 from starlette.staticfiles import NotModifiedResponse, StaticFiles
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from pyxle.cache import PageCache, set_active_cache
 from pyxle.cli.logger import ConsoleLogger
 from pyxle.ssr import (
     ComponentRenderer,
@@ -34,7 +35,7 @@ from pyxle.ssr import (
     build_page_response,
 )
 from pyxle.ssr.renderer import pool_render_factory
-from pyxle.ssr.view import build_not_found_response
+from pyxle.ssr.view import REVALIDATE_HEADER, build_not_found_response
 
 from .error_pages import ErrorBoundaryRegistry, build_error_boundary_registry
 from .middleware import MiddlewareHookError, load_custom_middlewares
@@ -629,6 +630,7 @@ def build_page_router(
     overlay: OverlayManager | None = None,
     route_hooks: Sequence[RouteHookCallable] | None = None,
     error_boundaries: ErrorBoundaryRegistry | None = None,
+    page_cache: PageCache | None = None,
 ) -> Router:
     """Create a router serving compiled pages via server-side rendering."""
 
@@ -642,6 +644,7 @@ def build_page_router(
             renderer=renderer,
             overlay=overlay,
             error_boundaries=error_boundaries,
+            page_cache=page_cache,
         )
         context = RouteContext(
             target="page",
@@ -660,6 +663,228 @@ def build_page_router(
     return router
 
 
+# Page-cache status header set on responses the server-side cache touched:
+# HIT (served fresh from cache), STALE (served stale while revalidating), or
+# MISS (rendered now and stored).
+_CACHE_STATUS_HEADER = "x-pyxle-cache"
+
+# Fallback s-maxage for a cached entry with no explicit revalidate window
+# (cache-until-invalidated). Only reachable via the compile-time cache
+# directive; loader-envelope and edge-config entries always carry a number.
+_DEFAULT_CACHE_SECONDS = 3600
+
+
+def _public_cache_control(seconds: int) -> str:
+    """The shared-cache directive for a publicly cacheable page response."""
+
+    return f"public, s-maxage={seconds}, stale-while-revalidate={seconds * 5}"
+
+
+def _read_revalidate_header(response: Response) -> float | None:
+    """Pop the framework's internal revalidate header (set by a loader envelope).
+
+    Returns the declared cache lifetime in seconds, or ``None`` when the render
+    declared none. The header is stripped so it never reaches the client.
+    """
+
+    raw = response.headers.get(REVALIDATE_HEADER)
+    if raw is None:
+        return None
+    del response.headers[REVALIDATE_HEADER]
+    try:
+        return float(raw)
+    except ValueError:  # pragma: no cover - the header is framework-produced
+        return None
+
+
+def _effective_cache_ttl(
+    response: Response, request: Request, cache_config: object | None
+) -> float | None:
+    """Resolve a render's cache TTL.
+
+    A loader ``revalidate`` wins over the edge ``cache`` config; ``None`` means
+    the route is not server-cacheable for this request.
+    """
+
+    loader_ttl = _read_revalidate_header(response)
+    if loader_ttl is not None:
+        return loader_ttl
+    if cache_config is not None:
+        edge = cache_config.max_age_for(request.url.path)
+        if edge is not None:
+            return float(edge)
+    return None
+
+
+async def _read_response_body(response: Response) -> bytes:
+    """Materialise a page response (possibly a stream) into bytes for caching."""
+
+    body = getattr(response, "body", None)
+    if body is not None:
+        return bytes(body)
+    chunks: list[bytes] = []
+    async for chunk in response.body_iterator:
+        chunks.append(
+            chunk if isinstance(chunk, (bytes, bytearray)) else str(chunk).encode("utf-8")
+        )
+    return b"".join(chunks)
+
+
+def _serve_cache_entry(entry, *, request: Request, status_label: str) -> Response:
+    """Build a response from a stored render, answering If-None-Match with 304."""
+
+    if_none_match = request.headers.get("if-none-match")
+    if if_none_match is not None and if_none_match == entry.etag:
+        response: Response = Response(status_code=304)
+    else:
+        response = Response(
+            content=entry.body, status_code=entry.status_code, media_type="text/html"
+        )
+    response.headers["ETag"] = entry.etag
+    response.headers["Vary"] = _NAVIGATION_HEADER
+    response.headers[_CACHE_STATUS_HEADER] = status_label
+    seconds = int(entry.revalidate) if entry.revalidate is not None else _DEFAULT_CACHE_SECONDS
+    response.headers["Cache-Control"] = _public_cache_control(seconds)
+    return response
+
+
+def _synthetic_get_request(request: Request) -> Request:
+    """A standalone GET request cloned from ``request`` for background re-render.
+
+    ISR revalidation runs after the original response is sent, so it must not
+    reuse the live request's receive channel. The scope is copied (same path,
+    params, app) with a fresh empty body.
+    """
+
+    scope = dict(request.scope)
+    scope["method"] = "GET"
+
+    async def _receive() -> Message:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    return Request(scope, _receive)
+
+
+def _make_page_revalidator(
+    *,
+    request: Request,
+    route: PageRoute,
+    settings: DevServerSettings,
+    renderer: ComponentRenderer,
+    error_boundaries: ErrorBoundaryRegistry | None,
+    page_cache: PageCache,
+    cache_key: str,
+):
+    """Build the coroutine that re-renders a stale page and refreshes the cache."""
+
+    cache_config = getattr(settings, "cache", None)
+
+    async def _revalidate() -> None:
+        fresh = await build_page_response(
+            request=_synthetic_get_request(request),
+            settings=settings,
+            page=route,
+            renderer=renderer,
+            overlay=None,
+            error_boundaries=error_boundaries,
+        )
+        if fresh.status_code != 200:
+            return
+        ttl = _effective_cache_ttl(fresh, request, cache_config)
+        if ttl is None:
+            return
+        body = await _read_response_body(fresh)
+        await page_cache.store(cache_key, body, status_code=200, revalidate=ttl)
+
+    return _revalidate
+
+
+async def _build_cached_page_response(
+    *,
+    request: Request,
+    route: PageRoute,
+    settings: DevServerSettings,
+    renderer: ComponentRenderer,
+    overlay: OverlayManager | None,
+    error_boundaries: ErrorBoundaryRegistry | None,
+    page_cache: PageCache | None,
+) -> Response:
+    """Render a page, or serve it from the server-side page cache.
+
+    Caching applies only to GET requests on routes that declared themselves
+    publicly cacheable -- a loader ``{data, revalidate}`` envelope or an edge
+    ``cache`` config entry -- the same "renders no per-user data" contract the
+    edge cache uses. A fresh hit skips both the loader and the Node SSR render;
+    a stale hit serves the stale bytes and refreshes in the background (ISR); a
+    miss renders now and stores the result.
+    """
+
+    cache_config = getattr(settings, "cache", None)
+    is_get = request.method == "GET"
+    cache_key = PageCache.make_key(request.url.path)
+
+    if page_cache is not None and is_get:
+        lookup = await page_cache.get(cache_key)
+        if lookup is not None:
+            if lookup.is_stale:
+                page_cache.schedule_revalidation(
+                    cache_key,
+                    _make_page_revalidator(
+                        request=request,
+                        route=route,
+                        settings=settings,
+                        renderer=renderer,
+                        error_boundaries=error_boundaries,
+                        page_cache=page_cache,
+                        cache_key=cache_key,
+                    ),
+                )
+            return _serve_cache_entry(
+                lookup.entry,
+                request=request,
+                status_label="STALE" if lookup.is_stale else "HIT",
+            )
+
+    response = await build_page_response(
+        request=request,
+        settings=settings,
+        page=route,
+        renderer=renderer,
+        overlay=overlay,
+        error_boundaries=error_boundaries,
+    )
+    # HTML page responses carry Vary so a browser that cached both the HTML and
+    # a nav-JSON payload for the same URL knows they are distinct entries.
+    response.headers["Vary"] = _NAVIGATION_HEADER
+
+    ttl = _effective_cache_ttl(response, request, cache_config)
+    if ttl is not None:
+        # A route declared cacheable is served `public, s-maxage=N` so a
+        # CDN/proxy can absorb the load — the CSRF middleware drops its per-user
+        # cookie from such responses. Every other page stays `private,
+        # no-cache`, never shared between users.
+        response.headers["Cache-Control"] = _public_cache_control(int(ttl))
+    else:
+        response.headers["Cache-Control"] = "private, no-cache"
+
+    if page_cache is not None and ttl is not None and is_get and response.status_code == 200:
+        body = await _read_response_body(response)
+        await page_cache.store(
+            cache_key, body, status_code=response.status_code, revalidate=ttl
+        )
+        served = Response(
+            content=body, status_code=response.status_code, media_type="text/html"
+        )
+        for key, value in response.headers.items():
+            if key.lower() != "content-length":
+                served.headers[key] = value
+        served.headers["ETag"] = PageCache.make_etag(body)
+        served.headers[_CACHE_STATUS_HEADER] = "MISS"
+        return served
+
+    return response
+
+
 def _make_page_handler(
     route: PageRoute,
     *,
@@ -667,6 +892,7 @@ def _make_page_handler(
     renderer: ComponentRenderer,
     overlay: OverlayManager | None,
     error_boundaries: ErrorBoundaryRegistry | None = None,
+    page_cache: PageCache | None = None,
 ):
     async def handler(request: Request):  # pragma: no cover - thin wrapper
         wants_navigation_payload = request.headers.get(_NAVIGATION_HEADER) == "1"
@@ -690,32 +916,15 @@ def _make_page_handler(
             response.headers["Cache-Control"] = "no-store"
             return response
 
-        response = await build_page_response(
+        return await _build_cached_page_response(
             request=request,
+            route=route,
             settings=settings,
-            page=route,
             renderer=renderer,
             overlay=overlay,
             error_boundaries=error_boundaries,
+            page_cache=page_cache,
         )
-        # HTML page responses also carry Vary so a browser that
-        # cached both the HTML and a nav-JSON payload for the same
-        # URL knows they are distinct entries.
-        response.headers["Vary"] = _NAVIGATION_HEADER
-        # A route the app explicitly declared cacheable (it renders no
-        # per-user data) is served `public, s-maxage=N` so a CDN/proxy can
-        # absorb the load — the CSRF middleware drops its per-user cookie from
-        # such responses. Every other page stays `private, no-cache`, never
-        # shared between users.
-        cache = getattr(settings, "cache", None)
-        max_age = cache.max_age_for(request.url.path) if cache is not None else None
-        if max_age is not None:
-            response.headers["Cache-Control"] = (
-                f"public, s-maxage={max_age}, stale-while-revalidate={max_age * 5}"
-            )
-        else:
-            response.headers["Cache-Control"] = "private, no-cache"
-        return response
 
     handler.__name__ = f"page_{route.module_key.replace('.', '_')}"
     return handler
@@ -960,6 +1169,7 @@ def _build_app_routes(
     overlay: OverlayManager | None,
     api_route_hooks: Sequence[RouteHookCallable],
     page_route_hooks: Sequence[RouteHookCallable],
+    page_cache: PageCache | None = None,
 ) -> tuple[list[Any], ErrorBoundaryRegistry]:
     """Build the ordered Starlette route list for a route table.
 
@@ -981,6 +1191,7 @@ def _build_app_routes(
         overlay=overlay,
         route_hooks=[*DEFAULT_PAGE_POLICIES, *page_route_hooks],
         error_boundaries=error_boundaries,
+        page_cache=page_cache,
     )
     action_router = build_action_router(routes.actions, debug=settings.debug)
 
@@ -1032,6 +1243,12 @@ def create_starlette_app(
         renderer = ComponentRenderer(factory=pool_render_factory(pool))
     else:
         renderer = ComponentRenderer()
+    # Server-side page cache: enabled for production serves, off in debug so a
+    # cached render never masks an edit during development. Only routes that
+    # declared themselves cacheable (a loader `revalidate` or an edge `cache`
+    # entry) are ever stored, so leaving it on in production is zero-config and
+    # safe. Defaults to the bounded in-memory backend.
+    page_cache: PageCache | None = None if settings.debug else PageCache()
     overlay: OverlayManager | None = None
     vite_proxy: ViteProxy | None = None
     proxy_middleware: Middleware | None = None
@@ -1217,11 +1434,19 @@ def create_starlette_app(
         #      preferred for most app code.
         app.state.pyxle_plugins = _plugin_ctx
         set_active_context(_plugin_ctx)
+        # Register the page cache so `pyxle.cache.invalidate(path)` can reach it
+        # from actions without threading a handle through the request.
+        if page_cache is not None:
+            app.state.pyxle_page_cache = page_cache
+            set_active_cache(page_cache)
         try:
             yield
         finally:
             # Shutdown in reverse order — best-effort; individual
             # failures are logged, not re-raised.
+            if page_cache is not None:
+                set_active_cache(None)
+                await page_cache.aclose()
             set_active_context(None)
             await run_shutdown(_plugins, _plugin_ctx)
             if pool is not None:
@@ -1305,6 +1530,7 @@ def create_starlette_app(
         overlay=overlay,
         api_route_hooks=api_route_hooks,
         page_route_hooks=page_route_hooks,
+        page_cache=page_cache,
     )
     app.router.routes.extend(app_routes)
 

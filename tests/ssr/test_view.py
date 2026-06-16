@@ -276,6 +276,108 @@ async def load_home(request):
     assert renderer.calls[-1][1]["data"]["value"] == "9"
 
 
+# --------------------------------------------------------------------------- #
+# Loader {data, revalidate} cache envelope (ROADMAP 2.1)
+# --------------------------------------------------------------------------- #
+
+
+def test_normalize_loader_result_plain_mapping_has_no_revalidate(tmp_path: Path) -> None:
+    page = _page_route(tmp_path, loader_name="load")
+    payload, status, revalidate = ssr_view._normalize_loader_result({"a": 1}, page)
+    assert payload == {"a": 1}
+    assert status == 200
+    assert revalidate is None
+
+
+def test_normalize_loader_result_unwraps_envelope(tmp_path: Path) -> None:
+    page = _page_route(tmp_path, loader_name="load")
+    payload, status, revalidate = ssr_view._normalize_loader_result(
+        {"data": {"a": 1}, "revalidate": 60}, page
+    )
+    assert payload == {"a": 1}
+    assert status == 200
+    assert revalidate == 60.0
+
+
+def test_normalize_loader_result_envelope_with_status_tuple(tmp_path: Path) -> None:
+    page = _page_route(tmp_path, loader_name="load")
+    payload, status, revalidate = ssr_view._normalize_loader_result(
+        ({"data": {"a": 1}, "revalidate": 30}, 201), page
+    )
+    assert payload == {"a": 1}
+    assert status == 201
+    assert revalidate == 30.0
+
+
+def test_normalize_loader_result_not_envelope_with_extra_keys(tmp_path: Path) -> None:
+    # A page that genuinely exposes data/revalidate *plus* another key is not a
+    # cache directive — it is returned verbatim as props.
+    page = _page_route(tmp_path, loader_name="load")
+    result = {"data": {"a": 1}, "revalidate": 60, "extra": True}
+    payload, _status, revalidate = ssr_view._normalize_loader_result(result, page)
+    assert payload == result
+    assert revalidate is None
+
+
+def test_normalize_loader_result_not_envelope_when_data_not_mapping(tmp_path: Path) -> None:
+    page = _page_route(tmp_path, loader_name="load")
+    result = {"data": [1, 2], "revalidate": 60}
+    payload, _status, revalidate = ssr_view._normalize_loader_result(result, page)
+    assert payload == result
+    assert revalidate is None
+
+
+@pytest.mark.parametrize("value,expected", [(None, None), (0, 0.0), (60, 60.0), (1.5, 1.5)])
+def test_coerce_revalidate_accepts_valid(tmp_path: Path, value, expected) -> None:
+    page = _page_route(tmp_path, loader_name="load")
+    assert ssr_view._coerce_revalidate(value, page) == expected
+
+
+@pytest.mark.parametrize("value", [-1, True, False, "60", [1]])
+def test_coerce_revalidate_rejects_invalid(tmp_path: Path, value) -> None:
+    page = _page_route(tmp_path, loader_name="load")
+    with pytest.raises(ssr_view.LoaderExecutionError):
+        ssr_view._coerce_revalidate(value, page)
+
+
+@pytest.mark.anyio
+async def test_build_page_response_sets_revalidate_header_from_envelope(
+    settings: DevServerSettings, tmp_path: Path
+) -> None:
+    server_module = tmp_path / "server" / "index.py"
+    server_module.parent.mkdir(parents=True, exist_ok=True)
+    server_module.write_text(
+        '\nasync def load_home(request):\n'
+        '    return {"data": {"value": "x"}, "revalidate": 90}\n',
+        encoding="utf-8",
+    )
+    page = replace(
+        _page_route(tmp_path, loader_name="load_home"), server_module_path=server_module
+    )
+
+    renderer = StubRenderer()
+    renderer.responses.append(RenderResult(html="<p>SSR</p>"))
+    request = Request(
+        {
+            "type": "http",
+            "http_version": "1.1",
+            "method": "GET",
+            "path": "/",
+            "root_path": "",
+            "headers": [],
+            "query_string": b"",
+        }
+    )
+
+    response = await build_page_response(
+        request=request, settings=settings, page=page, renderer=renderer
+    )
+
+    assert response.headers[ssr_view.REVALIDATE_HEADER] == "90"
+    # The inner data became the component props; envelope keys did not leak.
+    assert renderer.calls[-1][1]["data"] == {"value": "x"}
+
+
 @pytest.mark.anyio
 async def test_build_page_response_inlines_renderer_styles(
     settings: DevServerSettings,

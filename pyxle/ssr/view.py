@@ -39,6 +39,13 @@ class HeadEvaluationError(RuntimeError):
     """Raised when HEAD cannot be resolved at runtime."""
 
 
+#: Response header carrying a render's cache lifetime (seconds) from the page
+#: handler's perspective. Set by :func:`build_page_response` when a loader
+#: declared a ``{data, revalidate}`` envelope; read and stripped by the page
+#: handler when it decides what TTL to store the rendered HTML under.
+REVALIDATE_HEADER = "x-pyxle-revalidate"
+
+
 @dataclass(slots=True)
 class PageArtifacts:
     component_props: dict[str, Any]
@@ -47,6 +54,7 @@ class PageArtifacts:
     head_markup: str
     inline_styles: tuple[InlineStyleFragment, ...]
     status_code: int
+    revalidate: float | None = None
 
 
 _logger = logging.getLogger(__name__)
@@ -107,6 +115,17 @@ def _resolve_nav_cache_ttl(settings: DevServerSettings, path: str) -> int | None
     return cache.max_age_for(path)
 
 
+def _attach_revalidate(response: Response, revalidate: float | None) -> None:
+    """Stamp a render's cache lifetime onto the response for the page handler.
+
+    The page handler reads :data:`REVALIDATE_HEADER` to decide the TTL under
+    which it stores the rendered HTML, then strips it before the response
+    reaches the client.
+    """
+    if revalidate is not None:
+        response.headers[REVALIDATE_HEADER] = f"{revalidate:g}"
+
+
 async def build_page_response(
     *,
     request: Request,
@@ -155,7 +174,11 @@ async def build_page_response(
             )
             if overlay is not None:
                 await overlay.notify_clear(route_path=page.path)
-            return HTMLResponse(document, status_code=artifacts.status_code)
+            fallback_response: Response = HTMLResponse(
+                document, status_code=artifacts.status_code
+            )
+            _attach_revalidate(fallback_response, artifacts.revalidate)
+            return fallback_response
 
         async def _document_stream():
             yield shell.prefix.encode("utf-8")
@@ -164,11 +187,13 @@ async def build_page_response(
 
         if overlay is not None:
             await overlay.notify_clear(route_path=page.path)
-        return StreamingResponse(
+        streamed_response: Response = StreamingResponse(
             _document_stream(),
             status_code=artifacts.status_code,
             media_type="text/html",
         )
+        _attach_revalidate(streamed_response, artifacts.revalidate)
+        return streamed_response
     except LoaderError as exc:
         # Structured loader error — try the nearest error boundary.
         loader_breadcrumb = _make_loader_breadcrumb(page, status="failed", detail=str(exc))
@@ -421,9 +446,9 @@ async def _execute_loader(
     *,
     module: Any | None,
     debug: bool = False,
-) -> Tuple[dict[str, Any], int, Any | None]:
+) -> Tuple[dict[str, Any], int, float | None, Any | None]:
     if not page.has_loader:
-        return {}, 200, module
+        return {}, 200, None, module
 
     if module is None:
         module = _import_server_module(page.module_key, page.server_module_path, debug=debug)
@@ -437,8 +462,8 @@ async def _execute_loader(
     if hasattr(result, "__await__"):
         result = await result  # type: ignore[assignment]
 
-    payload, status_code = _normalize_loader_result(result, page)
-    return payload, status_code, module
+    payload, status_code, revalidate = _normalize_loader_result(result, page)
+    return payload, status_code, revalidate, module
 
 
 async def _execute_layout_loaders(
@@ -501,8 +526,33 @@ def _resolve_head_elements(
     return _normalize_head_entries(page, head_value)
 
 
-def _normalize_loader_result(result: Any, page: PageRoute) -> Tuple[dict[str, Any], int]:
+def _coerce_revalidate(value: Any, page: PageRoute) -> float | None:
+    """Validate a loader's ``revalidate`` hint.
+
+    ``None`` means "cache until explicitly invalidated"; a non-negative number
+    is the freshness window in seconds. Anything else (a bool, a negative, a
+    string) is a programming error surfaced as a structured loader failure
+    rather than silently caching forever or not at all.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise LoaderExecutionError(
+            f"Loader for {page.path} returned revalidate={value!r}; "
+            "expected a non-negative number of seconds or None"
+        )
+    if value < 0:
+        raise LoaderExecutionError(
+            f"Loader for {page.path} returned a negative revalidate ({value})"
+        )
+    return float(value)
+
+
+def _normalize_loader_result(
+    result: Any, page: PageRoute
+) -> Tuple[dict[str, Any], int, float | None]:
     status_code = 200
+    revalidate: float | None = None
     payload = result
 
     if isinstance(result, tuple) and result:
@@ -510,12 +560,24 @@ def _normalize_loader_result(result: Any, page: PageRoute) -> Tuple[dict[str, An
         if len(result) > 1:
             status_code = int(result[1])
 
+    # ``{data, revalidate}`` envelope: a loader may declare its own cache
+    # lifetime (ROADMAP 2.1). Recognised only in its exact two-key shape so an
+    # ordinary loader returning "data"/"revalidate" as page props is never
+    # mistaken for a cache directive.
+    if (
+        isinstance(payload, Mapping)
+        and set(payload) == {"data", "revalidate"}
+        and isinstance(payload["data"], Mapping)
+    ):
+        revalidate = _coerce_revalidate(payload["revalidate"], page)
+        payload = payload["data"]
+
     if not isinstance(payload, Mapping):
         raise LoaderExecutionError(
             f"Loader for {page.path} must return a mapping or (mapping, status_code) tuple"
         )
 
-    return dict(payload), status_code
+    return dict(payload), status_code, revalidate
 
 
 def _compose_component_props(
@@ -561,7 +623,7 @@ async def _create_page_artifacts(
             page.module_key, page.server_module_path, debug=settings.debug,
         )
 
-    loader_props, status_code, module = await _execute_loader(
+    loader_props, status_code, revalidate, module = await _execute_loader(
         page,
         request,
         module=module,
@@ -616,6 +678,7 @@ async def _create_page_artifacts(
         head_markup=head_markup,
         inline_styles=inline_styles,
         status_code=status_code,
+        revalidate=revalidate,
     )
 
 

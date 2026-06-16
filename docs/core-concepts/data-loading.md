@@ -61,6 +61,25 @@ async def load_page(request):
     return {"item": item}
 ```
 
+## Caching the render
+
+For a page whose content is the same for every visitor and changes rarely,
+return a `{"data": ..., "revalidate": <seconds>}` envelope instead of a plain
+dict. Pyxle caches the rendered HTML and serves it back without re-running the
+loader, refreshing it in the background once it goes stale:
+
+```python
+@server
+async def load_post(request):
+    post = await fetch_post(request.path_params["slug"])
+    return {"data": {"post": post}, "revalidate": 60}
+```
+
+`data` is the props your component receives; `revalidate` is the freshness
+window in seconds. **Only do this for pages that render no per-user data** — a
+cached render is shared with every visitor. See [Caching](../guides/caching.md)
+for invalidation, incremental regeneration, and the full contract.
+
 ## Error handling in loaders
 
 Raise `LoaderError` to trigger the nearest error boundary:
@@ -156,7 +175,7 @@ export default function StaticPage() {
 5. The full HTML is sent to the browser
 6. React hydrates the page on the client, using the same props embedded in the HTML
 
-The loader runs on **every request**. There is no built-in caching -- use your own caching strategy in the loader if needed.
+By default the loader runs on **every request**. To cache the rendered page and skip the loader on later requests, return a `{"data": ..., "revalidate": N}` envelope -- see [Caching](../guides/caching.md).
 
 ## Next steps
 
