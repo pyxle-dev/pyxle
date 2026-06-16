@@ -13,6 +13,16 @@
  *
  * Response format (error):
  *   {"id":"<uuid>","ok":false,"message":"..."}
+ *
+ * Streaming requests carry ``"stream":true`` and are answered with a sequence
+ * of newline-delimited frames sharing the request id (consumed by the Python
+ * worker pool's ``render_stream``):
+ *   {"id":"<uuid>","type":"chunk","html":"..."}            -- a streamed slice
+ *   {"id":"<uuid>","type":"end","styles":[...],"headElements":[...]}  -- success
+ *   {"id":"<uuid>","type":"error","error":"..."}           -- terminal failure
+ * The shell is only piped after ``onShellReady``, so a shell-level error maps
+ * to a single terminal ``error`` frame and the buffered path stays the hot
+ * path for non-streaming renders.
  */
 
 import { Console } from 'node:console';
@@ -20,6 +30,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { createRequire } from 'node:module';
+import { Writable } from 'node:stream';
 import { pathToFileURL } from 'node:url';
 
 // Pin the SSR worker's locale deterministically so ``toLocaleString()``,
@@ -209,6 +220,20 @@ async function main() {
         continue;
       }
 
+      if (request.stream === true) {
+        // Streaming render: emit framed NDJSON sharing the request id.
+        const emit = (frame) => process.stdout.write(JSON.stringify({ id, ...frame }) + '\n');
+        try {
+          await renderRequestStream(request, emit);
+        } catch (error) {
+          // A failure before the first byte (component load / esbuild) is a
+          // terminal error frame; the Python side falls back to a buffered
+          // error render.
+          emit({ type: 'error', error: String(error.message || error) });
+        }
+        continue;
+      }
+
       try {
         const result = await renderRequest(request);
         const response = JSON.stringify({ id, ok: true, ...result });
@@ -222,7 +247,24 @@ async function main() {
   process.exit(0);
 }
 
-async function renderRequest({ componentPath, props, clientRoot, projectRoot: projectRootArg, requestPathname, csrfToken }) {
+/**
+ * Resolve, compile (or load from the bundle cache), and instantiate the page
+ * component for a render request. Installs the per-render SSR globals (style
+ * and head registries, request pathname, CSRF token) and returns a
+ * ``restoreGlobals`` closure the caller MUST invoke once rendering finishes so
+ * the pathname/CSRF globals don't leak into the next request.
+ *
+ * Shared by the buffered (``renderRequest``) and streaming
+ * (``renderRequestStream``) paths so both compile and cache bundles
+ * identically.
+ */
+async function loadComponentForRender({
+  componentPath,
+  clientRoot,
+  projectRoot: projectRootArg,
+  requestPathname,
+  csrfToken,
+}) {
   if (!componentPath) {
     throw new Error('Missing componentPath in render request.');
   }
@@ -356,9 +398,9 @@ export default entry.contents;
   }
 
   // Make the request path / CSRF token visible to SSR code (e.g.
-  // usePathname, <Form>'s hidden field). Cleared in `finally` so a
-  // request without these values can't inherit the previous request's
-  // value via the global.
+  // usePathname, <Form>'s hidden field). The returned ``restoreGlobals``
+  // resets them so a later request without these values can't inherit the
+  // previous request's value via the global.
   const previousPathname = globalThis.__PYXLE_CURRENT_PATHNAME__;
   const previousCsrf = globalThis.__PYXLE_CSRF_TOKEN__;
   if (typeof requestPathname === 'string') {
@@ -372,13 +414,7 @@ export default entry.contents;
     delete globalThis.__PYXLE_CSRF_TOKEN__;
   }
 
-  try {
-    const element = React.createElement(Component, props);
-    const html = ReactDOMServer.renderToString(element);
-    const styles = styleRegistry.list();
-    const headElements = headRegistry.list();
-    return { html, styles, headElements };
-  } finally {
+  const restoreGlobals = () => {
     if (previousPathname === undefined) {
       delete globalThis.__PYXLE_CURRENT_PATHNAME__;
     } else {
@@ -389,7 +425,122 @@ export default entry.contents;
     } else {
       globalThis.__PYXLE_CSRF_TOKEN__ = previousCsrf;
     }
+  };
+
+  return { React, ReactDOMServer, Component, styleRegistry, headRegistry, restoreGlobals };
+}
+
+/**
+ * Buffered render: produce the complete HTML string in one shot via
+ * ``renderToString``. This is the hot path for non-streaming, cacheable, and
+ * statically generated pages — its behaviour is unchanged.
+ */
+async function renderRequest(request) {
+  const { React, ReactDOMServer, Component, styleRegistry, headRegistry, restoreGlobals } =
+    await loadComponentForRender(request);
+  try {
+    const element = React.createElement(Component, request.props);
+    const html = ReactDOMServer.renderToString(element);
+    const styles = styleRegistry.list();
+    const headElements = headRegistry.list();
+    return { html, styles, headElements };
+  } finally {
+    restoreGlobals();
   }
+}
+
+/**
+ * Streaming render: drive React's ``renderToPipeableStream`` and call
+ * ``emit(frame)`` for each protocol frame (``chunk`` / ``end`` / ``error``).
+ *
+ * The shell is piped only after ``onShellReady`` so a shell-level failure
+ * surfaces as a single terminal ``error`` frame (the Python side then renders
+ * a buffered error page, preserving the error-boundary contract). Backpressure
+ * propagates end-to-end: when stdout can't accept more, the pipe pauses until
+ * it drains. A render that never completes (e.g. a Suspense boundary that
+ * hangs) is aborted after ``streamTimeout`` ms so the worker is never wedged.
+ */
+async function renderRequestStream(request, emit) {
+  const { React, ReactDOMServer, Component, styleRegistry, headRegistry, restoreGlobals } =
+    await loadComponentForRender(request);
+
+  await new Promise((resolve) => {
+    let settled = false;
+    let piped = false;
+    let shellReady = false;
+    let renderer = null;
+    let timer = null;
+
+    const settle = (frame) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      restoreGlobals();
+      if (frame) emit(frame);
+      resolve();
+    };
+
+    const collector = new Writable({
+      write(chunk, _encoding, callback) {
+        // Respect stdout backpressure: pause the React pipe until the OS pipe
+        // (drained by the Python read loop) can accept more output.
+        const ok = emit({ type: 'chunk', html: chunk.toString('utf8') });
+        if (ok) {
+          callback();
+        } else {
+          process.stdout.once('drain', callback);
+        }
+      },
+    });
+    collector.on('finish', () =>
+      settle({ type: 'end', styles: styleRegistry.list(), headElements: headRegistry.list() }),
+    );
+    collector.on('error', (err) =>
+      settle({ type: 'error', error: String((err && err.message) || err) }),
+    );
+
+    const tryPipe = () => {
+      if (settled || piped || !shellReady || !renderer) return;
+      piped = true;
+      renderer.pipe(collector);
+    };
+
+    try {
+      const element = React.createElement(Component, request.props);
+      renderer = ReactDOMServer.renderToPipeableStream(element, {
+        onShellReady() {
+          shellReady = true;
+          tryPipe();
+        },
+        onShellError(error) {
+          settle({ type: 'error', error: String((error && error.message) || error) });
+        },
+        onError(error) {
+          // Recoverable error inside a Suspense boundary after the shell
+          // flushed: React streams the fallback and retries on the client.
+          // Log it; don't break the NDJSON protocol.
+          process.stderr.write(`SSR stream error: ${String((error && error.message) || error)}\n`);
+        },
+      });
+    } catch (error) {
+      settle({ type: 'error', error: String((error && error.message) || error) });
+      return;
+    }
+
+    // ``onShellReady`` may already have fired synchronously above; pipe now
+    // that ``renderer`` is assigned.
+    tryPipe();
+
+    const timeoutMs = Number(request.streamTimeout) > 0 ? Number(request.streamTimeout) : 30000;
+    timer = setTimeout(() => {
+      try {
+        renderer.abort();
+      } catch {
+        // Already finished — nothing to abort.
+      }
+    }, timeoutMs);
+    if (typeof timer.unref === 'function') timer.unref();
+  });
 }
 
 // --- Helpers (shared with render_component.mjs) ---
