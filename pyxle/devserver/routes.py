@@ -34,6 +34,7 @@ class PageRoute:
     head_jsx_blocks: tuple[str, ...] = ()
     actions: tuple[dict, ...] = ()
     cache_revalidate: float | None = None
+    uses_suspense: bool = False
 
     @property
     def has_loader(self) -> bool:
@@ -183,6 +184,7 @@ def _page_route(
         head_jsx_blocks=entry.head_jsx_blocks,
         actions=entry.actions,
         cache_revalidate=entry.cache_revalidate,
+        uses_suspense=entry.uses_suspense,
     )
 
 

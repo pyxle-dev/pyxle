@@ -96,6 +96,7 @@ class PyxParseResult:
     head_jsx_blocks: tuple[str, ...] = ()
     actions: tuple[ActionDetails, ...] = ()
     cache_revalidate: float | None = None
+    uses_suspense: bool = False
     diagnostics: tuple[PyxDiagnostic, ...] = ()
 
 
@@ -985,45 +986,61 @@ def _detect_cache_directive(
 # ---------------------------------------------------------------------------
 
 
-def _detect_script_declarations(jsx_code: str) -> tuple[dict, ...]:
+@dataclass(frozen=True)
+class _JsxMetadata:
+    """JSX component metadata extracted from a single Babel pass."""
+
+    script_declarations: tuple[dict, ...]
+    image_declarations: tuple[dict, ...]
+    head_jsx_blocks: tuple[str, ...]
+    uses_suspense: bool
+
+
+# Element names that opt a page into streaming SSR. ``React.Suspense`` is the
+# member-expression form Babel reports for ``<React.Suspense>``.
+_SUSPENSE_ELEMENT_NAMES = ("Suspense", "React.Suspense")
+
+
+def _detect_jsx_metadata(jsx_code: str) -> _JsxMetadata:
+    """Extract all JSX component metadata the compiler needs in one Babel pass.
+
+    Scripts, images, ``<Head>`` blocks, and whether the page uses
+    ``<Suspense>`` (the implicit streaming-SSR opt-in) are all derived from a
+    single ``parse_jsx_components`` call. Babel is a Node.js subprocess, so
+    consolidating the targets keeps the compile to one spawn instead of one
+    per component kind.
+    """
     from .jsx_parser import parse_jsx_components
 
-    result = parse_jsx_components(jsx_code, target_components={"Script"})
+    result = parse_jsx_components(
+        jsx_code,
+        target_components={"Script", "Image", "Head", *_SUSPENSE_ELEMENT_NAMES},
+    )
     if result.error:
-        return ()
-    return tuple(
+        return _JsxMetadata((), (), (), False)
+
+    components = result.components
+    scripts = tuple(
         component.props
-        for component in result.components
+        for component in components
         if component.name == "Script" and component.props
     )
-
-
-def _detect_image_declarations(jsx_code: str) -> tuple[dict, ...]:
-    from .jsx_parser import parse_jsx_components
-
-    result = parse_jsx_components(jsx_code, target_components={"Image"})
-    if result.error:
-        return ()
-    return tuple(
+    images = tuple(
         component.props
-        for component in result.components
+        for component in components
         if component.name == "Image" and component.props
     )
-
-
-def _detect_head_jsx_blocks(jsx_code: str) -> tuple[str, ...]:
-    from .jsx_parser import parse_jsx_components
-
-    result = parse_jsx_components(jsx_code, target_components={"Head"})
-    if result.error:
-        return ()
-    return tuple(
+    head_blocks = tuple(
         component.children.strip()
-        for component in result.components
+        for component in components
         if component.name == "Head"
         and component.children
         and component.children.strip()
     )
+    uses_suspense = any(
+        component.name in _SUSPENSE_ELEMENT_NAMES for component in components
+    )
+    return _JsxMetadata(scripts, images, head_blocks, uses_suspense)
 
 
 def _validate_jsx_syntax(
@@ -1164,9 +1181,10 @@ class PyxParser:
         )
 
         # Layer 5: JSX metadata + optional Babel validation.
-        script_declarations = _detect_script_declarations(jsx_code)
-        image_declarations = _detect_image_declarations(jsx_code)
-        head_jsx_blocks = _detect_head_jsx_blocks(jsx_code)
+        jsx_metadata = _detect_jsx_metadata(jsx_code)
+        script_declarations = jsx_metadata.script_declarations
+        image_declarations = jsx_metadata.image_declarations
+        head_jsx_blocks = jsx_metadata.head_jsx_blocks
 
         # Only run JSX validation when the Python section is clean.
         # If Python already has diagnostics, the broken Python content
@@ -1203,6 +1221,7 @@ class PyxParser:
             head_jsx_blocks=head_jsx_blocks,
             actions=actions,
             cache_revalidate=cache_revalidate,
+            uses_suspense=jsx_metadata.uses_suspense,
             diagnostics=diagnostics,
         )
 

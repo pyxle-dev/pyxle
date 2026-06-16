@@ -39,6 +39,7 @@ class PageRegistryEntry:
     head_jsx_blocks: tuple[str, ...] = ()
     actions: tuple[dict, ...] = ()
     cache_revalidate: float | None = None
+    uses_suspense: bool = False
 
     @property
     def has_loader(self) -> bool:
@@ -101,6 +102,7 @@ class MetadataRegistry:
                     "head_jsx_blocks": list(entry.head_jsx_blocks),
                     "actions": list(entry.actions),
                     "cache_revalidate": entry.cache_revalidate,
+                    "uses_suspense": entry.uses_suspense,
                 }
                 for entry in self.pages
             ],
@@ -193,6 +195,7 @@ def _build_page_entry(
         head_jsx_blocks=metadata.head_jsx_blocks,
         actions=metadata.actions,
         cache_revalidate=metadata.cache_revalidate,
+        uses_suspense=metadata.uses_suspense,
     )
 
 
@@ -305,6 +308,8 @@ def _load_page_metadata(path: Path) -> Optional[PageMetadata]:
     else:
         cache_revalidate = None
 
+    uses_suspense = payload.get("uses_suspense") is True
+
     return PageMetadata(
         route_path=route_path,
         alternate_route_paths=alternate_route_paths,
@@ -319,6 +324,7 @@ def _load_page_metadata(path: Path) -> Optional[PageMetadata]:
         head_jsx_blocks=head_jsx_blocks,
         actions=actions,
         cache_revalidate=cache_revalidate,
+        uses_suspense=uses_suspense,
     )
 
 

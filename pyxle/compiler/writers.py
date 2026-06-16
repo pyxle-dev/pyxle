@@ -134,6 +134,7 @@ class ArtifactWriter:
             head_jsx_blocks=parse_result.head_jsx_blocks,
             actions=actions,
             cache_revalidate=parse_result.cache_revalidate,
+            uses_suspense=parse_result.uses_suspense,
         )
 
         metadata_output.write_text(

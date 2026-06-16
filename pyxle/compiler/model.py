@@ -79,6 +79,7 @@ class PageMetadata:
     head_jsx_blocks: tuple[str, ...] = ()
     actions: tuple[ActionDeclaration, ...] = ()
     cache_revalidate: float | None = None
+    uses_suspense: bool = False
 
     def to_json(self) -> Dict[str, Any]:
         return {
@@ -95,6 +96,7 @@ class PageMetadata:
             "head_jsx_blocks": list(self.head_jsx_blocks),
             "actions": [a.to_json() for a in self.actions],
             "cache_revalidate": self.cache_revalidate,
+            "uses_suspense": self.uses_suspense,
         }
 
     @property
