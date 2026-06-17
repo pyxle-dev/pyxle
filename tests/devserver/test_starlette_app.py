@@ -21,6 +21,7 @@ from pyxle.devserver.routes import build_route_table
 from pyxle.devserver.settings import DevServerSettings
 from pyxle.devserver.starlette_app import (
     ApiRouteError,
+    PageRouteError,
     build_api_router,
     build_page_router,
     build_static_files_mount,
@@ -179,6 +180,80 @@ def test_build_api_router_supports_http_and_ws_in_same_module(
         assert client.get("/api/dual").json() == {"ok": True}
         with client.websocket_connect("/api/dual") as ws:
             assert ws.receive_text() == "ws-hello"
+
+
+def test_build_page_router_registers_page_websocket(
+    project: DevServerSettings, monkeypatch
+) -> None:
+    """A page that declares ``async def websocket(ws)`` serves a WebSocket
+    route at its path, ALONGSIDE its HTTP GET — both on the same dynamic path,
+    with path params resolved for the WS upgrade too."""
+    write_file(
+        project.pages_dir / "chat/[room].pyxl",
+        "async def websocket(ws):\n"
+        "    await ws.accept()\n"
+        "    room = ws.path_params['room']\n"
+        "    msg = await ws.receive_text()\n"
+        "    await ws.send_text(f'{room}:{msg}')\n"
+        "    await ws.close()\n"
+        "\n"
+        "import React from 'react';\n"
+        "export default function Chat() { return <div>chat</div>; }\n",
+    )
+
+    build_once(project)
+    registry = load_metadata_registry(project)
+    table = build_route_table(registry)
+
+    async def fake_build_page_response(*, request, settings, page, renderer, overlay=None, **_kw):
+        return PlainTextResponse(f"SSR:{page.path}")
+
+    monkeypatch.setattr(
+        "pyxle.devserver.starlette_app.build_page_response",
+        fake_build_page_response,
+    )
+
+    router = build_page_router(table.pages, settings=project, renderer=object())
+    app = Starlette()
+    app.router.routes.extend(router.routes)
+
+    with TestClient(app) as client:
+        # The HTTP GET still renders on the same path…
+        assert client.get("/chat/lobby").text == "SSR:/chat/{room}"
+        # …and a WS upgrade to the same path resolves the [room] param.
+        with client.websocket_connect("/chat/lobby") as ws:
+            ws.send_text("hi")
+            assert ws.receive_text() == "lobby:hi"
+
+
+def test_page_without_websocket_has_no_ws_route(project: DevServerSettings) -> None:
+    """A page with no ``websocket`` handler exposes only its HTTP route — a WS
+    upgrade to its path is rejected."""
+    build_once(project)  # index.pyxl declares only a loader
+    registry = load_metadata_registry(project)
+    table = build_route_table(registry)
+
+    router = build_page_router(table.pages, settings=project, renderer=object())
+    app = Starlette()
+    app.router.routes.extend(router.routes)
+
+    with TestClient(app) as client:
+        with pytest.raises(WebSocketDisconnect):
+            with client.websocket_connect("/"):
+                pass
+
+
+def test_page_websocket_stale_metadata_raises(project: DevServerSettings) -> None:
+    """Metadata that names a websocket handler the server module doesn't expose
+    (a stale build) fails loudly at router build, not with a 500 on connect."""
+    build_once(project)
+    registry = load_metadata_registry(project)
+    table = build_route_table(registry)
+    index = next(page for page in table.pages if page.path == "/")
+    broken = replace(index, websocket_name="not_a_real_handler")
+
+    with pytest.raises(PageRouteError, match="no such callable"):
+        build_page_router([broken], settings=project, renderer=object())
 
 
 def test_build_page_router_invokes_build_page_response(project: DevServerSettings, monkeypatch) -> None:

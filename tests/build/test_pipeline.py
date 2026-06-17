@@ -12,6 +12,51 @@ def silent_logger() -> ConsoleLogger:
     return ConsoleLogger(secho=lambda *args, **kwargs: None)
 
 
+def _page_entry(tmp_path: Path, **overrides) -> PageRegistryEntry:
+    base = dict(
+        route_path="/chat/{room}",
+        alternate_route_paths=(),
+        source_relative_path=Path("pages/chat/[room].pyxl"),
+        source_absolute_path=tmp_path / "pages" / "chat" / "[room].pyxl",
+        server_module_path=tmp_path / "server" / "chat" / "[room].py",
+        client_module_path=tmp_path / "client" / "chat" / "[room].jsx",
+        metadata_path=tmp_path / "metadata" / "chat" / "[room].json",
+        client_asset_path="/pages/chat/[room].jsx",
+        server_asset_path="server/pages/chat/[room].py",
+        module_key="pyxle.server.pages.chat.room",
+        content_hash="h",
+        loader_name=None,
+        loader_line=None,
+        head_elements=(),
+        head_is_dynamic=False,
+    )
+    base.update(overrides)
+    return PageRegistryEntry(**base)
+
+
+def test_build_page_manifest_emits_websocket(tmp_path) -> None:
+    """A page with a websocket handler gets a ``websocket`` entry in the
+    page-manifest, so production tooling/parity sees it on disk."""
+    from pyxle.build.pipeline import _build_page_manifest
+
+    settings = DevServerSettings.from_project_root(tmp_path)
+    registry = MetadataRegistry(
+        pages=[_page_entry(tmp_path, websocket_name="websocket", websocket_line=3)],
+        apis=[],
+    )
+    manifest = _build_page_manifest(settings, registry)
+    assert manifest["/chat/{room}"]["websocket"] == {"name": "websocket", "line": 3}
+
+
+def test_build_page_manifest_omits_websocket_when_absent(tmp_path) -> None:
+    from pyxle.build.pipeline import _build_page_manifest
+
+    settings = DevServerSettings.from_project_root(tmp_path)
+    registry = MetadataRegistry(pages=[_page_entry(tmp_path)], apis=[])
+    manifest = _build_page_manifest(settings, registry)
+    assert "websocket" not in manifest["/chat/{room}"]
+
+
 def _write_vite_manifest(settings: DevServerSettings, payload: dict) -> Path:
     """Place a Vite manifest where ``_load_vite_manifest`` / ``_copy_client_manifest``
     expect it (``<client_build_dir>/dist/.vite/manifest.json``)."""

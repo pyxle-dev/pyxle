@@ -306,6 +306,11 @@ def _build_page_manifest(
                 "name": page.loader_name,
                 "line": page.loader_line,
             }
+        if page.websocket_name:
+            entry["websocket"] = {
+                "name": page.websocket_name,
+                "line": page.websocket_line,
+            }
         if page.head_elements:
             entry["head"] = list(page.head_elements)
         if page.head_jsx_blocks:

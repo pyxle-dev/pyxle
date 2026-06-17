@@ -133,6 +133,14 @@ class ArtifactWriter:
             images=images,
             head_jsx_blocks=parse_result.head_jsx_blocks,
             actions=actions,
+            websocket_name=(
+                parse_result.websocket.name if parse_result.websocket else None
+            ),
+            websocket_line=(
+                parse_result.websocket.line_number
+                if parse_result.websocket
+                else None
+            ),
             cache_revalidate=parse_result.cache_revalidate,
             uses_suspense=parse_result.uses_suspense,
         )

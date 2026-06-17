@@ -50,6 +50,22 @@ class ActionDetails:
 
 
 @dataclass(frozen=True)
+class WebsocketDetails:
+    """Metadata about a page's ``async def websocket(ws)`` handler.
+
+    Detected by convention (a module-scope coroutine named ``websocket``),
+    not a decorator — mirroring how API modules expose a ``websocket``
+    callable. A page that declares one also serves a WebSocket route at its
+    path.
+    """
+
+    name: str
+    line_number: int
+    is_async: bool
+    parameters: Sequence[str]
+
+
+@dataclass(frozen=True)
 class PyxDiagnostic:
     """A syntax or structural error found during parsing.
 
@@ -95,6 +111,7 @@ class PyxParseResult:
     image_declarations: tuple[dict, ...] = ()
     head_jsx_blocks: tuple[str, ...] = ()
     actions: tuple[ActionDetails, ...] = ()
+    websocket: WebsocketDetails | None = None
     cache_revalidate: float | None = None
     uses_suspense: bool = False
     diagnostics: tuple[PyxDiagnostic, ...] = ()
@@ -848,6 +865,72 @@ def _detect_actions(
     return tuple(actions)
 
 
+def _detect_websocket(
+    tree: ast.Module | None,
+    python_line_numbers: Sequence[int],
+    *,
+    collector: _DiagnosticCollector,
+) -> WebsocketDetails | None:
+    """Detect a module-scope ``async def websocket(ws)`` handler.
+
+    Detection is by **convention** — a single coroutine named ``websocket`` at
+    module scope — not a decorator. We scan only the module's direct children
+    (``ast.iter_child_nodes``), so a local helper named ``websocket`` nested
+    inside another function never false-matches and never breaks a page; only
+    a module-level definition (the one that can actually be served) counts.
+
+    A mis-shaped definition is reported so the developer isn't left with a
+    silent 404: a sync ``def websocket`` or a ``class websocket`` at module
+    scope is almost certainly a mistyped handler.
+    """
+    if tree is None:
+        return None
+
+    websocket_node: ast.AsyncFunctionDef | None = None
+
+    for node in ast.iter_child_nodes(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "websocket":
+            line = _map_lineno(node.lineno, python_line_numbers)
+            collector.emit(
+                "`websocket` handler must be declared as async", line
+            )
+            return None
+        if isinstance(node, ast.ClassDef) and node.name == "websocket":
+            line = _map_lineno(node.lineno, python_line_numbers)
+            collector.emit(
+                "`websocket` must be an async function, not a class", line
+            )
+            return None
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "websocket":
+            if websocket_node is not None:
+                line = _map_lineno(node.lineno, python_line_numbers)
+                collector.emit("Multiple `websocket` handlers detected", line)
+                return None
+            websocket_node = node
+
+    if websocket_node is None:
+        return None
+
+    all_pos_args = (
+        list(websocket_node.args.posonlyargs) + list(websocket_node.args.args)
+    )
+    if not all_pos_args:
+        line = _map_lineno(websocket_node.lineno, python_line_numbers)
+        collector.emit(
+            "`websocket` handler must accept a WebSocket argument", line
+        )
+        return None
+
+    parameters = tuple(arg.arg for arg in all_pos_args)
+    line = _map_lineno(websocket_node.lineno, python_line_numbers)
+    return WebsocketDetails(
+        name=websocket_node.name,
+        line_number=line,
+        is_async=True,
+        parameters=parameters,
+    )
+
+
 def _extract_head_literal(
     value: ast.AST, line: int | None, collector: _DiagnosticCollector
 ) -> list[str] | None:
@@ -1173,6 +1256,9 @@ class PyxParser:
         actions = _detect_actions(
             tree, python_line_numbers, collector=collector
         )
+        websocket = _detect_websocket(
+            tree, python_line_numbers, collector=collector
+        )
         head_elements, head_is_dynamic = _collect_head_elements(
             tree, python_line_numbers, collector=collector
         )
@@ -1220,6 +1306,7 @@ class PyxParser:
             image_declarations=image_declarations,
             head_jsx_blocks=head_jsx_blocks,
             actions=actions,
+            websocket=websocket,
             cache_revalidate=cache_revalidate,
             uses_suspense=jsx_metadata.uses_suspense,
             diagnostics=diagnostics,

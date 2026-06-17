@@ -222,6 +222,49 @@ def test_load_page_metadata_defaults_head_when_missing(tmp_path: Path) -> None:
     assert metadata.head_elements == ()
 
 
+def test_load_page_metadata_reads_websocket(tmp_path: Path) -> None:
+    """A metadata JSON with a websocket handler loads with has_websocket True —
+    the disk round-trip the production server depends on."""
+    from pyxle.devserver import registry as registry_module
+
+    path = tmp_path / "meta.json"
+    payload = {
+        "route_path": "/chat/{room}",
+        "client_path": "/pages/chat/[room].jsx",
+        "server_path": "/pages/chat/[room].py",
+        "websocket_name": "websocket",
+        "websocket_line": 3,
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    metadata = registry_module._load_page_metadata(path)
+    assert metadata is not None
+    assert metadata.has_websocket is True
+    assert metadata.websocket_name == "websocket"
+    assert metadata.websocket_line == 3
+
+
+def test_load_page_metadata_defaults_websocket_for_old_builds(tmp_path: Path) -> None:
+    """A pre-2.5 build's metadata JSON (no websocket key) loads with
+    has_websocket False — never crashes ``pyxle serve --skip-build``."""
+    from pyxle.devserver import registry as registry_module
+
+    path = tmp_path / "meta.json"
+    payload = {
+        "route_path": "/",
+        "client_path": "/pages/index.jsx",
+        "server_path": "/pages/index.py",
+        "loader_name": "load_home",
+        "loader_line": 10,
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    metadata = registry_module._load_page_metadata(path)
+    assert metadata is not None
+    assert metadata.has_websocket is False
+    assert metadata.websocket_name is None
+
+
 def test_find_layout_head_jsx_blocks_no_layout(project: DevServerSettings) -> None:
     """Test that empty tuple is returned when no layout exists."""
     from pyxle.devserver.registry import find_layout_head_jsx_blocks

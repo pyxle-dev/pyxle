@@ -153,6 +153,61 @@ Parameters:
 
 Returns the `response` argument (possibly with a header or sentinel key added) so you can `return invalidate_routes(...)` in one line.
 
+## WebSockets — `pyxle.realtime`
+
+A page that exports a module-scope `async def websocket(ws)` also serves a
+WebSocket at its path. `pyxle.realtime` provides the pub/sub and auth helpers
+those handlers use. See the [WebSockets guide](../guides/websockets.md) for the
+full walkthrough.
+
+### `channel(ws, name, *, broker=None)`
+
+An async context manager that subscribes `ws` to a named channel for the life of
+the block (unsubscribing on exit, including disconnect) and yields a handle with
+`.publish(message)`:
+
+```python
+from pyxle.realtime import channel
+
+async def websocket(ws):
+    await ws.accept()
+    async with channel(ws, f"room:{ws.path_params['room']}") as room:
+        async for message in ws.iter_text():
+            await room.publish(message)   # reaches every subscriber
+```
+
+A published `dict`/`list` is sent as a JSON frame, `str` as text, `bytes` as
+binary. The broker defaults to the app-scoped `InProcessBroker` on
+`app.state.pyxle_broker` (one per process — see the guide's **multi-worker
+caveat**). Implement the `Broker` protocol (`subscribe` / `unsubscribe` /
+`publish`) for a Redis/NATS backend.
+
+### `authenticate_websocket(ws)`
+
+Resolve the signed-in [`pyxle-auth`](../plugins/pyxle-auth.md) user for a
+WebSocket upgrade, or `None`. The auth middleware never runs for WebSocket scope,
+so a handler that needs the user must call this (it reads the session cookie off
+the handshake). Returns `None` — zero database work — when the plugin isn't
+installed or no cookie is present.
+
+```python
+from pyxle.realtime import authenticate_websocket
+
+async def websocket(ws):
+    user = await authenticate_websocket(ws)
+    if user is None:
+        await ws.close(code=4401)
+        return
+    await ws.accept()
+    ...
+```
+
+### `origin_allowed(ws, allowed_origins)`
+
+Whether the upgrade's `Origin` is permitted. CSRF doesn't apply to a WebSocket,
+so checking the origin is the equivalent guard. An empty `allowed_origins`
+allows all; a missing `Origin` header (same-origin / non-browser) is allowed.
+
 ## Document `<head>` elements
 
 Pyxle offers two ways to contribute elements to the document `<head>`: the `<Head>` component (**recommended**) and the `HEAD` Python variable (lower-level alternative). Both are merged with automatic deduplication.

@@ -78,6 +78,8 @@ class PageMetadata:
     images: tuple[ImageDeclaration, ...] = ()
     head_jsx_blocks: tuple[str, ...] = ()
     actions: tuple[ActionDeclaration, ...] = ()
+    websocket_name: str | None = None
+    websocket_line: int | None = None
     cache_revalidate: float | None = None
     uses_suspense: bool = False
 
@@ -95,6 +97,8 @@ class PageMetadata:
             "images": [i.to_json() for i in self.images],
             "head_jsx_blocks": list(self.head_jsx_blocks),
             "actions": [a.to_json() for a in self.actions],
+            "websocket_name": self.websocket_name,
+            "websocket_line": self.websocket_line,
             "cache_revalidate": self.cache_revalidate,
             "uses_suspense": self.uses_suspense,
         }
@@ -106,6 +110,10 @@ class PageMetadata:
     @property
     def has_actions(self) -> bool:
         return bool(self.actions)
+
+    @property
+    def has_websocket(self) -> bool:
+        return self.websocket_name is not None
 
 
 @dataclass(frozen=True)

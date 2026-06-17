@@ -113,6 +113,10 @@ class ApiRouteError(RuntimeError):
     """Raised when an API module cannot be resolved to a valid handler."""
 
 
+class PageRouteError(RuntimeError):
+    """Raised when a page's ``websocket`` handler cannot be resolved."""
+
+
 class HttpOnlyStaticFiles(StaticFiles):
     """Static files app that gracefully rejects non-HTTP scopes."""
 
@@ -672,7 +676,40 @@ def build_page_router(
         handler = wrap_with_route_hooks(handler, hooks=hooks, context=context)
         router.add_route(route.path, handler, methods=["GET"])
 
+        if route.has_websocket:
+            # A page that declares `async def websocket(ws)` also serves a
+            # WebSocket route at the SAME path. Starlette dispatches the HTTP
+            # Route for an http-scope request and this WebSocketRoute for a
+            # websocket-scope upgrade, so both coexist (path params resolve
+            # into ws.scope["path_params"]). Like the API WS path (see
+            # build_api_router), WS routes bypass the HTTP route-hook chain —
+            # hooks wrap a request→response callable, which the WS lifecycle
+            # (accept/send/recv/close) doesn't match. Any per-request work a WS
+            # upgrade needs (auth, origin checks) belongs in the handler body.
+            ws_handler = _resolve_page_websocket(route, settings=settings)
+            router.routes.append(WebSocketRoute(route.path, ws_handler))
+
     return router
+
+
+def _resolve_page_websocket(route: PageRoute, *, settings: DevServerSettings) -> Any:
+    """Import a page's server module and return its ``websocket`` handler.
+
+    Raises :class:`PageRouteError` when the metadata names a handler the module
+    doesn't actually expose (a stale build), so the developer gets a clear
+    message instead of a route that 500s on connect.
+    """
+    module = _import_module(
+        route.module_key, route.server_module_path, debug=settings.debug
+    )
+    handler = getattr(module, route.websocket_name, None)
+    if not callable(handler):
+        raise PageRouteError(
+            f"Page {route.path!r} declares a websocket handler "
+            f"{route.websocket_name!r}, but its server module exposes no such "
+            "callable. Re-run the build."
+        )
+    return handler
 
 
 # Page-cache status header set on responses the server-side cache touched:
@@ -1682,6 +1719,13 @@ def create_starlette_app(
     # Streaming SSR's render_stream is bound to the worker pool, which outlives
     # route-table refreshes — stash it so a hot rebuild keeps streaming wired.
     app.state.pyxle_stream_render = stream_render
+    # One in-process pub/sub broker per app process, shared by every WebSocket
+    # connection (pyxle.realtime.channel reads it off app.state). In-process
+    # only — see the multi-worker caveat documented in pyxle.realtime.channels
+    # and logged at serve time when --workers > 1.
+    from pyxle.realtime import InProcessBroker  # noqa: PLC0415 - lazy, optional path
+
+    app.state.pyxle_broker = InProcessBroker()
 
     return app
 

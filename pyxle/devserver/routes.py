@@ -34,6 +34,8 @@ class PageRoute:
     images: tuple[dict, ...] = ()
     head_jsx_blocks: tuple[str, ...] = ()
     actions: tuple[dict, ...] = ()
+    websocket_name: Optional[str] = None
+    websocket_line: Optional[int] = None
     cache_revalidate: float | None = None
     uses_suspense: bool = False
     #: The nearest ``loading.pyxl`` page route for this route, if any. When set,
@@ -50,6 +52,10 @@ class PageRoute:
     @property
     def has_actions(self) -> bool:
         return bool(self.actions)
+
+    @property
+    def has_websocket(self) -> bool:
+        return self.websocket_name is not None
 
 
 @dataclass(frozen=True, slots=True)
@@ -209,6 +215,8 @@ def _page_route(
         images=entry.images,
         head_jsx_blocks=entry.head_jsx_blocks,
         actions=entry.actions,
+        websocket_name=entry.websocket_name,
+        websocket_line=entry.websocket_line,
         cache_revalidate=entry.cache_revalidate,
         uses_suspense=entry.uses_suspense,
     )

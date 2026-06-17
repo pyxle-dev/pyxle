@@ -724,6 +724,26 @@ def serve(
         raise typer.Exit(code=1) from exc
 
 
+def _dist_has_websocket_pages(resolved_dist: Path) -> bool:
+    """Whether any compiled page in ``resolved_dist`` declares a WS handler.
+
+    Reads the build's ``page-manifest.json`` (a ``{route: entry}`` map) and
+    checks for a ``websocket`` entry. Used to warn, at multi-worker serve time,
+    that the in-process broker doesn't span workers.
+    """
+    manifest_path = resolved_dist / "page-manifest.json"
+    try:
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    return any(
+        isinstance(entry, dict) and "websocket" in entry
+        for entry in data.values()
+    )
+
+
 def _serve_multiworker(
     project_root: Path,
     *,
@@ -765,6 +785,14 @@ def _serve_multiworker(
         f"Serving Pyxle build on http://{host}:{port} across {workers} worker "
         f"process(es) (dist: {resolved_dist})"
     )
+    if _dist_has_websocket_pages(resolved_dist):
+        logger.warning(
+            "This build has WebSocket page(s) and is running with "
+            f"{workers} workers. The default in-process realtime broker does "
+            "NOT span worker processes — a client on one worker won't receive "
+            "messages published on another. Use a shared broker (e.g. Redis) or "
+            "sticky-session load balancing for cross-worker realtime."
+        )
     try:
         # loop is left at uvicorn's default ("auto" → uvloop). Forcing the pure
         # asyncio loop here adds a ~40-50ms per-request stall on Linux when

@@ -2728,3 +2728,37 @@ def test_check_command_with_package_json_skips_warning() -> None:
         assert result.exit_code == 0, result.stdout
         assert "No package.json found" not in result.stdout
         assert "passed" in result.stdout
+
+
+def test_dist_has_websocket_pages(tmp_path: Path) -> None:
+    """The multi-worker WS warning trigger: detects a websocket page in the
+    build's page-manifest.json (and is safe when the manifest is absent)."""
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    manifest = dist / "page-manifest.json"
+
+    # No manifest yet → no websocket pages.
+    assert cli._dist_has_websocket_pages(dist) is False
+
+    # Manifest with only ordinary pages → False.
+    manifest.write_text(
+        json.dumps({"/": {"client": {"file": "x"}}, "/about": {"server": {}}}),
+        encoding="utf-8",
+    )
+    assert cli._dist_has_websocket_pages(dist) is False
+
+    # Manifest with a websocket page → True.
+    manifest.write_text(
+        json.dumps(
+            {
+                "/": {"client": {"file": "x"}},
+                "/chat/{room}": {"websocket": {"name": "websocket", "line": 3}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert cli._dist_has_websocket_pages(dist) is True
+
+    # Malformed manifest → False (never raises).
+    manifest.write_text("not json", encoding="utf-8")
+    assert cli._dist_has_websocket_pages(dist) is False
