@@ -98,6 +98,35 @@ async def endpoint(request: Request) -> JSONResponse:
 - Sessions are **sliding**: each resolved request can extend the expiry (`resolve_session(cookie_value=..., extend=True)`), up to an absolute maximum age. Defaults: 30-day sliding window, 90-day absolute cap.
 - `revoke_all_sessions(user_id=...)` signs out everywhere; `list_sessions` / `revoke_session` power a "manage devices" page. Password changes and resets revoke every session automatically.
 
+## Session middleware, `request.user`, and `useAuth()`
+
+Listing the plugin installs **`AuthSessionMiddleware`** automatically. On every request it resolves the session cookie and sets `request.user` (a `User`, or `None` when anonymous) — so loaders and actions can read the signed-in user without calling a guard. A request **without** the cookie does zero database work; one **with** it does a single indexed lookup that the guards then reuse, so a guarded loader never resolves the session twice.
+
+The middleware also serves the endpoints the client [`useAuth()`](../reference/client-api.md#useauth) hook talks to, under `authPathPrefix` (default `/auth`):
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /auth/me` | The current user as JSON. |
+| `POST /auth/login` | Sign in with `{ email, password }`. *(opt-out)* |
+| `POST /auth/signup` | Create an account with `{ email, password }`. *(opt-out)* |
+| `POST /auth/logout` | Revoke the session and clear the cookie. |
+
+`/login` and `/signup` reuse `AuthService.sign_in` / `sign_up` — same rate limiting, same enumeration-safe errors — and map failures to status codes (`401` invalid credentials, `409` account exists, `422` weak password, `403` unverified email, `429` rate limited with `Retry-After`). They are state-changing POSTs, so the framework's CSRF protection applies; `useAuth` sends the token for you. Set `enableCredentialsApi: false` to turn them off and drive sign-in from your own `@action` instead (then call `useAuth().refresh()`); `/me` and `/logout` stay available.
+
+```jsx
+// A whole auth UI, client-side:
+import { useAuth } from 'pyxle/client';
+
+function Account() {
+  const { user, isAuthenticated, login, logout } = useAuth();
+  return isAuthenticated
+    ? <button onClick={() => logout()}>Sign out {user.email}</button>
+    : <button onClick={() => login({ email, password })}>Sign in</button>;
+}
+```
+
+The signed-in user is **seeded into the server render** (`window.__PYXLE_AUTH__`), so `useAuth` shows the right state on the first frame — no flash of "logged out", no extra round-trip.
+
 ## Guards
 
 Drop-in checks for loaders, actions, and API routes:
@@ -110,6 +139,17 @@ Drop-in checks for loaders, actions, and API routes:
 | `require_permission_page(request, permission)` | User must hold the permission, else 401/403. |
 | `require_permission_action(request, permission)` | Same, for actions. |
 | `bearer_token(request)` | Extracts a `Bearer` token from the `Authorization` header, or `None`. |
+
+The roadmap-named aliases `login_required` / `login_required_action` and `permission_required` / `permission_required_action` are the same functions as `require_user_*` / `require_permission_*` — call them at the top of a loader or action (Pyxle guards are awaited, not wrapping decorators):
+
+```python
+from pyxle_auth import login_required
+
+@server
+async def load(request):
+    user = await login_required(request)   # raises LoaderError(401) when anonymous
+    return {"email": user.email}
+```
 
 ## Passwords
 
@@ -229,6 +269,8 @@ Configure in `pyxle.config.json` (camelCase), override per environment with `PYX
 | `cookieSecure` | `PYXLE_AUTH_COOKIE_SECURE` | `true` |
 | `cookieSameSite` | `PYXLE_AUTH_COOKIE_SAMESITE` | `"Lax"` |
 | `cookieDomain` | `PYXLE_AUTH_COOKIE_DOMAIN` | unset |
+| `authPathPrefix` | `PYXLE_AUTH_PATH_PREFIX` | `"/auth"` |
+| `enableCredentialsApi` | `PYXLE_AUTH_ENABLE_CREDENTIALS_API` | `true` |
 | `passwordResetTtlSeconds` | `PYXLE_AUTH_PASSWORD_RESET_TTL_SECONDS` | `1800` (30 min) |
 | `emailVerifyTtlSeconds` | `PYXLE_AUTH_EMAIL_VERIFY_TTL_SECONDS` | `86400` (24 h) |
 | `rateLimitSignInPerHour` | `PYXLE_AUTH_RL_SIGN_IN_PER_HOUR` | `10` |
@@ -264,12 +306,109 @@ All inherit from `AuthError`:
 | `TokenLimitReached` | API-token cap hit. |
 | `RoleNotFound` | Granting an undefined role. |
 
+## OAuth sign-in (Google, GitHub, Discord)
+
+Social sign-in ships in the `pyxle_auth.oauth` subpackage behind the `[oauth]`
+extra (`pip install 'pyxle-auth[oauth]'`). Enable it with the `oauth` setting:
+
+```json
+{
+  "plugins": [
+    "pyxle-db",
+    {
+      "name": "pyxle-auth",
+      "settings": {
+        "oauth": {
+          "providers": ["google", "github"],
+          "failureRedirect": "/login"
+        }
+      }
+    }
+  ]
+}
+```
+
+Client credentials are read **from the environment only** — never put them in
+`pyxle.config.json`:
+
+```bash
+PYXLE_AUTH_OAUTH_GOOGLE_CLIENT_ID=...
+PYXLE_AUTH_OAUTH_GOOGLE_CLIENT_SECRET=...
+PYXLE_AUTH_SECRET=...   # signs the OAuth state cookie (required in strict mode)
+```
+
+A sign-in link is just an anchor to the start endpoint:
+
+```jsx
+<a href="/auth/oauth/google/start?next=/dashboard">Continue with Google</a>
+```
+
+The middleware redirects to the provider, handles the callback, creates or
+links the local account, sets the session cookie, and sends the user to `next`.
+On failure it redirects to `failureRedirect` with `?oauth_error=<reason>`
+(`state`, `denied`, `email_unverified`, `exchange`, `unknown_provider`).
+
+**Security model** — the callback is a `GET` carrying an attacker-influenceable
+`?code&state`, so the defenses are deliberate:
+
+- **PKCE `S256` is mandatory**; the verifier lives only in the signed cookie.
+- A **signed, single-use, HttpOnly `state` cookie** binds the flow to the
+  browser; the `state` the provider echoes must equal the cookie's nonce
+  (constant-time) — this is the login-CSRF defense.
+- An identity links to an existing account **only when the provider says the
+  email is verified** — otherwise an attacker could pre-register the victim's
+  address at the provider and hijack the account.
+- `next` is **same-origin path only** (open-redirect guard).
+- Secrets come from the environment, are redacted in `repr`, and never reach a
+  log or the browser.
+
+Set `redirectBaseUrl` when behind a reverse proxy / on a custom domain so the
+`redirect_uri` matches what you registered with the provider.
+
+## JWT for API & mobile clients
+
+For clients that send `Authorization: Bearer` instead of a cookie, enable JWT
+(`[jwt]` extra) with the `jwt` setting:
+
+```json
+{ "name": "pyxle-auth", "settings": { "jwt": { "accessTtlSeconds": 900 } } }
+```
+
+Two endpoints appear (sign with `PYXLE_AUTH_SECRET` / `PYXLE_SECRET_KEY`):
+
+| Endpoint | Body | Returns |
+|---|---|---|
+| `POST /auth/token` | `{ email, password }` | `{ accessToken, refreshToken, expiresIn }` |
+| `POST /auth/token/refresh` | `{ refreshToken }` | a rotated pair |
+
+- **Access token** — a short-lived signed JWT (HS256), verified statelessly.
+- **Refresh token** — a long-lived **opaque** string stored only as its hash.
+  Refresh **rotates**: each use issues a new token and invalidates the old one.
+  Replaying a rotated token **revokes the whole family** (theft detection).
+
+> **CSRF:** these endpoints authenticate from the request body (not a cookie),
+> so they aren't CSRF-vulnerable — but the framework's CSRF middleware still
+> guards POSTs. Add `/auth/token` and `/auth/token/refresh` to
+> `csrf.exempt_paths` so non-browser clients can reach them.
+
+Resolve a bearer token in a loader or API route with the guards, which try
+**JWT then PAT** (and `authenticate` tries the **session** first):
+
+```python
+from pyxle_auth import bearer_user, authenticate
+
+user = await bearer_user(request)              # JWT access token → PAT
+user = await authenticate(request)             # session → JWT → PAT
+```
+
+`JWTService` is also usable directly (`auth.jwt` service): `issue_pair`,
+`verify_access`, `refresh`, `revoke_family`, `revoke_all_for_user`.
+
 ## What pyxle-auth is not (yet)
 
 Honest scope, so you can plan around it:
 
 - **No email delivery** — by design, permanently. Bring your mailer.
-- **No OAuth / OIDC sign-in** (Google, GitHub) — not implemented yet.
 - **No multi-factor authentication** (TOTP, WebAuthn) — not implemented yet.
 
 The building blocks (sessions, `TokenService`, guards) compose underneath whatever you add on top; contributions are welcome.

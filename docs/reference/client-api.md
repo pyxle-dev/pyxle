@@ -5,7 +5,7 @@ All client-side components and hooks are importable from `pyxle/client`:
 ```jsx
 import {
   Head, Script, Image, ClientOnly,
-  Form, useAction,
+  Form, useAction, useAuth, useWebSocket,
   Link, navigate, prefetch, refresh, usePathname
 } from 'pyxle/client';
 ```
@@ -255,6 +255,134 @@ function NavLink({ href, children }) {
   — no hydration mismatch
 - Subscribes to framework navigation events (`Link`, `navigate()`,
   `refresh()`, `popstate`) and re-renders on change
+
+---
+
+### `useAuth()`
+
+Read and mutate the signed-in user. State is **shared across every component**
+that calls the hook, so a sign-out in the navbar updates the user everywhere at
+once.
+
+```jsx
+import { useAuth } from 'pyxle/client';
+
+function AccountMenu() {
+  const { user, isAuthenticated, loading, logout } = useAuth();
+
+  if (loading) return <span>…</span>;
+  if (!isAuthenticated) return <a href="/login">Sign in</a>;
+
+  return (
+    <div>
+      <span>{user.email}</span>
+      <button onClick={() => logout()}>Sign out</button>
+    </div>
+  );
+}
+```
+
+A login form is just `login()` plus the error/loading state the hook exposes:
+
+```jsx
+function LoginForm() {
+  const { login, loading, error } = useAuth();
+
+  async function onSubmit(e) {
+    e.preventDefault();
+    const data = new FormData(e.currentTarget);
+    const result = await login({
+      email: data.get('email'),
+      password: data.get('password'),
+    });
+    if (result.ok) navigate('/dashboard');
+  }
+
+  return (
+    <form onSubmit={onSubmit}>
+      <input name="email" type="email" />
+      <input name="password" type="password" />
+      {error && <p role="alert">{error}</p>}
+      <button disabled={loading}>Sign in</button>
+    </form>
+  );
+}
+```
+
+**Returns** an object with:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `user` | `PyxleUser \| null` | The signed-in user, or `null` when anonymous |
+| `isAuthenticated` | `boolean` | `true` when a user is signed in |
+| `loading` | `boolean` | `true` while a sign-in / sign-up / refresh is in flight |
+| `error` | `string \| null` | The last error message, or `null` |
+| `login(credentials)` | `(creds) => Promise<AuthResult>` | Sign in via `POST {prefix}/login` |
+| `signup(credentials)` | `(creds) => Promise<AuthResult>` | Create an account via `POST {prefix}/signup` |
+| `logout()` | `() => Promise<void>` | Sign out via `POST {prefix}/logout` and clear local state |
+| `refresh()` | `() => Promise<PyxleUser \| null>` | Re-fetch the user from `GET {prefix}/me` |
+
+**Behaviour:**
+- Requires the [`pyxle-auth`](../plugins/pyxle-auth.md) plugin, which serves the
+  endpoints and seeds the initial user.
+- Seeds the user from the server render (`window.__PYXLE_AUTH__`), so a
+  signed-in user appears on the first client frame **with no round-trip** and
+  no hydration mismatch. When no seed is present (e.g. a client-only render),
+  the session is resolved once on mount via `{prefix}/me`.
+- `login` / `signup` / `logout` send the CSRF token automatically, exactly like
+  [`useAction`](#useactionactionname-options) and [`<Form>`](#form).
+- `login` / `signup` resolve to `{ ok, user?, error?, code? }`; the `code`
+  mirrors the server (`invalid_credentials`, `account_exists`, `weak_password`,
+  `email_not_verified`, `rate_limited`).
+
+> The login/signup endpoints are on by default. Apps that own their sign-in flow
+> set `enableCredentialsApi: false` on the plugin and call their own `@action`,
+> then `refresh()` — `useAuth` still manages shared user state, `/me`, and
+> `logout`.
+
+---
+
+### `useWebSocket(path, options?)`
+
+Connect to a WebSocket endpoint — a page's `async def websocket(ws)` handler, or
+any `ws` path — with auto-reconnect, JSON parsing, and connection state.
+
+```jsx
+import { useWebSocket } from 'pyxle/client';
+
+function Chat({ room }) {
+  const { status, send, lastMessage, error } = useWebSocket(`/chat/${room}`, {
+    onMessage(data) { /* data is JSON-parsed when possible */ },
+  });
+
+  return (
+    <button disabled={status !== 'open'} onClick={() => send({ text: 'hi' })}>
+      {status === 'open' ? 'Send' : status}
+    </button>
+  );
+}
+```
+
+**Returns** `{ status, send, lastMessage, error }`:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `status` | `'connecting' \| 'open' \| 'closed'` | Connection state |
+| `send(data)` | `(data) => boolean` | Send a string as-is, or JSON-encode anything else; `false` if not open |
+| `lastMessage` | `unknown` | The most recent received message (JSON-parsed when the frame is valid JSON) |
+| `error` | `string \| null` | The last error message |
+
+**Options:** `onMessage(data, event)`, `protocols`, `reconnect` (default `true`),
+`maxRetries` (default `Infinity`).
+
+**Behaviour:**
+- **Never connects during SSR** — all socket code is gated behind a window check,
+  so there's no hydration mismatch.
+- Reconnects with **exponential backoff** (capped at 30s, with jitter) unless
+  `reconnect: false`.
+- A relative `path` resolves against the current origin with the matching scheme
+  (`wss:` on `https:`); an absolute `ws://` / `wss://` URL passes through.
+- See the [WebSockets guide](../guides/websockets.md) for the server side.
 
 ---
 

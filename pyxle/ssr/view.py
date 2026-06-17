@@ -23,6 +23,7 @@ from pyxle.devserver.settings import DevServerSettings
 
 from .renderer import ComponentRenderer, ComponentRenderError, InlineStyleFragment
 from .template import (
+    _AUTH_SEED_ABSENT,
     ManifestLookupError,
     build_document_shell,
     render_document,
@@ -177,6 +178,7 @@ async def build_page_response(
                 head_elements=artifacts.head_elements,
                 inline_styles=artifacts.inline_styles,
                 nav_cache_ttl=nav_cache_ttl,
+                auth_seed=_auth_seed_for_request(request),
             )
         except ManifestLookupError:
             document = render_document(
@@ -188,6 +190,7 @@ async def build_page_response(
                 head_elements=artifacts.head_elements,
                 inline_styles=artifacts.inline_styles,
                 nav_cache_ttl=nav_cache_ttl,
+                auth_seed=_auth_seed_for_request(request),
             )
             if overlay is not None:
                 await overlay.notify_clear(route_path=page.path)
@@ -357,6 +360,7 @@ async def build_streaming_page_response(
                 head_elements=static_head,
                 inline_styles=(),
                 nav_cache_ttl=nav_cache_ttl,
+                auth_seed=_auth_seed_for_request(request),
             )
         except ManifestLookupError:
             # No client manifest to link the hydration bundle — fall back to the
@@ -606,6 +610,7 @@ async def build_not_found_response(
             script_nonce=script_nonce,
             head_elements=artifacts.head_elements,
             inline_styles=artifacts.inline_styles,
+            auth_seed=_auth_seed_for_request(request),
         )
         return HTMLResponse(document, status_code=404)
     except Exception:
@@ -762,6 +767,25 @@ def _compose_component_props(
     if layout_data:
         props["layoutData"] = layout_data
     return props
+
+
+def _auth_seed_for_request(request: Request) -> Any:
+    """Pluck the auth seed an auth provider stashed on the request scope.
+
+    The pyxle-auth session middleware publishes ``scope["pyxle.auth"]`` as
+    ``{"user": ..., "endpoints": {...}}``. SSR forwards it to
+    ``window.__PYXLE_AUTH__`` so the client ``useAuth`` hook shows the
+    signed-in user on the first frame and finds the (possibly relocated) auth
+    endpoints.
+
+    Returns the ABSENT sentinel when no provider populated the scope (or set
+    it to a non-object value), so the document emits no seed script and
+    ``useAuth`` resolves over the network.
+    """
+    seed = request.scope.get("pyxle.auth")
+    if isinstance(seed, dict):
+        return seed
+    return _AUTH_SEED_ABSENT
 
 
 def _csrf_token_for_request(request: Request) -> str | None:
@@ -952,6 +976,7 @@ async def _try_error_boundary(
             script_nonce=script_nonce,
             head_elements=head_elements,
             inline_styles=render_result.inline_styles,
+            auth_seed=_auth_seed_for_request(request),
         )
         return HTMLResponse(document, status_code=status_code)
     except Exception:

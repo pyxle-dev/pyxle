@@ -38,6 +38,8 @@ def write_client_bootstrap_files(settings: DevServerSettings) -> None:
         "pyxle/client-only.jsx": _render_client_only_component(),
         "pyxle/use-action.jsx": _render_use_action_component(),
         "pyxle/use-pathname.jsx": _render_use_pathname_component(),
+        "pyxle/use-auth.jsx": _render_use_auth_component(),
+        "pyxle/use-websocket.jsx": _render_use_websocket_component(),
         "pyxle/form.jsx": _render_form_component(),
         "pyxle/client.js": _render_client_barrel(),
         "pyxle/index.d.ts": _render_client_runtime_index_types(),
@@ -48,6 +50,8 @@ def write_client_bootstrap_files(settings: DevServerSettings) -> None:
         "pyxle/head.d.ts": _render_head_component_types(),
         "pyxle/client-only.d.ts": _render_client_only_component_types(),
         "pyxle/use-pathname.d.ts": _render_use_pathname_component_types(),
+        "pyxle/use-auth.d.ts": _render_use_auth_component_types(),
+        "pyxle/use-websocket.d.ts": _render_use_websocket_component_types(),
     }
 
     for relative_path, contents in files.items():
@@ -3126,6 +3130,486 @@ def _render_form_component() -> str:
     )
 
 
+def _render_use_auth_component() -> str:
+    return (
+        dedent(
+            """
+            import { useCallback, useEffect, useSyncExternalStore } from 'react';
+
+            // --- CSRF resolution (mirrors use-action.jsx) -------------------
+            // The auth endpoints (/login, /signup, /logout) are state-changing
+            // POSTs guarded by the framework CSRF middleware, so each request
+            // must echo the token the same way useAction does.
+            function csrfCookieName() {
+              if (typeof globalThis !== 'undefined' && typeof globalThis.__PYXLE_CSRF_COOKIE__ === 'string' && globalThis.__PYXLE_CSRF_COOKIE__) {
+                return globalThis.__PYXLE_CSRF_COOKIE__;
+              }
+              return 'pyxle-csrf';
+            }
+
+            function csrfHeaderName() {
+              if (typeof globalThis !== 'undefined' && typeof globalThis.__PYXLE_CSRF_HEADER__ === 'string' && globalThis.__PYXLE_CSRF_HEADER__) {
+                return globalThis.__PYXLE_CSRF_HEADER__;
+              }
+              return 'x-csrf-token';
+            }
+
+            function getCsrfToken() {
+              if (typeof document !== 'undefined') {
+                const cookieName = csrfCookieName();
+                for (const part of document.cookie.split(';')) {
+                  const eq = part.indexOf('=');
+                  if (eq === -1) continue;
+                  if (part.slice(0, eq).trim() === cookieName) {
+                    return decodeURIComponent(part.slice(eq + 1));
+                  }
+                }
+              }
+              if (typeof globalThis !== 'undefined' && typeof globalThis.__PYXLE_CSRF_TOKEN__ === 'string') {
+                return globalThis.__PYXLE_CSRF_TOKEN__;
+              }
+              return '';
+            }
+
+            // --- Auth seed (window.__PYXLE_AUTH__) --------------------------
+            // The session middleware publishes the current user plus the
+            // endpoint map; the SSR document seeds it as window.__PYXLE_AUTH__.
+            // Endpoints default to the conventional /auth/* paths when no seed
+            // is present (e.g. the auth plugin isn't installed).
+            const DEFAULT_ENDPOINTS = {
+              me: '/auth/me',
+              login: '/auth/login',
+              signup: '/auth/signup',
+              logout: '/auth/logout',
+            };
+
+            function readSeed() {
+              if (typeof window === 'undefined') return null;
+              const seed = window.__PYXLE_AUTH__;
+              return seed && typeof seed === 'object' ? seed : null;
+            }
+
+            function resolveEndpoints() {
+              const seed = readSeed();
+              const ep = seed && seed.endpoints && typeof seed.endpoints === 'object' ? seed.endpoints : {};
+              return {
+                me: typeof ep.me === 'string' ? ep.me : DEFAULT_ENDPOINTS.me,
+                login: typeof ep.login === 'string' ? ep.login : DEFAULT_ENDPOINTS.login,
+                signup: typeof ep.signup === 'string' ? ep.signup : DEFAULT_ENDPOINTS.signup,
+                logout: typeof ep.logout === 'string' ? ep.logout : DEFAULT_ENDPOINTS.logout,
+              };
+            }
+
+            // --- Shared store -----------------------------------------------
+            // Module-level so every useAuth() consumer stays in sync: a logout
+            // in the navbar updates the user everywhere at once.
+            const store = {
+              user: undefined,   // undefined = unresolved; null = anonymous
+              loading: true,
+              error: null,
+              endpoints: resolveEndpoints(),
+              subscribers: new Set(),
+            };
+
+            function computeSnapshot() {
+              const user = store.user === undefined ? null : store.user;
+              return {
+                user,
+                isAuthenticated: user != null,
+                loading: store.loading,
+                error: store.error,
+              };
+            }
+
+            // A constant server snapshot keeps the hydration render identical
+            // on both sides (no mismatch); the client swaps to the real value
+            // immediately after hydration via getSnapshot.
+            const SERVER_SNAPSHOT = { user: null, isAuthenticated: false, loading: true, error: null };
+            let clientSnapshot = computeSnapshot();
+
+            function commit(partial) {
+              Object.assign(store, partial);
+              clientSnapshot = computeSnapshot();
+              for (const cb of store.subscribers) cb();
+            }
+
+            function subscribe(cb) {
+              store.subscribers.add(cb);
+              return () => { store.subscribers.delete(cb); };
+            }
+            function getSnapshot() { return clientSnapshot; }
+            function getServerSnapshot() { return SERVER_SNAPSHOT; }
+
+            // Seed synchronously on the client so the first post-hydration
+            // render shows the SSR-resolved user with no network round-trip.
+            (function seedFromWindow() {
+              const seed = readSeed();
+              if (seed && 'user' in seed) {
+                store.user = seed.user == null ? null : seed.user;
+                store.loading = false;
+                clientSnapshot = computeSnapshot();
+              }
+            })();
+
+            // --- Network ----------------------------------------------------
+            async function postJson(url, body) {
+              const headers = { 'Content-Type': 'application/json', 'Accept': 'application/json' };
+              const token = getCsrfToken();
+              if (token) headers[csrfHeaderName()] = token;
+              const res = await fetch(url, {
+                method: 'POST',
+                headers,
+                body: JSON.stringify(body ?? {}),
+                credentials: 'same-origin',
+              });
+              let json = null;
+              try { json = await res.json(); } catch { /* tolerate empty/non-JSON */ }
+              return { res, json };
+            }
+
+            let refreshInFlight = null;
+
+            async function refresh() {
+              if (refreshInFlight) return refreshInFlight;
+              commit({ loading: true, error: null });
+              refreshInFlight = (async () => {
+                try {
+                  const res = await fetch(store.endpoints.me, {
+                    method: 'GET',
+                    headers: { 'Accept': 'application/json' },
+                    credentials: 'same-origin',
+                  });
+                  if (!res.ok) throw new Error(`Failed to load session (${res.status})`);
+                  const json = await res.json();
+                  const user = (json && json.user) || null;
+                  commit({ user, loading: false, error: null });
+                  return user;
+                } catch (err) {
+                  // Treat any failure as anonymous, but surface the message.
+                  commit({ user: null, loading: false, error: err.message ?? 'Failed to load session' });
+                  return null;
+                } finally {
+                  refreshInFlight = null;
+                }
+              })();
+              return refreshInFlight;
+            }
+
+            async function submitCredentials(url, credentials) {
+              commit({ loading: true, error: null });
+              try {
+                const { res, json } = await postJson(url, credentials);
+                if (!res.ok || (json && json.ok === false)) {
+                  const message = (json && json.error) || `Request failed (${res.status})`;
+                  commit({ loading: false, error: message });
+                  return { ok: false, error: message, code: json && json.code };
+                }
+                const user = (json && json.user) || null;
+                commit({ user, loading: false, error: null });
+                return { ok: true, user };
+              } catch (err) {
+                const message = err.message ?? 'Network error';
+                commit({ loading: false, error: message });
+                return { ok: false, error: message };
+              }
+            }
+
+            function login(credentials) {
+              return submitCredentials(store.endpoints.login, credentials);
+            }
+
+            function signup(credentials) {
+              return submitCredentials(store.endpoints.signup, credentials);
+            }
+
+            async function logout() {
+              commit({ loading: true, error: null });
+              try {
+                await postJson(store.endpoints.logout, {});
+              } catch { /* drop the local session even if the request fails */ }
+              commit({ user: null, loading: false, error: null });
+            }
+
+            /**
+             * useAuth — read and mutate the signed-in user.
+             *
+             * State is shared across every component that calls the hook, and
+             * is seeded from the server render (window.__PYXLE_AUTH__) so a
+             * signed-in user appears on the first client frame without a
+             * round-trip. When no seed is present the session is resolved once
+             * on mount.
+             */
+            export function useAuth() {
+              const snapshot = useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot);
+
+              useEffect(() => {
+                if (store.user === undefined && refreshInFlight === null) {
+                  refresh();
+                }
+              }, []);
+
+              return {
+                user: snapshot.user,
+                isAuthenticated: snapshot.isAuthenticated,
+                loading: snapshot.loading,
+                error: snapshot.error,
+                login,
+                signup,
+                logout,
+                refresh,
+              };
+            }
+            """
+        ).strip()
+        + "\n"
+    )
+
+
+def _render_use_auth_component_types() -> str:
+    return (
+        dedent(
+            """
+            export interface PyxleUser {
+              id: string;
+              email: string;
+              emailVerified: boolean;
+              plan: string;
+              createdAt: string;
+            }
+
+            export interface AuthResult {
+              ok: boolean;
+              user?: PyxleUser | null;
+              error?: string;
+              code?: string;
+            }
+
+            export interface UseAuthResult {
+              /** The signed-in user, or `null` when anonymous. */
+              user: PyxleUser | null;
+              /** `true` when a user is signed in. */
+              isAuthenticated: boolean;
+              /** `true` while a sign-in / sign-up / refresh is in flight. */
+              loading: boolean;
+              /** The last error message, or `null`. */
+              error: string | null;
+              /** Sign in with email + password against `POST {prefix}/login`. */
+              login(credentials: { email: string; password: string }): Promise<AuthResult>;
+              /** Create an account against `POST {prefix}/signup`. */
+              signup(credentials: { email: string; password: string }): Promise<AuthResult>;
+              /** Sign out against `POST {prefix}/logout` and clear local state. */
+              logout(): Promise<void>;
+              /** Re-fetch the current user from `GET {prefix}/me`. */
+              refresh(): Promise<PyxleUser | null>;
+            }
+
+            /**
+             * Read and mutate the signed-in user. State is shared across all
+             * consumers and seeded from the server render.
+             */
+            export declare function useAuth(): UseAuthResult;
+            """
+        ).strip()
+        + "\n"
+    )
+
+
+def _render_use_websocket_component() -> str:
+    return (
+        dedent(
+            """
+            import { useCallback, useEffect, useRef, useState } from 'react';
+
+            // Resolve a same-origin WebSocket URL. An absolute ws://, wss://
+            // URL passes through; a path is joined to the current origin with
+            // the matching secure scheme (wss: on https:).
+            function resolveWsUrl(path) {
+              const lower = String(path).toLowerCase();
+              if (lower.startsWith('ws://') || lower.startsWith('wss://')) {
+                return path;
+              }
+              const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+              const base = proto + '//' + window.location.host;
+              return path.startsWith('/') ? base + path : base + '/' + path;
+            }
+
+            /**
+             * useWebSocket — connect to a Pyxle page's `async def websocket(ws)`
+             * handler (or any WS endpoint) with auto-reconnect, JSON message
+             * parsing, and connection state.
+             *
+             * Returns { status, send, lastMessage, error }:
+             *   - status: 'connecting' | 'open' | 'closed'
+             *   - send(data): send a string as-is, or JSON-encode anything else;
+             *     returns false if the socket isn't open
+             *   - lastMessage: the most recent received message (JSON-parsed when
+             *     the frame is valid JSON, else the raw string)
+             *   - error: the last error message, or null
+             *
+             * Never connects during SSR. Reconnects with exponential backoff
+             * (capped at 30s, with jitter) unless `reconnect: false`.
+             */
+            export function useWebSocket(path, options = {}) {
+              const { onMessage, protocols, reconnect = true, maxRetries = Infinity } = options;
+              // A stable dependency key: re-run (reconnect) when protocols change
+              // by VALUE, but not when an inline array literal changes identity
+              // on every render. Avoids both stale subprotocols and reconnect storms.
+              const protocolsKey = JSON.stringify(protocols ?? null);
+              const [status, setStatus] = useState('connecting');
+              const [lastMessage, setLastMessage] = useState(null);
+              const [error, setError] = useState(null);
+              const socketRef = useRef(null);
+              const onMessageRef = useRef(onMessage);
+              onMessageRef.current = onMessage;
+
+              const send = useCallback((data) => {
+                const sock = socketRef.current;
+                if (!sock || sock.readyState !== WebSocket.OPEN) return false;
+                sock.send(typeof data === 'string' ? data : JSON.stringify(data));
+                return true;
+              }, []);
+
+              useEffect(() => {
+                // Never open a socket during SSR — keeps the server render and
+                // the first client render identical (no hydration mismatch).
+                if (typeof window === 'undefined') return undefined;
+
+                let cancelled = false;
+                let retries = 0;
+                let retryTimer = null;
+
+                function scheduleReconnect() {
+                  if (cancelled || !reconnect || retries >= maxRetries) return;
+                  // Exponential backoff with jitter, capped — never a fixed-delay
+                  // reconnect loop that would thundering-herd a restarting server.
+                  const ceiling = Math.min(1000 * Math.pow(2, retries), 30000);
+                  const delay = ceiling / 2 + Math.random() * (ceiling / 2);
+                  retries += 1;
+                  retryTimer = setTimeout(connect, delay);
+                }
+
+                function connect() {
+                  if (cancelled) return;
+                  setStatus('connecting');
+                  let sock;
+                  try {
+                    sock = protocols
+                      ? new WebSocket(resolveWsUrl(path), protocols)
+                      : new WebSocket(resolveWsUrl(path));
+                  } catch (err) {
+                    setError((err && err.message) || 'WebSocket connection failed');
+                    scheduleReconnect();
+                    return;
+                  }
+                  socketRef.current = sock;
+
+                  sock.onopen = () => {
+                    if (cancelled) return;
+                    retries = 0;
+                    setError(null);
+                    setStatus('open');
+                  };
+                  sock.onmessage = (event) => {
+                    if (cancelled) return;
+                    let data = event.data;
+                    if (typeof data === 'string') {
+                      try {
+                        data = JSON.parse(data);
+                      } catch {
+                        // Not JSON — keep the raw string.
+                      }
+                    }
+                    setLastMessage(data);
+                    if (typeof onMessageRef.current === 'function') {
+                      try {
+                        onMessageRef.current(data, event);
+                      } catch (err) {
+                        setError((err && err.message) || 'onMessage handler error');
+                      }
+                    }
+                  };
+                  sock.onerror = () => {
+                    if (!cancelled) setError('WebSocket error');
+                  };
+                  sock.onclose = () => {
+                    if (cancelled) return;
+                    setStatus('closed');
+                    scheduleReconnect();
+                  };
+                }
+
+                connect();
+
+                return () => {
+                  cancelled = true;
+                  if (retryTimer) clearTimeout(retryTimer);
+                  const sock = socketRef.current;
+                  socketRef.current = null;
+                  if (sock) {
+                    try {
+                      sock.close();
+                    } catch {
+                      // ignore close races
+                    }
+                  }
+                };
+                // `protocols` enters the deps via the stable protocolsKey above,
+                // so a changed subprotocol reconnects with the new value.
+                // eslint-disable-next-line react-hooks/exhaustive-deps
+              }, [path, reconnect, maxRetries, protocolsKey]);
+
+              return { status, send, lastMessage, error };
+            }
+            """
+        ).strip()
+        + "\n"
+    )
+
+
+def _render_use_websocket_component_types() -> str:
+    return (
+        dedent(
+            """
+            export type WebSocketStatus = 'connecting' | 'open' | 'closed';
+
+            export interface UseWebSocketOptions {
+              /** Called for each received message (JSON-parsed when possible). */
+              onMessage?(data: unknown, event: MessageEvent): void;
+              /** WebSocket subprotocol(s). */
+              protocols?: string | string[];
+              /** Auto-reconnect on close with exponential backoff. Default true. */
+              reconnect?: boolean;
+              /** Max reconnect attempts. Default Infinity. */
+              maxRetries?: number;
+            }
+
+            export interface UseWebSocketResult {
+              /** Connection state. */
+              status: WebSocketStatus;
+              /** Send a string as-is, or JSON-encode anything else. Returns false
+               *  if the socket isn't open. */
+              send(data: unknown): boolean;
+              /** The most recent received message. */
+              lastMessage: unknown;
+              /** The last error message, or null. */
+              error: string | null;
+            }
+
+            /**
+             * Connect to a WebSocket endpoint (a page's `async def websocket(ws)`
+             * or any ws path) with auto-reconnect and JSON parsing. Same-origin
+             * paths are resolved against the current origin.
+             */
+            export declare function useWebSocket(
+              path: string,
+              options?: UseWebSocketOptions
+            ): UseWebSocketResult;
+            """
+        ).strip()
+        + "\n"
+    )
+
+
 def _render_use_pathname_component() -> str:
     return (
         dedent(
@@ -3207,6 +3691,8 @@ def _render_client_barrel() -> str:
             export { default as ClientOnly } from './client-only.jsx';
             export { useAction } from './use-action.jsx';
             export { usePathname } from './use-pathname.jsx';
+            export { useAuth } from './use-auth.jsx';
+            export { useWebSocket } from './use-websocket.jsx';
             export { Form } from './form.jsx';
             export { Link, navigate, prefetch, refresh, invalidate, Slot, SlotProvider, useSlot, useSlots } from './index.js';
             """
@@ -3232,5 +3718,9 @@ __all__ = [
     "_render_vite_config",
     "_render_use_pathname_component",
     "_render_use_pathname_component_types",
+    "_render_use_auth_component",
+    "_render_use_auth_component_types",
+    "_render_use_websocket_component",
+    "_render_use_websocket_component_types",
     "_build_public_env_defines",
 ]

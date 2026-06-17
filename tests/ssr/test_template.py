@@ -235,6 +235,86 @@ def test_render_document_omits_csrf_names_for_defaults(
         assert "__PYXLE_CSRF_HEADER__" not in html
 
 
+def test_render_document_embeds_auth_seed(
+    page_route: PageRoute, tmp_path: Path
+) -> None:
+    """An auth provider's scope seed becomes window.__PYXLE_AUTH__ so the
+    client useAuth hook shows the signed-in user on the first frame."""
+    settings = DevServerSettings.from_project_root(tmp_path)
+    seed = {
+        "user": {"id": "u1", "email": "a@b.c", "emailVerified": True, "plan": "free"},
+        "endpoints": {"me": "/auth/me", "logout": "/auth/logout"},
+    }
+    html = render_document(
+        settings=settings,
+        page=page_route,
+        body_html="<p>Hi</p>",
+        props={},
+        script_nonce="n",
+        head_elements=page_route.head_elements,
+        auth_seed=seed,
+    )
+    assert "window.__PYXLE_AUTH__ = " in html
+    assert '"email":"a@b.c"' in html
+    assert '<script nonce="n">window.__PYXLE_AUTH__' in html
+
+
+def test_render_document_embeds_anonymous_auth_seed(
+    page_route: PageRoute, tmp_path: Path
+) -> None:
+    """A seed with ``user: None`` is still emitted — the client then knows it
+    is definitively logged out, no /auth/me round-trip needed."""
+    settings = DevServerSettings.from_project_root(tmp_path)
+    html = render_document(
+        settings=settings,
+        page=page_route,
+        body_html="<p>Hi</p>",
+        props={},
+        script_nonce="n",
+        head_elements=page_route.head_elements,
+        auth_seed={"user": None, "endpoints": {"me": "/auth/me"}},
+    )
+    assert '"user":null' in html
+    assert "window.__PYXLE_AUTH__ = " in html
+
+
+def test_render_document_omits_auth_seed_when_absent(
+    page_route: PageRoute, tmp_path: Path
+) -> None:
+    """No auth provider on the request → no seed script (useAuth resolves over
+    the network instead)."""
+    settings = DevServerSettings.from_project_root(tmp_path)
+    html = render_document(
+        settings=settings,
+        page=page_route,
+        body_html="<p>Hi</p>",
+        props={},
+        script_nonce="n",
+        head_elements=page_route.head_elements,
+    )
+    assert "__PYXLE_AUTH__" not in html
+
+
+def test_render_document_auth_seed_escapes_script_close(
+    page_route: PageRoute, tmp_path: Path
+) -> None:
+    """A hostile value in the seed (here an email-shaped payload) must not be
+    able to break out of the inline <script>."""
+    settings = DevServerSettings.from_project_root(tmp_path)
+    html = render_document(
+        settings=settings,
+        page=page_route,
+        body_html="<p>Hi</p>",
+        props={},
+        script_nonce="n",
+        head_elements=page_route.head_elements,
+        auth_seed={"user": {"email": "</script><script>alert(1)</script>"}, "endpoints": {}},
+    )
+    # The raw closing tag must be escaped in the emitted seed.
+    assert "</script><script>alert(1)" not in html
+    assert "<\\/script>" in html
+
+
 def test_render_document_inlines_global_styles(page_route: PageRoute, tmp_path: Path) -> None:
     style_path = tmp_path / "styles" / "base.css"
     style_path.parent.mkdir(parents=True, exist_ok=True)

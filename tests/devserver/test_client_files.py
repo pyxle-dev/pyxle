@@ -16,8 +16,12 @@ from pyxle.devserver.client_files import (
     _render_slot_runtime,
     _render_slot_runtime_types,
     _render_tsconfig,
+    _render_use_auth_component,
+    _render_use_auth_component_types,
     _render_use_pathname_component,
     _render_use_pathname_component_types,
+    _render_use_websocket_component,
+    _render_use_websocket_component_types,
     _render_vite_config,
     write_client_bootstrap_files,
 )
@@ -711,6 +715,149 @@ def test_write_client_bootstrap_files_generates_use_pathname(tmp_path: Path) -> 
 
     types = (settings.client_build_dir / "pyxle" / "use-pathname.d.ts").read_text(encoding="utf-8")
     assert "usePathname" in types
+
+
+# ---------------------------------------------------------------------------
+# useAuth hook
+
+
+def test_use_auth_component_exposes_full_surface() -> None:
+    """The hook exposes user state plus login/signup/logout/refresh."""
+    source = _render_use_auth_component()
+    assert "export function useAuth()" in source
+    for member in ("user", "isAuthenticated", "loading", "error", "login", "signup", "logout", "refresh"):
+        assert member in source
+    # Shared store via useSyncExternalStore so consumers stay in sync.
+    assert "useSyncExternalStore" in source
+
+
+def test_use_auth_component_is_ssr_safe() -> None:
+    """The hook must guard window access and use a stable server snapshot so
+    hydration never mismatches."""
+    source = _render_use_auth_component()
+    assert "typeof window === 'undefined'" in source
+    # A constant server snapshot keeps the hydration render identical on both
+    # sides; the client swaps to the seeded value after hydration.
+    assert "getServerSnapshot" in source
+    assert "SERVER_SNAPSHOT" in source
+
+
+def test_use_auth_component_seeds_from_window_global() -> None:
+    """The hook seeds from window.__PYXLE_AUTH__ so a signed-in user appears
+    on the first client frame with no round-trip."""
+    source = _render_use_auth_component()
+    assert "window.__PYXLE_AUTH__" in source
+    # Endpoints come from the seed with conventional /auth/* fallbacks.
+    assert "/auth/me" in source
+    assert "/auth/login" in source
+    assert "/auth/logout" in source
+
+
+def test_use_auth_component_sends_csrf_on_mutations() -> None:
+    """login/signup/logout POSTs must carry the CSRF token like useAction."""
+    source = _render_use_auth_component()
+    assert "csrfHeaderName()" in source
+    assert "getCsrfToken()" in source
+    assert "credentials: 'same-origin'" in source
+
+
+def test_use_auth_component_types() -> None:
+    """Type declaration exposes the user shape and the hook result."""
+    types = _render_use_auth_component_types()
+    assert "useAuth" in types
+    assert "PyxleUser" in types
+    assert "isAuthenticated" in types
+
+
+def test_write_client_bootstrap_files_generates_use_auth(tmp_path: Path) -> None:
+    """Bootstrap writes the useAuth hook, its types, and the barrel export."""
+    settings = create_project(tmp_path)
+    write_client_bootstrap_files(settings)
+
+    hook = (settings.client_build_dir / "pyxle" / "use-auth.jsx").read_text(encoding="utf-8")
+    assert "export function useAuth()" in hook
+
+    types = (settings.client_build_dir / "pyxle" / "use-auth.d.ts").read_text(encoding="utf-8")
+    assert "useAuth" in types
+
+    barrel = (settings.client_build_dir / "pyxle" / "client.js").read_text(encoding="utf-8")
+    assert "useAuth" in barrel
+
+
+# ---------------------------------------------------------------------------
+# useWebSocket hook
+
+
+def test_use_websocket_component_exposes_contract() -> None:
+    source = _render_use_websocket_component()
+    assert "export function useWebSocket(path, options" in source
+    for member in ("status", "send", "lastMessage", "error"):
+        assert member in source
+
+
+def test_use_websocket_component_is_ssr_safe() -> None:
+    """The hook must never open a socket during SSR — all socket code is gated
+    behind a typeof-window check inside useEffect."""
+    source = _render_use_websocket_component()
+    assert "typeof window === 'undefined'" in source
+    assert "useEffect" in source
+    # The window guard precedes any `new WebSocket(` construction.
+    assert source.index("typeof window === 'undefined'") < source.index("new WebSocket(")
+
+
+def test_use_websocket_component_reconnects_on_protocol_change() -> None:
+    """`protocols` must enter the effect deps (via a stable JSON key) so a
+    changed subprotocol reconnects, without an inline array literal causing a
+    reconnect on every render."""
+    source = _render_use_websocket_component()
+    assert "JSON.stringify(protocols" in source
+    assert "protocolsKey" in source
+    # The deps array includes the stable key.
+    assert "[path, reconnect, maxRetries, protocolsKey]" in source
+
+
+def test_use_websocket_component_uses_exponential_backoff() -> None:
+    """Reconnect must back off exponentially with jitter and a cap — not the
+    fixed-delay loop the dev overlay uses (which would thundering-herd a
+    restarting server)."""
+    source = _render_use_websocket_component()
+    assert "Math.pow(2, retries)" in source
+    assert "30000" in source  # 30s cap
+    assert "Math.random()" in source  # jitter
+
+
+def test_use_websocket_component_parses_json_safely() -> None:
+    source = _render_use_websocket_component()
+    assert "JSON.parse(data)" in source
+    # JSON.parse is wrapped so a non-JSON frame keeps the raw string.
+    assert "try {" in source
+
+
+def test_use_websocket_component_resolves_same_origin_url() -> None:
+    source = _render_use_websocket_component()
+    assert "wss:" in source and "ws:" in source
+    assert "window.location.protocol === 'https:'" in source
+
+
+def test_use_websocket_component_types() -> None:
+    types = _render_use_websocket_component_types()
+    assert "useWebSocket" in types
+    assert "WebSocketStatus" in types
+    assert "UseWebSocketResult" in types
+
+
+def test_write_client_bootstrap_files_generates_use_websocket(tmp_path: Path) -> None:
+    settings = create_project(tmp_path)
+    write_client_bootstrap_files(settings)
+
+    hook = (settings.client_build_dir / "pyxle" / "use-websocket.jsx").read_text(encoding="utf-8")
+    assert "export function useWebSocket" in hook
+
+    types = (settings.client_build_dir / "pyxle" / "use-websocket.d.ts").read_text(encoding="utf-8")
+    assert "useWebSocket" in types
+
+    barrel = (settings.client_build_dir / "pyxle" / "client.js").read_text(encoding="utf-8")
+    assert "useWebSocket" in barrel
 
 
 def test_navigation_scrolls_to_hash_after_cross_page_commit(tmp_path: Path) -> None:

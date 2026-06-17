@@ -38,6 +38,23 @@ def _stream_of(*frames):
     return _gen
 
 
+def test_auth_seed_for_request_returns_scope_value() -> None:
+    """An auth provider's scope blob is forwarded verbatim to the document."""
+    seed = {"user": {"email": "a@b.c"}, "endpoints": {"me": "/auth/me"}}
+    request = Request(
+        {"type": "http", "method": "GET", "path": "/", "headers": [], "pyxle.auth": seed}
+    )
+    assert ssr_view._auth_seed_for_request(request) is seed
+
+
+def test_auth_seed_for_request_absent_returns_sentinel() -> None:
+    """No auth provider → the ABSENT sentinel, so the document emits no seed."""
+    from pyxle.ssr.template import _AUTH_SEED_ABSENT
+
+    request = Request({"type": "http", "method": "GET", "path": "/", "headers": []})
+    assert ssr_view._auth_seed_for_request(request) is _AUTH_SEED_ABSENT
+
+
 @pytest.fixture
 def anyio_backend() -> str:  # pragma: no cover - fixture wiring
     return "asyncio"

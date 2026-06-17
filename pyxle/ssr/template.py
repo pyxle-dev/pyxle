@@ -35,6 +35,12 @@ class DocumentShell:
   suffix: str
 
 
+# Sentinel for "no auth seed on this request" — distinct from a seed whose
+# ``user`` is ``None`` (an authenticated-middleware request for an anonymous
+# visitor, which we DO emit so the client knows it is definitively logged out).
+_AUTH_SEED_ABSENT: Any = object()
+
+
 class ManifestLookupError(RuntimeError):
   """Raised when manifest-backed assets cannot be resolved."""
 
@@ -49,6 +55,7 @@ def render_document(
   head_elements: tuple[str, ...],
   inline_styles: tuple[InlineStyleFragment, ...] = tuple(),
   nav_cache_ttl: int | None = None,
+  auth_seed: Any = _AUTH_SEED_ABSENT,
 ) -> str:
   """Compose the HTML document for a rendered page."""
   try:
@@ -60,6 +67,7 @@ def render_document(
       head_elements=head_elements,
       inline_styles=inline_styles,
       nav_cache_ttl=nav_cache_ttl,
+      auth_seed=auth_seed,
     )
   except ManifestLookupError:
     return _render_manifest_error(page)
@@ -75,6 +83,7 @@ def build_document_shell(
   head_elements: tuple[str, ...],
   inline_styles: tuple[InlineStyleFragment, ...] = tuple(),
   nav_cache_ttl: int | None = None,
+  auth_seed: Any = _AUTH_SEED_ABSENT,
 ) -> DocumentShell:
   props_payload = _serialize_props(props)
   page_path_literal = json.dumps(page.client_asset_path)
@@ -112,6 +121,10 @@ def build_document_shell(
   # When the app customises ``csrf.cookieName`` / ``csrf.headerName``, expose
   # the names to the client runtime. Absent → the framework defaults.
   csrf_names_script = _render_csrf_names_script(settings, nonce_attr)
+  # When an auth provider published a seed on the request scope, expose the
+  # signed-in user + endpoint map to the client ``useAuth`` hook. Absent → no
+  # script (``useAuth`` resolves over the network).
+  auth_seed_script = _render_auth_seed_script(auth_seed, nonce_attr)
 
   if not settings.debug and settings.page_manifest is not None:
     manifest_entry = settings.page_manifest.get(page.path)
@@ -154,7 +167,7 @@ def build_document_shell(
   <script id=\"__PYXLE_PROPS__\" type=\"application/json\"{nonce_attr}>{props_payload}</script>
   <script id=\"__PYXLE_NAV_SEED__\" type=\"application/json\"{nonce_attr}>{nav_seed_payload}</script>
   <script{nonce_attr}>window.__PYXLE_PAGE_PATH__ = {page_path_literal};</script>
-  <script{nonce_attr}>window.__PYXLE_LOADING_ASSET__ = {loading_asset_literal};</script>{nav_stale_script}{csrf_names_script}
+  <script{nonce_attr}>window.__PYXLE_LOADING_ASSET__ = {loading_asset_literal};</script>{nav_stale_script}{csrf_names_script}{auth_seed_script}
   <script{nonce_attr}>window.__PYXLE_SCRIPTS__ = {scripts_metadata};</script>
   <script type=\"module\" src=\"{js_src}\"></script>
   </body>
@@ -168,6 +181,7 @@ def build_document_shell(
       scripts_metadata=scripts_metadata,
       nav_stale_script=nav_stale_script,
       csrf_names_script=csrf_names_script,
+      auth_seed_script=auth_seed_script,
       js_src=js_src,
     )
     return DocumentShell(prefix=prefix, suffix=suffix)
@@ -199,7 +213,7 @@ def build_document_shell(
   <script id=\"__PYXLE_PROPS__\" type=\"application/json\"{nonce_attr}>{props_payload}</script>
   <script id=\"__PYXLE_NAV_SEED__\" type=\"application/json\"{nonce_attr}>{nav_seed_payload}</script>
   <script{nonce_attr}>window.__PYXLE_PAGE_PATH__ = {page_path_literal};</script>
-  <script{nonce_attr}>window.__PYXLE_LOADING_ASSET__ = {loading_asset_literal};</script>{nav_stale_script}{csrf_names_script}
+  <script{nonce_attr}>window.__PYXLE_LOADING_ASSET__ = {loading_asset_literal};</script>{nav_stale_script}{csrf_names_script}{auth_seed_script}
   <script{nonce_attr}>window.__PYXLE_SCRIPTS__ = {scripts_metadata};</script>
   <script type=\"module\" src=\"{vite_origin}/client-entry.js\"></script>
   </body>
@@ -213,6 +227,7 @@ def build_document_shell(
     scripts_metadata=scripts_metadata,
     nav_stale_script=nav_stale_script,
     csrf_names_script=csrf_names_script,
+    auth_seed_script=auth_seed_script,
     vite_origin=vite_origin,
   )
   return DocumentShell(prefix=prefix, suffix=suffix)
@@ -267,6 +282,26 @@ def _render_csrf_names_script(settings: DevServerSettings, nonce_attr: str) -> s
     if not assignments:
         return ""
     return f"\n  <script{nonce_attr}>{' '.join(assignments)}</script>"
+
+
+def _render_auth_seed_script(auth_seed: Any, nonce_attr: str) -> str:
+    """Render the ``window.__PYXLE_AUTH__`` bootstrap script, or ``""``.
+
+    ``auth_seed`` is the JSON-serializable blob an auth provider published on
+    ``request.scope["pyxle.auth"]`` (the pyxle-auth plugin sets ``{"user":
+    ..., "endpoints": {...}}``). The client ``useAuth`` hook reads the global
+    to seed the signed-in user on the first frame and to discover the
+    (possibly relocated) auth endpoints. Absent → no script, and ``useAuth``
+    resolves the session over the network instead.
+    """
+    if auth_seed is _AUTH_SEED_ABSENT:
+        return ""
+    from pyxle.ssr._escape import escape_inline_json
+
+    payload = escape_inline_json(
+        json.dumps(auth_seed, ensure_ascii=False, separators=(",", ":"))
+    )
+    return f"\n  <script{nonce_attr}>window.__PYXLE_AUTH__ = {payload};</script>"
 
 
 def _serialize_js_string(value: str) -> str:
