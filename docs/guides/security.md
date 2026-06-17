@@ -192,6 +192,22 @@ Referrer-Policy: strict-origin-when-cross-origin
 Content-Security-Policy: default-src 'self'
 ```
 
+## Rate limiting
+
+Pyxle ships a built-in token-bucket rate limiter, off by default. Enable it from `pyxle.config.json` to cap how fast a single client can hit the app and blunt brute-force and scraping abuse:
+
+```json
+{
+  "rateLimit": {
+    "requests": 100,
+    "window": 60,
+    "exemptPaths": ["/health"]
+  }
+}
+```
+
+A client may burst up to `requests` and then sustains `requests / window` per second; over-limit requests get `429 Too Many Requests` with a `Retry-After` header. The store is in-memory and **per-process**, so for a single shared limit across `--workers` or hosts, rate-limit at your reverse proxy. Full details: [middleware guide](middleware.md#rate-limiting) and [configuration reference](../reference/configuration.md#rate-limiting).
+
 ## Environment variable safety
 
 - Variables without the `PYXLE_PUBLIC_` prefix are **server-only** and never appear in client bundles

@@ -306,7 +306,7 @@ async def signup(request, body: Signup):
 
 For a single task you can return the shorthand `{"background": [fn, *args]}`
 instead. For fire-and-forget work that isn't tied to this response (including
-from `@server` loaders), use [`pyxle.tasks.enqueue`](../guides/background-tasks.md#fire-and-forget-work--pyxletasks). See the [Background Tasks guide](../guides/background-tasks.md).
+from `@server` loaders), use [`pyxle.tasks.enqueue`](../guides/background-tasks.md#fire-and-forget-work-pyxletasks). See the [Background Tasks guide](../guides/background-tasks.md).
 
 ## How actions are routed
 
@@ -339,6 +339,10 @@ CSRF protection is on by default, so a raw `curl` like this is rejected with `40
 ## CSRF protection
 
 Actions are protected by CSRF middleware by default. The `<Form>` component and `useAction` hook handle token management automatically. See [Security](../guides/security.md) for details.
+
+## Route policies on actions
+
+Actions run through the same route-hook pipeline as pages and API routes, so an auth or rate-limit policy can apply to `@action` POSTs. Register action hooks under [`routeMiddleware.actions`](../reference/configuration.md#routemiddleware) — an action hook should reject with a JSON `401`/`403` (not an HTML redirect, which a page hook might use). See the [Middleware guide](../guides/middleware.md#route-level-hooks).
 
 ## Next steps
 

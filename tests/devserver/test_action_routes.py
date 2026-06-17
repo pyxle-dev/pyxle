@@ -1131,3 +1131,97 @@ def test_action_background_non_callable_first_returns_500(tmp_path: Path) -> Non
     client, url = _action_client(tmp_path, "bgnc", "go", src)
     response = client.post(url, json={})
     assert response.status_code == 500
+
+
+# ---------------------------------------------------------------------------
+# Route policies / hooks on @action calls (auth hooks must fire for actions)
+
+
+def test_action_route_hook_can_deny_the_call(tmp_path: Path) -> None:
+    from starlette.applications import Starlette
+    from starlette.responses import JSONResponse
+
+    module_path = _write_module(
+        tmp_path / "server" / "pages" / "guarded.py",
+        "from pyxle.runtime import action\n\n"
+        "@action\nasync def go(request):\n    return {'ok': True}\n",
+    )
+    route = ActionRoute(
+        path="/api/__actions/guarded/go",
+        page_path="/guarded",
+        action_name="go",
+        server_module_path=module_path,
+        module_key="pyxle.server.pages.guarded",
+    )
+
+    async def deny_hook(context, request, call_next):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+
+    router = build_action_router([route], route_hooks=[deny_hook])
+    app = Starlette()
+    app.router.routes.extend(router.routes)
+    client = TestClient(app, raise_server_exceptions=False)
+
+    response = client.post("/api/__actions/guarded/go", json={})
+    # The hook short-circuited the action — the @action never ran.
+    assert response.status_code == 401
+    assert response.json()["error"] == "unauthorized"
+
+
+def test_action_route_hook_receives_action_context(tmp_path: Path) -> None:
+    from starlette.applications import Starlette
+
+    module_path = _write_module(
+        tmp_path / "server" / "pages" / "ctx.py",
+        "from pyxle.runtime import action\n\n"
+        "@action\nasync def go(request):\n    return {'ok': True}\n",
+    )
+    route = ActionRoute(
+        path="/api/__actions/ctx/go",
+        page_path="/ctx",
+        action_name="go",
+        server_module_path=module_path,
+        module_key="pyxle.server.pages.ctx",
+    )
+    captured: dict = {}
+
+    async def capture_hook(context, request, call_next):
+        captured["target"] = context.target
+        captured["path"] = context.path
+        return await call_next(request)
+
+    router = build_action_router([route], route_hooks=[capture_hook])
+    app = Starlette()
+    app.router.routes.extend(router.routes)
+    client = TestClient(app, raise_server_exceptions=False)
+
+    response = client.post("/api/__actions/ctx/go", json={})
+    assert response.status_code == 200
+    assert captured["target"] == "action"
+    assert captured["path"] == "/api/__actions/ctx/go"
+
+
+def test_action_router_without_hooks_still_dispatches(tmp_path: Path) -> None:
+    # The no-hooks path (default) must keep working unchanged.
+    from starlette.applications import Starlette
+
+    module_path = _write_module(
+        tmp_path / "server" / "pages" / "nohooks_dispatch.py",
+        "from pyxle.runtime import action\n\n"
+        "@action\nasync def go(request):\n    return {'value': 1}\n",
+    )
+    route = ActionRoute(
+        path="/api/__actions/nohooks_dispatch/go",
+        page_path="/nohooks_dispatch",
+        action_name="go",
+        server_module_path=module_path,
+        module_key="pyxle.server.pages.nohooks_dispatch",
+    )
+    router = build_action_router([route])
+    app = Starlette()
+    app.router.routes.extend(router.routes)
+    client = TestClient(app, raise_server_exceptions=False)
+
+    response = client.post("/api/__actions/nohooks_dispatch/go", json={})
+    assert response.status_code == 200
+    assert response.json() == {"ok": True, "value": 1}

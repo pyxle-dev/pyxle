@@ -110,7 +110,7 @@ show_missing = true
 skip_covered = true
 
 [tool.pytest.ini_options]
-addopts = "--strict-markers --strict-config --cov=pyxle.cli --cov=pyxle.compiler --cov=pyxle.devserver --cov=pyxle.ssr --cov=pyxle.security --cov=pyxle.cache --cov=pyxle.realtime --cov=pyxle.observability --cov=pyxle.tasks --cov-report=term-missing"
+addopts = "--strict-markers --strict-config --cov=pyxle.cli --cov=pyxle.compiler --cov=pyxle.devserver --cov=pyxle.ssr --cov=pyxle.security --cov=pyxle.cache --cov=pyxle.realtime --cov=pyxle.observability --cov=pyxle.tasks --cov=pyxle.middleware --cov-report=term-missing"
 testpaths = ["tests"]
 pythonpath = ["."]
 # pytest's default ``norecursedirs`` skips any directory literally named

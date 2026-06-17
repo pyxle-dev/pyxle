@@ -45,12 +45,17 @@ Route hooks run before and after specific route handlers. Configure them per rou
 {
   "routeMiddleware": {
     "pages": ["myapp.hooks:require_auth"],
-    "apis": ["myapp.hooks:rate_limit"]
+    "apis": ["myapp.hooks:rate_limit"],
+    "actions": ["myapp.hooks:require_auth_json"]
   }
 }
 ```
 
-> **Note:** Route hooks wrap function endpoints (`endpoint` in `pages/api/`) and page handlers. [`HTTPEndpoint` classes](api-routes.md#using-httpendpoint-classes) are dispatched natively by Starlette and bypass route hooks — as do WebSocket handlers — so auth or rate-limiting for class-based endpoints must live in the endpoint methods themselves or in application-level middleware.
+The three lists wrap **page** handlers, **API** route functions, and **`@action`** endpoints respectively. They run through the same hook pipeline, so an `@action` POST is subject to its own policy chain instead of bypassing it.
+
+> **Actions vs pages — return the right thing.** An action endpoint replies with JSON, so an action hook that rejects a request should return a JSON `401`/`403` (not an HTML redirect a page hook might use). That's why actions have a **separate** `actions` list rather than inheriting the page's hooks — protect a page *and* its actions, but with responses each side can parse.
+
+> **Note:** Route hooks wrap function endpoints (`endpoint` in `pages/api/`), page handlers, and `@action` endpoints. [`HTTPEndpoint` classes](api-routes.md#using-httpendpoint-classes) are dispatched natively by Starlette and bypass route hooks — as do WebSocket handlers — so auth or rate-limiting for class-based endpoints must live in the endpoint methods themselves or in application-level middleware.
 
 ### Writing a route hook (function style)
 
@@ -119,17 +124,50 @@ Pyxle applies two default hooks:
 - **`attach_route_metadata`** -- adds route info to `request.scope["pyxle"]["route"]`
 - **`enforce_allowed_methods`** -- returns 405 for disallowed API methods
 
+## Rate limiting
+
+Pyxle ships a dependency-free **token-bucket** rate limiter, `pyxle.middleware.RateLimitMiddleware`. Enable it from `pyxle.config.json` — no code required:
+
+```json
+{
+  "rateLimit": {
+    "requests": 100,
+    "window": 60,
+    "exemptPaths": ["/health"],
+    "trustForwardedFor": false
+  }
+}
+```
+
+Each client gets a bucket holding up to `requests` tokens that refills at `requests / window` tokens per second. A request spends one token; when the bucket is empty the request is rejected with `429 Too Many Requests` and a `Retry-After` header. This permits a short burst up to the capacity while bounding the sustained rate — friendlier than a hard fixed window, and it never blocks the event loop.
+
+- **Client key** — the connection's remote IP, or the first `X-Forwarded-For` hop when `trustForwardedFor` is set. Only trust the header behind a proxy you control; otherwise a client can spoof it to dodge the limit.
+- **Exempt paths** — `exemptPaths` skips the limiter on segment boundaries (same matching as `csrf.exemptPaths`). List health checks and metrics scrapes here so monitors aren't throttled.
+- **Placement** — the limiter sits just inside request observability, so a throttled request is still assigned a correlation id and counted in metrics, but is rejected before CSRF, static serving, or your handler do any work.
+
+**Multi-worker caveat.** The bucket store is in-memory and **per-process**. Under `pyxle serve --workers N` each worker enforces the limit independently, so the effective global cap is `N × requests`. When you need one shared limit across workers or hosts, rate-limit at your reverse proxy / load balancer instead. See the full schema in the [configuration reference](../reference/configuration.md#rate-limiting).
+
+You can also apply it yourself in a custom ASGI stack:
+
+```python
+from pyxle.middleware import RateLimitMiddleware
+
+app = RateLimitMiddleware(app, requests=100, window_seconds=60.0)
+```
+
 ## Middleware execution order
 
 From outermost to innermost:
 
-1. Custom middleware (from `middleware` config)
-2. CORS middleware (if configured)
-3. CSRF middleware (if enabled)
-4. Vite proxy (dev mode)
-5. Static file serving
-6. Route hooks (from `routeMiddleware` config) — skipped for `HTTPEndpoint` classes and WebSocket handlers, which Starlette dispatches natively
-7. Page/API handler
+1. Request observability (correlation id + timing, on by default)
+2. Rate limiter (if `rateLimit.requests > 0`)
+3. Custom middleware (from `middleware` config)
+4. CORS middleware (if configured)
+5. CSRF middleware (if enabled)
+6. Vite proxy (dev mode)
+7. Static file serving
+8. Route hooks (from `routeMiddleware` config) — skipped for `HTTPEndpoint` classes and WebSocket handlers, which Starlette dispatches natively
+9. Page/API handler
 
 ## Next steps
 

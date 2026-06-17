@@ -46,7 +46,7 @@ class RouteHook:
 class RouteContext:
     """Metadata describing the current route for policy enforcement."""
 
-    target: Literal["page", "api"]
+    target: Literal["page", "api", "action"]
     path: str
     source_relative_path: Path
     source_absolute_path: Path
@@ -198,6 +198,9 @@ async def enforce_allowed_methods(context: RouteContext, request: Request, call_
 
 DEFAULT_PAGE_POLICIES: Sequence[RouteHookCallable] = (attach_route_metadata,)
 DEFAULT_API_POLICIES: Sequence[RouteHookCallable] = (attach_route_metadata, enforce_allowed_methods)
+# Actions are registered POST-only, so they need no method enforcement — just
+# the route-metadata hook. User auth/policy hooks run after this.
+DEFAULT_ACTION_POLICIES: Sequence[RouteHookCallable] = (attach_route_metadata,)
 
 
 def is_async_callable(obj: object) -> bool:
@@ -265,6 +268,7 @@ def wrap_with_route_hooks(
 
 
 __all__ = [
+    "DEFAULT_ACTION_POLICIES",
     "DEFAULT_API_POLICIES",
     "DEFAULT_PAGE_POLICIES",
     "RouteContext",

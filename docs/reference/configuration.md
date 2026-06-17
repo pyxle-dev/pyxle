@@ -21,7 +21,8 @@ Pyxle is configured via `pyxle.config.json` in the project root. All fields are 
   "middleware": [],
   "routeMiddleware": {
     "pages": [],
-    "apis": []
+    "apis": [],
+    "actions": []
   },
   "styling": {
     "globalStyles": [],
@@ -44,6 +45,12 @@ Pyxle is configured via `pyxle.config.json` in the project root. All fields are 
   },
   "cache": {},
   "navigation": {},
+  "rateLimit": {
+    "requests": 0,
+    "window": 60,
+    "exemptPaths": [],
+    "trustForwardedFor": false
+  },
   "observability": {
     "requestId": true,
     "requestIdHeader": "X-Request-Id",
@@ -118,7 +125,8 @@ Route-level hooks applied to specific route types.
 {
   "routeMiddleware": {
     "pages": ["myapp.hooks:require_auth"],
-    "apis": ["myapp.hooks:rate_limit"]
+    "apis": ["myapp.hooks:rate_limit"],
+    "actions": ["myapp.hooks:require_auth_json"]
   }
 }
 ```
@@ -127,6 +135,7 @@ Route-level hooks applied to specific route types.
 |-----|------|-------------|
 | `routeMiddleware.pages` | `string[]` | Hooks for page routes |
 | `routeMiddleware.apis` | `string[]` | Hooks for API routes |
+| `routeMiddleware.actions` | `string[]` | Hooks for `@action` endpoints. An action hook should reject with a JSON `401`/`403` (not an HTML redirect) — see the [Middleware guide](../guides/middleware.md#route-level-hooks). |
 
 ## Styling
 
@@ -248,6 +257,32 @@ Pyxle's client keeps an in-memory **navigation cache** so client-side navigation
 
 A route listed in the [`cache`](#edge-caching) block **reuses its edge-cache TTL** as its navigation-cache lifetime, overriding `defaultPrefetchTtl` for that route -- so a page's client freshness matches how long a CDN would serve it. (Consequence: raising a route's `cache` TTL also lengthens its edge cache, so purge the CDN on deploy -- which you should do regardless.) After a mutation, the client router's `invalidate(href)` drops a cached entry so the next navigation refetches.
 
+## Rate limiting
+
+A built-in [token-bucket](../guides/middleware.md#rate-limiting) limiter. **Disabled by default** (`requests: 0`). Set `requests` to a positive number to cap how fast a single client may call the app.
+
+```json
+{
+  "rateLimit": {
+    "requests": 100,
+    "window": 60,
+    "exemptPaths": ["/health"],
+    "trustForwardedFor": false
+  }
+}
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `rateLimit.requests` | `integer` | `0` | Bucket capacity = max burst. `0` disables the limiter. |
+| `rateLimit.window` | `number` | `60` | Seconds for a full bucket to refill, so the sustained rate is `requests / window` per second. |
+| `rateLimit.exemptPaths` | `string[]` | `[]` | Paths skipped by the limiter, matched on segment boundaries (same rules as [`csrf.exemptPaths`](#csrf)). Use for health checks and metrics scrapes. |
+| `rateLimit.trustForwardedFor` | `boolean` | `false` | Key clients by the first `X-Forwarded-For` hop instead of the socket IP. **Only enable behind a trusted proxy** — a client can otherwise spoof the header to dodge the limit. |
+
+**Burst vs. sustained.** `requests` is the burst a client can spend at once; the bucket then refills at `requests / window` per second, so the long-run average is bounded without rejecting brief spikes. A blocked request gets `429 Too Many Requests` with a `Retry-After` header.
+
+**Multi-worker caveat.** The bucket store is in-memory and **per-process**, so under `pyxle serve --workers N` each worker enforces the limit independently and the effective global cap is `N × requests`. For a single shared limit, rate-limit at your reverse proxy or load balancer. See the [middleware guide](../guides/middleware.md#rate-limiting).
+
 ## Observability
 
 Request correlation IDs and timing. Both are **on by default** -- generating an id and reading two timestamps per request is sub-microsecond and adds no I/O, and every request gets a correlation key surfaced as the response header and on `request.state.request_id` (readable from any loader or `@action`). See the [Observability guide](../guides/observability.md).
@@ -283,7 +318,7 @@ Request correlation IDs and timing. Both are **on by default** -- generating an 
 | `observability.otelServiceName` | `string` | `"pyxle-app"` | `service.name` resource attribute for the tracer. |
 | `observability.otelSampleRatio` | `number` | `0.05` | Trace sampling ratio (0.0–1.0). Low by default so tracing can't swamp a busy server. The exporter endpoint comes from the standard `OTEL_EXPORTER_OTLP_ENDPOINT` env var. |
 
-Shorthand to disable request-id and timing: `"observability": false`. The page-cache hit-ratio metric requires the [server-side page cache](caching.md) (active under `pyxle serve`). **Multi-worker note:** under `pyxle serve --workers N` each worker process exposes its own metrics (with a `worker` label), so aggregate across workers at the scraper.
+Shorthand to disable request-id and timing: `"observability": false`. The page-cache hit-ratio metric requires the [server-side page cache](../guides/caching.md) (active under `pyxle serve`). **Multi-worker note:** under `pyxle serve --workers N` each worker process exposes its own metrics (with a `worker` label), so aggregate across workers at the scraper.
 
 ## Plugins
 

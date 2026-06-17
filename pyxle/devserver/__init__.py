@@ -328,6 +328,9 @@ def _rebuild_app_routes(app, settings: DevServerSettings):
         overlay=getattr(app.state, "overlay", None),
         api_route_hooks=app.state.pyxle_route_hooks[0],
         page_route_hooks=app.state.pyxle_route_hooks[1],
+        action_route_hooks=app.state.pyxle_route_hooks[2]
+        if len(app.state.pyxle_route_hooks) > 2
+        else (),
         stream_render=getattr(app.state, "pyxle_stream_render", None),
     )
 

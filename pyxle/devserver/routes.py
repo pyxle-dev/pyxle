@@ -79,6 +79,11 @@ class ActionRoute:
     server_module_path: Path
     module_key: str
     is_catchall: bool = False
+    # Source of the owning page (for the route-hook RouteContext). Defaulted so
+    # existing constructors stay valid; populated from the page entry below.
+    source_relative_path: Path = Path(".")
+    source_absolute_path: Path = Path(".")
+    content_hash: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -295,6 +300,9 @@ def _action_routes(entry: PageRegistryEntry) -> List[ActionRoute]:
                 action_name=action_name,
                 server_module_path=entry.server_module_path,
                 module_key=entry.module_key,
+                source_relative_path=entry.source_relative_path,
+                source_absolute_path=entry.source_absolute_path,
+                content_hash=entry.content_hash,
             )
         )
 
@@ -314,6 +322,9 @@ def _action_routes(entry: PageRegistryEntry) -> List[ActionRoute]:
                 server_module_path=entry.server_module_path,
                 module_key=entry.module_key,
                 is_catchall=True,
+                source_relative_path=entry.source_relative_path,
+                source_absolute_path=entry.source_absolute_path,
+                content_hash=entry.content_hash,
             )
         )
 

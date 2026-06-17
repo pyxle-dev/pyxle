@@ -52,6 +52,7 @@ from .middleware import MiddlewareHookError, load_custom_middlewares
 from .overlay import OverlayManager
 from .proxy import ViteProxy
 from .route_hooks import (
+    DEFAULT_ACTION_POLICIES,
     DEFAULT_API_POLICIES,
     DEFAULT_PAGE_POLICIES,
     RouteContext,
@@ -1129,7 +1130,10 @@ def _make_page_handler(
 
 
 def build_action_router(
-    routes: Iterable[ActionRoute], *, debug: bool = False,
+    routes: Iterable[ActionRoute],
+    *,
+    debug: bool = False,
+    route_hooks: Sequence[RouteHookCallable] | None = None,
 ) -> Router:
     """Create a Starlette ``Router`` for auto-generated ``@action`` endpoints.
 
@@ -1148,13 +1152,27 @@ def build_action_router(
     """
 
     router = Router()
+    hooks = list(route_hooks or [])
 
     for route in routes:
         if route.is_catchall:
             handler = _make_catchall_action_handler(route, debug=debug)
         else:
             handler = _make_action_handler(route, debug=debug)
-        router.add_route(route.path, handler, methods=["POST"])
+        # Run the action through the route-hook chain — the same per-route
+        # policy pipeline pages and API routes use — so an auth/policy hook
+        # actually fires for action POSTs instead of being bypassed.
+        context = RouteContext(
+            target="action",
+            path=route.path,
+            source_relative_path=route.source_relative_path,
+            source_absolute_path=route.source_absolute_path,
+            module_key=route.module_key,
+            content_hash=route.content_hash,
+            allowed_methods=("POST",),
+        )
+        wrapped = wrap_with_route_hooks(handler, hooks=hooks, context=context)
+        router.add_route(route.path, wrapped, methods=["POST"])
 
     return router
 
@@ -1421,6 +1439,7 @@ def _build_app_routes(
     overlay: OverlayManager | None,
     api_route_hooks: Sequence[RouteHookCallable],
     page_route_hooks: Sequence[RouteHookCallable],
+    action_route_hooks: Sequence[RouteHookCallable] = (),
     page_cache: PageCache | None = None,
     stream_render: Callable[..., Any] | None = None,
 ) -> tuple[list[Any], ErrorBoundaryRegistry]:
@@ -1447,7 +1466,11 @@ def _build_app_routes(
         page_cache=page_cache,
         stream_render=stream_render,
     )
-    action_router = build_action_router(routes.actions, debug=settings.debug)
+    action_router = build_action_router(
+        routes.actions,
+        debug=settings.debug,
+        route_hooks=[*DEFAULT_ACTION_POLICIES, *action_route_hooks],
+    )
 
     built: list[Any] = []
     built.extend(api_router.routes)
@@ -1660,6 +1683,7 @@ def create_starlette_app(
     try:
         page_route_hooks = load_route_hooks(settings.page_route_hooks)
         api_route_hooks = load_route_hooks(settings.api_route_hooks)
+        action_route_hooks = load_route_hooks(getattr(settings, "action_route_hooks", ()))
     except RouteHookError as exc:
         console_logger.error(str(exc))
         raise
@@ -1816,6 +1840,27 @@ def create_starlette_app(
     if proxy_middleware is not None:
         middleware_stack.append(proxy_middleware)
 
+    # Token-bucket rate limit. Inserted at the front of the stack so it sits
+    # just inside observability (added next, also via insert(0, ...)): a
+    # throttled request is still assigned a correlation id and counted, but is
+    # rejected with 429 before CSRF, static serving, or the handler do any work.
+    # The store is in-memory/per-process — see the middleware guide for the
+    # multi-worker caveat.
+    _rl = getattr(settings, "rate_limit", None)
+    if _rl is not None and getattr(_rl, "enabled", False):
+        from pyxle.middleware import RateLimitMiddleware  # noqa: PLC0415
+
+        middleware_stack.insert(
+            0,
+            Middleware(
+                RateLimitMiddleware,
+                requests=_rl.requests,
+                window_seconds=_rl.window_seconds,
+                exempt_paths=_rl.exempt_paths,
+                trust_forwarded_for=_rl.trust_forwarded_for,
+            ),
+        )
+
     # The per-process metrics registry is always present (it is cheap — a few
     # int counters and fixed-bucket histograms) and recorded into from the
     # request, render, loader, action, and cache sites. Exposure of those
@@ -1884,6 +1929,7 @@ def create_starlette_app(
         overlay=overlay,
         api_route_hooks=api_route_hooks,
         page_route_hooks=page_route_hooks,
+        action_route_hooks=action_route_hooks,
         page_cache=page_cache,
         stream_render=stream_render,
     )
@@ -1896,7 +1942,7 @@ def create_starlette_app(
     # The dev-server hot route-table refresh reuses these to rebuild routes live
     # on a source change (see ``DevServer._handle_rebuild``). Config-derived
     # hooks are stable across rebuilds — config changes still need a restart.
-    app.state.pyxle_route_hooks = (api_route_hooks, page_route_hooks)
+    app.state.pyxle_route_hooks = (api_route_hooks, page_route_hooks, action_route_hooks)
     # Streaming SSR's render_stream is bound to the worker pool, which outlives
     # route-table refreshes — stash it so a hot rebuild keeps streaming wired.
     app.state.pyxle_stream_render = stream_render

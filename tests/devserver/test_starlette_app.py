@@ -2116,6 +2116,69 @@ def test_create_starlette_app_csrf_secure_cookie_in_production(
     assert "Secure" in csrf_cookie
 
 
+def test_create_starlette_app_installs_rate_limit_middleware(
+    project: DevServerSettings,
+    monkeypatch,
+) -> None:
+    """When ``settings.rate_limit`` is enabled the limiter is wired into the
+    stack: requests up to the capacity pass, the next is rejected with 429, and
+    because observability sits outside the limiter the 429 still carries the
+    correlation id header."""
+    from pyxle.config import RateLimitConfig
+
+    monkeypatch.setattr(
+        "pyxle.devserver.starlette_app.ComponentRenderer",
+        lambda: object(),
+    )
+
+    build_once(project)
+    registry = load_metadata_registry(project)
+    table = build_route_table(registry)
+
+    with_rl = replace(
+        project, rate_limit=RateLimitConfig(requests=2, window_seconds=60.0)
+    )
+    app = create_starlette_app(with_rl, table)
+    client = TestClient(app, raise_server_exceptions=False)
+
+    # The first two requests drain the bucket (real clock barely advances, so
+    # the ~0.03 tokens/sec refill is negligible across three rapid calls).
+    assert client.get("/api/pulse").status_code == 200
+    assert client.get("/api/pulse").status_code == 200
+
+    throttled = client.get("/api/pulse")
+    assert throttled.status_code == 429
+    assert int(throttled.headers["retry-after"]) >= 1
+    assert throttled.json() == {"ok": False, "error": "Too Many Requests"}
+    # Observability wraps the limiter: the rejected request is still tagged.
+    assert throttled.headers.get("x-request-id")
+
+
+def test_create_starlette_app_skips_rate_limit_when_disabled(
+    project: DevServerSettings,
+    monkeypatch,
+) -> None:
+    """A disabled ``RateLimitConfig`` (requests == 0) installs no limiter, so
+    far more requests than any bucket capacity all succeed."""
+    from pyxle.config import RateLimitConfig
+
+    monkeypatch.setattr(
+        "pyxle.devserver.starlette_app.ComponentRenderer",
+        lambda: object(),
+    )
+
+    build_once(project)
+    registry = load_metadata_registry(project)
+    table = build_route_table(registry)
+
+    with_rl = replace(project, rate_limit=RateLimitConfig(requests=0))
+    app = create_starlette_app(with_rl, table)
+    client = TestClient(app, raise_server_exceptions=False)
+
+    for _ in range(10):
+        assert client.get("/api/pulse").status_code == 200
+
+
 # ---------------------------------------------------------------------------
 # Plugin-contributed middleware
 # ---------------------------------------------------------------------------

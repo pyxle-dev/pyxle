@@ -35,6 +35,7 @@ class DevServerSettings:
     custom_middlewares: tuple[str, ...] = ()
     page_route_hooks: tuple[str, ...] = ()
     api_route_hooks: tuple[str, ...] = ()
+    action_route_hooks: tuple[str, ...] = ()
     # Number of persistent Node.js SSR worker processes. 0 means per-request
     # subprocess rendering in the dev server, but auto-sizes the pool in
     # production serve (pyxle.build.production._resolve_pool_size).
@@ -50,6 +51,8 @@ class DevServerSettings:
     cache: Any = None
     # Client navigation/prefetch cache policy (NavigationConfig). None = default.
     navigation: Any = None
+    # Token-bucket rate limit (RateLimitConfig). None / disabled = no limit.
+    rate_limit: Any = None
     # Request observability (ObservabilityConfig). None = framework defaults
     # (request-id + timing on).
     observability: Any = None
@@ -74,6 +77,7 @@ class DevServerSettings:
         custom_middlewares: tuple[str, ...] | list[str] | None = None,
         page_route_hooks: tuple[str, ...] | list[str] | None = None,
         api_route_hooks: tuple[str, ...] | list[str] | None = None,
+        action_route_hooks: tuple[str, ...] | list[str] | None = None,
         page_manifest: dict[str, Any] | None = None,
         global_stylesheets: Sequence[str] | Sequence[GlobalStylesheet] | None = None,
         global_scripts: Sequence[str] | Sequence[GlobalScript] | None = None,
@@ -82,6 +86,7 @@ class DevServerSettings:
         csrf: Any = None,
         cache: Any = None,
         navigation: Any = None,
+        rate_limit: Any = None,
         observability: Any = None,
         plugins: Sequence[Any] | None = None,
     ) -> "DevServerSettings":
@@ -93,6 +98,7 @@ class DevServerSettings:
         middleware_specs = tuple(custom_middlewares) if custom_middlewares else ()
         page_hook_specs = tuple(page_route_hooks) if page_route_hooks else ()
         api_hook_specs = tuple(api_route_hooks) if api_route_hooks else ()
+        action_hook_specs = tuple(action_route_hooks) if action_route_hooks else ()
         style_specs: tuple[GlobalStylesheet, ...] = ()
         if global_stylesheets:
             iterator = iter(global_stylesheets)
@@ -133,6 +139,7 @@ class DevServerSettings:
             custom_middlewares=middleware_specs,
             page_route_hooks=page_hook_specs,
             api_route_hooks=api_hook_specs,
+            action_route_hooks=action_hook_specs,
             page_manifest=page_manifest,
             global_stylesheets=style_specs,
             global_scripts=script_specs,
@@ -141,6 +148,7 @@ class DevServerSettings:
             csrf=csrf,
             cache=cache,
             navigation=navigation,
+            rate_limit=rate_limit,
             observability=observability,
             plugins=tuple(plugins) if plugins else (),
         )
@@ -164,6 +172,7 @@ class DevServerSettings:
             "custom_middlewares": list(self.custom_middlewares),
             "page_route_hooks": list(self.page_route_hooks),
             "api_route_hooks": list(self.api_route_hooks),
+            "action_route_hooks": list(self.action_route_hooks),
             "page_manifest_loaded": self.page_manifest is not None,
             "global_stylesheets": [sheet.as_dict() for sheet in self.global_stylesheets],
             "global_scripts": [script.as_dict() for script in self.global_scripts],

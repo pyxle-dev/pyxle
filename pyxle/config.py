@@ -97,6 +97,27 @@ class NavigationConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class RateLimitConfig:
+    """Token-bucket rate limit applied to incoming requests.
+
+    Disabled when ``requests`` is 0. ``requests`` is the burst capacity and
+    ``window_seconds`` the period over which a full bucket refills (so the
+    sustained rate is ``requests / window_seconds`` per second). The limit is
+    in-memory and per-process — see the middleware guide for the multi-worker
+    caveat.
+    """
+
+    requests: int = 0
+    window_seconds: float = 60.0
+    exempt_paths: tuple[str, ...] = ()
+    trust_forwarded_for: bool = False
+
+    @property
+    def enabled(self) -> bool:
+        return self.requests > 0
+
+
+@dataclass(frozen=True, slots=True)
 class ObservabilityConfig:
     """Request observability: correlation IDs and request timing.
 
@@ -156,12 +177,14 @@ class PyxleConfig:
     middleware: tuple[str, ...] = ()
     page_route_middleware: tuple[str, ...] = ()
     api_route_middleware: tuple[str, ...] = ()
+    action_route_middleware: tuple[str, ...] = ()
     global_styles: tuple[str, ...] = ()
     global_scripts: tuple[str, ...] = ()
     cors: CorsConfig = CorsConfig()
     csrf: CsrfConfig = CsrfConfig()
     cache: CacheConfig = CacheConfig()
     navigation: NavigationConfig = NavigationConfig()
+    rate_limit: RateLimitConfig = RateLimitConfig()
     observability: ObservabilityConfig = ObservabilityConfig()
     # Plugin entries as the raw payload from ``pyxle.config.json`` —
     # either a bare string (``"pyxle-auth"``) or an object
@@ -186,10 +209,12 @@ class PyxleConfig:
             "custom_middlewares": self.middleware,
             "page_route_hooks": self.page_route_middleware,
             "api_route_hooks": self.api_route_middleware,
+            "action_route_hooks": self.action_route_middleware,
             "cors": self.cors,
             "csrf": self.csrf,
             "cache": self.cache,
             "navigation": self.navigation,
+            "rate_limit": self.rate_limit,
             "observability": self.observability,
             "plugins": self.plugins,
         }
@@ -208,6 +233,7 @@ class PyxleConfig:
             "routeMiddleware": {
                 "pages": list(self.page_route_middleware),
                 "apis": list(self.api_route_middleware),
+                "actions": list(self.action_route_middleware),
             },
             "styling": {
                 "globalStyles": list(self.global_styles),
@@ -296,6 +322,7 @@ def _parse_config_dict(data: Dict[str, Any], *, source: Path) -> PyxleConfig:
         "csrf",
         "cache",
         "navigation",
+        "rateLimit",
         "observability",
         "plugins",
     }
@@ -321,7 +348,7 @@ def _parse_config_dict(data: Dict[str, Any], *, source: Path) -> PyxleConfig:
         )
 
     middleware_specs = _parse_middleware_list(data.get("middleware"), source=source)
-    page_route_specs, api_route_specs = _parse_route_middleware_block(
+    page_route_specs, api_route_specs, action_route_specs = _parse_route_middleware_block(
         data.get("routeMiddleware"),
         source=source,
     )
@@ -330,6 +357,7 @@ def _parse_config_dict(data: Dict[str, Any], *, source: Path) -> PyxleConfig:
     csrf_config = _parse_csrf_block(data.get("csrf"), source=source)
     cache_config = _parse_cache_block(data.get("cache"), source=source)
     navigation_config = _parse_navigation_block(data.get("navigation"), source=source)
+    rate_limit_config = _parse_rate_limit_block(data.get("rateLimit"), source=source)
     observability_config = _parse_observability_block(data.get("observability"), source=source)
     plugins = _parse_plugins_block(data.get("plugins"), source=source)
 
@@ -345,12 +373,14 @@ def _parse_config_dict(data: Dict[str, Any], *, source: Path) -> PyxleConfig:
         middleware=middleware_specs,
         page_route_middleware=page_route_specs,
         api_route_middleware=api_route_specs,
+        action_route_middleware=action_route_specs,
         global_styles=global_styles,
         global_scripts=global_scripts,
         cors=cors_config,
         csrf=csrf_config,
         cache=cache_config,
         navigation=navigation_config,
+        rate_limit=rate_limit_config,
         observability=observability_config,
         plugins=plugins,
     )
@@ -460,17 +490,23 @@ def _validate_port(value: Any, key: str) -> int:
     return value
 
 
-def _parse_route_middleware_block(value: Any, *, source: Path) -> tuple[tuple[str, ...], tuple[str, ...]]:
+def _parse_route_middleware_block(
+    value: Any, *, source: Path
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
     if value is None:
-        return ((), ())
+        return ((), (), ())
     if not isinstance(value, Mapping):
         raise ConfigError(
-            f"Invalid value for 'routeMiddleware' in '{source}': expected object with 'pages'/'apis' arrays."
+            f"Invalid value for 'routeMiddleware' in '{source}': "
+            "expected object with 'pages'/'apis'/'actions' arrays."
         )
 
     pages = _parse_middleware_list(value.get("pages"), source=source, field_name="routeMiddleware.pages")
     apis = _parse_middleware_list(value.get("apis"), source=source, field_name="routeMiddleware.apis")
-    return (pages, apis)
+    actions = _parse_middleware_list(
+        value.get("actions"), source=source, field_name="routeMiddleware.actions"
+    )
+    return (pages, apis, actions)
 
 
 def _parse_middleware_list(value: Any, *, source: Path, field_name: str = "middleware") -> tuple[str, ...]:
@@ -647,6 +683,58 @@ def _parse_csrf_block(value: Any, *, source: Path) -> CsrfConfig:
         cookie_secure=cookie_secure,
         cookie_samesite=cookie_samesite.lower(),
         exempt_paths=exempt_paths or (),
+    )
+
+
+def _parse_rate_limit_block(value: Any, *, source: Path) -> RateLimitConfig:
+    if value is None:
+        return RateLimitConfig()
+    if not isinstance(value, Mapping):
+        raise ConfigError(
+            f"Invalid value for 'rateLimit' in '{source}': expected object."
+        )
+
+    unknown = set(value) - {"requests", "window", "exemptPaths", "trustForwardedFor"}
+    if unknown:
+        formatted = ", ".join(sorted(str(key) for key in unknown))
+        raise ConfigError(
+            f"Unknown keys in 'rateLimit' block in '{source}': {formatted}."
+        )
+
+    requests = value.get("requests", 0)
+    if not isinstance(requests, int) or isinstance(requests, bool) or requests < 0:
+        raise ConfigError(
+            f"Invalid value for 'rateLimit.requests' in '{source}': "
+            "expected a non-negative integer (0 disables the limit)."
+        )
+
+    window = value.get("window", 60)
+    if (
+        not isinstance(window, (int, float))
+        or isinstance(window, bool)
+        or window <= 0
+    ):
+        raise ConfigError(
+            f"Invalid value for 'rateLimit.window' in '{source}': "
+            "expected a positive number of seconds."
+        )
+
+    exempt_paths = _parse_string_list(
+        value.get("exemptPaths"), source=source, field_name="rateLimit.exemptPaths"
+    )
+
+    trust_forwarded_for = value.get("trustForwardedFor", False)
+    if not isinstance(trust_forwarded_for, bool):
+        raise ConfigError(
+            f"Invalid value for 'rateLimit.trustForwardedFor' in '{source}': "
+            "expected boolean."
+        )
+
+    return RateLimitConfig(
+        requests=requests,
+        window_seconds=float(window),
+        exempt_paths=exempt_paths or (),
+        trust_forwarded_for=trust_forwarded_for,
     )
 
 
