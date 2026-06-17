@@ -59,11 +59,18 @@ langkit = [
 redis = [
   "redis>=5.0,<6.0",
 ]
+# Request-body validation on @action via Pydantic models, and OpenAPI schema
+# generation (`pyxle openapi`). Optional — actions without a Pydantic-typed
+# `body` parameter need nothing extra.
+pydantic = [
+  "pydantic>=2.0,<3.0",
+]
 dev = [
   "pytest>=8.0,<9.0",
   "pytest-cov>=4.1,<5.0",
   "coverage>=7.4,<8.0",
   "ruff>=0.6,<0.7",
+  "pydantic>=2.0,<3.0",
   # The CLI tests use CliRunner.isolated_filesystem, which a newer Typer (and
   # Click 8.2) dropped. Pin both to the validated range. Test-only constraint —
   # the package's runtime deps are unaffected.

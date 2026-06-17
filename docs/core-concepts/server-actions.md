@@ -63,7 +63,7 @@ export default function NewPostPage() {
 | `action` | `string` | Name of the `@action` function |
 | `pagePath` | `string?` | Override which page the action belongs to (defaults to current page) |
 | `onSuccess` | `(data) => void` | Called with response data on success |
-| `onError` | `(message) => void` | Called with error message on failure |
+| `onError` | `(message, fields) => void` | Called with the error message and, for a `422` validation failure, the per-field errors (`{ [field]: string[] }`) — otherwise `null` |
 | `resetOnSuccess` | `boolean` | Reset form fields after success (default: `true`) |
 
 ### Using the `useAction` hook
@@ -101,6 +101,7 @@ export default function ProfilePage({ data }) {
 |----------|------|-------------|
 | `pending` | `boolean` | `true` while the request is in flight |
 | `error` | `string \| null` | Error message on failure, `null` otherwise |
+| `fields` | `Record<string, string[]> \| null` | Per-field validation errors from the last failed submit (a `422`), or `null`. Cleared when a new request starts |
 | `data` | `object \| null` | Last successful response data |
 
 Options:
@@ -134,6 +135,141 @@ The client receives:
 ```json
 { "ok": false, "error": "Not authorised" }
 ```
+
+## Validating request bodies with Pydantic
+
+Reading `await request.json()` and pulling fields out by hand means writing the
+same "is this present, is it the right type, is it in range" checks in every
+action. Pyxle can do that for you: annotate a parameter with a
+[Pydantic](https://docs.pydantic.dev/) model and the dispatcher parses, coerces,
+and validates the request body **before** your action runs. Your function only
+executes with a valid, fully-typed model.
+
+```python
+from pydantic import BaseModel, EmailStr, Field
+
+class CreatePost(BaseModel):
+    title: str = Field(min_length=1, max_length=120)
+    content: str
+    tags: list[str] = []
+
+@action
+async def create_post(request, body: CreatePost):
+    # `body` is a validated CreatePost instance — no manual checks needed.
+    post = await db.insert_post(title=body.title, content=body.content)
+    return {"id": post.id, "title": post.title}
+```
+
+The body parameter:
+
+- Is the first parameter (after `request`) annotated with a Pydantic `BaseModel`
+  subclass. The name is up to you (`body`, `payload`, `form`, …).
+- May be `Optional[Model]` / `Model | None` for an optional body.
+- Is parsed from the JSON request body. `<Form>` submissions (which post form
+  fields) validate the same way.
+
+Pydantic is an **optional dependency**. Install it with the extra:
+
+```bash
+pip install "pyxle-framework[pydantic]"
+```
+
+If an action declares a Pydantic body but Pydantic isn't installed, the request
+fails with a clear `500` (and the dev server logs why) — actions without a model
+parameter are unaffected.
+
+### What the client receives on a validation failure
+
+When the body fails validation, the action is **not** called. The client gets a
+`422` response with a top-level `fields` map — field path to a list of messages:
+
+```json
+{
+  "ok": false,
+  "error": "Validation failed",
+  "fields": {
+    "title": ["String should have at least 1 character"],
+    "tags.0": ["Input should be a valid string"]
+  }
+}
+```
+
+Field paths are dotted for nested models (`address.zip`) and indexed for list
+items (`tags.0`).
+
+### Showing field errors in the UI
+
+Both `useAction` and `<Form>` surface the `fields` map so you can render messages
+next to each input. With `useAction`, read `result.fields` (or the reactive
+`submit.fields`):
+
+```jsx
+import { useAction } from 'pyxle/client';
+
+export default function NewPostPage() {
+  const submit = useAction('create_post');
+
+  async function onSubmit(event) {
+    event.preventDefault();
+    const form = new FormData(event.target);
+    const result = await submit(Object.fromEntries(form));
+    if (result.ok) {
+      // navigate, toast, etc.
+    }
+  }
+
+  return (
+    <form onSubmit={onSubmit}>
+      <input name="title" />
+      {submit.fields?.title && <p className="error">{submit.fields.title[0]}</p>}
+      <textarea name="content" />
+      <button disabled={submit.pending}>Create</button>
+    </form>
+  );
+}
+```
+
+With `<Form>`, the field map is the second argument to `onError`:
+
+```jsx
+<Form
+  action="create_post"
+  onError={(message, fields) => setFieldErrors(fields ?? {})}
+>
+  {/* inputs */}
+</Form>
+```
+
+### Raising validation errors yourself
+
+For checks Pydantic can't express — uniqueness, cross-field rules, anything that
+needs a database — raise `ValidationActionError`. It produces the same `422`
+shape, so the client handles model-level and hand-rolled errors identically:
+
+```python
+from pyxle.runtime import ValidationActionError
+
+@action
+async def register(request, body: Signup):
+    if await db.email_taken(body.email):
+        raise ValidationActionError(fields={"email": ["That email is already registered."]})
+    ...
+```
+
+`ValidationActionError` is auto-imported alongside `ActionError` in any `.pyxl`
+file that declares an `@action`. See the [Runtime API reference](../reference/runtime-api.md#validationactionerror).
+
+### Exporting an OpenAPI schema
+
+Because the body models are real Pydantic models, Pyxle can generate an
+[OpenAPI 3.1](https://spec.openapis.org/oas/v3.1.0) document describing every
+action's request body straight from your code:
+
+```bash
+pyxle openapi --out openapi.json
+```
+
+See the [CLI reference](../reference/cli.md#pyxle-openapi) for options.
 
 ## Invalidating client caches after a mutation
 

@@ -230,3 +230,29 @@ pyxle routes [directory] [options]
 ```
 
 Use `--json` for machine-readable output.
+
+## `pyxle openapi`
+
+Generate an [OpenAPI 3.1](https://spec.openapis.org/oas/v3.1.0) document from your `@action` request models. For every action that declares a [Pydantic body parameter](../core-concepts/server-actions.md#validating-request-bodies-with-pydantic), Pyxle emits a `POST` operation with the model's JSON Schema as the request body and a structured `422` validation response; actions without a model get a permissive object body.
+
+```bash
+pyxle openapi [directory] [options]
+```
+
+| Argument / Flag | Default | Description |
+|----------------|---------|-------------|
+| `directory` | `.` | Project directory |
+| `--config` | -- | Path to `pyxle.config.json` |
+| `--out` / `-o` | -- | Write the schema to this file (default: stdout) |
+| `--title` | `Pyxle API` | OpenAPI `info.title` |
+| `--api-version` | `0.1.0` | OpenAPI `info.version` |
+
+```bash
+# Print to stdout
+pyxle openapi
+
+# Write a file with custom metadata
+pyxle openapi --out openapi.json --title "Acme API" --api-version 2.0.0
+```
+
+The schema is derived from runtime introspection of the compiled action modules, so it always matches what the dispatcher actually validates. Requires the `[pydantic]` extra (`pip install "pyxle-framework[pydantic]"`); the command exits with an error if Pydantic isn't installed or a page module can't be imported.

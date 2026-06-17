@@ -49,9 +49,11 @@ def write_client_bootstrap_files(settings: DevServerSettings) -> None:
         "pyxle/image.d.ts": _render_image_component_types(),
         "pyxle/head.d.ts": _render_head_component_types(),
         "pyxle/client-only.d.ts": _render_client_only_component_types(),
+        "pyxle/use-action.d.ts": _render_use_action_component_types(),
         "pyxle/use-pathname.d.ts": _render_use_pathname_component_types(),
         "pyxle/use-auth.d.ts": _render_use_auth_component_types(),
         "pyxle/use-websocket.d.ts": _render_use_websocket_component_types(),
+        "pyxle/form.d.ts": _render_form_component_types(),
     }
 
     for relative_path, contents in files.items():
@@ -2863,6 +2865,7 @@ def _render_use_action_component() -> str:
               const { pagePath, onMutate } = options;
               const [pending, setPending] = useState(false);
               const [error, setError] = useState(null);
+              const [fields, setFields] = useState(null);
               const [data, setData] = useState(null);
               const abortRef = useRef(null);
 
@@ -2875,6 +2878,7 @@ def _render_use_action_component() -> str:
                   abortRef.current = controller;
 
                   setError(null);
+                  setFields(null);
                   setPending(true);
 
                   if (typeof onMutate === 'function') {
@@ -2903,20 +2907,22 @@ def _render_use_action_component() -> str:
 
                     if (!response.ok || json.ok === false) {
                       const message = json.error ?? `Action failed with status ${response.status}`;
+                      const fieldErrors = json.fields ?? null;
                       setError(message);
-                      return { ok: false, error: message, data: json.data ?? null };
+                      setFields(fieldErrors);
+                      return { ok: false, error: message, fields: fieldErrors, data: json.data ?? null };
                     }
 
-                    const { ok: _ok, error: _err, ...rest } = json;
+                    const { ok: _ok, error: _err, fields: _fields, ...rest } = json;
                     setData(rest);
                     return { ok: true, ...rest };
                   } catch (err) {
                     if (err.name === 'AbortError') {
-                      return { ok: false, error: 'Request aborted' };
+                      return { ok: false, error: 'Request aborted', fields: null };
                     }
                     const message = err.message ?? 'Network error';
                     setError(message);
-                    return { ok: false, error: message };
+                    return { ok: false, error: message, fields: null };
                   } finally {
                     if (abortRef.current === controller) {
                       setPending(false);
@@ -2929,10 +2935,82 @@ def _render_use_action_component() -> str:
 
               execute.pending = pending;
               execute.error = error;
+              execute.fields = fields;
               execute.data = data;
 
               return execute;
             }
+            """
+        ).strip()
+        + "\n"
+    )
+
+
+def _render_use_action_component_types() -> str:
+    return (
+        dedent(
+            """
+            /** Per-field validation errors: field path -> messages. */
+            export type ActionFieldErrors = Record<string, string[]>;
+
+            export interface UseActionOptions {
+              /**
+               * The page the action belongs to (e.g. ``"/todos"``). Defaults to
+               * the current request path, so you rarely need to set it.
+               */
+              pagePath?: string;
+              /** Called with the payload the moment a submit starts (optimistic UI). */
+              onMutate?(payload: unknown): void;
+            }
+
+            /** The resolved result of invoking an action. */
+            export type ActionResult<TData = Record<string, unknown>> =
+              | ({ ok: true } & TData)
+              | {
+                  ok: false;
+                  /** Human-readable error message. */
+                  error: string;
+                  /**
+                   * Field-level validation errors when the server rejected the
+                   * request body (HTTP 422), or ``null`` for any other failure.
+                   */
+                  fields: ActionFieldErrors | null;
+                  /** Structured error payload, when the action attached one. */
+                  data?: unknown;
+                };
+
+            /**
+             * A callable action invoker. Call it with the request body to run
+             * the action; reactive status is exposed as properties on the
+             * function itself.
+             */
+            export interface ActionInvoker<TData = Record<string, unknown>> {
+              (payload?: unknown): Promise<ActionResult<TData>>;
+              /** True while a request is in flight. */
+              pending: boolean;
+              /** The last error message, or null. */
+              error: string | null;
+              /**
+               * Field-level validation errors from the last failed submit, or
+               * null. Cleared at the start of every new submit.
+               */
+              fields: ActionFieldErrors | null;
+              /** The last successful result payload, or null. */
+              data: TData | null;
+            }
+
+            /**
+             * Bind a typed invoker to a named ``@action`` on the current page.
+             *
+             * The returned value is a function you call with the request body;
+             * it also carries ``pending``, ``error``, ``fields`` and ``data``
+             * so a form can render inline validation messages without extra
+             * state.
+             */
+            export declare function useAction<TData = Record<string, unknown>>(
+              actionName: string,
+              options?: UseActionOptions
+            ): ActionInvoker<TData>;
             """
         ).strip()
         + "\n"
@@ -3075,14 +3153,15 @@ def _render_form_component() -> str:
 
                     if (!response.ok || json.ok === false) {
                       const message = json.error ?? `Action failed with status ${response.status}`;
+                      const fieldErrors = json.fields ?? null;
                       setError(message);
                       if (typeof onError === 'function') {
-                        onError(message);
+                        onError(message, fieldErrors);
                       }
                       return;
                     }
 
-                    const { ok: _ok, error: _err, ...data } = json;
+                    const { ok: _ok, error: _err, fields: _fields, ...data } = json;
 
                     if (resetOnSuccess && form) {
                       form.reset();
@@ -3095,7 +3174,7 @@ def _render_form_component() -> str:
                     const message = err.message ?? 'Network error';
                     setError(message);
                     if (typeof onError === 'function') {
-                      onError(message);
+                      onError(message, null);
                     }
                   } finally {
                     setPending(false);
@@ -3124,6 +3203,47 @@ def _render_form_component() -> str:
                 </form>
               );
             }
+            """
+        ).strip()
+        + "\n"
+    )
+
+
+def _render_form_component_types() -> str:
+    return (
+        dedent(
+            """
+            import type * as React from 'react';
+            import type { ActionFieldErrors } from './use-action';
+
+            export interface FormProps
+              extends Omit<React.FormHTMLAttributes<HTMLFormElement>, 'action' | 'onError' | 'onSubmit'> {
+              /** Name of the ``@action`` to POST to. */
+              action: string;
+              /**
+               * The page the action belongs to (e.g. ``"/todos"``). Defaults to
+               * the current request path, so you rarely need to set it.
+               */
+              pagePath?: string;
+              /** Called with the action's result payload after a successful submit. */
+              onSuccess?(data: Record<string, unknown>): void;
+              /**
+               * Called when the submit fails. Receives the error message and, for
+               * a 422 validation failure, the per-field errors (else ``null``).
+               */
+              onError?(message: string, fields: ActionFieldErrors | null): void;
+              /** Reset the form's fields after a successful submit. Default true. */
+              resetOnSuccess?: boolean;
+              children?: React.ReactNode;
+            }
+
+            /**
+             * A progressively-enhanced ``<form>`` that POSTs to a Pyxle
+             * ``@action``. Works without JavaScript (native POST) and upgrades
+             * to a fetch submission with CSRF and cache invalidation when
+             * hydrated.
+             */
+            export declare function Form(props: FormProps): React.ReactElement;
             """
         ).strip()
         + "\n"
@@ -3716,6 +3836,10 @@ __all__ = [
     "_render_slot_runtime_types",
     "_render_tsconfig",
     "_render_vite_config",
+    "_render_use_action_component",
+    "_render_use_action_component_types",
+    "_render_form_component",
+    "_render_form_component_types",
     "_render_use_pathname_component",
     "_render_use_pathname_component_types",
     "_render_use_auth_component",

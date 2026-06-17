@@ -132,12 +132,31 @@ import { Form } from 'pyxle/client';
 </Form>
 ```
 
+**Optional — validate the body with Pydantic.** Annotate a parameter with a Pydantic model and
+Pyxle validates the request body before your action runs (install `pyxle-framework[pydantic]`):
+
+```python
+from pydantic import BaseModel
+
+class NewPost(BaseModel):
+    title: str
+
+@action
+async def create_post(request, body: NewPost):     # body is a validated NewPost
+    return {"id": 1, "title": body.title}
+```
+
+On failure the client gets `{ ok: false, error, fields }` (HTTP 422). Read `res.fields` (or
+`create.fields`) — `{ [field]: string[] }` — to show messages per input; `<Form>` passes them as
+`onError(msg, fields)`. For hand-rolled checks raise `ValidationActionError(fields={...})` (also
+auto-injected). Export an OpenAPI schema with `pyxle openapi`.
+
 If a mutation should refresh data shown elsewhere, re-run the current loader with `refresh()`
 (from `pyxle/client`); see the docs for invalidating other routes.
 
 ## The client toolkit — `import { … } from 'pyxle/client'`
 
-- `useAction(name)` — bind to an `@action`; returns a callable with `.pending`, `.error`, `.data`.
+- `useAction(name)` — bind to an `@action`; returns a callable with `.pending`, `.error`, `.fields`, `.data`.
 - `<Form action="name" onSuccess onError>` — submit named inputs to an `@action`.
 - `<Head>` — set per-page `<title>`/`<meta>`/`<link>` (deduped + merged with layouts).
 - `<Link href="/path">` — client-side navigation; `navigate('/path')` to do it imperatively.

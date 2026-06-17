@@ -1183,6 +1183,86 @@ def routes(
     logger.success(f"{total} route(s) found")
 
 
+@app.command(help="Export an OpenAPI 3.1 schema generated from @action request models.")
+def openapi(
+    directory: Path = typer.Argument(
+        Path("."),
+        help="Project root containing pages/ directory.",
+        show_default=True,
+    ),
+    config_file: Optional[Path] = typer.Option(
+        None, "--config", help="Path to a pyxle.config.json file."
+    ),
+    out: Optional[Path] = typer.Option(
+        None, "--out", "-o", help="Write the schema to this file (default: stdout)."
+    ),
+    title: str = typer.Option("Pyxle API", "--title", help="OpenAPI info.title."),
+    api_version: str = typer.Option(
+        "0.1.0", "--api-version", help="OpenAPI info.version."
+    ),
+) -> None:
+    """Generate an OpenAPI document from every ``@action``'s Pydantic body model."""
+    logger = get_logger()
+    project_root = directory.expanduser().resolve()
+
+    global DevServerSettings
+    if DevServerSettings is None:  # noqa: PLC0206 - module-level caching
+        from pyxle.devserver import DevServerSettings as _DevServerSettings
+
+        DevServerSettings = _DevServerSettings
+
+    if not project_root.exists() or not project_root.is_dir():
+        logger.error(f"Project directory '{project_root}' does not exist.")
+        raise typer.Exit(code=1)
+
+    try:
+        file_config: PyxleConfig = load_config(project_root, config_path=config_file)
+    except ConfigError as exc:
+        logger.error(str(exc))
+        raise typer.Exit(code=1) from exc
+
+    try:
+        settings = DevServerSettings.from_project_root(  # type: ignore[union-attr]
+            project_root, **file_config.to_devserver_kwargs()
+        )
+    except Exception as exc:
+        logger.error(f"Failed to create settings: {exc}")
+        raise typer.Exit(code=1) from exc
+
+    from pyxle.devserver.builder import build_once
+
+    try:
+        build_once(settings)
+    except Exception as exc:
+        logger.error(f"Build failed: {exc}")
+        raise typer.Exit(code=1) from exc
+
+    from pyxle.devserver.openapi import build_openapi_document
+    from pyxle.devserver.validation import PydanticNotInstalledError
+
+    try:
+        result = build_openapi_document(
+            settings, title=title, version=api_version
+        )
+    except PydanticNotInstalledError as exc:
+        logger.error(str(exc))
+        raise typer.Exit(code=1) from exc
+
+    if result.import_errors:
+        for problem in result.import_errors:
+            logger.error(f"Could not import page module: {problem}")
+        raise typer.Exit(code=1)
+
+    payload = json.dumps(result.document, indent=2)
+    if out is not None:
+        out_path = out.expanduser()
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(payload + "\n", encoding="utf-8")
+        logger.success(f"Wrote OpenAPI schema to {out_path}")
+    else:
+        typer.echo(payload)
+
+
 @app.command(name="compile", help="Compile a single .pyxl file (developer utility).", hidden=True)
 def compile_command(
     source: Path = typer.Argument(..., help="Path to the .pyxl file to compile."),

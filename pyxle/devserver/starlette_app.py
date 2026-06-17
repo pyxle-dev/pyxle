@@ -553,7 +553,12 @@ def _import_module(
 
     try:
         spec.loader.exec_module(module)
-    except Exception as exc:  # pragma: no cover - bubbled up for clarity
+    except Exception as exc:
+        # Don't leave a half-initialised module behind: a later debug=False
+        # import of the same key would return the broken partial silently
+        # instead of re-raising (and re-imports during debug expect a clean
+        # slate). Match importlib's own failure semantics.
+        sys.modules.pop(module_key, None)
         raise ApiRouteError(f"Failed to import API module {module_key}: {exc}") from exc
 
     return module
@@ -1171,7 +1176,12 @@ async def _dispatch_action(
 ) -> JSONResponse:
     """Shared dispatch logic for both specific and catch-all action handlers."""
     from pyxle.devserver._security import SAFE_IDENTIFIER_RE
-    from pyxle.runtime import ActionError
+    from pyxle.devserver.validation import (
+        PydanticNotInstalledError,
+        get_cached_body_model,
+        validate_body,
+    )
+    from pyxle.runtime import ActionError, ValidationActionError
 
     # L-9: reject obviously invalid action names early.
     if not SAFE_IDENTIFIER_RE.match(action_name):
@@ -1221,12 +1231,34 @@ async def _dispatch_action(
     # take the original Starlette path unchanged.
     _maybe_install_form_body_shim(request)
 
+    # When the action type-hints a Pydantic model as its body parameter, parse
+    # and validate the request body into the model and inject it; otherwise the
+    # action is called with just ``request`` (unchanged). Introspection is
+    # cached per function object.
     try:
-        result = await action_fn(request)
+        resolved = get_cached_body_model(action_fn)
+    except PydanticNotInstalledError as exc:
+        error_msg = str(exc) if debug else "Internal server error"
+        return JSONResponse({"ok": False, "error": error_msg}, status_code=500)
+
+    try:
+        if resolved is None:
+            result = await action_fn(request)
+        else:
+            try:
+                body_payload = await request.json()
+            except Exception:
+                raise ValidationActionError(
+                    fields={"__root__": ["Request body must be valid JSON."]}
+                ) from None
+            body = validate_body(resolved.model, body_payload)
+            result = await action_fn(request, **{resolved.param_name: body})
     except ActionError as exc:
         payload: dict[str, object] = {"ok": False, "error": exc.message}
         if exc.data:
             payload["data"] = exc.data
+        if exc.fields:
+            payload["fields"] = exc.fields
         return JSONResponse(payload, status_code=exc.status_code)
     except Exception as exc:
         error_msg = str(exc) if debug else "Internal server error"

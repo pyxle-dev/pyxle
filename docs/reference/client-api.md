@@ -137,7 +137,7 @@ Progressive-enhancement form component for calling server actions.
 | `action` | `string` | (required) | Name of the `@action` function |
 | `pagePath` | `string` | current page | Page where the action is defined |
 | `onSuccess` | `(data) => void` | -- | Called with response data on success |
-| `onError` | `(message) => void` | -- | Called with error message on failure |
+| `onError` | `(message, fields) => void` | -- | Called on failure with the message and, for a `422` validation error, the per-field errors (`{ [field]: string[] }`) — otherwise `null` |
 | `resetOnSuccess` | `boolean` | `true` | Reset form fields after success |
 | `children` | `ReactNode` | -- | Form contents |
 
@@ -145,6 +145,7 @@ Progressive-enhancement form component for calling server actions.
 - With JavaScript: intercepts submit, serialises form data to JSON, POSTs to the action endpoint
 - Without JavaScript: falls back to a standard HTML form POST
 - Displays inline error messages on failure
+- For an action with a [Pydantic body model](../core-concepts/server-actions.md#validating-request-bodies-with-pydantic), a `422` passes the field map to `onError` so you can render messages next to inputs
 - Automatically resolves the action endpoint URL
 - All additional props are forwarded to the `<form>` element
 
@@ -209,6 +210,7 @@ async function handleDelete(id) {
 |----------|------|-------------|
 | `.pending` | `boolean` | `true` while request is in flight |
 | `.error` | `string \| null` | Error message on failure |
+| `.fields` | `Record<string, string[]> \| null` | Per-field validation errors from the last failed submit (a `422`), or `null`. Cleared when a new request starts |
 | `.data` | `object \| null` | Last successful response data |
 
 **Calling the returned function:**
@@ -216,14 +218,16 @@ async function handleDelete(id) {
 ```jsx
 const result = await actionFn(payload);
 // result.ok: boolean
-// result.error?: string
-// result.*: response data fields
+// result.error?: string          (when !ok)
+// result.fields?: Record<string, string[]> | null   (when !ok — per-field 422 errors)
+// result.*: response data fields  (when ok)
 ```
 
 **Behaviour:**
 - New calls abort previous in-flight requests
 - State resets on each new call
 - `onMutate` fires synchronously before the fetch (use for optimistic UI)
+- For an action with a [Pydantic body model](../core-concepts/server-actions.md#validating-request-bodies-with-pydantic), a `422` populates `.fields` / `result.fields` with `{ [fieldPath]: string[] }`
 
 ---
 

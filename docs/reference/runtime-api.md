@@ -54,6 +54,23 @@ async def create_item(request):
 - Accessible via `POST /api/__actions/{page_path}/{action_name}`
 - Protected by CSRF middleware by default
 
+**Validated body parameter (optional):**
+
+Annotate a parameter (after `request`) with a [Pydantic](https://docs.pydantic.dev/) `BaseModel` and Pyxle parses and validates the request body before the action runs, passing the typed model in:
+
+```python
+from pydantic import BaseModel
+
+class NewItem(BaseModel):
+    name: str
+
+@action
+async def create_item(request, body: NewItem):
+    return {"id": 1, "name": body.name}
+```
+
+Requires the `[pydantic]` extra (`pip install "pyxle-framework[pydantic]"`). On a validation failure the action is not called and the client gets a `422` with a `fields` map. See [Validating request bodies](../core-concepts/server-actions.md#validating-request-bodies-with-pydantic) for the full pattern and the [`pyxle openapi`](cli.md#pyxle-openapi) command.
+
 **Client response format:**
 
 ```json
@@ -62,6 +79,9 @@ async def create_item(request):
 
 // Error (from ActionError)
 { "ok": false, "error": "Error message" }
+
+// Validation error (422, from a Pydantic body or ValidationActionError)
+{ "ok": false, "error": "Validation failed", "fields": { "name": ["Field required"] } }
 ```
 
 ## `LoaderError`
@@ -111,7 +131,7 @@ async def update_item(request):
 **Constructor:**
 
 ```python
-ActionError(message: str, status_code: int = 400, data: dict | None = None)
+ActionError(message: str, status_code: int = 400, data: dict | None = None, *, fields: dict[str, list[str]] | None = None)
 ```
 
 | Parameter | Type | Default | Description |
@@ -119,6 +139,7 @@ ActionError(message: str, status_code: int = 400, data: dict | None = None)
 | `message` | `str` | (required) | Error message sent to the client |
 | `status_code` | `int` | `400` | HTTP response status code |
 | `data` | `dict \| None` | `None` | Additional JSON-serializable payload |
+| `fields` | `dict[str, list[str]] \| None` | `None` | Per-field validation messages (field path → messages), surfaced to the client as `fields`. Keyword-only |
 
 **Properties:**
 
@@ -127,6 +148,38 @@ ActionError(message: str, status_code: int = 400, data: dict | None = None)
 | `.message` | `str` | The error message |
 | `.status_code` | `int` | HTTP status code |
 | `.data` | `dict` | Additional data (empty dict if None was passed) |
+| `.fields` | `dict[str, list[str]]` | Per-field messages (empty dict if None was passed) |
+
+## `ValidationActionError`
+
+A subclass of [`ActionError`](#actionerror) for request-body validation failures. Defaults to HTTP `422` and always carries `fields`. Pyxle raises it automatically when a Pydantic-typed `@action` body fails validation; raise it yourself for checks Pydantic can't express (uniqueness, cross-field rules):
+
+```python
+from pyxle.runtime import ValidationActionError
+
+@action
+async def register(request, body: Signup):
+    if await db.email_taken(body.email):
+        raise ValidationActionError(fields={"email": ["That email is already registered."]})
+    ...
+```
+
+> **Auto-imported.** Like `ActionError`, any `.pyxl` file that declares at least one `@action` gets `ValidationActionError` injected by the compiler. A user-defined class or existing import takes precedence.
+
+**Constructor:**
+
+```python
+ValidationActionError(message: str = "Validation failed", *, fields: dict[str, list[str]], status_code: int = 422, data: dict | None = None)
+```
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `message` | `str` | `"Validation failed"` | Top-level error message |
+| `fields` | `dict[str, list[str]]` | (required) | Field path → list of messages. Keyword-only |
+| `status_code` | `int` | `422` | HTTP response status code |
+| `data` | `dict \| None` | `None` | Additional JSON-serializable payload |
+
+The client receives `{ "ok": false, "error": ..., "fields": { ... } }`. The `useAction` hook exposes the map as `result.fields`; `<Form>` passes it as the second argument to `onError`. See [Validating request bodies](../core-concepts/server-actions.md#validating-request-bodies-with-pydantic).
 
 ## `invalidate_routes(response, *urls)`
 
@@ -263,7 +316,7 @@ The callable receives the loader's return value. Must return a string or list of
 While the compiler auto-injects `@server` and `@action`, you can also import explicitly:
 
 ```python
-from pyxle.runtime import server, action, LoaderError, ActionError
+from pyxle.runtime import server, action, LoaderError, ActionError, ValidationActionError
 ```
 
 This is useful for type checking and IDE support.

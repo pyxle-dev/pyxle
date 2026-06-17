@@ -16,6 +16,8 @@ from pyxle.devserver.client_files import (
     _render_slot_runtime,
     _render_slot_runtime_types,
     _render_tsconfig,
+    _render_use_action_component,
+    _render_use_action_component_types,
     _render_use_auth_component,
     _render_use_auth_component_types,
     _render_use_pathname_component,
@@ -591,6 +593,36 @@ def test_resolve_action_url_reads_ssr_pathname_global() -> None:
         # The window-branch still comes first — we only hit the SSR branch
         # when there's no window (true SSR path).
         assert "typeof window !== 'undefined'" in source
+
+
+def test_use_action_surfaces_validation_field_errors() -> None:
+    """useAction must expose the server's per-field validation errors so a
+    form can render messages next to each input. The dispatcher returns a
+    top-level ``fields`` map (field path -> messages) on a 422; the hook
+    mirrors it into ``execute.fields`` and the resolved result object, and
+    clears it at the start of every new request."""
+    source = _render_use_action_component()
+
+    # Dedicated state for field errors, cleared on each new submit.
+    assert "const [fields, setFields] = useState(null);" in source
+    assert "setFields(null);" in source
+    # The error branch reads the server's ``fields`` key and surfaces it.
+    assert "json.fields ?? null" in source
+    assert "setFields(fieldErrors);" in source
+    # ``fields`` is attached to the callable and present in the result object.
+    assert "execute.fields = fields;" in source
+    assert "fields: fieldErrors" in source
+    # The framework's reserved key must not leak into the success ``data``.
+    assert "fields: _fields" in source
+
+
+def test_use_action_types_declare_fields() -> None:
+    """The .d.ts for useAction must declare the ``fields`` surface so editors
+    and typecheck see it."""
+    types = _render_use_action_component_types()
+    assert "fields" in types
+    assert "ActionFieldErrors" in types
+    assert "ActionInvoker" in types
 
 
 def test_csrf_runtime_honours_configured_names() -> None:
