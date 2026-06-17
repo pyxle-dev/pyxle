@@ -1,8 +1,8 @@
 # pyxle-db
 
-`pyxle-db` is Pyxle's official database plugin: one explicit-SQL API over **SQLite, PostgreSQL, and MySQL**, with portable placeholders, a uniform `Row` type, checksum-tracked migrations, and a startup-managed connection your loaders and actions just use. It is deliberately *not* an ORM — you write SQL, it makes that SQL portable.
+`pyxle-db` is Pyxle's official database plugin over **SQLite, PostgreSQL, and MySQL**. It offers two first-class paths: an **explicit-SQL** API (portable placeholders, a uniform `Row` type, checksum-tracked migrations — you write SQL, it makes that SQL portable) and an optional **SQLAlchemy ORM** path. Either way, every loader and action gets a request-scoped database handle, and writes commit or roll back automatically.
 
-> **Version 0.2.0.** SQLite needs nothing beyond the package; PostgreSQL and MySQL ship as extras. Every backend-specific behaviour documented here is enforced by test suites that run against real PostgreSQL 16 and MySQL 8 servers in CI.
+> **Version 0.3.0.** SQLite needs nothing beyond the package; PostgreSQL, MySQL, and the SQLAlchemy ORM ship as extras (the base install stays SQLAlchemy-free). Every backend-specific behaviour documented here is enforced by test suites that run against real PostgreSQL 16 and MySQL 8 servers in CI.
 
 ## Install
 
@@ -139,6 +139,53 @@ async with db.transaction() as tx:
 ```
 
 The transaction object carries the full query surface (`execute`, `executemany`, `fetchone`, `fetchall`, `get`). Two escape hatches are SQLite-only and raise `UnsupportedOperationError` on server backends: `db.sync_transaction()` and `db.close()` — prefer `await db.aclose()`, which works everywhere.
+
+## Request-scoped access and auto-transactions
+
+With the plugin installed, every loader and action gets a lazy database handle on `request.state.db` — no import, no service lookup. A request that never queries opens no connection.
+
+```python
+@server
+async def load(request):
+    rows = await request.state.db.fetchall("SELECT * FROM posts ORDER BY id DESC")
+    return {"posts": rows}
+
+@action
+async def create_post(request):
+    await request.state.db.execute("INSERT INTO posts (title) VALUES (?)", (title,))
+    return {"ok": True}   # committed automatically on success
+```
+
+On an unsafe method (`POST`/`PUT`/`PATCH`/`DELETE`) the request's writes run inside **one transaction that commits when the action succeeds and rolls back when it fails** — where "fails" means the action raised `ActionError` (or any exception), which Pyxle turns into a non-2xx response. You never call `commit()`/`rollback()`, and a failed action never leaves a partial write behind. `GET`/`HEAD` run read-only.
+
+Opt out per action with `@no_auto_transaction` (then manage `async with request.state.db.transaction()` yourself), or app-wide with `"autoTransactions": false`.
+
+## The ORM path (SQLAlchemy)
+
+Prefer an ORM? Install `pip install 'pyxle-db[sqlalchemy]'` and set `"orm": {"metadata": "app.models:Base"}` in the plugin settings. Models subclass `pyxle_db.orm.Base`; loaders and actions get a request-scoped `AsyncSession` on `request.state.session` under the same auto-transaction rules:
+
+```python
+from sqlalchemy import select
+
+@server
+async def load(request):
+    notes = (await request.state.session.scalars(select(Note))).all()
+    return {"notes": [n.body for n in notes]}
+```
+
+SQLAlchemy errors surface as the **same** pyxle-db error types as the explicit-SQL path. The base install stays SQLAlchemy-free.
+
+## The `pyxle-db` CLI
+
+```bash
+pyxle-db migrate              # apply pending checksum migrations
+pyxle-db status               # applied vs pending
+pyxle-db alembic-init         # scaffold Alembic for the ORM path
+pyxle-db revision -m "…" --autogenerate
+pyxle-db upgrade head         # / downgrade / current / history
+```
+
+The CLI reads the same `pyxle.config.json` + `.env` the app uses. Pick one migration tool per app: the checksum migrator for explicit-SQL, Alembic for the ORM.
 
 ## Datetimes
 
