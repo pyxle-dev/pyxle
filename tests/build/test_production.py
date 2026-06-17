@@ -105,6 +105,23 @@ def test_resolve_pool_size(requested: int, expected: int) -> None:
     assert _resolve_pool_size(requested) == expected
 
 
+@pytest.mark.parametrize(
+    "requested,expected",
+    [(1, 1), (4, 4), (0, max(1, os.cpu_count() or 1))],
+)
+def test_resolve_server_workers(requested: int, expected: int) -> None:
+    from pyxle.build.production import resolve_server_workers
+
+    assert resolve_server_workers(requested) == expected
+
+
+def test_resolve_server_workers_clamps_to_one_when_no_cores(monkeypatch) -> None:
+    from pyxle.build import production
+
+    monkeypatch.setattr(production.os, "cpu_count", lambda: None)
+    assert production.resolve_server_workers(0) == 1
+
+
 # ── build_settings ───────────────────────────────────────────────────────────
 
 

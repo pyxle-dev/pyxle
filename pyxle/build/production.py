@@ -160,6 +160,17 @@ def _resolve_pool_size(ssr_workers: int) -> int:
     return ssr_workers
 
 
+def resolve_server_workers(requested: int) -> int:
+    """Effective number of server worker processes.
+
+    ``0`` auto-detects from CPU cores (one worker per core, at least one); any
+    other value is used as-is (clamped to a minimum of one).
+    """
+    if requested == 0:
+        return max(1, os.cpu_count() or 1)
+    return max(1, requested)
+
+
 def _resolve_static_dirs(
     settings: DevServerSettings,
     resolved_dist: Path,

@@ -619,11 +619,11 @@ def serve(
         1,
         "--workers",
         "-w",
-        help="Number of server worker processes, one per CPU core. >1 serves the "
-        "build across that many uvicorn worker processes (multi-core); --ssr-workers "
-        "then applies per worker. Default 1 = single process.",
+        help="Number of server worker processes (multi-core). >1 serves the build "
+        "across that many uvicorn worker processes; --ssr-workers then applies per "
+        "worker. 0 = auto-detect from CPU cores. Default 1 = single process.",
         show_default=True,
-        min=1,
+        min=0,
     ),
 ) -> None:
     """Entry-point for the ``pyxle serve`` command."""
@@ -686,6 +686,14 @@ def serve(
             raise typer.Exit(code=1) from exc
     else:
         logger.warning("Skipping production build; using existing dist artifacts.")
+
+    # Resolve an auto-detect request (--workers 0) to a concrete core count.
+    from pyxle.build.production import resolve_server_workers  # noqa: PLC0415
+
+    requested_workers = workers
+    workers = resolve_server_workers(workers)
+    if requested_workers == 0:
+        logger.info(f"Auto-detected {workers} server worker(s) from CPU cores")
 
     # Multi-process serving: hand uvicorn an importable app factory and let it
     # supervise ``workers`` worker subprocesses. Each rebuilds its own app (and

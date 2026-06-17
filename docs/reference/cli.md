@@ -139,7 +139,7 @@ pyxle serve [directory] [options]
 | `--config` | -- | Path to `pyxle.config.json` |
 | `--serve-static` / `--no-serve-static` | `true` | Serve static assets directly from Pyxle |
 | `--ssr-workers` | `1` | Number of persistent SSR worker processes, per server worker (`0` = auto-size to CPU cores, capped at 4) |
-| `--workers` / `-w` | `1` | Number of server worker processes (one per CPU core); `>1` enables multi-core serving |
+| `--workers` / `-w` | `1` | Number of server worker processes (one per CPU core); `>1` enables multi-core serving; `0` auto-detects from CPU cores |
 
 **Examples:**
 
