@@ -1077,6 +1077,10 @@ class _JsxMetadata:
     image_declarations: tuple[dict, ...]
     head_jsx_blocks: tuple[str, ...]
     uses_suspense: bool
+    #: ``(message, jsx_relative_line)`` when the extractor reported TypeScript
+    #: syntax in the client block, else ``None``. Surfaced by ``parse_text`` as a
+    #: source-located diagnostic once the Python section is confirmed clean.
+    ts_violation: tuple[str, int | None] | None = None
 
 
 # Element names that opt a page into streaming SSR. ``React.Suspense`` is the
@@ -1100,6 +1104,15 @@ def _detect_jsx_metadata(jsx_code: str) -> _JsxMetadata:
         target_components={"Script", "Image", "Head", *_SUSPENSE_ELEMENT_NAMES},
     )
     if result.error:
+        # TypeScript syntax in the client block is a real, surfaceable user
+        # error (Babel accepts it but esbuild later fails opaquely). Carry it
+        # out so ``parse_text`` can emit a source-located diagnostic. Every
+        # other extractor failure (unavailable toolchain, genuine JSX syntax
+        # error already surfaced elsewhere) keeps degrading silently here.
+        if result.error_code == "ts_in_client_block":
+            return _JsxMetadata(
+                (), (), (), False, ts_violation=(result.error, result.error_line)
+            )
         return _JsxMetadata((), (), (), False)
 
     components = result.components
@@ -1282,6 +1295,22 @@ class PyxParser:
         has_python_errors = any(
             d.section == "python" for d in collector.diagnostics
         )
+        # TypeScript syntax in the client block is surfaced on every compile
+        # (not just the opt-in ``validate_jsx`` path) because Babel accepts it
+        # but esbuild later fails opaquely — catching it here gives a clear,
+        # source-located error instead. Gated on a clean Python section so a
+        # mis-split (broken Python absorbed into ``jsx_code``) can't be misread
+        # as a type annotation.
+        if jsx_metadata.ts_violation is not None and not has_python_errors:
+            ts_message, ts_jsx_line = jsx_metadata.ts_violation
+            if (
+                ts_jsx_line is not None
+                and 0 <= ts_jsx_line - 1 < len(jsx_line_numbers)
+            ):
+                mapped_line: int | None = jsx_line_numbers[ts_jsx_line - 1]
+            else:
+                mapped_line = jsx_line_numbers[0] if jsx_line_numbers else None
+            collector.emit(ts_message, mapped_line, section="jsx")
         if validate_jsx and jsx_code.strip() and not has_python_errors:
             _validate_jsx_syntax(
                 jsx_code, jsx_line_numbers, collector=collector

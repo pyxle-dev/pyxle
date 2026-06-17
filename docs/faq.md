@@ -40,7 +40,7 @@ Node.js 18 or later. Node.js 20+ is recommended.
 
 ### Can I use TypeScript in `.pyxl` files?
 
-The JSX section supports JSX syntax. TypeScript type annotations are not directly supported in `.pyxl` files, but you can run `pyxle typecheck` to type-check the compiled JSX output if you have TypeScript installed.
+The JSX section is plain JSX — TypeScript *syntax* (type annotations, `interface`, generics, `as` casts) isn't supported there, and the compiler flags it with a clear, source-located error if you try. You still get typed editor support and a `pyxle typecheck` gate against the generated declarations. See the [TypeScript guide](guides/typescript.md) for the full picture.
 
 ### Can I import Python code in the JSX section?
 

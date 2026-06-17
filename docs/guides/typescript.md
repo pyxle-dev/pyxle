@@ -10,7 +10,7 @@ Three concrete things, all generated for you on every `pyxle dev` / `pyxle build
 2. A full set of **`.d.ts` declarations** for every `pyxle/client` hook and component, so imports resolve to real types.
 3. The **`pyxle typecheck`** command, which runs `tsc --noEmit` over the generated client so you can gate CI on type errors.
 
-What it does **not** include is TypeScript *syntax* in the JSX block of a `.pyxl` file. The compiler emits the client component as `.jsx`, and esbuild (used by both the SSR runtime and Vite) loads it with its **JSX loader, not the TypeScript loader** — so type annotations, `interface`, generics, and `x as T` casts in a client block are not stripped and fail when the client bundle is built (see [Limitations](#limitations)). In short: the client block is plain JSX that gets type-*checked*, never type-*annotated*.
+What it does **not** include is TypeScript *syntax* in the JSX block of a `.pyxl` file. The compiler emits the client component as `.jsx`, and esbuild (used by both the SSR runtime and Vite) loads it with its **JSX loader, not the TypeScript loader** — so type annotations, `interface`, generics, and `x as T` casts in a client block aren't transpiled. Pyxle flags them at **compile time** with a clear error pointing at your `.pyxl` file, rather than letting them fail later in the bundler (see [Limitations](#limitations)). In short: the client block is plain JSX that gets type-*checked*, never type-*annotated*.
 
 ## Server-side types (Python)
 
@@ -99,7 +99,7 @@ The [pyxle-langkit](editor-setup.md) language server runs a TypeScript language 
 
 TypeScript support today is **consumption-only**. The following are not yet available and are tracked for a later phase — they are roadmap items, not bugs:
 
-- **No TypeScript syntax in the client block.** The compiler emits `.jsx` and the bundlers use a JS loader, so `const x: number = 1`, `interface`, generics, and `as` casts aren't supported in a `.pyxl` JSX block — keep the client half plain JSX. (TS syntax currently fails when the bundle is built; a clearer compile-time error is on the roadmap.)
+- **No TypeScript syntax in the client block.** The compiler emits `.jsx` and the bundlers use a JSX loader, so `const x: number = 1`, `interface`, generics, and `as` casts aren't supported in a `.pyxl` JSX block — keep the client half plain JSX. Pyxle's compiler flags TypeScript syntax there with a clear, source-located error.
 - **No `.tsx` authoring.** You can't write the client half as full `.tsx`/TypeScript yet.
 - **No per-page loader-type generation.** Your loader's `data` arrives on the client as an untyped object — there's no generated `.d.ts` describing a specific loader's return shape.
 - **No OpenAPI → TypeScript client generation** from your action models.
