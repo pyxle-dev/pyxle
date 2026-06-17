@@ -540,6 +540,44 @@ def test_dev_command_invokes_devserver(monkeypatch) -> None:
         assert captured.get("logger").__class__.__name__ == "ConsoleLogger"
 
 
+def test_dev_command_dashboard_flag(monkeypatch) -> None:
+    with runner.isolated_filesystem():
+        project = Path("demo")
+        (project / "pages").mkdir(parents=True)
+        (project / "public").mkdir(parents=True)
+
+        captured: dict[str, object] = {}
+
+        class StubDevServer:
+            def __init__(self, settings, logger, **kwargs):
+                captured.update(kwargs)
+
+            async def start(self) -> None:
+                pass
+
+        def fake_run(coro):
+            loop = asyncio.new_event_loop()
+            try:
+                return loop.run_until_complete(coro)
+            finally:
+                loop.close()
+
+        # dev() lazily initialises its DevServer / DevServerSettings globals and
+        # re-imports them when either is None, which would clobber the stub.
+        # Pin DevServerSettings to the real class so that block is skipped.
+        from pyxle.devserver import DevServerSettings as _RealSettings
+
+        monkeypatch.setattr("pyxle.cli.DevServerSettings", _RealSettings)
+        monkeypatch.setattr("pyxle.cli.DevServer", StubDevServer)
+        monkeypatch.setattr("pyxle.cli.asyncio.run", fake_run)
+
+        result = runner.invoke(
+            app, ["dev", "demo", "--dashboard"], catch_exceptions=False
+        )
+        assert result.exit_code == 0, result.stdout
+        assert captured.get("dashboard") is True
+
+
 def test_dev_command_respects_config_file(monkeypatch) -> None:
     with runner.isolated_filesystem():
         project = Path("demo")

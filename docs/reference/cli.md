@@ -75,6 +75,7 @@ pyxle dev [directory] [options]
 | `--config` | -- | Path to `pyxle.config.json` |
 | `--print-config` / `--no-print-config` | `false` | Print merged configuration before starting |
 | `--tailwind` / `--no-tailwind` | `true` | Auto-start Tailwind CSS watcher |
+| `--dashboard` / `--no-dashboard` | `false` | Periodically print a live [observability](../guides/observability.md#dev-dashboard) panel (request/SSR metrics) to the terminal |
 
 **Examples:**
 

@@ -201,6 +201,25 @@ pip install "pyxle-framework[observability]"
 
 It's off by default so it doesn't disrupt an existing log pipeline.
 
+## Dev dashboard
+
+Run `pyxle dev --dashboard` to print a live observability panel to the terminal
+every few seconds — a zero-dependency, at-a-glance view of what your dev server
+is doing:
+
+```
+┌─ Pyxle dev ─ observability ───────────────────
+│ uptime 2m05s   requests 142 (+18, 3.6/s)
+│ status 2xx=131 4xx=8 5xx=3   errors 2.1%
+│ latency  request 14.2ms   render 9.1ms   loader 3.0ms   action 1.4ms
+│ cache  hit-ratio 88%   (hit 44 / stale 2 / miss 4)
+└───────────────────────────────────────────────
+```
+
+It reads the same in-process metrics described above, so it costs nothing on the
+request path, and it's dev-only — there's no equivalent in `pyxle serve`, where
+you'd scrape the [metrics endpoint](#metrics) instead.
+
 ## Turning it off
 
 Request-id and timing are individually toggleable, and a bare `false` disables

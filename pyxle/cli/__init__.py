@@ -322,6 +322,12 @@ def dev(
         help="Automatically run the Tailwind CSS watcher if tailwind.config.* is present.",
         show_default=True,
     ),
+    dashboard: bool = typer.Option(
+        False,
+        "--dashboard/--no-dashboard",
+        help="Periodically print a live observability panel (request/SSR metrics) to the terminal.",
+        show_default=True,
+    ),
 ) -> None:
     """Entry-point for the ``pyxle dev`` command."""
 
@@ -403,7 +409,7 @@ def dev(
         f" with Vite proxy at http://{settings.vite_host}:{settings.vite_port}"
     )
 
-    server = DevServer(settings, logger=logger, tailwind=tailwind)  # type: ignore[call-arg]
+    server = DevServer(settings, logger=logger, tailwind=tailwind, dashboard=dashboard)  # type: ignore[call-arg]
 
     try:
         asyncio.run(server.start())

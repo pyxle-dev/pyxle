@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import socket
+import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
@@ -39,6 +40,10 @@ class DevServer:
     _watcher: Optional[ProjectWatcher] = field(default=None, init=False, repr=False)
     vite_port_search_limit: int = 10
     tailwind: bool = True
+    # When true, periodically print a live observability panel (request/SSR
+    # metrics) to the terminal. Dev-only convenience; off by default.
+    dashboard: bool = False
+    dashboard_interval: float = 5.0
 
     async def start(self) -> None:
         """Run the development server until the underlying uvicorn server exits."""
@@ -118,6 +123,7 @@ class DevServer:
         watcher: ProjectWatcher | None = None
         vite_process: ViteProcess | None = None
         tailwind_process: TailwindProcess | None = None
+        dashboard_task: asyncio.Task | None = None
 
         try:
             vite_process = ViteProcess(settings, logger=logger)
@@ -147,6 +153,7 @@ class DevServer:
 
             watcher.start()
             _set_app_ready_flag(app, True)
+            dashboard_task = self._start_dashboard(app, loop)
             try:
                 await server.serve()
             except asyncio.CancelledError:
@@ -155,6 +162,8 @@ class DevServer:
                 raise
         finally:
             _set_app_ready_flag(app, False)
+            if dashboard_task is not None:
+                dashboard_task.cancel()
             if watcher is not None:
                 watcher.close()
                 self._watcher = None
@@ -163,6 +172,26 @@ class DevServer:
             if vite_process is not None:
                 await vite_process.stop()
             logger.info("Dev server stopped")
+
+    def _start_dashboard(self, app, loop) -> "Optional[asyncio.Task]":
+        """Start the terminal observability dashboard task, if enabled."""
+        if not self.dashboard:
+            return None
+        registry = getattr(app.state, "pyxle_metrics", None)
+        started_at = getattr(app.state, "pyxle_started_at", None)
+        if registry is None or not isinstance(started_at, (int, float)):
+            return None
+
+        from pyxle.observability.dashboard import run_dashboard  # noqa: PLC0415
+
+        return loop.create_task(
+            run_dashboard(
+                get_snapshot=registry.snapshot,
+                emit=self.logger.info,
+                uptime=lambda: max(0.0, time.time() - float(started_at)),
+                interval_s=self.dashboard_interval,
+            )
+        )
 
     async def _ensure_node_modules(self, settings: DevServerSettings) -> None:
         """Run ``npm install`` if ``node_modules/`` is missing and ``package.json`` exists."""
