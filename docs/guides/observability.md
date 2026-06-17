@@ -167,6 +167,40 @@ the probe stays cheap. Today `/readyz` verifies the SSR worker pool has at least
 one live worker; point your readiness probe at it so traffic is only routed to a
 worker that can actually render.
 
+## Structured logging
+
+Turn on a structured access log — one line per request, carrying the method,
+path, status, duration, and the request's correlation id:
+
+```json
+{
+  "observability": {
+    "accessLog": true,
+    "logFormat": "json"
+  }
+}
+```
+
+```json
+{"level": "info", "logger": "pyxle.access", "message": "http_request", "request_id": "3f9a…", "method": "GET", "path": "/", "status": 200, "duration_ms": 8.4}
+```
+
+Set `logFormat` to `"console"` (the default) for a human-readable line instead,
+and `logLevel` to tune verbosity. The correlation id is bound into a context
+variable for the duration of the request, so **your own** log calls within a
+loader or action carry the same `request_id` automatically when you log through
+the `pyxle.access` logger or your own logger configured the same way.
+
+Structured logging works with **no extra dependency** (a stdlib JSON/console
+formatter). Installing the optional `[observability]` extra adds
+[structlog](https://www.structlog.org/) for richer rendering:
+
+```bash
+pip install "pyxle-framework[observability]"
+```
+
+It's off by default so it doesn't disrupt an existing log pipeline.
+
 ## Turning it off
 
 Request-id and timing are individually toggleable, and a bare `false` disables

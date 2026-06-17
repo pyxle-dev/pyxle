@@ -51,7 +51,10 @@ Pyxle is configured via `pyxle.config.json` in the project root. All fields are 
     "timing": true,
     "metricsEndpoint": false,
     "metricsEndpointPath": "/api/__pyxle/metrics",
-    "metricsEndpointToken": null
+    "metricsEndpointToken": null,
+    "accessLog": false,
+    "logFormat": "console",
+    "logLevel": "INFO"
   },
   "plugins": []
 }
@@ -270,6 +273,9 @@ Request correlation IDs and timing. Both are **on by default** -- generating an 
 | `observability.metricsEndpoint` | `boolean` | `false` | Expose a Prometheus metrics endpoint (request/render/loader/action durations and page-cache hit ratio). **Off by default** -- it exposes internal state. |
 | `observability.metricsEndpointPath` | `string` | `"/api/__pyxle/metrics"` | Path the metrics endpoint is served at when enabled. |
 | `observability.metricsEndpointToken` | `string` \| `null` | `null` | Optional bearer token: when set, the endpoint requires `Authorization: Bearer <token>` (compared in constant time). |
+| `observability.accessLog` | `boolean` | `false` | Emit one structured access-log line per request (`method`, `path`, `status`, `duration_ms`, `request_id`). Off by default so it doesn't surprise existing log scrapers. |
+| `observability.logFormat` | `string` | `"console"` | `"console"` (human-readable) or `"json"` (one JSON object per line). |
+| `observability.logLevel` | `string` | `"INFO"` | Access-logger level (`CRITICAL`/`ERROR`/`WARNING`/`INFO`/`DEBUG`). |
 
 Shorthand to disable request-id and timing: `"observability": false`. The page-cache hit-ratio metric requires the [server-side page cache](caching.md) (active under `pyxle serve`). **Multi-worker note:** under `pyxle serve --workers N` each worker process exposes its own metrics (with a `worker` label), so aggregate across workers at the scraper.
 

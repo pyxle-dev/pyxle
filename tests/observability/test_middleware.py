@@ -155,6 +155,28 @@ def test_metrics_recorded_even_with_request_id_and_timing_off() -> None:
     assert "duration_ms" not in _CAPTURED[0]
 
 
+def test_access_log_emits_one_line_per_request() -> None:
+    import io
+    import json
+    import logging
+
+    from pyxle.observability.logging import ACCESS_LOGGER_NAME, configure_logging
+
+    configure_logging(log_format="json")
+    buffer = io.StringIO()
+    logging.getLogger(ACCESS_LOGGER_NAME).handlers[0].stream = buffer
+
+    _client(access_log=True).get("/")
+    line = buffer.getvalue().strip()
+    record = json.loads(line)
+    assert record["message"] == "http_request"
+    assert record["method"] == "GET"
+    assert record["path"] == "/"
+    assert record["status"] == 200
+    # The request id bound during the request is present on the access line.
+    assert "request_id" in record
+
+
 def test_request_timing_ms_reads_scope_field() -> None:
     class _Req:
         scope = {"pyxle": {"duration_ms": 12.5}}

@@ -92,6 +92,7 @@ class RequestIdMiddleware:
         trust_incoming: bool = False,
         timing: bool = True,
         metrics: Any = None,
+        access_log: bool = False,
     ) -> None:
         self.app = app
         self.emit_request_id = emit_request_id
@@ -102,6 +103,8 @@ class RequestIdMiddleware:
         self.timing = timing
         # Optional MetricsRegistry; request totals are recorded into it when set.
         self.metrics = metrics
+        # Emit one structured access-log line per request when enabled.
+        self.access_log = access_log
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope.get("type") != "http":
@@ -116,19 +119,33 @@ class RequestIdMiddleware:
             # Mirror onto request.state's backing dict so that
             # ``request.state.request_id`` works inside loaders and actions.
             scope.setdefault("state", {})[_REQUEST_ID_FIELD] = request_id
+        # Bind the id (or None) into the logging context so any log emitted while
+        # handling this request carries it. Per-task contextvar — no leak across
+        # requests (each runs in its own asyncio task/context).
+        from pyxle.observability.logging import bind_request_id  # noqa: PLC0415
 
-        # Measure when timing is on, or when a registry needs the duration.
-        measure = self.timing or self.metrics is not None
+        bind_request_id(request_id)
+
+        # Measure when timing is on, or when a registry/access log needs it.
+        measure = self.timing or self.metrics is not None or self.access_log
         start = time.perf_counter() if measure else 0.0
 
         async def send_wrapper(message: Message) -> None:
             if message["type"] == "http.response.start":
                 elapsed_ms = (time.perf_counter() - start) * 1000.0 if measure else 0.0
+                status = int(message.get("status", 0))
                 if self.timing:
                     pyxle_state[_DURATION_FIELD] = elapsed_ms
                 if self.metrics is not None:
-                    self.metrics.observe_request(
-                        int(message.get("status", 0)), elapsed_ms
+                    self.metrics.observe_request(status, elapsed_ms)
+                if self.access_log:
+                    from pyxle.observability.logging import log_access  # noqa: PLC0415
+
+                    log_access(
+                        method=scope.get("method", ""),
+                        path=scope.get("path", ""),
+                        status=status,
+                        duration_ms=elapsed_ms,
                     )
                 if request_id is not None:
                     headers = message.setdefault("headers", [])

@@ -1770,10 +1770,18 @@ def create_starlette_app(
     _obs_request_id = True if _obs is None else bool(getattr(_obs, "request_id", True))
     _obs_timing = True if _obs is None else bool(getattr(_obs, "timing", True))
     _obs_metrics_ep = False if _obs is None else bool(getattr(_obs, "metrics_endpoint", False))
-    # Add the middleware when anything needs it — request-id/timing, or the
-    # metrics endpoint (which needs request totals recorded even if the
-    # correlation id and scope timing are off).
-    if _obs_request_id or _obs_timing or _obs_metrics_ep:
+    _obs_access_log = False if _obs is None else bool(getattr(_obs, "access_log", False))
+    if _obs_access_log:
+        from pyxle.observability.logging import configure_logging  # noqa: PLC0415
+
+        configure_logging(
+            log_format=getattr(_obs, "log_format", "console"),
+            log_level=getattr(_obs, "log_level", "INFO"),
+        )
+    # Add the middleware when anything needs it — request-id/timing, the metrics
+    # endpoint (which needs request totals recorded even if the correlation id
+    # and scope timing are off), or the structured access log.
+    if _obs_request_id or _obs_timing or _obs_metrics_ep or _obs_access_log:
         from pyxle.observability import RequestIdMiddleware  # noqa: PLC0415
 
         middleware_stack.insert(
@@ -1789,6 +1797,7 @@ def create_starlette_app(
                 ),
                 timing=_obs_timing,
                 metrics=metrics_registry,
+                access_log=_obs_access_log,
             ),
         )
 

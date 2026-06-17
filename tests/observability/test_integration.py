@@ -106,6 +106,28 @@ def test_metrics_endpoint_custom_path(tmp_path: Path) -> None:
     assert client.get("/internal/m").status_code == 200
 
 
+def test_access_log_enabled_through_real_app(tmp_path: Path) -> None:
+    import io
+    import json
+    import logging
+
+    from pyxle.observability.logging import ACCESS_LOGGER_NAME
+
+    client = _app(
+        tmp_path,
+        observability=ObservabilityConfig(access_log=True, log_format="json"),
+    )
+    # create_starlette_app called configure_logging; redirect its stream.
+    buffer = io.StringIO()
+    logging.getLogger(ACCESS_LOGGER_NAME).handlers[0].stream = buffer
+
+    client.get("/api/whoami")
+    record = json.loads(buffer.getvalue().strip().splitlines()[-1])
+    assert record["message"] == "http_request"
+    assert record["path"] == "/api/whoami"
+    assert "request_id" in record
+
+
 def test_metrics_endpoint_bearer_token(tmp_path: Path) -> None:
     client = _app(
         tmp_path,

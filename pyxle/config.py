@@ -122,11 +122,16 @@ class ObservabilityConfig:
     metrics_endpoint: bool = False
     metrics_endpoint_path: str = "/api/__pyxle/metrics"
     metrics_endpoint_token: str | None = None
+    # Structured access log — off by default so it doesn't surprise log
+    # scrapers. ``log_format`` is "console" or "json".
+    access_log: bool = False
+    log_format: str = "console"
+    log_level: str = "INFO"
 
     @property
     def enabled(self) -> bool:
         """Whether any request-scoped instrumentation is active."""
-        return self.request_id or self.timing or self.metrics_endpoint
+        return self.request_id or self.timing or self.metrics_endpoint or self.access_log
 
 
 @dataclass(frozen=True, slots=True)
@@ -698,6 +703,27 @@ def _parse_observability_block(value: Any, *, source: Path) -> ObservabilityConf
             "expected a non-empty string or null."
         )
 
+    access_log = value.get("accessLog", False)
+    if not isinstance(access_log, bool):
+        raise ConfigError(
+            f"Invalid value for 'observability.accessLog' in '{source}': expected boolean."
+        )
+
+    log_format = value.get("logFormat", "console")
+    if not isinstance(log_format, str) or log_format not in {"console", "json"}:
+        raise ConfigError(
+            f"Invalid value for 'observability.logFormat' in '{source}': "
+            "expected 'console' or 'json'."
+        )
+
+    log_level = value.get("logLevel", "INFO")
+    _valid_levels = {"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"}
+    if not isinstance(log_level, str) or log_level.upper() not in _valid_levels:
+        raise ConfigError(
+            f"Invalid value for 'observability.logLevel' in '{source}': "
+            f"expected one of {sorted(_valid_levels)}."
+        )
+
     return ObservabilityConfig(
         request_id=request_id,
         request_id_header=request_id_header.strip(),
@@ -706,6 +732,9 @@ def _parse_observability_block(value: Any, *, source: Path) -> ObservabilityConf
         metrics_endpoint=metrics_endpoint,
         metrics_endpoint_path=metrics_path,
         metrics_endpoint_token=metrics_token,
+        access_log=access_log,
+        log_format=log_format,
+        log_level=log_level.upper(),
     )
 
 

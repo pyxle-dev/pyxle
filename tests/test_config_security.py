@@ -496,3 +496,35 @@ class TestObservabilityConfigParsing:
     def test_empty_metrics_token_raises(self, tmp_path: Path):
         with pytest.raises(ConfigError, match="metricsEndpointToken"):
             self._load(tmp_path, {"metricsEndpointToken": "  "})
+
+    def test_access_log_defaults(self):
+        obs = ObservabilityConfig()
+        assert obs.access_log is False
+        assert obs.log_format == "console"
+        assert obs.log_level == "INFO"
+
+    def test_access_log_fields(self, tmp_path: Path):
+        config = self._load(
+            tmp_path,
+            {"accessLog": True, "logFormat": "json", "logLevel": "debug"},
+        )
+        obs = config.observability
+        assert obs.access_log is True
+        assert obs.log_format == "json"
+        assert obs.log_level == "DEBUG"  # normalised to upper-case
+
+    def test_access_log_enables_observability(self):
+        obs = ObservabilityConfig(request_id=False, timing=False, access_log=True)
+        assert obs.enabled is True
+
+    def test_invalid_access_log_type_raises(self, tmp_path: Path):
+        with pytest.raises(ConfigError, match="accessLog"):
+            self._load(tmp_path, {"accessLog": "yes"})
+
+    def test_invalid_log_format_raises(self, tmp_path: Path):
+        with pytest.raises(ConfigError, match="logFormat"):
+            self._load(tmp_path, {"logFormat": "xml"})
+
+    def test_invalid_log_level_raises(self, tmp_path: Path):
+        with pytest.raises(ConfigError, match="logLevel"):
+            self._load(tmp_path, {"logLevel": "LOUD"})

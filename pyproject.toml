@@ -65,6 +65,12 @@ redis = [
 pydantic = [
   "pydantic>=2.0,<3.0",
 ]
+# Nicer structured logging (JSON/console) for the observability access log.
+# Optional — without it Pyxle falls back to a stdlib JSON/console formatter, so
+# structured logging works either way.
+observability = [
+  "structlog>=24.1,<26.0",
+]
 dev = [
   "pytest>=8.0,<9.0",
   "pytest-cov>=4.1,<5.0",
