@@ -109,4 +109,4 @@ own client directly so you keep their full feature set.
 ## See also
 
 - [Server Actions](../core-concepts/server-actions.md)
-- [Runtime API → `pyxle.tasks`](../reference/runtime-api.md#pyxletasks)
+- [Runtime API → `pyxle.tasks`](../reference/runtime-api.md#background-tasks-pyxletasks)

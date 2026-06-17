@@ -110,7 +110,7 @@ pyxle build [directory] [options]
 | `--out-dir` | `dist/` | Output directory for build artifacts |
 | `--incremental` / `--no-incremental` | `false` | Reuse cached artifacts |
 | `--static` / `--no-static` | `false` | Pre-render loader-less, non-dynamic pages to HTML at build time (SSG) — see [Caching](../guides/caching.md#static-pre-rendering-pyxle-build-static) |
-| `--analyze` / `--no-analyze` | `false` | Print a JS/CSS bundle-size report (raw + gzip, largest first) after the build — see [Build Optimization](../guides/build-optimization.md#inspecting-the-bundle--pyxle-build---analyze) |
+| `--analyze` / `--no-analyze` | `false` | Print a JS/CSS bundle-size report (raw + gzip, largest first) after the build — see [Build Optimization](../guides/build-optimization.md#inspecting-the-bundle-pyxle-build-analyze) |
 
 **Examples:**
 

@@ -72,7 +72,7 @@ def test_redis_backend_selected_or_guides_to_extra() -> None:
     try:
         import redis.asyncio  # noqa: F401, PLC0415
     except ImportError:
-        with pytest.raises(ImportError, match=r"pyxle\[redis\]"):
+        with pytest.raises(ImportError, match=r"pyxle-framework\[redis\]"):
             build_page_cache(debug=False, env=env)
     else:  # pragma: no cover - depends on the test environment having redis
         cache = build_page_cache(debug=False, env=env)
