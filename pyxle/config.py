@@ -97,6 +97,39 @@ class NavigationConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class ObservabilityConfig:
+    """Request observability: correlation IDs and request timing.
+
+    The defaults are deliberately *on* — generating a request id and reading
+    two ``perf_counter`` timestamps per request is sub-microsecond and adds no
+    I/O, while giving every request a correlation key (surfaced as the
+    ``request_id_header`` response header and on ``request.state.request_id``).
+
+    ``trust_incoming_request_id`` is off by default: echoing a client-supplied
+    id back into logs and downstream systems is a spoofing / log-injection
+    vector, so an incoming header is only honoured when an operator opts in
+    (typically behind a trusted reverse proxy). Heavier, exporter-style
+    observability (structured access logs, the metrics endpoint, OpenTelemetry)
+    is configured separately and stays off by default.
+    """
+
+    request_id: bool = True
+    request_id_header: str = "X-Request-Id"
+    trust_incoming_request_id: bool = False
+    timing: bool = True
+    # Prometheus metrics endpoint — off by default: it exposes internal state,
+    # so it must be turned on deliberately (and optionally bearer-guarded).
+    metrics_endpoint: bool = False
+    metrics_endpoint_path: str = "/api/__pyxle/metrics"
+    metrics_endpoint_token: str | None = None
+
+    @property
+    def enabled(self) -> bool:
+        """Whether any request-scoped instrumentation is active."""
+        return self.request_id or self.timing or self.metrics_endpoint
+
+
+@dataclass(frozen=True, slots=True)
 class PyxleConfig:
     """Resolved configuration values for a Pyxle project."""
 
@@ -117,6 +150,7 @@ class PyxleConfig:
     csrf: CsrfConfig = CsrfConfig()
     cache: CacheConfig = CacheConfig()
     navigation: NavigationConfig = NavigationConfig()
+    observability: ObservabilityConfig = ObservabilityConfig()
     # Plugin entries as the raw payload from ``pyxle.config.json`` —
     # either a bare string (``"pyxle-auth"``) or an object
     # (``{"name": "pyxle-auth", "settings": {...}}``). Resolved into
@@ -144,6 +178,7 @@ class PyxleConfig:
             "csrf": self.csrf,
             "cache": self.cache,
             "navigation": self.navigation,
+            "observability": self.observability,
             "plugins": self.plugins,
         }
 
@@ -249,6 +284,7 @@ def _parse_config_dict(data: Dict[str, Any], *, source: Path) -> PyxleConfig:
         "csrf",
         "cache",
         "navigation",
+        "observability",
         "plugins",
     }
     unknown_keys = set(data) - allowed_top_keys
@@ -282,6 +318,7 @@ def _parse_config_dict(data: Dict[str, Any], *, source: Path) -> PyxleConfig:
     csrf_config = _parse_csrf_block(data.get("csrf"), source=source)
     cache_config = _parse_cache_block(data.get("cache"), source=source)
     navigation_config = _parse_navigation_block(data.get("navigation"), source=source)
+    observability_config = _parse_observability_block(data.get("observability"), source=source)
     plugins = _parse_plugins_block(data.get("plugins"), source=source)
 
     return PyxleConfig(
@@ -302,6 +339,7 @@ def _parse_config_dict(data: Dict[str, Any], *, source: Path) -> PyxleConfig:
         csrf=csrf_config,
         cache=cache_config,
         navigation=navigation_config,
+        observability=observability_config,
         plugins=plugins,
     )
 
@@ -597,6 +635,77 @@ def _parse_csrf_block(value: Any, *, source: Path) -> CsrfConfig:
         cookie_secure=cookie_secure,
         cookie_samesite=cookie_samesite.lower(),
         exempt_paths=exempt_paths or (),
+    )
+
+
+def _parse_observability_block(value: Any, *, source: Path) -> ObservabilityConfig:
+    if value is None:
+        return ObservabilityConfig()
+    if isinstance(value, bool):
+        # A bare boolean toggles both request-id and timing together.
+        return ObservabilityConfig(request_id=value, timing=value)
+    if not isinstance(value, Mapping):
+        raise ConfigError(
+            f"Invalid value for 'observability' in '{source}': expected boolean or object."
+        )
+
+    request_id = value.get("requestId", True)
+    if not isinstance(request_id, bool):
+        raise ConfigError(
+            f"Invalid value for 'observability.requestId' in '{source}': expected boolean."
+        )
+
+    request_id_header = value.get("requestIdHeader", "X-Request-Id")
+    if not isinstance(request_id_header, str) or not request_id_header.strip():
+        raise ConfigError(
+            f"Invalid value for 'observability.requestIdHeader' in '{source}': "
+            "expected non-empty string."
+        )
+
+    trust_incoming = value.get("trustIncomingRequestId", False)
+    if not isinstance(trust_incoming, bool):
+        raise ConfigError(
+            f"Invalid value for 'observability.trustIncomingRequestId' in '{source}': "
+            "expected boolean."
+        )
+
+    timing = value.get("timing", True)
+    if not isinstance(timing, bool):
+        raise ConfigError(
+            f"Invalid value for 'observability.timing' in '{source}': expected boolean."
+        )
+
+    metrics_endpoint = value.get("metricsEndpoint", False)
+    if not isinstance(metrics_endpoint, bool):
+        raise ConfigError(
+            f"Invalid value for 'observability.metricsEndpoint' in '{source}': "
+            "expected boolean."
+        )
+
+    metrics_path = value.get("metricsEndpointPath", "/api/__pyxle/metrics")
+    if not isinstance(metrics_path, str) or not metrics_path.startswith("/"):
+        raise ConfigError(
+            f"Invalid value for 'observability.metricsEndpointPath' in '{source}': "
+            "expected an absolute path starting with '/'."
+        )
+
+    metrics_token = value.get("metricsEndpointToken")
+    if metrics_token is not None and (
+        not isinstance(metrics_token, str) or not metrics_token.strip()
+    ):
+        raise ConfigError(
+            f"Invalid value for 'observability.metricsEndpointToken' in '{source}': "
+            "expected a non-empty string or null."
+        )
+
+    return ObservabilityConfig(
+        request_id=request_id,
+        request_id_header=request_id_header.strip(),
+        trust_incoming_request_id=trust_incoming,
+        timing=timing,
+        metrics_endpoint=metrics_endpoint,
+        metrics_endpoint_path=metrics_path,
+        metrics_endpoint_token=metrics_token,
     )
 
 

@@ -32,6 +32,7 @@ async def load_page(request):
 | `request.url` | `URL` | Full request URL |
 | `request.method` | `str` | HTTP method |
 | `request.state` | `State` | Mutable state for middleware to attach data |
+| `request.state.request_id` | `str` | The request's correlation id (also the `X-Request-Id` response header), unless [observability](../guides/observability.md) is disabled |
 
 ## `@action`
 

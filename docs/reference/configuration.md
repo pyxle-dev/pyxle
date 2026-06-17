@@ -44,6 +44,15 @@ Pyxle is configured via `pyxle.config.json` in the project root. All fields are 
   },
   "cache": {},
   "navigation": {},
+  "observability": {
+    "requestId": true,
+    "requestIdHeader": "X-Request-Id",
+    "trustIncomingRequestId": false,
+    "timing": true,
+    "metricsEndpoint": false,
+    "metricsEndpointPath": "/api/__pyxle/metrics",
+    "metricsEndpointToken": null
+  },
   "plugins": []
 }
 ```
@@ -232,6 +241,37 @@ Pyxle's client keeps an in-memory **navigation cache** so client-side navigation
 | `navigation.defaultPrefetchTtl` | `integer` | `120` | Lifetime in seconds (≥ 0) that a prefetched or seeded page stays fresh in the client navigation cache, for routes **without** a `cache` entry. `0` disables navigation caching. |
 
 A route listed in the [`cache`](#edge-caching) block **reuses its edge-cache TTL** as its navigation-cache lifetime, overriding `defaultPrefetchTtl` for that route -- so a page's client freshness matches how long a CDN would serve it. (Consequence: raising a route's `cache` TTL also lengthens its edge cache, so purge the CDN on deploy -- which you should do regardless.) After a mutation, the client router's `invalidate(href)` drops a cached entry so the next navigation refetches.
+
+## Observability
+
+Request correlation IDs and timing. Both are **on by default** -- generating an id and reading two timestamps per request is sub-microsecond and adds no I/O, and every request gets a correlation key surfaced as the response header and on `request.state.request_id` (readable from any loader or `@action`). See the [Observability guide](../guides/observability.md).
+
+```json
+{
+  "observability": {
+    "requestId": true,
+    "requestIdHeader": "X-Request-Id",
+    "trustIncomingRequestId": false,
+    "timing": true,
+    "metricsEndpoint": false,
+    "metricsEndpointPath": "/api/__pyxle/metrics",
+    "metricsEndpointToken": null
+  }
+}
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `observability` | `object` \| `boolean` | `{}` | Request observability settings. `false` disables request-id and timing; `true` enables both. |
+| `observability.requestId` | `boolean` | `true` | Assign each request a correlation id, expose it on `request.state.request_id`, and echo it as the response header. |
+| `observability.requestIdHeader` | `string` | `"X-Request-Id"` | The request/response header carrying the correlation id. |
+| `observability.trustIncomingRequestId` | `boolean` | `false` | Honour a well-formed incoming id from `requestIdHeader` instead of generating one. **Leave off** unless behind a trusted reverse proxy -- echoing a client-supplied id is a log-injection/spoofing vector. Even when on, an incoming id must match `[A-Za-z0-9._-]{1,128}` or it is replaced. |
+| `observability.timing` | `boolean` | `true` | Measure wall-clock request duration (to the response start). |
+| `observability.metricsEndpoint` | `boolean` | `false` | Expose a Prometheus metrics endpoint (request/render/loader/action durations and page-cache hit ratio). **Off by default** -- it exposes internal state. |
+| `observability.metricsEndpointPath` | `string` | `"/api/__pyxle/metrics"` | Path the metrics endpoint is served at when enabled. |
+| `observability.metricsEndpointToken` | `string` \| `null` | `null` | Optional bearer token: when set, the endpoint requires `Authorization: Bearer <token>` (compared in constant time). |
+
+Shorthand to disable request-id and timing: `"observability": false`. The page-cache hit-ratio metric requires the [server-side page cache](caching.md) (active under `pyxle serve`). **Multi-worker note:** under `pyxle serve --workers N` each worker process exposes its own metrics (with a `worker` label), so aggregate across workers at the scraper.
 
 ## Plugins
 

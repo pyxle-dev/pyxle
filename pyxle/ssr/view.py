@@ -8,6 +8,7 @@ import inspect
 import logging
 import secrets
 import sys
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -619,6 +620,23 @@ async def build_not_found_response(
         return None
 
 
+def _record_render_metric(request: Request, kind: str, duration_ms: float) -> None:
+    """Record a loader or SSR-render duration into the metrics registry, if any.
+
+    ``kind`` is ``"loader"`` or ``"render"``. A no-op when no registry is bound
+    to the request's app (e.g. in unit tests that build a bare Starlette app).
+    """
+    from pyxle.observability.metrics import get_metrics  # noqa: PLC0415
+
+    registry = get_metrics(request)
+    if registry is None:
+        return
+    if kind == "loader":
+        registry.observe_loader(duration_ms)
+    else:
+        registry.observe_render(duration_ms)
+
+
 async def _execute_loader(
     page: PageRoute,
     request: Request,
@@ -637,9 +655,11 @@ async def _execute_loader(
             f"Loader '{page.loader_name}' not found in module {page.module_key}"
         )
 
+    _loader_start = time.perf_counter()
     result = loader(request)
     if hasattr(result, "__await__"):
         result = await result  # type: ignore[assignment]
+    _record_render_metric(request, "loader", (time.perf_counter() - _loader_start) * 1000.0)
 
     payload, status_code, revalidate = _normalize_loader_result(result, page)
     return payload, status_code, revalidate, module
@@ -887,12 +907,14 @@ async def _create_page_artifacts(
         suppress_per_user=suppress_per_user,
     )
 
+    _render_start = time.perf_counter()
     render_result = await renderer.render(
         page.client_module_path,
         prelude.component_props,
         request_pathname=request.url.path,
         csrf_token=prelude.csrf_token,
     )
+    _record_render_metric(request, "render", (time.perf_counter() - _render_start) * 1000.0)
     body_html = render_result.html
     inline_styles = render_result.inline_styles
 
@@ -960,11 +982,15 @@ async def _try_error_boundary(
     error_context = _build_error_context(error, status_code)
 
     try:
+        _boundary_render_start = time.perf_counter()
         render_result = await renderer.render(
             boundary_page.client_module_path,
             {"error": error_context},
             request_pathname=request.url.path,
             csrf_token=_csrf_token_for_request(request),
+        )
+        _record_render_metric(
+            request, "render", (time.perf_counter() - _boundary_render_start) * 1000.0
         )
         script_nonce = secrets.token_urlsafe(24)
         head_elements = boundary_page.head_elements

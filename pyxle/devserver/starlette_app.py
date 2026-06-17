@@ -722,6 +722,24 @@ def _resolve_page_websocket(route: PageRoute, *, settings: DevServerSettings) ->
 # MISS (rendered now and stored).
 _CACHE_STATUS_HEADER = "x-pyxle-cache"
 
+
+def _record_cache_metric(request: Request, outcome: str) -> None:
+    """Record a page-cache outcome into the app's metrics registry, if present."""
+    from pyxle.observability.metrics import get_metrics  # noqa: PLC0415
+
+    registry = get_metrics(request)
+    if registry is not None:
+        registry.record_cache(outcome)
+
+
+def _record_action_metric(request: Request, duration_ms: float) -> None:
+    """Record an action's execution time into the metrics registry, if present."""
+    from pyxle.observability.metrics import get_metrics  # noqa: PLC0415
+
+    registry = get_metrics(request)
+    if registry is not None:
+        registry.observe_action(duration_ms)
+
 # Fallback s-maxage for a cached entry with no explicit revalidate window
 # (cache-until-invalidated). Only reachable via the compile-time cache
 # directive; loader-envelope and edge-config entries always carry a number.
@@ -942,6 +960,7 @@ async def _build_cached_page_response(
                         cache_key=cache_key,
                     ),
                 )
+            _record_cache_metric(request, "stale" if lookup.is_stale else "hit")
             return _serve_cache_entry(
                 lookup.entry,
                 request=request,
@@ -1032,6 +1051,7 @@ async def _build_cached_page_response(
                 served.headers[key] = value
         served.headers["ETag"] = PageCache.make_etag(body)
         served.headers[_CACHE_STATUS_HEADER] = "MISS"
+        _record_cache_metric(request, "miss")
         # Conditional GET: if the client already holds this exact render, 304.
         if _if_none_match_matches(request.headers.get("if-none-match"), served.headers["ETag"]):
             not_modified = Response(status_code=304)
@@ -1241,6 +1261,7 @@ async def _dispatch_action(
         error_msg = str(exc) if debug else "Internal server error"
         return JSONResponse({"ok": False, "error": error_msg}, status_code=500)
 
+    _action_start = time.perf_counter()
     try:
         if resolved is None:
             result = await action_fn(request)
@@ -1263,6 +1284,8 @@ async def _dispatch_action(
     except Exception as exc:
         error_msg = str(exc) if debug else "Internal server error"
         return JSONResponse({"ok": False, "error": error_msg}, status_code=500)
+
+    _record_action_metric(request, (time.perf_counter() - _action_start) * 1000.0)
 
     if not isinstance(result, dict):
         return JSONResponse(
@@ -1393,6 +1416,17 @@ def _build_app_routes(
         built.append(WebSocketRoute("/__pyxle__/overlay", overlay.websocket_endpoint))
     built.append(Route("/healthz", _healthz_endpoint, methods=["GET"]))
     built.append(Route("/readyz", _readyz_endpoint, methods=["GET"]))
+    # Opt-in Prometheus metrics endpoint. Off by default because it exposes
+    # internal state; an optional bearer token guards it when on.
+    _obs = getattr(settings, "observability", None)
+    if _obs is not None and getattr(_obs, "metrics_endpoint", False):
+        built.append(
+            Route(
+                getattr(_obs, "metrics_endpoint_path", "/api/__pyxle/metrics"),
+                _make_metrics_endpoint(getattr(_obs, "metrics_endpoint_token", None)),
+                methods=["GET"],
+            )
+        )
     # Catch-all 404 handler from not-found.pyxl boundaries — registered last so
     # it only matches when no concrete route does.
     if error_boundaries.has_not_found_pages:
@@ -1719,12 +1753,55 @@ def create_starlette_app(
     if proxy_middleware is not None:
         middleware_stack.append(proxy_middleware)
 
+    # The per-process metrics registry is always present (it is cheap — a few
+    # int counters and fixed-bucket histograms) and recorded into from the
+    # request, render, loader, action, and cache sites. Exposure of those
+    # metrics is gated separately (the opt-in /api/__pyxle/metrics endpoint).
+    from pyxle.observability.metrics import MetricsRegistry  # noqa: PLC0415
+
+    metrics_registry = MetricsRegistry()
+
+    # Observability sits at the very top of the stack (outermost) so a request
+    # is assigned its correlation id and timed before any other middleware can
+    # short-circuit it — a CSRF rejection or security-header response is still
+    # tagged with an X-Request-Id and counted. Defaults (request-id + timing
+    # on) apply when no observability config is present.
+    _obs = getattr(settings, "observability", None)
+    _obs_request_id = True if _obs is None else bool(getattr(_obs, "request_id", True))
+    _obs_timing = True if _obs is None else bool(getattr(_obs, "timing", True))
+    _obs_metrics_ep = False if _obs is None else bool(getattr(_obs, "metrics_endpoint", False))
+    # Add the middleware when anything needs it — request-id/timing, or the
+    # metrics endpoint (which needs request totals recorded even if the
+    # correlation id and scope timing are off).
+    if _obs_request_id or _obs_timing or _obs_metrics_ep:
+        from pyxle.observability import RequestIdMiddleware  # noqa: PLC0415
+
+        middleware_stack.insert(
+            0,
+            Middleware(
+                RequestIdMiddleware,
+                emit_request_id=_obs_request_id,
+                header_name=(
+                    "X-Request-Id" if _obs is None else getattr(_obs, "request_id_header", "X-Request-Id")
+                ),
+                trust_incoming=(
+                    False if _obs is None else bool(getattr(_obs, "trust_incoming_request_id", False))
+                ),
+                timing=_obs_timing,
+                metrics=metrics_registry,
+            ),
+        )
+
     app = Starlette(
         debug=settings.debug,
         middleware=middleware_stack,
         lifespan=lifespan,
     )
 
+    app.state.pyxle_metrics = metrics_registry
+    # The SSR worker pool (None in subprocess/inline render mode) backs the
+    # /readyz dependency check — a server with no live workers can't render.
+    app.state.pyxle_ssr_pool = pool
     app.state.pyxle_started_at = time.time()
     app.state.pyxle_ready = False
 
@@ -1812,29 +1889,100 @@ def _maybe_attach_manifest(settings: DevServerSettings, logger: ConsoleLogger) -
     return replace(settings, page_manifest=manifest_data)
 
 
+def _readiness_checks(app: Starlette) -> dict[str, dict[str, object]]:
+    """Fast, non-blocking dependency checks that gate ``/readyz``.
+
+    Each check is a cheap attribute read — never a network round-trip — so the
+    probe stays well under the budget a liveness/readiness poller expects. A
+    dependency that isn't configured contributes no check (it can't be "down").
+    """
+    checks: dict[str, dict[str, object]] = {}
+
+    # SSR worker pool: in pool mode the server can't render a page if every
+    # worker has crashed, so at least one must be alive. Subprocess/inline mode
+    # has no pool and so contributes no check.
+    pool = getattr(app.state, "pyxle_ssr_pool", None)
+    if pool is not None:
+        alive = int(getattr(pool, "alive_count", 0))
+        checks["ssr_pool"] = {
+            "ok": alive >= 1,
+            "alive": alive,
+            "size": int(getattr(pool, "size", 0)),
+        }
+
+    return checks
+
+
+def _metrics_summary(app: Starlette) -> dict[str, object] | None:
+    registry = getattr(app.state, "pyxle_metrics", None)
+    if registry is None:
+        return None
+    snapshot = registry.snapshot()
+    return {
+        "requests_total": snapshot["requests_total"],
+        "cache_hit_ratio": snapshot["cache"]["hit_ratio"],
+    }
+
+
 def _health_payload(app: Starlette) -> dict[str, object]:
     started_at = getattr(app.state, "pyxle_started_at", None)
-    ready = bool(getattr(app.state, "pyxle_ready", False))
+    ready_flag = bool(getattr(app.state, "pyxle_ready", False))
     uptime = 0.0
     if isinstance(started_at, (int, float)):
         uptime = max(0.0, time.time() - float(started_at))
 
-    return {
+    checks = _readiness_checks(app)
+    # Ready only when the runner has finished warming up *and* every configured
+    # dependency check passes.
+    ready = ready_flag and all(check["ok"] for check in checks.values())
+
+    payload: dict[str, object] = {
         "status": "ok",
         "ready": ready,
         "uptime": uptime,
+        "checks": checks,
     }
+    metrics = _metrics_summary(app)
+    if metrics is not None:
+        payload["metrics"] = metrics
+    return payload
 
 
 async def _healthz_endpoint(request: Request) -> JSONResponse:
-    payload = _health_payload(request.app)
-    return JSONResponse(payload)
+    # Liveness: the process is up and serving. Always 200, never gated on
+    # dependencies (the readiness signal lives in the payload and /readyz).
+    return JSONResponse(_health_payload(request.app))
 
 
 async def _readyz_endpoint(request: Request) -> JSONResponse:
     payload = _health_payload(request.app)
     status_code = 200 if payload["ready"] else 503
     return JSONResponse(payload, status_code=status_code)
+
+
+def _make_metrics_endpoint(token: str | None):
+    """Build the opt-in Prometheus metrics endpoint, optionally bearer-guarded."""
+    import hmac  # noqa: PLC0415
+
+    expected = f"Bearer {token}" if token is not None else None
+
+    async def _metrics_endpoint(request: Request) -> Response:
+        if expected is not None:
+            # Constant-time comparison so the token can't be timing-probed.
+            provided = request.headers.get("authorization", "")
+            if not hmac.compare_digest(provided, expected):
+                return Response("Unauthorized", status_code=401)
+        registry = getattr(request.app.state, "pyxle_metrics", None)
+        if registry is None:  # pragma: no cover - registry is always set in app
+            return Response("metrics unavailable", status_code=503)
+        from pyxle.observability.exposition import (  # noqa: PLC0415
+            CONTENT_TYPE,
+            render_prometheus,
+        )
+
+        return Response(render_prometheus(registry), media_type=CONTENT_TYPE)
+
+    return _metrics_endpoint
 
 
 __all__ = [

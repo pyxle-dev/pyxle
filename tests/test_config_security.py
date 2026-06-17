@@ -12,6 +12,7 @@ from pyxle.config import (
     ConfigError,
     CorsConfig,
     CsrfConfig,
+    ObservabilityConfig,
     PyxleConfig,
     load_config,
 )
@@ -367,3 +368,131 @@ class TestCacheConfigParsing:
         config_file.write_text("{}")
         config = load_config(tmp_path, config_path=config_file)
         assert config.cache.enabled is False
+
+
+# ---------------------------------------------------------------------------
+# ObservabilityConfig defaults + parsing
+# ---------------------------------------------------------------------------
+
+
+class TestObservabilityConfigDefaults:
+    def test_request_id_on_by_default(self):
+        assert ObservabilityConfig().request_id is True
+
+    def test_timing_on_by_default(self):
+        assert ObservabilityConfig().timing is True
+
+    def test_does_not_trust_incoming_id_by_default(self):
+        # Echoing client-supplied ids is a spoofing vector; off by default.
+        assert ObservabilityConfig().trust_incoming_request_id is False
+
+    def test_default_header_name(self):
+        assert ObservabilityConfig().request_id_header == "X-Request-Id"
+
+    def test_enabled_reflects_either_signal(self):
+        assert ObservabilityConfig().enabled is True
+        assert ObservabilityConfig(request_id=False, timing=False).enabled is False
+        assert ObservabilityConfig(request_id=False, timing=True).enabled is True
+
+
+class TestObservabilityConfigParsing:
+    def _load(self, tmp_path: Path, observability_data) -> PyxleConfig:
+        config_file = tmp_path / "pyxle.config.json"
+        config_file.write_text(json.dumps({"observability": observability_data}))
+        return load_config(tmp_path, config_path=config_file)
+
+    def test_no_block_returns_defaults(self, tmp_path: Path):
+        config_file = tmp_path / "pyxle.config.json"
+        config_file.write_text("{}")
+        config = load_config(tmp_path, config_path=config_file)
+        assert config.observability == ObservabilityConfig()
+
+    def test_bare_false_disables_both(self, tmp_path: Path):
+        config = self._load(tmp_path, False)
+        assert config.observability.request_id is False
+        assert config.observability.timing is False
+
+    def test_bare_true_enables_both(self, tmp_path: Path):
+        config = self._load(tmp_path, True)
+        assert config.observability.request_id is True
+        assert config.observability.timing is True
+
+    def test_object_fields(self, tmp_path: Path):
+        config = self._load(
+            tmp_path,
+            {
+                "requestId": False,
+                "requestIdHeader": "X-Trace-Id",
+                "trustIncomingRequestId": True,
+                "timing": False,
+            },
+        )
+        obs = config.observability
+        assert obs.request_id is False
+        assert obs.request_id_header == "X-Trace-Id"
+        assert obs.trust_incoming_request_id is True
+        assert obs.timing is False
+
+    def test_threads_into_devserver_kwargs(self, tmp_path: Path):
+        config = self._load(tmp_path, {"requestId": False})
+        assert config.to_devserver_kwargs()["observability"] is config.observability
+
+    def test_invalid_top_type_raises(self, tmp_path: Path):
+        config_file = tmp_path / "pyxle.config.json"
+        config_file.write_text(json.dumps({"observability": 42}))
+        with pytest.raises(ConfigError, match="observability"):
+            load_config(tmp_path, config_path=config_file)
+
+    def test_invalid_request_id_type_raises(self, tmp_path: Path):
+        with pytest.raises(ConfigError, match="observability.requestId"):
+            self._load(tmp_path, {"requestId": "yes"})
+
+    def test_empty_header_name_raises(self, tmp_path: Path):
+        with pytest.raises(ConfigError, match="requestIdHeader"):
+            self._load(tmp_path, {"requestIdHeader": "  "})
+
+    def test_invalid_trust_incoming_type_raises(self, tmp_path: Path):
+        with pytest.raises(ConfigError, match="trustIncomingRequestId"):
+            self._load(tmp_path, {"trustIncomingRequestId": "no"})
+
+    def test_invalid_timing_type_raises(self, tmp_path: Path):
+        with pytest.raises(ConfigError, match="observability.timing"):
+            self._load(tmp_path, {"timing": 1})
+
+    def test_metrics_endpoint_defaults_off(self):
+        obs = ObservabilityConfig()
+        assert obs.metrics_endpoint is False
+        assert obs.metrics_endpoint_path == "/api/__pyxle/metrics"
+        assert obs.metrics_endpoint_token is None
+
+    def test_metrics_endpoint_fields(self, tmp_path: Path):
+        config = self._load(
+            tmp_path,
+            {
+                "metricsEndpoint": True,
+                "metricsEndpointPath": "/internal/metrics",
+                "metricsEndpointToken": "s3cret",
+            },
+        )
+        obs = config.observability
+        assert obs.metrics_endpoint is True
+        assert obs.metrics_endpoint_path == "/internal/metrics"
+        assert obs.metrics_endpoint_token == "s3cret"
+
+    def test_metrics_endpoint_enables_observability(self):
+        # Even with request-id and timing off, the metrics endpoint counts as
+        # "enabled" so the recording middleware is installed.
+        obs = ObservabilityConfig(request_id=False, timing=False, metrics_endpoint=True)
+        assert obs.enabled is True
+
+    def test_invalid_metrics_endpoint_type_raises(self, tmp_path: Path):
+        with pytest.raises(ConfigError, match="metricsEndpoint"):
+            self._load(tmp_path, {"metricsEndpoint": "yes"})
+
+    def test_relative_metrics_path_raises(self, tmp_path: Path):
+        with pytest.raises(ConfigError, match="metricsEndpointPath"):
+            self._load(tmp_path, {"metricsEndpointPath": "metrics"})
+
+    def test_empty_metrics_token_raises(self, tmp_path: Path):
+        with pytest.raises(ConfigError, match="metricsEndpointToken"):
+            self._load(tmp_path, {"metricsEndpointToken": "  "})

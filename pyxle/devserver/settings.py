@@ -50,6 +50,9 @@ class DevServerSettings:
     cache: Any = None
     # Client navigation/prefetch cache policy (NavigationConfig). None = default.
     navigation: Any = None
+    # Request observability (ObservabilityConfig). None = framework defaults
+    # (request-id + timing on).
+    observability: Any = None
     # Plugin entries from pyxle.config.json::plugins — raw payload
     # (strings or dicts), resolved to PluginSpec/PyxlePlugin instances
     # by the starlette app at startup. Empty tuple = no plugins.
@@ -79,6 +82,7 @@ class DevServerSettings:
         csrf: Any = None,
         cache: Any = None,
         navigation: Any = None,
+        observability: Any = None,
         plugins: Sequence[Any] | None = None,
     ) -> "DevServerSettings":
         """Create settings derived from a project root directory."""
@@ -137,6 +141,7 @@ class DevServerSettings:
             csrf=csrf,
             cache=cache,
             navigation=navigation,
+            observability=observability,
             plugins=tuple(plugins) if plugins else (),
         )
 
