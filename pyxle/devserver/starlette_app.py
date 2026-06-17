@@ -740,6 +740,23 @@ def _record_action_metric(request: Request, duration_ms: float) -> None:
     if registry is not None:
         registry.observe_action(duration_ms)
 
+
+def _schedule_background_spec(background, spec) -> None:
+    """Add a ``{"background": [fn, *args]}`` action-return shorthand to *background*.
+
+    The spec is a non-empty list/tuple whose first element is the callable and
+    the rest are its positional arguments. Raises ``ValueError`` on a malformed
+    spec so the dispatcher can surface a clear error.
+    """
+    if not isinstance(spec, (list, tuple)) or not spec:
+        raise ValueError(
+            "Action 'background' must be a non-empty [callable, *args] list."
+        )
+    func, *args = spec
+    if not callable(func):
+        raise ValueError("Action 'background' first element must be callable.")
+    background.add_task(func, *args)
+
 # Fallback s-maxage for a cached entry with no explicit revalidate window
 # (cache-until-invalidated). Only reachable via the compile-time cache
 # directive; loader-envelope and edge-config entries always carry a number.
@@ -1262,6 +1279,11 @@ async def _dispatch_action(
         return JSONResponse({"ok": False, "error": error_msg}, status_code=500)
 
     from pyxle.observability.otel import span  # noqa: PLC0415
+    from starlette.background import BackgroundTasks  # noqa: PLC0415
+
+    # Expose request.state.background so an action can schedule fire-and-forget
+    # work that runs after the response is sent (Starlette BackgroundTasks).
+    request.state.background = BackgroundTasks()
 
     _action_start = time.perf_counter()
     try:
@@ -1296,6 +1318,18 @@ async def _dispatch_action(
             status_code=500,
         )
 
+    # A ``{"background": [fn, *args]}`` return is shorthand for scheduling one
+    # post-response task; pop it so it isn't serialised into the body.
+    background_spec = result.pop("background", None)
+    if background_spec is not None:
+        try:
+            _schedule_background_spec(request.state.background, background_spec)
+        except ValueError as exc:
+            return JSONResponse(
+                {"ok": False, "error": str(exc) if debug else "Internal server error"},
+                status_code=500,
+            )
+
     # If the action used ``invalidate_routes(...)`` on a plain dict, the
     # invalidation targets were stashed under ``__pyxle_invalidate__``.
     # Lift them into an HTTP response header and strip the sentinel from
@@ -1308,6 +1342,10 @@ async def _dispatch_action(
         joined = ", ".join(u for u in invalidate_hints if u)
         if joined:
             response.headers["x-pyxle-invalidate"] = joined
+    # Attach any scheduled post-response work; Starlette runs it after the body
+    # is sent. No-op when the action scheduled nothing.
+    if request.state.background.tasks:
+        response.background = request.state.background
     return response
 
 
@@ -1677,6 +1715,14 @@ def create_starlette_app(
         #      preferred for most app code.
         app.state.pyxle_plugins = _plugin_ctx
         set_active_context(_plugin_ctx)
+        # Start the in-process background task queue and register it so
+        # ``pyxle.tasks.enqueue(...)`` works from any loader/action.
+        from pyxle.tasks import TaskQueue, set_active_queue  # noqa: PLC0415
+
+        task_queue = TaskQueue()
+        await task_queue.start()
+        app.state.pyxle_tasks = task_queue
+        set_active_queue(task_queue)
         # Register the page cache so `pyxle.cache.invalidate(path)` can reach it
         # from actions without threading a handle through the request.
         if page_cache is not None:
@@ -1699,6 +1745,10 @@ def create_starlette_app(
             if page_cache is not None:
                 set_active_cache(None)
                 await page_cache.aclose()
+            # Drain and stop the task queue before tearing down plugins so
+            # in-flight tasks can still reach plugin services (e.g. the DB).
+            set_active_queue(None)
+            await task_queue.stop()
             set_active_context(None)
             await run_shutdown(_plugins, _plugin_ctx)
             if pool is not None:

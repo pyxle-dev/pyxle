@@ -207,6 +207,43 @@ Parameters:
 
 Returns the `response` argument (possibly with a header or sentinel key added) so you can `return invalidate_routes(...)` in one line.
 
+## Background tasks — `pyxle.tasks`
+
+Fire-and-forget background work that runs in-process on the app's event loop.
+See the [Background Tasks guide](../guides/background-tasks.md).
+
+### `enqueue(func, *args, **kwargs)`
+
+Schedule `func(*args, **kwargs)` on the app's bounded worker pool and return
+immediately. Coroutine functions are awaited; plain callables run in a thread.
+Usable from any loader or action while the app is running.
+
+```python
+from pyxle.tasks import enqueue
+
+@server
+async def load_article(request):
+    enqueue(record_view, request.path_params["slug"])  # returns now
+    return {"article": ...}
+```
+
+| Raises | When |
+|--------|------|
+| `TaskQueueNotRunning` | Called outside a running Pyxle app (no active queue) |
+| `TaskQueueFull` | The bounded queue is at capacity (sustained overload) |
+
+A task that raises is logged (`pyxle.tasks` logger) and never takes a worker
+down. The queue is **per-process** — under `pyxle serve --workers N` each worker
+has its own, and queued work is lost on restart. For durable or cross-worker
+jobs, use a real job queue (Celery / ARQ / Dramatiq) — see the guide.
+
+### Post-response tasks in an `@action`
+
+Inside an `@action`, `request.state.background` is a Starlette
+[`BackgroundTasks`](https://www.starlette.io/background/); `add_task(func, *args)`
+runs after the response is sent. Returning `{"background": [fn, *args]}` from the
+action is shorthand for a single such task.
+
 ## WebSockets — `pyxle.realtime`
 
 A page that exports a module-scope `async def websocket(ws)` also serves a

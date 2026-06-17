@@ -1065,3 +1065,69 @@ def test_action_pydantic_not_installed_is_500(tmp_path: Path, monkeypatch) -> No
     response = client.post(url, json={})
     assert response.status_code == 500
     assert response.json()["ok"] is False
+
+
+# ---------------------------------------------------------------------------
+# Background tasks (request.state.background + {"background": [...]} shorthand)
+
+
+def test_action_state_background_runs_after_response(tmp_path: Path) -> None:
+    marker = tmp_path / "bg_state.txt"
+    src = (
+        "from pyxle.runtime import action\n\n"
+        "def _write():\n"
+        f"    open({str(marker)!r}, 'w').write('ran')\n\n"
+        "@action\n"
+        "async def go(request):\n"
+        "    request.state.background.add_task(_write)\n"
+        "    return {'ok': True}\n"
+    )
+    client, url = _action_client(tmp_path, "bgstate", "go", src)
+    assert not marker.exists()
+    response = client.post(url, json={})
+    assert response.status_code == 200
+    # The TestClient runs the response's background tasks before returning.
+    assert marker.read_text() == "ran"
+
+
+def test_action_background_shorthand_runs_and_is_stripped(tmp_path: Path) -> None:
+    marker = tmp_path / "bg_short.txt"
+    src = (
+        "from pyxle.runtime import action\n\n"
+        "def _write(content):\n"
+        f"    open({str(marker)!r}, 'w').write(content)\n\n"
+        "@action\n"
+        "async def go(request):\n"
+        "    return {'ok': True, 'background': [_write, 'shorthand']}\n"
+    )
+    client, url = _action_client(tmp_path, "bgshort", "go", src)
+    response = client.post(url, json={})
+    assert response.status_code == 200
+    # The 'background' key is stripped from the response body.
+    assert "background" not in response.json()
+    assert marker.read_text() == "shorthand"
+
+
+def test_action_background_malformed_returns_500(tmp_path: Path) -> None:
+    src = (
+        "from pyxle.runtime import action\n\n"
+        "@action\n"
+        "async def go(request):\n"
+        "    return {'ok': True, 'background': 'not-a-list'}\n"
+    )
+    client, url = _action_client(tmp_path, "bgmal", "go", src)
+    response = client.post(url, json={})
+    assert response.status_code == 500
+    assert response.json()["ok"] is False
+
+
+def test_action_background_non_callable_first_returns_500(tmp_path: Path) -> None:
+    src = (
+        "from pyxle.runtime import action\n\n"
+        "@action\n"
+        "async def go(request):\n"
+        "    return {'ok': True, 'background': ['not-callable', 1]}\n"
+    )
+    client, url = _action_client(tmp_path, "bgnc", "go", src)
+    response = client.post(url, json={})
+    assert response.status_code == 500

@@ -154,6 +154,12 @@ auto-injected). Export an OpenAPI schema with `pyxle openapi`.
 If a mutation should refresh data shown elsewhere, re-run the current loader with `refresh()`
 (from `pyxle/client`); see the docs for invalidating other routes.
 
+**Background work — don't make the client wait.** To run work *after* the response (send an
+email, emit a webhook), use `request.state.background.add_task(fn, *args)` inside an `@action`,
+or return the shorthand `{"background": [fn, *args]}`. For fire-and-forget work from anywhere
+(loaders too), `from pyxle.tasks import enqueue; enqueue(fn, *args)`. Both run **in-process** —
+for durable/cross-worker jobs, hand off to Celery/ARQ/Dramatiq (see the Background Tasks guide).
+
 ## The client toolkit — `import { … } from 'pyxle/client'`
 
 - `useAction(name)` — bind to an `@action`; returns a callable with `.pending`, `.error`, `.fields`, `.data`.

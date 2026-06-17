@@ -290,6 +290,24 @@ Pyxle attaches an `x-pyxle-invalidate: /posts, /dashboard` header to the respons
 
 For purely client-driven invalidation (no server roundtrip), use [`invalidate(url)`](../reference/client-api.md#invalidateurl) from `pyxle/client`.
 
+## Running work after the response
+
+To do work without making the client wait — send an email, emit a webhook —
+schedule it on `request.state.background`. Pyxle runs it after the response is
+sent:
+
+```python
+@action
+async def signup(request, body: Signup):
+    user = await db.create_user(body.email)
+    request.state.background.add_task(send_welcome_email, user.email)
+    return {"id": user.id}
+```
+
+For a single task you can return the shorthand `{"background": [fn, *args]}`
+instead. For fire-and-forget work that isn't tied to this response (including
+from `@server` loaders), use [`pyxle.tasks.enqueue`](../guides/background-tasks.md#fire-and-forget-work--pyxletasks). See the [Background Tasks guide](../guides/background-tasks.md).
+
 ## How actions are routed
 
 Each `@action` function gets an automatic endpoint:
