@@ -6,7 +6,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterable, List, Optional
 
-from .error_pages import is_error_boundary_file
+from .error_pages import build_error_boundary_registry, is_error_boundary_file
 from .loading_pages import build_loading_boundary_registry, is_loading_file
 from .path_utils import route_path_from_relative
 from .registry import ApiRegistryEntry, MetadataRegistry, PageRegistryEntry
@@ -44,6 +44,13 @@ class PageRoute:
     #: state shows while the render suspends. ``None`` for routes with no
     #: enclosing loading boundary.
     loading_boundary: Optional["PageRoute"] = None
+    #: The nearest ``error.pyxl`` page route for this route, if any. Carried so
+    #: the client hydration entry can wrap the page in a React error boundary
+    #: that renders this ``error.pyxl`` when a *client-side* render throws —
+    #: parity with the server, which already renders the nearest ``error.pyxl``
+    #: when a loader or the SSR render fails. ``None`` for routes with no
+    #: enclosing error boundary.
+    error_boundary: Optional["PageRoute"] = None
 
     @property
     def has_loader(self) -> bool:
@@ -169,6 +176,18 @@ def build_route_table(registry: MetadataRegistry) -> RouteTable:
     if loading_registry.has_loading_pages:
         page_routes = [
             replace(route, loading_boundary=loading_registry.find_loading_boundary(route.path))
+            for route in page_routes
+        ]
+
+    # Resolve each page's nearest error.pyxl (closest-ancestor walk-up) and
+    # stamp it on, so the client hydration entry can wrap the page in a React
+    # error boundary that renders that error.pyxl when a client-side render
+    # throws — parity with the server, which already renders the nearest
+    # error.pyxl when a loader or the SSR render fails.
+    error_registry = build_error_boundary_registry(error_boundary_routes)
+    if error_registry.has_error_pages:
+        page_routes = [
+            replace(route, error_boundary=error_registry.find_error_boundary(route.path))
             for route in page_routes
         ]
 

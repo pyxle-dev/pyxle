@@ -97,6 +97,16 @@ def build_document_shell(
     if loading_boundary is not None
     else "null"
   )
+  # The nearest error.pyxl's client asset (or null). The client hydration entry
+  # reads this to wrap the page in a React error boundary whose fallback is that
+  # error.pyxl — client-side render faults then render the same page the server
+  # already renders on a loader/SSR failure.
+  error_boundary = getattr(page, "error_boundary", None)
+  error_asset_literal = (
+    json.dumps(error_boundary.client_asset_path)
+    if error_boundary is not None
+    else "null"
+  )
   head_injections = render_head_markup(head_elements)
   # Seed payload for the client navigation cache. Lets the page the user
   # landed on satisfy its own prefetch (the active self-link) from cache
@@ -183,7 +193,8 @@ def build_document_shell(
   <script id=\"__PYXLE_PROPS__\" type=\"application/json\"{nonce_attr}>{props_payload}</script>
   <script id=\"__PYXLE_NAV_SEED__\" type=\"application/json\"{nonce_attr}>{nav_seed_payload}</script>
   <script{nonce_attr}>window.__PYXLE_PAGE_PATH__ = {page_path_literal};</script>
-  <script{nonce_attr}>window.__PYXLE_LOADING_ASSET__ = {loading_asset_literal};</script>{nav_stale_script}{csrf_names_script}{auth_seed_script}
+  <script{nonce_attr}>window.__PYXLE_LOADING_ASSET__ = {loading_asset_literal};</script>
+  <script{nonce_attr}>window.__PYXLE_ERROR_ASSET__ = {error_asset_literal};</script>{nav_stale_script}{csrf_names_script}{auth_seed_script}
   <script{nonce_attr}>window.__PYXLE_SCRIPTS__ = {scripts_metadata};</script>
   <script type=\"module\" src=\"{js_src}\"></script>
   </body>
@@ -194,6 +205,7 @@ def build_document_shell(
       nav_seed_payload=nav_seed_payload,
       page_path_literal=page_path_literal,
       loading_asset_literal=loading_asset_literal,
+      error_asset_literal=error_asset_literal,
       scripts_metadata=scripts_metadata,
       nav_stale_script=nav_stale_script,
       csrf_names_script=csrf_names_script,
@@ -229,7 +241,8 @@ def build_document_shell(
   <script id=\"__PYXLE_PROPS__\" type=\"application/json\"{nonce_attr}>{props_payload}</script>
   <script id=\"__PYXLE_NAV_SEED__\" type=\"application/json\"{nonce_attr}>{nav_seed_payload}</script>
   <script{nonce_attr}>window.__PYXLE_PAGE_PATH__ = {page_path_literal};</script>
-  <script{nonce_attr}>window.__PYXLE_LOADING_ASSET__ = {loading_asset_literal};</script>{nav_stale_script}{csrf_names_script}{auth_seed_script}
+  <script{nonce_attr}>window.__PYXLE_LOADING_ASSET__ = {loading_asset_literal};</script>
+  <script{nonce_attr}>window.__PYXLE_ERROR_ASSET__ = {error_asset_literal};</script>{nav_stale_script}{csrf_names_script}{auth_seed_script}
   <script{nonce_attr}>window.__PYXLE_SCRIPTS__ = {scripts_metadata};</script>
   <script type=\"module\" src=\"{vite_origin}/client-entry.js\"></script>
   </body>
@@ -240,6 +253,7 @@ def build_document_shell(
     nav_seed_payload=nav_seed_payload,
     page_path_literal=page_path_literal,
     loading_asset_literal=loading_asset_literal,
+    error_asset_literal=error_asset_literal,
     scripts_metadata=scripts_metadata,
     nav_stale_script=nav_stale_script,
     csrf_names_script=csrf_names_script,

@@ -101,6 +101,14 @@ When an error occurs, Pyxle walks up the directory tree from the page that faile
   2. Check `pages/error.pyxl`
   3. Use default error document
 
+### Client-side errors
+
+The same `error.pyxl` is also a **client-side React error boundary**. The server renders the nearest `error.pyxl` when a loader or the initial render fails; once the page is interactive, that boundary keeps working in the browser. If a component throws while re-rendering — after a state update, during a client-side navigation, or on a hydration fault — the boundary catches it and renders the nearest `error.pyxl` in place, instead of React unmounting the page to a blank screen.
+
+It receives the same `error` prop on both sides (`message`, `statusCode`, `type`), so one `error.pyxl` renders identically whether the fault happened on the server or in the browser. The boundary is transparent until something throws, so it never affects hydration, and it resets on the next navigation. In `pyxle dev` the [error overlay](#dev-mode-error-overlay) still surfaces the full stack on top; in production the boundary is the user-facing fallback.
+
+This catches *render* faults. An error thrown in an event handler or an `await` (e.g. a failed `fetch`) is not a render error — handle those where they occur (a `try/catch`, or surfacing an `ActionError` from `useAction`).
+
 ## Not-found pages (`not-found.pyxl`)
 
 Create a `not-found.pyxl` file to customise the 404 page:

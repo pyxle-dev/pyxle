@@ -506,6 +506,15 @@ async def build_page_navigation_response(
                     if page.loading_boundary is not None
                     else None
                 ),
+                # The nearest error.pyxl's client asset (or None). Carried
+                # per-route so a client-side render fault on the navigated-to
+                # page renders the same error.pyxl the server would — the
+                # client error boundary's fallback, kept in lockstep per route.
+                "errorAssetPath": (
+                    page.error_boundary.client_asset_path
+                    if page.error_boundary is not None
+                    else None
+                ),
             },
             "props": nav_component_props,
             "headMarkup": nav_head_markup,

@@ -82,6 +82,27 @@ def test_client_entry_seeds_nav_cache_and_guards_self_prefetch(tmp_path: Path) -
     assert "Never prefetch the page we're already on" in client_entry
 
 
+def test_client_entry_wraps_pages_in_error_boundary(tmp_path: Path) -> None:
+    settings = DevServerSettings.from_project_root(tmp_path)
+    client_entry = _render_client_entry(settings)
+
+    # A client-side React error boundary that renders the nearest error.pyxl on
+    # a render fault, keyed by pagePath so navigation clears the error state.
+    assert "class PyxleErrorBoundary extends React.Component" in client_entry
+    assert "getDerivedStateFromError" in client_entry
+    assert "fallbackComponent" in client_entry
+    # The error context is passed under the `error` prop key, matching the
+    # server's props={"error": ...} so one error.pyxl reads props.error on both.
+    assert "buildClientErrorContext" in client_entry
+    assert "error: buildClientErrorContext(this.state.error)" in client_entry
+
+    # The nearest error.pyxl asset is threaded through renderPage from both the
+    # navigation payload and the SSR-seeded global.
+    assert "errorAssetPath" in client_entry
+    assert "window.__PYXLE_ERROR_ASSET__" in client_entry
+    assert "payload.page?.errorAssetPath" in client_entry
+
+
 def test_write_client_bootstrap_files_is_idempotent(tmp_path: Path) -> None:
     settings = create_project(tmp_path)
 

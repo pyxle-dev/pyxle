@@ -2635,5 +2635,37 @@ async def test_nav_payload_for_plain_page_has_null_loading_asset(
     )
     body = json.loads((await _read_response_body(response)).decode())
     assert body["page"]["loadingAssetPath"] is None
+    assert body["page"]["errorAssetPath"] is None
     # A plain page's nav payload still renders buffered for its runtime head.
     assert renderer.calls != []
+
+
+@pytest.mark.anyio
+async def test_nav_payload_carries_error_asset_when_boundary_present(
+    settings: DevServerSettings, tmp_path: Path
+) -> None:
+    # A page with a nearest error.pyxl carries its client asset so the client
+    # error boundary can render the same error.pyxl the server would.
+    error_route = replace(
+        _page_route(tmp_path, loader_name=None),
+        client_asset_path="/pages/error.jsx",
+    )
+    page = replace(
+        _page_route(tmp_path, loader_name=None),
+        error_boundary=error_route,
+    )
+    renderer = StubRenderer()
+    renderer.responses.append(RenderResult(html="<main>plain</main>"))
+    request = Request(
+        {"type": "http", "http_version": "1.1", "method": "GET", "path": "/", "root_path": "", "headers": []}
+    )
+
+    response = await build_page_navigation_response(
+        request=request,
+        settings=settings,
+        page=page,
+        renderer=renderer,
+        overlay=StubOverlay(),
+    )
+    body = json.loads((await _read_response_body(response)).decode())
+    assert body["page"]["errorAssetPath"] == "/pages/error.jsx"

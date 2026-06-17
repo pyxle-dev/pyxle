@@ -1111,7 +1111,69 @@ def _render_client_entry(settings: DevServerSettings) -> str:
               return promise;
             }
 
-            async function renderPage(pagePath, props, loadingAssetPath) {
+            // The error context handed to the nearest error.pyxl when the
+            // client boundary catches a render fault. Mirrors the server's
+            // _build_error_context shape (message / statusCode / type) and is
+            // passed under the SAME `error` prop key the server uses
+            // (props={"error": ...}), so one error.pyxl reads `props.error`
+            // identically on both sides. The error originated in the browser,
+            // so its message is the client's own — no server-secret leak.
+            function buildClientErrorContext(error) {
+              const message =
+                error && error.message ? String(error.message) : String(error);
+              return {
+                message: message,
+                statusCode: 500,
+                type: (error && error.name) || 'Error',
+              };
+            }
+
+            // A React error boundary for the client. It is a transparent
+            // passthrough until a descendant throws (so it adds no DOM and never
+            // perturbs hydration); on error it renders the nearest error.pyxl —
+            // parity with the server, which already renders that error.pyxl when
+            // a loader or the SSR render fails. renderPage keys it by pagePath so
+            // a later navigation remounts it and clears the error state.
+            class PyxleErrorBoundary extends React.Component {
+              constructor(props) {
+                super(props);
+                this.state = { error: null };
+              }
+              static getDerivedStateFromError(error) {
+                return { error: error };
+              }
+              componentDidCatch(error, info) {
+                // The dev overlay hooks window.onerror/console separately, so
+                // logging here is enough to surface the fault in both modes.
+                console.error('[Pyxle] Unhandled error during client render:', error, info);
+              }
+              render() {
+                if (this.state.error) {
+                  const Fallback = this.props.fallbackComponent;
+                  if (Fallback) {
+                    return React.createElement(Fallback, {
+                      error: buildClientErrorContext(this.state.error),
+                    });
+                  }
+                  return React.createElement(
+                    'div',
+                    {
+                      role: 'alert',
+                      'data-pyxle-client-error': '',
+                      style: {
+                        padding: '2rem',
+                        fontFamily: 'system-ui, sans-serif',
+                        color: '#b91c1c',
+                      },
+                    },
+                    'Something went wrong rendering this page.',
+                  );
+                }
+                return this.props.children;
+              }
+            }
+
+            async function renderPage(pagePath, props, loadingAssetPath, errorAssetPath) {
               const module = await loadPageModule(pagePath);
               const Page = module.default;
               if (!Page) {
@@ -1136,6 +1198,28 @@ def _render_client_entry(settings: DevServerSettings) -> str:
                   React.createElement(Page, props),
                 );
               }
+
+              // Wrap the (possibly Suspense-wrapped) page in the client error
+              // boundary. Its fallback is the nearest error.pyxl, pre-loaded here
+              // so the boundary's synchronous render() can mount it on a fault.
+              // The boundary is transparent until then, so hydration is unchanged.
+              let errorFallbackComponent = null;
+              if (errorAssetPath) {
+                try {
+                  const errorModule = await loadPageModule(errorAssetPath);
+                  errorFallbackComponent = errorModule.default || null;
+                } catch (loadError) {
+                  // If error.pyxl itself fails to load, fall through to the
+                  // boundary's built-in message rather than break page render.
+                  console.error('[Pyxle] Failed to load error boundary module:', loadError);
+                }
+              }
+              element = React.createElement(
+                PyxleErrorBoundary,
+                { key: pagePath, fallbackComponent: errorFallbackComponent },
+                element,
+              );
+
               if (!reactRoot) {
                 const placeholder = container.firstElementChild;
                 const shouldClientRender = placeholder?.hasAttribute('data-pyxle-component');
@@ -1663,7 +1747,7 @@ def _render_client_entry(settings: DevServerSettings) -> str:
                 const nextProps = payload.props ?? {};
                 await prefetchModule(nextPagePath);
                 updateHead(payload.headMarkup ?? '');
-                await renderPage(nextPagePath, nextProps, payload.page?.loadingAssetPath ?? null);
+                await renderPage(nextPagePath, nextProps, payload.page?.loadingAssetPath ?? null, payload.page?.errorAssetPath ?? null);
 
                 if (options.updateHistory === false) {
                   window.history.replaceState({ pyxle: true, pagePath: nextPagePath }, '', `${url.pathname}${url.search}${url.hash}`);
@@ -1710,7 +1794,7 @@ def _render_client_entry(settings: DevServerSettings) -> str:
                 const nextPagePath = payload.page?.clientAssetPath ?? currentPagePath;
                 const nextProps = payload.props ?? {};
                 updateHead(payload.headMarkup ?? '');
-                await renderPage(nextPagePath, nextProps, payload.page?.loadingAssetPath ?? null);
+                await renderPage(nextPagePath, nextProps, payload.page?.loadingAssetPath ?? null, payload.page?.errorAssetPath ?? null);
 
                 // Replace current history entry with fresh state — no scroll change.
                 window.history.replaceState(
@@ -1798,7 +1882,9 @@ def _render_client_entry(settings: DevServerSettings) -> str:
               // The SSR document sets __PYXLE_LOADING_ASSET__ when this route
               // streamed wrapped in a loading.pyxl <Suspense> boundary; the
               // client wraps identically so hydration matches.
-              await renderPage(currentPagePath, initialProps, window.__PYXLE_LOADING_ASSET__ || null);
+              // __PYXLE_ERROR_ASSET__ carries the nearest error.pyxl so the
+              // client error boundary can render it on a render fault.
+              await renderPage(currentPagePath, initialProps, window.__PYXLE_LOADING_ASSET__ || null, window.__PYXLE_ERROR_ASSET__ || null);
               if (!window.history.state || !window.history.state.pyxle) {
                 window.history.replaceState({ pyxle: true, pagePath: currentPagePath }, '', window.location.href);
               }

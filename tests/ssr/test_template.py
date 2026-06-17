@@ -773,3 +773,38 @@ def test_document_loading_asset_is_null_without_boundary(
         head_elements=(),
     )
     assert "window.__PYXLE_LOADING_ASSET__ = null" in html
+
+
+def test_document_emits_error_asset_when_boundary_present(
+    page_route: PageRoute, tmp_path: Path
+) -> None:
+    settings = DevServerSettings.from_project_root(tmp_path)
+    error_route = replace(page_route, client_asset_path="/pages/dashboard/error.jsx")
+    page = replace(page_route, error_boundary=error_route)
+
+    html = render_document(
+        settings=settings,
+        page=page,
+        body_html="<main>x</main>",
+        props={"data": {}},
+        script_nonce="n",
+        head_elements=(),
+    )
+    # The client reads this to wrap the page in the React error boundary whose
+    # fallback is the nearest error.pyxl.
+    assert 'window.__PYXLE_ERROR_ASSET__ = "/pages/dashboard/error.jsx"' in html
+
+
+def test_document_error_asset_is_null_without_boundary(
+    page_route: PageRoute, tmp_path: Path
+) -> None:
+    settings = DevServerSettings.from_project_root(tmp_path)
+    html = render_document(
+        settings=settings,
+        page=page_route,  # no error_boundary
+        body_html="<main>x</main>",
+        props={"data": {}},
+        script_nonce="n",
+        head_elements=(),
+    )
+    assert "window.__PYXLE_ERROR_ASSET__ = null" in html
