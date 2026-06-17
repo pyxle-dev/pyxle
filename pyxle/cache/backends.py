@@ -9,7 +9,7 @@ the storage contract (:class:`CacheBackend`) and three implementations:
 * :class:`FileCacheBackend` -- persists entries on disk, surviving restarts and
   shared across worker processes on the same host.
 * :class:`RedisCacheBackend` -- a network-shared store for multi-host
-  deployments; requires the optional ``pyxle[redis]`` extra.
+  deployments; requires the optional ``pyxle-framework[redis]`` extra.
 
 Backends store opaque :class:`CacheEntry` values. Freshness / ISR policy lives
 in :mod:`pyxle.cache.page_cache`, which stamps and interprets the entry
@@ -259,7 +259,7 @@ class FileCacheBackend:
 
 
 class RedisCacheBackend:
-    """Network-shared page cache backed by Redis (``pyxle[redis]`` extra).
+    """Network-shared page cache backed by Redis (``pyxle-framework[redis]`` extra).
 
     The right choice for multi-host deployments and for cross-worker
     invalidation: every worker and host reads and writes the same store, so
@@ -277,7 +277,7 @@ class RedisCacheBackend:
             except ImportError as exc:  # pragma: no cover - exercised via the lazy-import test
                 raise ImportError(
                     "RedisCacheBackend requires the 'redis' package. "
-                    "Install it with: pip install 'pyxle[redis]'"
+                    "Install it with: pip install 'pyxle-framework[redis]'"
                 ) from exc
             client = Redis.from_url(url or "redis://localhost:6379")
         self._client = client

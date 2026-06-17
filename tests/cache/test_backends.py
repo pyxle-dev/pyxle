@@ -292,7 +292,7 @@ def test_redis_backend_without_client_requires_the_redis_extra() -> None:
     try:
         import redis.asyncio  # noqa: F401, PLC0415
     except ImportError:
-        with pytest.raises(ImportError, match=r"pyxle\[redis\]"):
+        with pytest.raises(ImportError, match=r"pyxle-framework\[redis\]"):
             RedisCacheBackend()
     else:  # pragma: no cover - depends on the test environment having redis
         pytest.skip("redis is installed; the lazy-import guard is not exercised here")

@@ -147,7 +147,7 @@ environment variable:
 The in-memory backend is **bounded** by entry count (`PYXLE_PAGE_CACHE_MAX_ENTRIES`,
 default 512) and total body bytes (`PYXLE_PAGE_CACHE_MAX_BYTES`, default 64 MiB)
 with LRU eviction, so it never grows without limit. The Redis backend needs the
-optional extra: `pip install 'pyxle[redis]'`.
+optional extra: `pip install 'pyxle-framework[redis]'`.
 
 **Invalidation and workers.** With the in-memory or file backend under
 `pyxle serve --workers N`, each worker keeps its own store, so

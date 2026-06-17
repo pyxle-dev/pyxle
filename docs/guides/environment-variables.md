@@ -107,7 +107,7 @@ HTML. The default needs no configuration.
 | `PYXLE_PAGE_CACHE_REDIS_URL` | redis backend: connection URL (falls back to `REDIS_URL`) |
 
 The cache is active only for production serves (`pyxle serve`); `pyxle dev`
-never caches. The `redis` backend needs `pip install 'pyxle[redis]'`.
+never caches. The `redis` backend needs `pip install 'pyxle-framework[redis]'`.
 
 ## Using environment variables in loaders
 
