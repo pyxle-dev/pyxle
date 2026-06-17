@@ -528,3 +528,36 @@ class TestObservabilityConfigParsing:
     def test_invalid_log_level_raises(self, tmp_path: Path):
         with pytest.raises(ConfigError, match="logLevel"):
             self._load(tmp_path, {"logLevel": "LOUD"})
+
+    def test_otel_defaults(self):
+        obs = ObservabilityConfig()
+        assert obs.otel is False
+        assert obs.otel_service_name == "pyxle-app"
+        assert obs.otel_sample_ratio == 0.05
+
+    def test_otel_fields(self, tmp_path: Path):
+        config = self._load(
+            tmp_path,
+            {"otel": True, "otelServiceName": "shop", "otelSampleRatio": 0.5},
+        )
+        obs = config.observability
+        assert obs.otel is True
+        assert obs.otel_service_name == "shop"
+        assert obs.otel_sample_ratio == 0.5
+
+    def test_invalid_otel_type_raises(self, tmp_path: Path):
+        with pytest.raises(ConfigError, match="observability.otel"):
+            self._load(tmp_path, {"otel": "on"})
+
+    def test_empty_otel_service_name_raises(self, tmp_path: Path):
+        with pytest.raises(ConfigError, match="otelServiceName"):
+            self._load(tmp_path, {"otelServiceName": "  "})
+
+    def test_out_of_range_sample_ratio_raises(self, tmp_path: Path):
+        with pytest.raises(ConfigError, match="otelSampleRatio"):
+            self._load(tmp_path, {"otelSampleRatio": 1.5})
+
+    def test_boolean_sample_ratio_rejected(self, tmp_path: Path):
+        # bool is a subclass of int — must not be accepted as a ratio.
+        with pytest.raises(ConfigError, match="otelSampleRatio"):
+            self._load(tmp_path, {"otelSampleRatio": True})

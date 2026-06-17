@@ -159,7 +159,12 @@ class RequestIdMiddleware:
                     headers.append((self._header_bytes, request_id.encode("latin-1")))
             await send(message)
 
-        await self.app(scope, receive, send_wrapper)
+        # A server span around the whole request when OpenTelemetry tracing is
+        # active; a shared no-op context manager (no allocation) when it's off.
+        from pyxle.observability.otel import span  # noqa: PLC0415
+
+        with span("http.request"):
+            await self.app(scope, receive, send_wrapper)
 
     def _resolve_request_id(self, scope: Scope) -> str:
         if self.trust_incoming:

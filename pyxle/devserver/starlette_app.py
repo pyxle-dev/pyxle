@@ -1261,19 +1261,22 @@ async def _dispatch_action(
         error_msg = str(exc) if debug else "Internal server error"
         return JSONResponse({"ok": False, "error": error_msg}, status_code=500)
 
+    from pyxle.observability.otel import span  # noqa: PLC0415
+
     _action_start = time.perf_counter()
     try:
-        if resolved is None:
-            result = await action_fn(request)
-        else:
-            try:
-                body_payload = await request.json()
-            except Exception:
-                raise ValidationActionError(
-                    fields={"__root__": ["Request body must be valid JSON."]}
-                ) from None
-            body = validate_body(resolved.model, body_payload)
-            result = await action_fn(request, **{resolved.param_name: body})
+        with span("action"):
+            if resolved is None:
+                result = await action_fn(request)
+            else:
+                try:
+                    body_payload = await request.json()
+                except Exception:
+                    raise ValidationActionError(
+                        fields={"__root__": ["Request body must be valid JSON."]}
+                    ) from None
+                body = validate_body(resolved.model, body_payload)
+                result = await action_fn(request, **{resolved.param_name: body})
     except ActionError as exc:
         payload: dict[str, object] = {"ok": False, "error": exc.message}
         if exc.data:
@@ -1646,6 +1649,16 @@ def create_starlette_app(
 
     @asynccontextmanager
     async def lifespan(app: Starlette):  # pragma: no cover - lifecycle orchestration
+        # Configure OpenTelemetry tracing once at startup when enabled. Raises
+        # if the [observability-otel] extra is missing, so a misconfiguration
+        # fails loudly rather than silently dropping traces.
+        if _obs is not None and getattr(_obs, "otel", False):
+            from pyxle.observability.otel import setup_otel  # noqa: PLC0415
+
+            setup_otel(
+                service_name=getattr(_obs, "otel_service_name", "pyxle-app"),
+                sample_ratio=getattr(_obs, "otel_sample_ratio", 0.05),
+            )
         if pool is not None:
             await pool.start()
         # Startup plugins AFTER the SSR pool so plugins that need

@@ -54,7 +54,10 @@ Pyxle is configured via `pyxle.config.json` in the project root. All fields are 
     "metricsEndpointToken": null,
     "accessLog": false,
     "logFormat": "console",
-    "logLevel": "INFO"
+    "logLevel": "INFO",
+    "otel": false,
+    "otelServiceName": "pyxle-app",
+    "otelSampleRatio": 0.05
   },
   "plugins": []
 }
@@ -276,6 +279,9 @@ Request correlation IDs and timing. Both are **on by default** -- generating an 
 | `observability.accessLog` | `boolean` | `false` | Emit one structured access-log line per request (`method`, `path`, `status`, `duration_ms`, `request_id`). Off by default so it doesn't surprise existing log scrapers. |
 | `observability.logFormat` | `string` | `"console"` | `"console"` (human-readable) or `"json"` (one JSON object per line). |
 | `observability.logLevel` | `string` | `"INFO"` | Access-logger level (`CRITICAL`/`ERROR`/`WARNING`/`INFO`/`DEBUG`). |
+| `observability.otel` | `boolean` | `false` | Emit OpenTelemetry spans for requests, SSR renders, loaders, and actions. Requires the `[observability-otel]` extra; with it absent, enabling this fails loudly at startup. |
+| `observability.otelServiceName` | `string` | `"pyxle-app"` | `service.name` resource attribute for the tracer. |
+| `observability.otelSampleRatio` | `number` | `0.05` | Trace sampling ratio (0.0–1.0). Low by default so tracing can't swamp a busy server. The exporter endpoint comes from the standard `OTEL_EXPORTER_OTLP_ENDPOINT` env var. |
 
 Shorthand to disable request-id and timing: `"observability": false`. The page-cache hit-ratio metric requires the [server-side page cache](caching.md) (active under `pyxle serve`). **Multi-worker note:** under `pyxle serve --workers N` each worker process exposes its own metrics (with a `worker` label), so aggregate across workers at the scraper.
 

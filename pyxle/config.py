@@ -127,6 +127,13 @@ class ObservabilityConfig:
     access_log: bool = False
     log_format: str = "console"
     log_level: str = "INFO"
+    # OpenTelemetry tracing — off by default and the heaviest dependency
+    # (requires the [observability-otel] extra). Sampling defaults low so a busy
+    # server isn't swamped; the exporter endpoint is read from the standard
+    # OTEL_EXPORTER_OTLP_ENDPOINT env var.
+    otel: bool = False
+    otel_service_name: str = "pyxle-app"
+    otel_sample_ratio: float = 0.05
 
     @property
     def enabled(self) -> bool:
@@ -724,6 +731,30 @@ def _parse_observability_block(value: Any, *, source: Path) -> ObservabilityConf
             f"expected one of {sorted(_valid_levels)}."
         )
 
+    otel = value.get("otel", False)
+    if not isinstance(otel, bool):
+        raise ConfigError(
+            f"Invalid value for 'observability.otel' in '{source}': expected boolean."
+        )
+
+    otel_service_name = value.get("otelServiceName", "pyxle-app")
+    if not isinstance(otel_service_name, str) or not otel_service_name.strip():
+        raise ConfigError(
+            f"Invalid value for 'observability.otelServiceName' in '{source}': "
+            "expected a non-empty string."
+        )
+
+    otel_sample_ratio = value.get("otelSampleRatio", 0.05)
+    if (
+        not isinstance(otel_sample_ratio, (int, float))
+        or isinstance(otel_sample_ratio, bool)
+        or not 0.0 <= float(otel_sample_ratio) <= 1.0
+    ):
+        raise ConfigError(
+            f"Invalid value for 'observability.otelSampleRatio' in '{source}': "
+            "expected a number between 0.0 and 1.0."
+        )
+
     return ObservabilityConfig(
         request_id=request_id,
         request_id_header=request_id_header.strip(),
@@ -735,6 +766,9 @@ def _parse_observability_block(value: Any, *, source: Path) -> ObservabilityConf
         access_log=access_log,
         log_format=log_format,
         log_level=log_level.upper(),
+        otel=otel,
+        otel_service_name=otel_service_name,
+        otel_sample_ratio=float(otel_sample_ratio),
     )
 
 

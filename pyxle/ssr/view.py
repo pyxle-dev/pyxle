@@ -655,10 +655,13 @@ async def _execute_loader(
             f"Loader '{page.loader_name}' not found in module {page.module_key}"
         )
 
+    from pyxle.observability.otel import span  # noqa: PLC0415
+
     _loader_start = time.perf_counter()
-    result = loader(request)
-    if hasattr(result, "__await__"):
-        result = await result  # type: ignore[assignment]
+    with span("loader"):
+        result = loader(request)
+        if hasattr(result, "__await__"):
+            result = await result  # type: ignore[assignment]
     _record_render_metric(request, "loader", (time.perf_counter() - _loader_start) * 1000.0)
 
     payload, status_code, revalidate = _normalize_loader_result(result, page)
@@ -907,13 +910,16 @@ async def _create_page_artifacts(
         suppress_per_user=suppress_per_user,
     )
 
+    from pyxle.observability.otel import span  # noqa: PLC0415
+
     _render_start = time.perf_counter()
-    render_result = await renderer.render(
-        page.client_module_path,
-        prelude.component_props,
-        request_pathname=request.url.path,
-        csrf_token=prelude.csrf_token,
-    )
+    with span("ssr.render"):
+        render_result = await renderer.render(
+            page.client_module_path,
+            prelude.component_props,
+            request_pathname=request.url.path,
+            csrf_token=prelude.csrf_token,
+        )
     _record_render_metric(request, "render", (time.perf_counter() - _render_start) * 1000.0)
     body_html = render_result.html
     inline_styles = render_result.inline_styles

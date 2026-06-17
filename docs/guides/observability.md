@@ -201,6 +201,38 @@ pip install "pyxle-framework[observability]"
 
 It's off by default so it doesn't disrupt an existing log pipeline.
 
+## OpenTelemetry tracing
+
+For distributed tracing, Pyxle emits [OpenTelemetry](https://opentelemetry.io/)
+spans for each request and child spans for the SSR render, `@server` loaders,
+and `@action` calls — so a slow page shows up as a trace you can drill into.
+
+It's the heaviest integration, so it's a **separate** optional extra and
+**fully off** by default. Install it and turn it on:
+
+```bash
+pip install "pyxle-framework[observability-otel]"
+```
+
+```json
+{
+  "observability": {
+    "otel": true,
+    "otelServiceName": "my-app",
+    "otelSampleRatio": 0.05
+  }
+}
+```
+
+The exporter endpoint is read from the standard `OTEL_EXPORTER_OTLP_ENDPOINT`
+environment variable (so it works with any OTLP-compatible collector). Sampling
+defaults to **5%** so tracing can't swamp a busy server.
+
+When the extra isn't installed, spans are a no-op with **zero** per-request cost
+(a single boolean check) — but enabling `otel` *without* the extra installed
+fails loudly at startup rather than silently dropping traces. Tracing is kept
+entirely optional: a base Pyxle install pulls in no OpenTelemetry packages.
+
 ## Dev dashboard
 
 Run `pyxle dev --dashboard` to print a live observability panel to the terminal
