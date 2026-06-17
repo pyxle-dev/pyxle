@@ -73,10 +73,12 @@ Loads external scripts with configurable loading strategies.
 
 ### `<Image>`
 
-Renders an `<img>` tag with automatic lazy loading.
+An optimized `<img>` with responsive `srcset` (via a `loader`), `fill` mode,
+priority loading, layout-shift prevention, and a blur placeholder. See the
+[Image optimization guide](../guides/build-optimization.md#image-optimization).
 
 ```jsx
-<Image src="/hero.jpg" alt="Hero" width={1200} height={630} />
+<Image src="/hero.jpg" alt="Hero" width={1200} height={630} priority />
 ```
 
 **Props:**
@@ -85,16 +87,21 @@ Renders an `<img>` tag with automatic lazy loading.
 |------|------|---------|-------------|
 | `src` | `string` | (required) | Image source URL |
 | `alt` | `string` | `""` | Alt text for accessibility |
-| `width` | `number` | -- | Image width in pixels |
-| `height` | `number` | -- | Image height in pixels |
-| `priority` | `boolean` | `false` | Eager loading (above-the-fold images) |
-| `lazy` | `boolean` | `true` | Lazy loading (below-the-fold images) |
+| `width` | `number` | -- | Intrinsic width (px). With `height`, reserves space to avoid layout shift |
+| `height` | `number` | -- | Intrinsic height (px) |
+| `fill` | `boolean` | `false` | Fill the nearest positioned ancestor (omit width/height) |
+| `sizes` | `string` | -- | `sizes` attribute — which srcset candidate the browser picks |
+| `loader` | `({src,width,quality}) => string` | -- | Builds optimized URLs per width; **enables a responsive `srcset`**. Without it, a plain `<img>` |
+| `quality` | `number` | -- | 1–100, passed to the `loader` |
+| `objectFit` | `string` | `cover` (under fill) | CSS `object-fit` |
+| `priority` | `boolean` | `false` | Eager + `decoding="sync"` + `fetchpriority="high"` — use for the LCP image |
+| `lazy` | `boolean` | `true` | Native lazy loading (ignored when `priority`) |
 | `placeholder` | `string` | `"empty"` | `"blur"` shows a blur-up placeholder while loading |
 | `blurDataURL` | `string` | -- | Data URL used for the `placeholder="blur"` preview |
-| `placeholderColor` | `string` | `"#e5e5e5"` | Solid placeholder colour shown before the image loads |
+| `placeholderColor` | `string` | `"#e5e5e5"` | Solid placeholder colour before the image loads |
 | `fallbackSrc` | `string` | -- | Image swapped in automatically if `src` fails to load |
 
-**Behaviour:** Renders a standard `<img>` with `loading="eager"` when `priority` is true, `loading="lazy"` otherwise. All additional props are forwarded to the `<img>` element.
+**Responsive images:** provide a `loader` (a CDN such as Cloudinary/imgix, or a build plugin) and `<Image>` emits a `srcset` across a device-size ladder. Without a loader it stays a plain `<img>` — resizing needs a real backend, so Pyxle never emits a fake srcset that re-downloads the full image. All additional props are forwarded to the `<img>`.
 
 ---
 

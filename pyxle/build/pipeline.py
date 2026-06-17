@@ -261,6 +261,53 @@ def _collect_css_from_vite_entry(
     return collected
 
 
+def _collect_js_imports_from_vite_entry(
+    vite_manifest: Dict[str, Any],
+    entry_key: str,
+) -> list[str]:
+    """Collect the JS chunk files an entry statically imports (transitively).
+
+    The entry's own file is loaded via ``<script type="module">`` at the end of
+    the body; its imported chunks would otherwise be discovered only after the
+    browser parses the entry. Returning them here lets the SSR template emit a
+    ``<link rel="modulepreload">`` for each, so they download in parallel with
+    the entry. Files are de-duplicated, preserving first-seen (import) order.
+    """
+    collected: list[str] = []
+    seen: set[str] = set()
+    visited_keys: set[str] = {entry_key}
+
+    entry = vite_manifest.get(entry_key)
+    stack: list[str] = []
+    if isinstance(entry, dict):
+        first = entry.get("imports")
+        if isinstance(first, list):
+            stack = [k for k in first if isinstance(k, str)]
+
+    while stack:
+        key = stack.pop(0)
+        if key in visited_keys:
+            continue
+        visited_keys.add(key)
+
+        chunk = vite_manifest.get(key)
+        if not isinstance(chunk, dict):
+            continue
+
+        chunk_file = chunk.get("file")
+        if isinstance(chunk_file, str) and chunk_file and chunk_file not in seen:
+            seen.add(chunk_file)
+            collected.append(chunk_file)
+
+        imports = chunk.get("imports")
+        if isinstance(imports, list):
+            for imported_key in imports:
+                if isinstance(imported_key, str) and imported_key not in visited_keys:
+                    stack.append(imported_key)
+
+    return collected
+
+
 def _build_page_manifest(
     settings: DevServerSettings,
     registry: MetadataRegistry,
@@ -271,6 +318,7 @@ def _build_page_manifest(
     for page in registry.pages:
         client_file = page.client_asset_path
         css_assets: list[str] = []
+        js_imports: list[str] = []
 
         if vite_manifest is not None:
             vite_key = client_file.lstrip("/")
@@ -290,10 +338,14 @@ def _build_page_manifest(
                 vite_css = _collect_css_from_vite_entry(vite_manifest, vite_key)
                 css_assets = [f"dist/{c}" for c in vite_css]
 
+                # The JS chunks the entry imports — preloaded by the template.
+                vite_js = _collect_js_imports_from_vite_entry(vite_manifest, vite_key)
+                js_imports = [f"dist/{j}" for j in vite_js]
+
         entry: Dict[str, Any] = {
             "client": {
                 "file": client_file,
-                "imports": [],
+                "imports": js_imports if vite_manifest is not None else [],
                 "css": css_assets,
             },
             "server": {

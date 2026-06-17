@@ -144,7 +144,22 @@ def build_document_shell(
           css_links.append(f'<link rel="stylesheet" href="/client/{asset.lstrip("/")}" />')
     css_html = "".join(f"\n    {link}" for link in css_links)
     js_src = f"/client/{js_file.lstrip('/')}"
-    
+
+    # Preload the entry module and the chunks it imports, so the browser fetches
+    # them in parallel with HTML parsing instead of after parsing the entry
+    # (the <script> tag sits at the end of the body). Vite's automatic
+    # modulePreload only applies to index.html builds, not our SSR output, so we
+    # inject these from the build manifest's import graph.
+    preload_links = [f'<link rel="modulepreload" href="{js_src}" />']
+    js_imports = client_info.get("imports", [])
+    if isinstance(js_imports, list):
+      for imp in js_imports:
+        if isinstance(imp, str) and imp:
+          preload_links.append(
+            f'<link rel="modulepreload" href="/client/{imp.lstrip("/")}" />'
+          )
+    preload_html = "".join(f"\n    {link}" for link in preload_links)
+
     before_interactive_scripts = _render_before_interactive_scripts(page.scripts, nonce_attr)
     scripts_metadata = _serialize_scripts_metadata(page.scripts)
 
@@ -152,10 +167,11 @@ def build_document_shell(
 <html lang=\"en\">
   <head>
   <meta charset=\"utf-8\" />
-  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />{css_html}{before_interactive_scripts}{global_styles}{inline_styles_markup}{head_block}
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />{preload_html}{css_html}{before_interactive_scripts}{global_styles}{inline_styles_markup}{head_block}
   </head>
   <body>
   <div id=\"root\">""".format(
+      preload_html=preload_html,
       css_html=css_html,
       before_interactive_scripts=before_interactive_scripts,
       global_styles=global_styles,

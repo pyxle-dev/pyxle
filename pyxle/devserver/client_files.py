@@ -428,6 +428,16 @@ def _render_vite_config(settings: DevServerSettings) -> str:
               root: clientRoot,
               publicDir: path.resolve(projectRoot, 'public'),
               plugins: [react()],{define_block}
+              build: {{
+                // esbuild minification + Rollup tree-shaking/code-splitting are
+                // Vite's production defaults; these make the rest explicit.
+                target: 'es2020',
+                sourcemap: false,
+                cssCodeSplit: true,
+                // Pyxle ships its own `pyxle build --analyze`, so skip Vite's
+                // slower gzip-size reporting to keep production builds fast.
+                reportCompressedSize: false,
+              }},
               resolve: {{
                 alias: [
                   {{ find: '/pages', replacement: path.resolve(clientRoot, 'pages') }},
@@ -2365,16 +2375,20 @@ def _render_image_component() -> str:
         dedent(
             """
             /**
-             * <Image> — thin wrapper over the native <img> with:
-             *   1. Native lazy-loading via the standard `loading` attribute.
-             *   2. Blur-up placeholder (`placeholder="blur"` + blurDataURL).
-             *   3. onLoad / onError callbacks + `data-pyxle-image-state`
-             *      attribute exposing loading | loaded | error.
-             *   4. Optional `fallbackSrc` that transparently replaces a
-             *      broken URL before surfacing the error.
+             * <Image> — an optimized <img> on par with Next.js's Image, for the
+             * parts that don't need a server-side optimizer:
+             *   - Responsive `srcset`/`sizes` generated from a `loader` (a CDN
+             *     such as Cloudinary/imgix, or a build plugin). Without a loader
+             *     it stays a plain <img> — resizing needs a real backend, so we
+             *     never emit a fake srcset that re-downloads the full image.
+             *   - `fill` mode (image fills a positioned parent).
+             *   - `priority` (eager + `fetchpriority="high"`) for the LCP image.
+             *   - Layout-shift prevention: width/height give the intrinsic ratio.
+             *   - Blur-up placeholder, `fallbackSrc`, native lazy-loading,
+             *     onLoad/onError, and a `data-pyxle-image-state` attribute.
              *
-             * Unspecified props pass straight through, so `srcSet`, `sizes`,
-             * `className`, `style`, `onClick`, etc. all work as expected.
+             * Actual byte optimization (compression, WebP/AVIF) is opt-in via
+             * `loader` — see the Image optimization guide.
              */
 
             import React from 'react';
@@ -2383,12 +2397,38 @@ def _render_image_component() -> str:
             const STATE_LOADED = 'loaded';
             const STATE_ERROR = 'error';
 
+            // Responsive width ladder (mirrors Next.js deviceSizes + imageSizes).
+            const DEVICE_SIZES = [640, 750, 828, 1080, 1200, 1920, 2048, 3840];
+            const IMAGE_SIZES = [16, 32, 48, 64, 96, 128, 256, 384];
+            const ALL_SIZES = [...IMAGE_SIZES, ...DEVICE_SIZES].sort((a, b) => a - b);
+
+            function isPassthroughSrc(src) {
+              return typeof src !== 'string' || /^data:/.test(src) || /^blob:/.test(src);
+            }
+
+            // Which widths to put in the srcset. With `sizes`/`fill` the rendered
+            // size is unknown, so offer the full device ladder; for a fixed width,
+            // 1x and 2x (retina).
+            function candidateWidths(width, sizes, fill) {
+              if (fill || sizes) return DEVICE_SIZES;
+              const w = Number(width) || 0;
+              if (!w) return DEVICE_SIZES;
+              const atLeast = (target) =>
+                ALL_SIZES.find((s) => s >= target) || ALL_SIZES[ALL_SIZES.length - 1];
+              return Array.from(new Set([atLeast(w), atLeast(w * 2)]));
+            }
+
             export const Image = React.forwardRef(function PyxleImage(
               {
                 src,
                 alt = '',
                 width,
                 height,
+                fill = false,
+                sizes,
+                quality,
+                loader,
+                objectFit,
                 priority = false,
                 lazy = true,
                 placeholder = 'empty',
@@ -2454,6 +2494,19 @@ def _render_image_component() -> str:
                 if (onError) onError(event);
               };
 
+              // Resolve src + srcset through the loader, when one is configured.
+              const usesLoader = typeof loader === 'function' && !isPassthroughSrc(currentSrc);
+              const widths = usesLoader ? candidateWidths(width, sizes, fill) : null;
+              const resolvedSrc = usesLoader
+                ? loader({ src: currentSrc, width: widths[widths.length - 1], quality })
+                : currentSrc;
+              const srcSet = usesLoader
+                ? widths
+                    .map((w) => loader({ src: currentSrc, width: w, quality }) + ' ' + w + 'w')
+                    .join(', ')
+                : undefined;
+              const resolvedSizes = sizes || (fill ? '100vw' : undefined);
+
               const showPlaceholder = placeholder === 'blur' && state === STATE_LOADING;
               const mergedStyle = {
                 ...(showPlaceholder
@@ -2467,18 +2520,32 @@ def _render_image_component() -> str:
                     }
                   : {}),
                 transition: placeholder === 'blur' ? 'filter 250ms ease-out' : undefined,
+                ...(fill
+                  ? {
+                      position: 'absolute',
+                      inset: 0,
+                      width: '100%',
+                      height: '100%',
+                      objectFit: objectFit || 'cover',
+                    }
+                  : objectFit
+                    ? { objectFit }
+                    : {}),
                 ...style,
               };
 
               return (
                 <img
                   ref={setRef}
-                  src={currentSrc}
+                  src={resolvedSrc}
+                  srcSet={srcSet}
+                  sizes={resolvedSizes}
                   alt={alt}
-                  width={width}
-                  height={height}
+                  width={fill ? undefined : width}
+                  height={fill ? undefined : height}
                   loading={priority ? 'eager' : lazy ? 'lazy' : 'eager'}
                   decoding={priority ? 'sync' : 'async'}
+                  fetchPriority={priority ? 'high' : undefined}
                   onLoad={handleLoad}
                   onError={handleError}
                   className={className}
@@ -2707,12 +2774,36 @@ def _render_image_component_types() -> str:
               fromCache: boolean;
             }
 
-            export interface ImageProps extends Omit<React.ImgHTMLAttributes<HTMLImageElement>, 'onLoad' | 'onError' | 'placeholder'> {
+            /** Arguments passed to a custom image `loader`. */
+            export interface ImageLoaderProps {
+              src: string;
+              width: number;
+              quality?: number;
+            }
+
+            /** Builds an optimized URL for a given width — e.g. a CDN endpoint. */
+            export type ImageLoader = (props: ImageLoaderProps) => string;
+
+            export interface ImageProps extends Omit<React.ImgHTMLAttributes<HTMLImageElement>, 'onLoad' | 'onError' | 'placeholder' | 'loader'> {
               src: string;
               width?: number | string;
               height?: number | string;
               alt?: string;
-              /** Load eagerly (`loading="eager"` + `decoding="sync"`). */
+              /** Fill the nearest positioned ancestor (omit width/height). */
+              fill?: boolean;
+              /** `sizes` attribute — drives which srcset candidate the browser picks. */
+              sizes?: string;
+              /** Quality (1-100) passed to the `loader`. */
+              quality?: number;
+              /**
+               * Builds optimized URLs per width. With a loader, `<Image>` emits a
+               * responsive `srcset`; without one it stays a plain <img> (resizing
+               * needs a backend — a CDN or build plugin). See the guide.
+               */
+              loader?: ImageLoader;
+              /** CSS `object-fit` (applied to the <img>; defaults to `cover` under `fill`). */
+              objectFit?: React.CSSProperties['objectFit'];
+              /** Load eagerly (`loading="eager"`, `decoding="sync"`, `fetchpriority="high"`) — use for the LCP image. */
               priority?: boolean;
               /** Explicit lazy-load. Ignored when `priority` is true. Default: true. */
               lazy?: boolean;

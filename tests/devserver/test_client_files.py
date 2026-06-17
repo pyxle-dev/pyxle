@@ -280,6 +280,17 @@ def test_vite_config_aliases_cover_client_runtime(tmp_path: Path) -> None:
     assert "find: 'pyxle/client'" not in vite_config
 
 
+def test_vite_config_has_explicit_build_block(tmp_path: Path) -> None:
+    settings = create_project(tmp_path)
+    vite_config = _render_vite_config(settings)
+
+    assert "build: {" in vite_config
+    assert "target: 'es2020'" in vite_config
+    assert "cssCodeSplit: true" in vite_config
+    # We do our own --analyze, so Vite's slow gzip reporting is off.
+    assert "reportCompressedSize: false" in vite_config
+
+
 def test_vite_config_respects_base_environment(tmp_path: Path) -> None:
     settings = create_project(tmp_path)
     vite_config = _render_vite_config(settings)
@@ -575,6 +586,50 @@ def test_image_component_types_model_new_api() -> None:
     assert "fallbackSrc?:" in types
     assert "onLoad?:" in types
     assert "onError?:" in types
+
+
+def test_image_component_responsive_srcset_via_loader() -> None:
+    """A `loader` opts into responsive srcset; without one, no srcset is emitted
+    (resizing needs a real backend, so a fake srcset would just re-download the
+    full image at every width)."""
+    from pyxle.devserver.client_files import _render_image_component
+    source = _render_image_component()
+
+    # Loader-gated srcset generation across a responsive width ladder.
+    assert "usesLoader = typeof loader === 'function'" in source
+    assert "srcSet = usesLoader" in source
+    assert "candidateWidths" in source
+    assert "DEVICE_SIZES = [640, 750, 828, 1080, 1200, 1920, 2048, 3840]" in source
+    assert "IMAGE_SIZES" in source
+    # Fixed width -> 1x + 2x (retina); responsive -> full device ladder.
+    assert "atLeast(w)" in source and "atLeast(w * 2)" in source
+
+
+def test_image_component_fill_priority_and_sizes() -> None:
+    """Fill mode, priority (fetchpriority=high), and the sizes attribute."""
+    from pyxle.devserver.client_files import _render_image_component
+    source = _render_image_component()
+
+    assert "fill = false" in source
+    # Fill positions the image to cover a positioned ancestor.
+    assert "position: 'absolute'" in source
+    assert "objectFit: objectFit || 'cover'" in source
+    # LCP priority maps to fetchpriority high (plus eager + sync decode).
+    assert "fetchPriority={priority ? 'high' : undefined}" in source
+    # sizes defaults to 100vw under fill.
+    assert "resolvedSizes = sizes || (fill ? '100vw' : undefined)" in source
+    # Data/blob srcs bypass the loader.
+    assert "isPassthroughSrc" in source
+
+
+def test_image_component_types_model_responsive_api() -> None:
+    """The .d.ts exposes the Next.js-parity props and loader types."""
+    from pyxle.devserver.client_files import _render_image_component_types
+    types = _render_image_component_types()
+    for token in ("fill?:", "sizes?:", "quality?:", "loader?:", "objectFit?:"):
+        assert token in types
+    assert "ImageLoaderProps" in types
+    assert "export type ImageLoader" in types
 
 
 def test_resolve_action_url_reads_ssr_pathname_global() -> None:

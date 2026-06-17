@@ -191,6 +191,41 @@ def test_render_document_embeds_custom_csrf_names_in_production(
     assert 'window.__PYXLE_CSRF_HEADER__ = "x-cloud-csrf";' in html
 
 
+def test_render_document_injects_modulepreload_in_production(
+    page_route: PageRoute, tmp_path: Path
+) -> None:
+    """The production shell preloads the entry module and its imported chunks."""
+    settings = DevServerSettings.from_project_root(
+        tmp_path,
+        debug=False,
+        page_manifest={
+            "/": {
+                "client": {
+                    "file": "assets/index.js",
+                    "imports": ["dist/assets/vendor.js", "dist/assets/shared.js"],
+                    "css": [],
+                }
+            }
+        },
+    )
+
+    html = render_document(
+        settings=settings,
+        page=page_route,
+        body_html="<div>Prod</div>",
+        props={},
+        script_nonce="secure",
+        head_elements=page_route.head_elements,
+    )
+
+    # The entry module itself is preloaded (so it fetches during head parse,
+    # not when the <script> at the body end is reached)...
+    assert '<link rel="modulepreload" href="/client/assets/index.js" />' in html
+    # ...and so are the chunks it statically imports.
+    assert '<link rel="modulepreload" href="/client/dist/assets/vendor.js" />' in html
+    assert '<link rel="modulepreload" href="/client/dist/assets/shared.js" />' in html
+
+
 def test_render_document_embeds_only_non_default_csrf_names(
     page_route: PageRoute, tmp_path: Path
 ) -> None:

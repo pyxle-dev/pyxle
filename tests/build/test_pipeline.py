@@ -207,3 +207,50 @@ def test_run_build_supports_incremental_mode(monkeypatch, tmp_path):
     assert captured["force_rebuild"] is False
     assert result.page_manifest == {}
     assert result.client_manifest_path == result.client_dir / "manifest.json"
+
+
+def test_collect_js_imports_walks_import_chain() -> None:
+    from pyxle.build.pipeline import _collect_js_imports_from_vite_entry
+
+    manifest = {
+        "pages/index.jsx": {
+            "file": "assets/index-A.js",
+            "imports": ["_vendor-B.js", "_shared-C.js"],
+        },
+        "_vendor-B.js": {"file": "assets/vendor-B.js", "imports": ["_react-D.js"]},
+        "_shared-C.js": {"file": "assets/shared-C.js", "imports": []},
+        "_react-D.js": {"file": "assets/react-D.js"},
+    }
+    result = _collect_js_imports_from_vite_entry(manifest, "pages/index.jsx")
+    # The entry's own file is excluded; imported chunks (transitive) included once.
+    assert "assets/index-A.js" not in result
+    assert result == ["assets/vendor-B.js", "assets/shared-C.js", "assets/react-D.js"]
+
+
+def test_collect_js_imports_empty_for_no_imports_or_unknown() -> None:
+    from pyxle.build.pipeline import _collect_js_imports_from_vite_entry
+
+    assert _collect_js_imports_from_vite_entry({}, "missing") == []
+    assert _collect_js_imports_from_vite_entry({"e": {"file": "e.js"}}, "e") == []
+
+
+def test_build_page_manifest_populates_js_imports(tmp_path) -> None:
+    from pyxle.build.pipeline import _build_page_manifest
+
+    settings = DevServerSettings.from_project_root(tmp_path)
+    page = _page_entry(
+        tmp_path, route_path="/", client_asset_path="/pages/index.jsx"
+    )
+    registry = MetadataRegistry(pages=[page], apis=[])
+    vite_manifest = {
+        "pages/index.jsx": {
+            "file": "assets/index-A.js",
+            "imports": ["_vendor-B.js"],
+            "css": [],
+        },
+        "_vendor-B.js": {"file": "assets/vendor-B.js"},
+    }
+    manifest = _build_page_manifest(settings, registry, vite_manifest=vite_manifest)
+    client = manifest["/"]["client"]
+    assert client["file"] == "dist/assets/index-A.js"
+    assert client["imports"] == ["dist/assets/vendor-B.js"]

@@ -449,6 +449,12 @@ def build(
         help="Pre-render pages with no per-request data to HTML at build time (SSG).",
         show_default=True,
     ),
+    analyze: bool = typer.Option(
+        False,
+        "--analyze/--no-analyze",
+        help="Print a JS/CSS bundle-size report (raw + gzip) after the build.",
+        show_default=True,
+    ),
 ) -> None:
     """Entry-point for the ``pyxle build`` command."""
 
@@ -541,6 +547,13 @@ def build(
         public_detail += " (not generated)"
     logger.step("Public assets", detail=public_detail)
     logger.step("Artifacts", detail=str(result.dist_dir))
+
+    if analyze:
+        from pyxle.build.analyze import analyze_bundle, format_bundle_report  # noqa: PLC0415
+
+        assets = analyze_bundle(result.dist_dir / "client")
+        for line in format_bundle_report(assets).splitlines():
+            logger.info(line)
 
     if static:
         from pyxle.build.static_gen import generate_static_site  # noqa: PLC0415
