@@ -37,6 +37,9 @@ coverage.xml
 *.cover
 *.py.cover
 
+# Claude Code — agent worktrees and session state
+.claude/
+
 # IDE
 .idea/
 .vscode/
