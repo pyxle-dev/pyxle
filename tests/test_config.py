@@ -86,6 +86,109 @@ def test_load_config_rejects_unknown_navigation_keys(tmp_path: Path) -> None:
     assert "navigation" in str(excinfo.value)
 
 
+def test_load_config_rate_limit_defaults_to_disabled(tmp_path: Path) -> None:
+    # No rateLimit block at all → disabled.
+    config = load_config(tmp_path)
+    assert config.rate_limit.enabled is False
+    assert config.rate_limit.requests == 0
+    # Empty block → still disabled (requests defaults to 0).
+    write_config(tmp_path, {"rateLimit": {}})
+    assert load_config(tmp_path).rate_limit.enabled is False
+
+
+def test_load_config_parses_rate_limit_block(tmp_path: Path) -> None:
+    write_config(
+        tmp_path,
+        {
+            "rateLimit": {
+                "requests": 100,
+                "window": 30,
+                "exemptPaths": ["/health", "/metrics"],
+                "trustForwardedFor": True,
+            }
+        },
+    )
+
+    rl = load_config(tmp_path).rate_limit
+    assert rl.enabled is True
+    assert rl.requests == 100
+    assert rl.window_seconds == 30.0
+    assert rl.exempt_paths == ("/health", "/metrics")
+    assert rl.trust_forwarded_for is True
+
+
+def test_load_config_rate_limit_window_defaults_when_omitted(tmp_path: Path) -> None:
+    write_config(tmp_path, {"rateLimit": {"requests": 10}})
+
+    rl = load_config(tmp_path).rate_limit
+    assert rl.requests == 10
+    assert rl.window_seconds == 60.0
+    assert rl.exempt_paths == ()
+    assert rl.trust_forwarded_for is False
+
+
+@pytest.mark.parametrize("bad", [-1, "x", True, 1.5, None])
+def test_load_config_rejects_invalid_rate_limit_requests(
+    tmp_path: Path, bad: object
+) -> None:
+    write_config(tmp_path, {"rateLimit": {"requests": bad}})
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(tmp_path)
+
+    assert "rateLimit.requests" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("bad", [0, -5, "x", True])
+def test_load_config_rejects_invalid_rate_limit_window(
+    tmp_path: Path, bad: object
+) -> None:
+    write_config(tmp_path, {"rateLimit": {"requests": 5, "window": bad}})
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(tmp_path)
+
+    assert "rateLimit.window" in str(excinfo.value)
+
+
+def test_load_config_rejects_invalid_rate_limit_trust_forwarded(tmp_path: Path) -> None:
+    write_config(
+        tmp_path, {"rateLimit": {"requests": 5, "trustForwardedFor": "yes"}}
+    )
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(tmp_path)
+
+    assert "trustForwardedFor" in str(excinfo.value)
+
+
+def test_load_config_rejects_non_object_rate_limit_block(tmp_path: Path) -> None:
+    write_config(tmp_path, {"rateLimit": "nope"})
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(tmp_path)
+
+    assert "rateLimit" in str(excinfo.value)
+
+
+def test_load_config_rejects_unknown_rate_limit_keys(tmp_path: Path) -> None:
+    write_config(tmp_path, {"rateLimit": {"requests": 5, "windowSeconds": 30}})
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(tmp_path)
+
+    assert "rateLimit" in str(excinfo.value)
+    assert "windowSeconds" in str(excinfo.value)
+
+
+def test_rate_limit_config_threads_into_devserver_kwargs(tmp_path: Path) -> None:
+    write_config(tmp_path, {"rateLimit": {"requests": 7, "window": 14}})
+
+    kwargs = load_config(tmp_path).to_devserver_kwargs()
+    assert kwargs["rate_limit"].requests == 7
+    assert kwargs["rate_limit"].window_seconds == 14.0
+
+
 def test_load_config_rejects_unknown_keys(tmp_path: Path) -> None:
     write_config(tmp_path, {"unknown": "value"})
 
@@ -183,6 +286,7 @@ def test_load_config_parses_route_middleware_block(tmp_path: Path) -> None:
             "routeMiddleware": {
                 "pages": ["package.pages:policy"],
                 "apis": ["package.apis:policy"],
+                "actions": ["package.actions:policy"],
             }
         },
     )
@@ -190,12 +294,21 @@ def test_load_config_parses_route_middleware_block(tmp_path: Path) -> None:
     config = load_config(tmp_path)
     assert config.page_route_middleware == ("package.pages:policy",)
     assert config.api_route_middleware == ("package.apis:policy",)
+    assert config.action_route_middleware == ("package.actions:policy",)
     dev_kwargs = config.to_devserver_kwargs()
     assert dev_kwargs["page_route_hooks"] == config.page_route_middleware
     assert dev_kwargs["api_route_hooks"] == config.api_route_middleware
+    assert dev_kwargs["action_route_hooks"] == config.action_route_middleware
     representation = config.to_dict()["routeMiddleware"]
     assert representation["pages"] == ["package.pages:policy"]
     assert representation["apis"] == ["package.apis:policy"]
+    assert representation["actions"] == ["package.actions:policy"]
+
+
+def test_load_config_route_middleware_actions_defaults_empty(tmp_path: Path) -> None:
+    write_config(tmp_path, {"routeMiddleware": {"pages": ["package.pages:policy"]}})
+    config = load_config(tmp_path)
+    assert config.action_route_middleware == ()
 
 
 def test_load_config_rejects_invalid_route_middleware_block(tmp_path: Path) -> None:
@@ -207,6 +320,28 @@ def test_load_config_rejects_invalid_route_middleware_block(tmp_path: Path) -> N
     write_config(tmp_path, {"routeMiddleware": {"pages": ["" ]}})
 
     with pytest.raises(ConfigError):
+        load_config(tmp_path)
+
+
+def test_load_config_rejects_unknown_route_middleware_key(tmp_path: Path) -> None:
+    write_config(tmp_path, {"routeMiddleware": {"page": ["package:policy"]}})
+
+    with pytest.raises(ConfigError, match="Unknown keys in 'routeMiddleware'"):
+        load_config(tmp_path)
+
+
+def test_load_config_rejects_unknown_styling_key(tmp_path: Path) -> None:
+    # A singular-typo'd key (globalStyle) must fail loudly, not be silently dropped.
+    write_config(tmp_path, {"styling": {"globalStyle": ["styles/global.css"]}})
+
+    with pytest.raises(ConfigError, match="Unknown keys in 'styling'"):
+        load_config(tmp_path)
+
+
+def test_load_config_rejects_unknown_network_key(tmp_path: Path) -> None:
+    write_config(tmp_path, {"starlette": {"prot": 9000}})
+
+    with pytest.raises(ConfigError, match="Unknown keys in 'starlette'"):
         load_config(tmp_path)
 
 

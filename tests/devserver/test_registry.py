@@ -129,6 +129,21 @@ def test_registry_recovers_from_invalid_loader_metadata(project: DevServerSettin
     assert entry.loader_name is None
 
 
+def test_registry_carries_cache_revalidate_from_metadata(project: DevServerSettings) -> None:
+    build_once(project)
+    metadata_path = project.metadata_build_dir / "pages" / "index.json"
+    payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+    payload["cache_revalidate"] = 60
+    metadata_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    metadata = load_build_metadata(project.build_root)
+    registry = build_metadata_registry(project, metadata)
+
+    entry = registry.find_page("/")
+    assert entry is not None
+    assert entry.cache_revalidate == 60.0
+
+
 def test_module_key_sanitizes_segments() -> None:
     from pyxle.devserver import registry as registry_module
 
@@ -205,6 +220,49 @@ def test_load_page_metadata_defaults_head_when_missing(tmp_path: Path) -> None:
 
     assert metadata is not None
     assert metadata.head_elements == ()
+
+
+def test_load_page_metadata_reads_websocket(tmp_path: Path) -> None:
+    """A metadata JSON with a websocket handler loads with has_websocket True —
+    the disk round-trip the production server depends on."""
+    from pyxle.devserver import registry as registry_module
+
+    path = tmp_path / "meta.json"
+    payload = {
+        "route_path": "/chat/{room}",
+        "client_path": "/pages/chat/[room].jsx",
+        "server_path": "/pages/chat/[room].py",
+        "websocket_name": "websocket",
+        "websocket_line": 3,
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    metadata = registry_module._load_page_metadata(path)
+    assert metadata is not None
+    assert metadata.has_websocket is True
+    assert metadata.websocket_name == "websocket"
+    assert metadata.websocket_line == 3
+
+
+def test_load_page_metadata_defaults_websocket_for_old_builds(tmp_path: Path) -> None:
+    """A pre-2.5 build's metadata JSON (no websocket key) loads with
+    has_websocket False — never crashes ``pyxle serve --skip-build``."""
+    from pyxle.devserver import registry as registry_module
+
+    path = tmp_path / "meta.json"
+    payload = {
+        "route_path": "/",
+        "client_path": "/pages/index.jsx",
+        "server_path": "/pages/index.py",
+        "loader_name": "load_home",
+        "loader_line": 10,
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    metadata = registry_module._load_page_metadata(path)
+    assert metadata is not None
+    assert metadata.has_websocket is False
+    assert metadata.websocket_name is None
 
 
 def test_find_layout_head_jsx_blocks_no_layout(project: DevServerSettings) -> None:

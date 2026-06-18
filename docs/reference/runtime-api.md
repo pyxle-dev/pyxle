@@ -1,6 +1,8 @@
 # Runtime API Reference
 
-The `pyxle.runtime` module provides decorators and error classes used in `.pyxl` files. These are automatically available in the Python section of every `.pyxl` file -- you do not need to import them (the compiler injects the import).
+The `pyxle.runtime` module provides decorators and error classes used in `.pyxl` files. The compiler **auto-injects** a small set: the `@server` decorator, and — in any file that declares at least one `@action` — the `@action` decorator plus `ActionError` and `ValidationActionError`. You do not import those.
+
+Other `pyxle.runtime` symbols, including **`LoaderError`**, are **not** auto-injected — import them explicitly: `from pyxle.runtime import LoaderError`.
 
 ## `@server`
 
@@ -32,6 +34,7 @@ async def load_page(request):
 | `request.url` | `URL` | Full request URL |
 | `request.method` | `str` | HTTP method |
 | `request.state` | `State` | Mutable state for middleware to attach data |
+| `request.state.request_id` | `str` | The request's correlation id (also the `X-Request-Id` response header), unless [observability](../guides/observability.md) is disabled |
 
 ## `@action`
 
@@ -54,6 +57,23 @@ async def create_item(request):
 - Accessible via `POST /api/__actions/{page_path}/{action_name}`
 - Protected by CSRF middleware by default
 
+**Validated body parameter (optional):**
+
+Annotate a parameter (after `request`) with a [Pydantic](https://docs.pydantic.dev/) `BaseModel` and Pyxle parses and validates the request body before the action runs, passing the typed model in:
+
+```python
+from pydantic import BaseModel
+
+class NewItem(BaseModel):
+    name: str
+
+@action
+async def create_item(request, body: NewItem):
+    return {"id": 1, "name": body.name}
+```
+
+Requires the `[pydantic]` extra (`pip install "pyxle-framework[pydantic]"`). On a validation failure the action is not called and the client gets a `422` with a `fields` map. See [Validating request bodies](../core-concepts/server-actions.md#validating-request-bodies-with-pydantic) for the full pattern and the [`pyxle openapi`](cli.md#pyxle-openapi) command.
+
 **Client response format:**
 
 ```json
@@ -62,6 +82,9 @@ async def create_item(request):
 
 // Error (from ActionError)
 { "ok": false, "error": "Error message" }
+
+// Validation error (422, from a Pydantic body or ValidationActionError)
+{ "ok": false, "error": "Validation failed", "fields": { "name": ["Field required"] } }
 ```
 
 ## `LoaderError`
@@ -111,7 +134,7 @@ async def update_item(request):
 **Constructor:**
 
 ```python
-ActionError(message: str, status_code: int = 400, data: dict | None = None)
+ActionError(message: str, status_code: int = 400, data: dict | None = None, *, fields: dict[str, list[str]] | None = None)
 ```
 
 | Parameter | Type | Default | Description |
@@ -119,6 +142,7 @@ ActionError(message: str, status_code: int = 400, data: dict | None = None)
 | `message` | `str` | (required) | Error message sent to the client |
 | `status_code` | `int` | `400` | HTTP response status code |
 | `data` | `dict \| None` | `None` | Additional JSON-serializable payload |
+| `fields` | `dict[str, list[str]] \| None` | `None` | Per-field validation messages (field path → messages), surfaced to the client as `fields`. Keyword-only |
 
 **Properties:**
 
@@ -127,6 +151,38 @@ ActionError(message: str, status_code: int = 400, data: dict | None = None)
 | `.message` | `str` | The error message |
 | `.status_code` | `int` | HTTP status code |
 | `.data` | `dict` | Additional data (empty dict if None was passed) |
+| `.fields` | `dict[str, list[str]]` | Per-field messages (empty dict if None was passed) |
+
+## `ValidationActionError`
+
+A subclass of [`ActionError`](#actionerror) for request-body validation failures. Defaults to HTTP `422` and always carries `fields`. Pyxle raises it automatically when a Pydantic-typed `@action` body fails validation; raise it yourself for checks Pydantic can't express (uniqueness, cross-field rules):
+
+```python
+from pyxle.runtime import ValidationActionError
+
+@action
+async def register(request, body: Signup):
+    if await db.email_taken(body.email):
+        raise ValidationActionError(fields={"email": ["That email is already registered."]})
+    ...
+```
+
+> **Auto-imported.** Like `ActionError`, any `.pyxl` file that declares at least one `@action` gets `ValidationActionError` injected by the compiler. A user-defined class or existing import takes precedence.
+
+**Constructor:**
+
+```python
+ValidationActionError(message: str = "Validation failed", *, fields: dict[str, list[str]], status_code: int = 422, data: dict | None = None)
+```
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `message` | `str` | `"Validation failed"` | Top-level error message |
+| `fields` | `dict[str, list[str]]` | (required) | Field path → list of messages. Keyword-only |
+| `status_code` | `int` | `422` | HTTP response status code |
+| `data` | `dict \| None` | `None` | Additional JSON-serializable payload |
+
+The client receives `{ "ok": false, "error": ..., "fields": { ... } }`. The `useAction` hook exposes the map as `result.fields`; `<Form>` passes it as the second argument to `onError`. See [Validating request bodies](../core-concepts/server-actions.md#validating-request-bodies-with-pydantic).
 
 ## `invalidate_routes(response, *urls)`
 
@@ -152,6 +208,98 @@ Parameters:
 | `*urls` | `str` | URLs to invalidate. Empty / duplicate values are filtered. |
 
 Returns the `response` argument (possibly with a header or sentinel key added) so you can `return invalidate_routes(...)` in one line.
+
+## Background tasks — `pyxle.tasks`
+
+Fire-and-forget background work that runs in-process on the app's event loop.
+See the [Background Tasks guide](../guides/background-tasks.md).
+
+### `enqueue(func, *args, **kwargs)`
+
+Schedule `func(*args, **kwargs)` on the app's bounded worker pool and return
+immediately. Coroutine functions are awaited; plain callables run in a thread.
+Usable from any loader or action while the app is running.
+
+```python
+from pyxle.tasks import enqueue
+
+@server
+async def load_article(request):
+    enqueue(record_view, request.path_params["slug"])  # returns now
+    return {"article": ...}
+```
+
+| Raises | When |
+|--------|------|
+| `TaskQueueNotRunning` | Called outside a running Pyxle app (no active queue) |
+| `TaskQueueFull` | The bounded queue is at capacity (sustained overload) |
+
+A task that raises is logged (`pyxle.tasks` logger) and never takes a worker
+down. The queue is **per-process** — under `pyxle serve --workers N` each worker
+has its own, and queued work is lost on restart. For durable or cross-worker
+jobs, use a real job queue (Celery / ARQ / Dramatiq) — see the guide.
+
+### Post-response tasks in an `@action`
+
+Inside an `@action`, `request.state.background` is a Starlette
+[`BackgroundTasks`](https://www.starlette.io/background/); `add_task(func, *args)`
+runs after the response is sent. Returning `{"background": [fn, *args]}` from the
+action is shorthand for a single such task.
+
+## WebSockets — `pyxle.realtime`
+
+A page that exports a module-scope `async def websocket(ws)` also serves a
+WebSocket at its path. `pyxle.realtime` provides the pub/sub and auth helpers
+those handlers use. See the [WebSockets guide](../guides/websockets.md) for the
+full walkthrough.
+
+### `channel(ws, name, *, broker=None)`
+
+An async context manager that subscribes `ws` to a named channel for the life of
+the block (unsubscribing on exit, including disconnect) and yields a handle with
+`.publish(message)`:
+
+```python
+from pyxle.realtime import channel
+
+async def websocket(ws):
+    await ws.accept()
+    async with channel(ws, f"room:{ws.path_params['room']}") as room:
+        async for message in ws.iter_text():
+            await room.publish(message)   # reaches every subscriber
+```
+
+A published `dict`/`list` is sent as a JSON frame, `str` as text, `bytes` as
+binary. The broker defaults to the app-scoped `InProcessBroker` on
+`app.state.pyxle_broker` (one per process — see the guide's **multi-worker
+caveat**). Implement the `Broker` protocol (`subscribe` / `unsubscribe` /
+`publish`) for a Redis/NATS backend.
+
+### `authenticate_websocket(ws)`
+
+Resolve the signed-in [`pyxle-auth`](../plugins/pyxle-auth.md) user for a
+WebSocket upgrade, or `None`. The auth middleware never runs for WebSocket scope,
+so a handler that needs the user must call this (it reads the session cookie off
+the handshake). Returns `None` — zero database work — when the plugin isn't
+installed or no cookie is present.
+
+```python
+from pyxle.realtime import authenticate_websocket
+
+async def websocket(ws):
+    user = await authenticate_websocket(ws)
+    if user is None:
+        await ws.close(code=4401)
+        return
+    await ws.accept()
+    ...
+```
+
+### `origin_allowed(ws, allowed_origins)`
+
+Whether the upgrade's `Origin` is permitted. CSRF doesn't apply to a WebSocket,
+so checking the origin is the equivalent guard. An empty `allowed_origins`
+allows all; a missing `Origin` header (same-origin / non-browser) is allowed.
 
 ## Document `<head>` elements
 
@@ -208,7 +356,7 @@ The callable receives the loader's return value. Must return a string or list of
 While the compiler auto-injects `@server` and `@action`, you can also import explicitly:
 
 ```python
-from pyxle.runtime import server, action, LoaderError, ActionError
+from pyxle.runtime import server, action, LoaderError, ActionError, ValidationActionError
 ```
 
 This is useful for type checking and IDE support.

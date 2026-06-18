@@ -421,6 +421,31 @@ def test_action_dispatch_module_load_failure(tmp_path: Path) -> None:
     assert response.json()["ok"] is False
 
 
+def test_import_module_does_not_cache_failed_imports(tmp_path: Path) -> None:
+    """A module that fails to import must not be left in ``sys.modules``.
+
+    Otherwise a later ``debug=False`` import of the same key returns the
+    broken, half-initialised partial silently instead of re-raising — which
+    in production would serve an empty module for every subsequent request.
+    """
+    from pyxle.devserver.starlette_app import ApiRouteError, _import_module
+
+    module_key = "pyxle.server.pages.__import_failure_probe__"
+    source = tmp_path / "probe.py"
+    source.write_text("import a_module_that_does_not_exist\n", encoding="utf-8")
+    assert module_key not in sys.modules
+
+    for _ in range(2):
+        # Each call must re-raise (not return a cached partial) and clean up.
+        try:
+            _import_module(module_key, source, debug=False)
+        except ApiRouteError:
+            pass
+        else:  # pragma: no cover - defensive
+            raise AssertionError("expected ApiRouteError")
+        assert module_key not in sys.modules
+
+
 def test_action_only_accepts_post(tmp_path: Path) -> None:
     module_path = _write_module(
         tmp_path / "server" / "pages" / "data.py",
@@ -862,3 +887,341 @@ def test_action_form_body_collapses_repeated_fields(tmp_path: Path) -> None:
     payload = response.json()
     assert payload["name"] == "Shivam"
     assert payload["tags"] == ["python", "react"]
+
+
+# ---------------------------------------------------------------------------
+# Pydantic body validation (Phase 2.6)
+# ---------------------------------------------------------------------------
+
+
+def _action_client(tmp_path: Path, page: str, action_name: str, src: str):
+    """Compile a server module and return (TestClient, action_url)."""
+    from starlette.applications import Starlette
+
+    module_path = _write_module(tmp_path / "server" / "pages" / f"{page}.py", src)
+    route = ActionRoute(
+        path=f"/api/__actions/{page}/{action_name}",
+        page_path=f"/{page}",
+        action_name=action_name,
+        server_module_path=module_path,
+        module_key=f"pyxle.server.pages.{page}",
+    )
+    router = build_action_router([route])
+    app = Starlette()
+    app.router.routes.extend(router.routes)
+    return TestClient(app, raise_server_exceptions=False), route.path
+
+
+_SIGNUP_MODULE = """
+from pyxle.runtime import action
+from pydantic import BaseModel, Field
+
+class Address(BaseModel):
+    zip: str
+
+class Signup(BaseModel):
+    email: str
+    age: int = Field(gt=0)
+    address: Address
+    tags: list[str]
+
+@action
+async def register(request, body: Signup):
+    return {"email": body.email, "age": body.age, "zip": body.address.zip}
+"""
+
+
+def test_action_body_validation_success(tmp_path: Path) -> None:
+    client, url = _action_client(tmp_path, "signup_ok", "register", _SIGNUP_MODULE)
+    response = client.post(
+        url,
+        json={"email": "a@b.c", "age": 30, "address": {"zip": "12345"}, "tags": ["x"]},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data == {"ok": True, "email": "a@b.c", "age": 30, "zip": "12345"}
+
+
+def test_action_body_validation_422_with_field_paths(tmp_path: Path) -> None:
+    client, url = _action_client(tmp_path, "signup_bad", "register", _SIGNUP_MODULE)
+    response = client.post(
+        url, json={"age": 0, "address": {}, "tags": [123]}
+    )  # missing email, age<=0, missing zip, tag not a string
+    assert response.status_code == 422
+    data = response.json()
+    assert data["ok"] is False
+    assert data["error"] == "Validation failed"
+    fields = data["fields"]
+    assert "email" in fields  # top-level missing
+    assert "address.zip" in fields  # nested path
+    assert "tags.0" in fields  # list index path
+    assert any("greater than 0" in m for m in fields["age"])
+
+
+def test_action_body_validation_form_encoded(tmp_path: Path) -> None:
+    # A no-JS <Form> POST (form-encoded) validates transparently via the shim.
+    client, url = _action_client(
+        tmp_path,
+        "form_signup",
+        "save",
+        """
+        from pyxle.runtime import action
+        from pydantic import BaseModel
+
+        class NameBody(BaseModel):
+            name: str
+
+        @action
+        async def save(request, body: NameBody):
+            return {"name": body.name}
+        """,
+    )
+    response = client.post(url, data={"name": "Bob"})
+    assert response.status_code == 200
+    assert response.json()["name"] == "Bob"
+
+
+def test_action_optional_body_accepts_empty(tmp_path: Path) -> None:
+    client, url = _action_client(
+        tmp_path,
+        "opt",
+        "save",
+        """
+        from pyxle.runtime import action
+        from pydantic import BaseModel
+        from typing import Optional
+
+        class Filter(BaseModel):
+            q: str = ""
+
+        @action
+        async def save(request, body: Optional[Filter] = None):
+            return {"q": body.q if body else "none"}
+        """,
+    )
+    # Empty object validates into a default Filter.
+    assert client.post(url, json={}).json()["q"] == ""
+
+
+def test_action_non_json_body_is_422(tmp_path: Path) -> None:
+    client, url = _action_client(tmp_path, "njson", "register", _SIGNUP_MODULE)
+    response = client.post(
+        url, content=b"not json", headers={"content-type": "application/json"}
+    )
+    assert response.status_code == 422
+    assert "__root__" in response.json()["fields"]
+
+
+def test_action_legacy_no_body_param_unaffected(tmp_path: Path) -> None:
+    # Regression: an action without a body parameter is dispatched with just
+    # `request`, exactly as before.
+    client, url = _action_client(
+        tmp_path,
+        "legacy",
+        "save",
+        """
+        from pyxle.runtime import action
+
+        @action
+        async def save(request):
+            body = await request.json()
+            return {"echo": body.get("v")}
+        """,
+    )
+    assert client.post(url, json={"v": 42}).json()["echo"] == 42
+
+
+def test_action_user_raised_validation_error_emits_fields(tmp_path: Path) -> None:
+    client, url = _action_client(
+        tmp_path,
+        "manual",
+        "save",
+        """
+        from pyxle.runtime import action, ValidationActionError
+
+        @action
+        async def save(request):
+            raise ValidationActionError(fields={"email": ["already taken"]})
+        """,
+    )
+    response = client.post(url, json={})
+    assert response.status_code == 422
+    data = response.json()
+    assert data["error"] == "Validation failed"
+    assert data["fields"] == {"email": ["already taken"]}
+
+
+def test_action_pydantic_not_installed_is_500(tmp_path: Path, monkeypatch) -> None:
+    # If a validated action is dispatched but pydantic can't resolve the model,
+    # the server returns 500 (with install guidance in debug) — never crashes.
+    from pyxle.devserver import validation
+
+    monkeypatch.setattr(validation, "_try_import_pydantic", lambda: None)
+    validation._RESOLVE_CACHE.clear()
+    client, url = _action_client(tmp_path, "nopyd", "register", _SIGNUP_MODULE)
+    # The module itself imports pydantic at top, so import would fail first in a
+    # truly pydantic-less env; here we simulate resolution-time absence. Either
+    # way the response is a clean 500, not a crash.
+    response = client.post(url, json={})
+    assert response.status_code == 500
+    assert response.json()["ok"] is False
+
+
+# ---------------------------------------------------------------------------
+# Background tasks (request.state.background + {"background": [...]} shorthand)
+
+
+def test_action_state_background_runs_after_response(tmp_path: Path) -> None:
+    marker = tmp_path / "bg_state.txt"
+    src = (
+        "from pyxle.runtime import action\n\n"
+        "def _write():\n"
+        f"    open({str(marker)!r}, 'w').write('ran')\n\n"
+        "@action\n"
+        "async def go(request):\n"
+        "    request.state.background.add_task(_write)\n"
+        "    return {'ok': True}\n"
+    )
+    client, url = _action_client(tmp_path, "bgstate", "go", src)
+    assert not marker.exists()
+    response = client.post(url, json={})
+    assert response.status_code == 200
+    # The TestClient runs the response's background tasks before returning.
+    assert marker.read_text() == "ran"
+
+
+def test_action_background_shorthand_runs_and_is_stripped(tmp_path: Path) -> None:
+    marker = tmp_path / "bg_short.txt"
+    src = (
+        "from pyxle.runtime import action\n\n"
+        "def _write(content):\n"
+        f"    open({str(marker)!r}, 'w').write(content)\n\n"
+        "@action\n"
+        "async def go(request):\n"
+        "    return {'ok': True, 'background': [_write, 'shorthand']}\n"
+    )
+    client, url = _action_client(tmp_path, "bgshort", "go", src)
+    response = client.post(url, json={})
+    assert response.status_code == 200
+    # The 'background' key is stripped from the response body.
+    assert "background" not in response.json()
+    assert marker.read_text() == "shorthand"
+
+
+def test_action_background_malformed_returns_500(tmp_path: Path) -> None:
+    src = (
+        "from pyxle.runtime import action\n\n"
+        "@action\n"
+        "async def go(request):\n"
+        "    return {'ok': True, 'background': 'not-a-list'}\n"
+    )
+    client, url = _action_client(tmp_path, "bgmal", "go", src)
+    response = client.post(url, json={})
+    assert response.status_code == 500
+    assert response.json()["ok"] is False
+
+
+def test_action_background_non_callable_first_returns_500(tmp_path: Path) -> None:
+    src = (
+        "from pyxle.runtime import action\n\n"
+        "@action\n"
+        "async def go(request):\n"
+        "    return {'ok': True, 'background': ['not-callable', 1]}\n"
+    )
+    client, url = _action_client(tmp_path, "bgnc", "go", src)
+    response = client.post(url, json={})
+    assert response.status_code == 500
+
+
+# ---------------------------------------------------------------------------
+# Route policies / hooks on @action calls (auth hooks must fire for actions)
+
+
+def test_action_route_hook_can_deny_the_call(tmp_path: Path) -> None:
+    from starlette.applications import Starlette
+    from starlette.responses import JSONResponse
+
+    module_path = _write_module(
+        tmp_path / "server" / "pages" / "guarded.py",
+        "from pyxle.runtime import action\n\n"
+        "@action\nasync def go(request):\n    return {'ok': True}\n",
+    )
+    route = ActionRoute(
+        path="/api/__actions/guarded/go",
+        page_path="/guarded",
+        action_name="go",
+        server_module_path=module_path,
+        module_key="pyxle.server.pages.guarded",
+    )
+
+    async def deny_hook(context, request, call_next):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+
+    router = build_action_router([route], route_hooks=[deny_hook])
+    app = Starlette()
+    app.router.routes.extend(router.routes)
+    client = TestClient(app, raise_server_exceptions=False)
+
+    response = client.post("/api/__actions/guarded/go", json={})
+    # The hook short-circuited the action — the @action never ran.
+    assert response.status_code == 401
+    assert response.json()["error"] == "unauthorized"
+
+
+def test_action_route_hook_receives_action_context(tmp_path: Path) -> None:
+    from starlette.applications import Starlette
+
+    module_path = _write_module(
+        tmp_path / "server" / "pages" / "ctx.py",
+        "from pyxle.runtime import action\n\n"
+        "@action\nasync def go(request):\n    return {'ok': True}\n",
+    )
+    route = ActionRoute(
+        path="/api/__actions/ctx/go",
+        page_path="/ctx",
+        action_name="go",
+        server_module_path=module_path,
+        module_key="pyxle.server.pages.ctx",
+    )
+    captured: dict = {}
+
+    async def capture_hook(context, request, call_next):
+        captured["target"] = context.target
+        captured["path"] = context.path
+        return await call_next(request)
+
+    router = build_action_router([route], route_hooks=[capture_hook])
+    app = Starlette()
+    app.router.routes.extend(router.routes)
+    client = TestClient(app, raise_server_exceptions=False)
+
+    response = client.post("/api/__actions/ctx/go", json={})
+    assert response.status_code == 200
+    assert captured["target"] == "action"
+    assert captured["path"] == "/api/__actions/ctx/go"
+
+
+def test_action_router_without_hooks_still_dispatches(tmp_path: Path) -> None:
+    # The no-hooks path (default) must keep working unchanged.
+    from starlette.applications import Starlette
+
+    module_path = _write_module(
+        tmp_path / "server" / "pages" / "nohooks_dispatch.py",
+        "from pyxle.runtime import action\n\n"
+        "@action\nasync def go(request):\n    return {'value': 1}\n",
+    )
+    route = ActionRoute(
+        path="/api/__actions/nohooks_dispatch/go",
+        page_path="/nohooks_dispatch",
+        action_name="go",
+        server_module_path=module_path,
+        module_key="pyxle.server.pages.nohooks_dispatch",
+    )
+    router = build_action_router([route])
+    app = Starlette()
+    app.router.routes.extend(router.routes)
+    client = TestClient(app, raise_server_exceptions=False)
+
+    response = client.post("/api/__actions/nohooks_dispatch/go", json={})
+    assert response.status_code == 200
+    assert response.json() == {"ok": True, "value": 1}

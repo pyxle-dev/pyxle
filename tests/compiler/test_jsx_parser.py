@@ -7,6 +7,7 @@ missing, or the subprocess returns malformed output.
 
 from __future__ import annotations
 
+import json
 import subprocess
 from unittest.mock import patch
 
@@ -130,3 +131,51 @@ def test_jsx_parse_result_dataclass_is_frozen():
         pass
     else:
         raise AssertionError("JSXParseResult should be frozen")
+
+
+def test_ts_syntax_payload_captures_error_code_and_line():
+    """A ``ts_in_client_block`` payload surfaces its ``code`` and ``line`` so
+    the compiler can report a clear, source-located error."""
+
+    class _FakeProc:
+        returncode = 0
+        stdout = json.dumps(
+            {
+                "ok": False,
+                "code": "ts_in_client_block",
+                "message": (
+                    "TypeScript syntax (a type annotation (`: Type`)) isn't "
+                    "supported in a .pyxl client block yet — keep the client "
+                    "half plain JSX (see docs/guides/typescript.md)."
+                ),
+                "line": 4,
+            }
+        )
+        stderr = ""
+
+    with patch("pyxle.compiler.jsx_parser.subprocess.run") as mock_run:
+        mock_run.return_value = _FakeProc()
+        result = parse_jsx_components("const x: number = 1;", target_components={"Script"})
+
+    assert result.components == ()
+    assert result.error_code == "ts_in_client_block"
+    assert result.error_line == 4
+    assert "TypeScript syntax" in result.error
+
+
+def test_generic_jsx_error_has_no_error_code():
+    """A plain Babel parse error carries no structured ``code``/``line`` —
+    only the message — so it keeps degrading the way it always has."""
+
+    class _FakeProc:
+        returncode = 0
+        stdout = json.dumps({"ok": False, "message": "Unexpected token"})
+        stderr = ""
+
+    with patch("pyxle.compiler.jsx_parser.subprocess.run") as mock_run:
+        mock_run.return_value = _FakeProc()
+        result = parse_jsx_components("<div", target_components={"Script"})
+
+    assert result.error == "Unexpected token"
+    assert result.error_code is None
+    assert result.error_line is None

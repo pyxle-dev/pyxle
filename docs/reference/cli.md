@@ -6,10 +6,12 @@ The `pyxle` CLI manages Pyxle projects from scaffolding to production.
 
 | Flag | Description |
 |------|-------------|
-| `--version` | Print Pyxle version and exit |
+| `--version` | Show Pyxle version and exit |
 | `--log-format [console\|json]` | Output format (default: `console`) |
 | `--verbose` / `-v` | Show debug-level output |
 | `--quiet` / `-q` | Suppress informational output; show only warnings and errors |
+| `--install-completion` | Install shell completion for the current shell |
+| `--show-completion` | Print shell completion (to copy or customize) |
 
 ## `pyxle init`
 
@@ -75,6 +77,7 @@ pyxle dev [directory] [options]
 | `--config` | -- | Path to `pyxle.config.json` |
 | `--print-config` / `--no-print-config` | `false` | Print merged configuration before starting |
 | `--tailwind` / `--no-tailwind` | `true` | Auto-start Tailwind CSS watcher |
+| `--dashboard` / `--no-dashboard` | `false` | Periodically print a live [observability](../guides/observability.md#dev-dashboard) panel (request/SSR metrics) to the terminal |
 
 **Examples:**
 
@@ -108,12 +111,16 @@ pyxle build [directory] [options]
 | `--config` | -- | Path to `pyxle.config.json` |
 | `--out-dir` | `dist/` | Output directory for build artifacts |
 | `--incremental` / `--no-incremental` | `false` | Reuse cached artifacts |
+| `--static` / `--no-static` | `false` | Pre-render loader-less, non-dynamic pages to HTML at build time (SSG) — see [Caching](../guides/caching.md#static-pre-rendering-pyxle-build-static) |
+| `--analyze` / `--no-analyze` | `false` | Print a JS/CSS bundle-size report (raw + gzip, largest first) after the build — see [Build Optimization](../guides/build-optimization.md#inspecting-the-bundle-pyxle-build-analyze) |
 
 **Examples:**
 
 ```bash
 pyxle build
+pyxle build --analyze
 pyxle build --out-dir ./output --incremental
+pyxle build --static
 ```
 
 ## `pyxle serve`
@@ -134,7 +141,7 @@ pyxle serve [directory] [options]
 | `--config` | -- | Path to `pyxle.config.json` |
 | `--serve-static` / `--no-serve-static` | `true` | Serve static assets directly from Pyxle |
 | `--ssr-workers` | `1` | Number of persistent SSR worker processes, per server worker (`0` = auto-size to CPU cores, capped at 4) |
-| `--workers` / `-w` | `1` | Number of server worker processes (one per CPU core); `>1` enables multi-core serving |
+| `--workers` / `-w` | `1` | Number of server worker processes (one per CPU core); `>1` enables multi-core serving; `0` auto-detects from CPU cores |
 
 **Examples:**
 
@@ -228,3 +235,29 @@ pyxle routes [directory] [options]
 ```
 
 Use `--json` for machine-readable output.
+
+## `pyxle openapi`
+
+Generate an [OpenAPI 3.1](https://spec.openapis.org/oas/v3.1.0) document from your `@action` request models. For every action that declares a [Pydantic body parameter](../core-concepts/server-actions.md#validating-request-bodies-with-pydantic), Pyxle emits a `POST` operation with the model's JSON Schema as the request body and a structured `422` validation response; actions without a model get a permissive object body.
+
+```bash
+pyxle openapi [directory] [options]
+```
+
+| Argument / Flag | Default | Description |
+|----------------|---------|-------------|
+| `directory` | `.` | Project directory |
+| `--config` | -- | Path to `pyxle.config.json` |
+| `--out` / `-o` | -- | Write the schema to this file (default: stdout) |
+| `--title` | `Pyxle API` | OpenAPI `info.title` |
+| `--api-version` | `0.1.0` | OpenAPI `info.version` |
+
+```bash
+# Print to stdout
+pyxle openapi
+
+# Write a file with custom metadata
+pyxle openapi --out openapi.json --title "Acme API" --api-version 2.0.0
+```
+
+The schema is derived from runtime introspection of the compiled action modules, so it always matches what the dispatcher actually validates. Requires the `[pydantic]` extra (`pip install "pyxle-framework[pydantic]"`); the command exits with an error if Pydantic isn't installed or a page module can't be imported.

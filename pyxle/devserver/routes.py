@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import List, Optional
+from typing import Iterable, List, Optional
 
-from .error_pages import is_error_boundary_file
+from .error_pages import build_error_boundary_registry, is_error_boundary_file
+from .loading_pages import build_loading_boundary_registry, is_loading_file
 from .path_utils import route_path_from_relative
 from .registry import ApiRegistryEntry, MetadataRegistry, PageRegistryEntry
 
@@ -33,6 +34,23 @@ class PageRoute:
     images: tuple[dict, ...] = ()
     head_jsx_blocks: tuple[str, ...] = ()
     actions: tuple[dict, ...] = ()
+    websocket_name: Optional[str] = None
+    websocket_line: Optional[int] = None
+    cache_revalidate: float | None = None
+    uses_suspense: bool = False
+    #: The nearest ``loading.pyxl`` page route for this route, if any. When set,
+    #: the page is wrapped in ``<Suspense fallback={<Loading/>}>`` on both the
+    #: server (streaming) and the client (hydration) so a route-level loading
+    #: state shows while the render suspends. ``None`` for routes with no
+    #: enclosing loading boundary.
+    loading_boundary: Optional["PageRoute"] = None
+    #: The nearest ``error.pyxl`` page route for this route, if any. Carried so
+    #: the client hydration entry can wrap the page in a React error boundary
+    #: that renders this ``error.pyxl`` when a *client-side* render throws —
+    #: parity with the server, which already renders the nearest ``error.pyxl``
+    #: when a loader or the SSR render fails. ``None`` for routes with no
+    #: enclosing error boundary.
+    error_boundary: Optional["PageRoute"] = None
 
     @property
     def has_loader(self) -> bool:
@@ -41,6 +59,10 @@ class PageRoute:
     @property
     def has_actions(self) -> bool:
         return bool(self.actions)
+
+    @property
+    def has_websocket(self) -> bool:
+        return self.websocket_name is not None
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,6 +86,11 @@ class ActionRoute:
     server_module_path: Path
     module_key: str
     is_catchall: bool = False
+    # Source of the owning page (for the route-hook RouteContext). Defaulted so
+    # existing constructors stay valid; populated from the page entry below.
+    source_relative_path: Path = Path(".")
+    source_absolute_path: Path = Path(".")
+    content_hash: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,6 +113,7 @@ class RouteTable:
     apis: List[ApiRoute]
     actions: List[ActionRoute] = ()  # type: ignore[assignment]
     error_boundary_pages: List[PageRoute] = ()  # type: ignore[assignment]
+    loading_boundary_pages: List[PageRoute] = ()  # type: ignore[assignment]
 
     def find_page(self, path: str) -> Optional[PageRoute]:
         for entry in self.pages:
@@ -111,12 +139,17 @@ def build_route_table(registry: MetadataRegistry) -> RouteTable:
 
     page_routes: List[PageRoute] = []
     error_boundary_routes: List[PageRoute] = []
+    loading_boundary_routes: List[PageRoute] = []
 
     for entry in registry.pages:
         posix = entry.source_relative_path.as_posix()
         if is_error_boundary_file(posix):
             # Error/not-found pages are compiled but not routed normally.
             error_boundary_routes.extend(_page_routes(entry))
+        elif is_loading_file(posix):
+            # loading.pyxl supplies a Suspense fallback; it is compiled but not
+            # routed as a page.
+            loading_boundary_routes.extend(_page_routes(entry))
         else:
             page_routes.extend(_page_routes(entry))
 
@@ -126,19 +159,44 @@ def build_route_table(registry: MetadataRegistry) -> RouteTable:
 
     action_routes: List[ActionRoute] = []
     for entry in registry.pages:
-        if not is_error_boundary_file(entry.source_relative_path.as_posix()):
+        posix = entry.source_relative_path.as_posix()
+        if not is_error_boundary_file(posix) and not is_loading_file(posix):
             action_routes.extend(_action_routes(entry))
 
     page_routes.sort(key=lambda route: route.path)
     api_routes.sort(key=lambda route: route.path)
     action_routes.sort(key=lambda route: route.path)
     error_boundary_routes.sort(key=lambda route: route.path)
+    loading_boundary_routes.sort(key=lambda route: route.path)
+
+    # Resolve each page's nearest loading.pyxl (closest-ancestor walk-up) and
+    # stamp it onto the route, so the streaming render + client hydration can
+    # both wrap the page in that loading boundary from a single source of truth.
+    loading_registry = build_loading_boundary_registry(loading_boundary_routes)
+    if loading_registry.has_loading_pages:
+        page_routes = [
+            replace(route, loading_boundary=loading_registry.find_loading_boundary(route.path))
+            for route in page_routes
+        ]
+
+    # Resolve each page's nearest error.pyxl (closest-ancestor walk-up) and
+    # stamp it on, so the client hydration entry can wrap the page in a React
+    # error boundary that renders that error.pyxl when a client-side render
+    # throws — parity with the server, which already renders the nearest
+    # error.pyxl when a loader or the SSR render fails.
+    error_registry = build_error_boundary_registry(error_boundary_routes)
+    if error_registry.has_error_pages:
+        page_routes = [
+            replace(route, error_boundary=error_registry.find_error_boundary(route.path))
+            for route in page_routes
+        ]
 
     return RouteTable(
         pages=page_routes,
         apis=api_routes,
         actions=action_routes,
         error_boundary_pages=error_boundary_routes,
+        loading_boundary_pages=loading_boundary_routes,
     )
 
 
@@ -181,7 +239,22 @@ def _page_route(
         images=entry.images,
         head_jsx_blocks=entry.head_jsx_blocks,
         actions=entry.actions,
+        websocket_name=entry.websocket_name,
+        websocket_line=entry.websocket_line,
+        cache_revalidate=entry.cache_revalidate,
+        uses_suspense=entry.uses_suspense,
     )
+
+
+def select_static_pages(pages: Iterable[PageRoute]) -> list[PageRoute]:
+    """Pages that can be pre-rendered at build time (``pyxle build --static``).
+
+    A page is statically renderable when it has no ``@server`` loader -- so its
+    render is a deterministic function of no per-request data -- and no dynamic
+    route parameters (a ``{param}`` segment would need a value to render).
+    """
+
+    return [page for page in pages if not page.has_loader and "{" not in page.path]
 
 
 def _api_routes(entry: ApiRegistryEntry) -> List[ApiRoute]:
@@ -246,6 +319,9 @@ def _action_routes(entry: PageRegistryEntry) -> List[ActionRoute]:
                 action_name=action_name,
                 server_module_path=entry.server_module_path,
                 module_key=entry.module_key,
+                source_relative_path=entry.source_relative_path,
+                source_absolute_path=entry.source_absolute_path,
+                content_hash=entry.content_hash,
             )
         )
 
@@ -265,6 +341,9 @@ def _action_routes(entry: PageRegistryEntry) -> List[ActionRoute]:
                 server_module_path=entry.server_module_path,
                 module_key=entry.module_key,
                 is_catchall=True,
+                source_relative_path=entry.source_relative_path,
+                source_absolute_path=entry.source_absolute_path,
+                content_hash=entry.content_hash,
             )
         )
 

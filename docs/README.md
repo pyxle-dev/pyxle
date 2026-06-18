@@ -50,6 +50,8 @@ Practical guides for common tasks.
 - [Comparison](guides/comparison.md) -- Pyxle vs. Reflex, Django, NiceGUI, Streamlit, and Next.js + FastAPI
 - [Styling](guides/styling.md) -- Tailwind CSS, global stylesheets, and inline styles
 - [Head Management](guides/head-management.md) -- `<Head>` component, the `HEAD` variable, and dynamic meta tags
+- [Caching](guides/caching.md) -- Server-side page caching, `revalidate`, the `CACHE` directive, and static generation
+- [Streaming SSR](guides/streaming.md) -- Streaming `<Suspense>` pages with `renderToPipeableStream` for faster time-to-first-byte
 - [API Routes](guides/api-routes.md) -- Building JSON APIs under `pages/api/`
 - [Middleware](guides/middleware.md) -- Application-level and route-level middleware
 - [Plugins](guides/plugins.md) -- Composing apps via `pyxle.config.json::plugins` (Django-style)

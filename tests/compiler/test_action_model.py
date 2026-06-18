@@ -63,3 +63,7 @@ class TestPageMetadataActions:
         meta = _base_metadata()
         payload = meta.to_json()
         assert payload["actions"] == []
+
+    def test_to_json_includes_cache_revalidate(self) -> None:
+        assert _base_metadata().to_json()["cache_revalidate"] is None
+        assert _base_metadata(cache_revalidate=60.0).to_json()["cache_revalidate"] == 60.0

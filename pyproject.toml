@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pyxle-framework"
-version = "0.4.5"
+version = "0.5.0"
 description = "Python-first full-stack framework with an intelligent CLI."
 readme = "README.md"
 authors = [
@@ -53,11 +53,38 @@ PyPI = "https://pypi.org/project/pyxle-framework/"
 langkit = [
   "pyxle-langkit>=0.2.0",
 ]
+# Shared Redis backends — the server-side page cache
+# (PYXLE_PAGE_CACHE_BACKEND=redis) and the cross-worker realtime broker
+# (PYXLE_REALTIME_BROKER=redis). Optional — the in-memory/file page cache and the
+# in-process realtime broker (the defaults) need nothing extra.
+redis = [
+  "redis>=5.0,<6.0",
+]
+# Request-body validation on @action via Pydantic models, and OpenAPI schema
+# generation (`pyxle openapi`). Optional — actions without a Pydantic-typed
+# `body` parameter need nothing extra.
+pydantic = [
+  "pydantic>=2.0,<3.0",
+]
+# Nicer structured logging (JSON/console) for the observability access log.
+# Optional — without it Pyxle falls back to a stdlib JSON/console formatter, so
+# structured logging works either way.
+observability = [
+  "structlog>=24.1,<26.0",
+]
+# OpenTelemetry distributed tracing (observability.otel). A separate extra so a
+# logs-only install doesn't pull the OTel SDK. Off by default; without it,
+# tracing is a no-op.
+observability-otel = [
+  "opentelemetry-sdk>=1.20,<2.0",
+  "opentelemetry-exporter-otlp-proto-http>=1.20,<2.0",
+]
 dev = [
   "pytest>=8.0,<9.0",
   "pytest-cov>=4.1,<5.0",
   "coverage>=7.4,<8.0",
   "ruff>=0.6,<0.7",
+  "pydantic>=2.0,<3.0",
   # The CLI tests use CliRunner.isolated_filesystem, which a newer Typer (and
   # Click 8.2) dropped. Pin both to the validated range. Test-only constraint —
   # the package's runtime deps are unaffected.
@@ -84,6 +111,12 @@ show_missing = true
 skip_covered = true
 
 [tool.pytest.ini_options]
-addopts = "--strict-markers --strict-config --cov=pyxle.cli --cov=pyxle.compiler --cov=pyxle.devserver --cov=pyxle.ssr --cov=pyxle.security --cov-report=term-missing"
+addopts = "--strict-markers --strict-config --cov=pyxle.cli --cov=pyxle.compiler --cov=pyxle.devserver --cov=pyxle.ssr --cov=pyxle.security --cov=pyxle.cache --cov=pyxle.realtime --cov=pyxle.observability --cov=pyxle.tasks --cov=pyxle.middleware --cov-report=term-missing"
 testpaths = ["tests"]
 pythonpath = ["."]
+# pytest's default ``norecursedirs`` skips any directory literally named
+# ``build`` — which silently drops ``tests/build`` (the test package mirroring
+# the ``pyxle/build`` source package) during recursion. Re-declare the defaults
+# *without* ``build`` so those tests run in CI. Real build artifacts live under
+# dot-dirs (``.pyxle-build``, matched by ``.*``) and ``dist``, still excluded.
+norecursedirs = ["*.egg", ".*", "_darcs", "CVS", "dist", "node_modules", "venv", "{arch}"]

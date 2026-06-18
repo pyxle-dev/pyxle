@@ -17,6 +17,7 @@ _SERVER_IMPORT = "from pyxle.runtime import server"
 _ACTION_IMPORT = "from pyxle.runtime import action"
 _SERVER_ACTION_IMPORT = "from pyxle.runtime import server, action"
 _ACTION_ERROR_IMPORT = "from pyxle.runtime import ActionError"
+_VALIDATION_ACTION_ERROR_IMPORT = "from pyxle.runtime import ValidationActionError"
 
 
 @dataclass
@@ -66,6 +67,7 @@ class ArtifactWriter:
         # most common surprise in early Pyxle apps.
         if has_actions and python_code.strip():
             python_code = ensure_action_error_import(python_code)
+            python_code = ensure_validation_action_error_import(python_code)
         jsx_code = (
             parse_result.jsx_code
             if parse_result.jsx_code.strip()
@@ -133,6 +135,16 @@ class ArtifactWriter:
             images=images,
             head_jsx_blocks=parse_result.head_jsx_blocks,
             actions=actions,
+            websocket_name=(
+                parse_result.websocket.name if parse_result.websocket else None
+            ),
+            websocket_line=(
+                parse_result.websocket.line_number
+                if parse_result.websocket
+                else None
+            ),
+            cache_revalidate=parse_result.cache_revalidate,
+            uses_suspense=parse_result.uses_suspense,
         )
 
         metadata_output.write_text(
@@ -282,6 +294,24 @@ def ensure_action_error_import(source: str) -> str:
     that name or via an alias, module-level attribute, or as a
     local class) is detected and the helper is a no-op.
     """
+    return _ensure_runtime_name_import(source, "ActionError", _ACTION_ERROR_IMPORT)
+
+
+def ensure_validation_action_error_import(source: str) -> str:
+    """Ensure ``from pyxle.runtime import ValidationActionError`` is present.
+
+    Mirror of :func:`ensure_action_error_import` for the validation
+    subclass, which a handler raises by hand for checks Pydantic can't
+    express (uniqueness, cross-field rules). Auto-imported independently
+    of ``ActionError`` — a user-defined name still takes precedence.
+    """
+    return _ensure_runtime_name_import(
+        source, "ValidationActionError", _VALIDATION_ACTION_ERROR_IMPORT
+    )
+
+
+def _ensure_runtime_name_import(source: str, name: str, import_line: str) -> str:
+    """Inject ``import_line`` unless ``name`` is already defined/imported."""
     if not source.strip():
         return source
 
@@ -290,41 +320,46 @@ def ensure_action_error_import(source: str) -> str:
     except SyntaxError:  # pragma: no cover - defensive fallback
         module = None
 
-    if module is not None and not _needs_action_error_import(module):
+    if module is not None and not _needs_runtime_name(module, name):
         return source
 
     lines = source.splitlines()
     insert_at = _determine_server_import_index(lines, module)
-    lines.insert(insert_at, _ACTION_ERROR_IMPORT)
+    lines.insert(insert_at, import_line)
     result = "\n".join(lines)
     if source.endswith("\n"):
         result += "\n"
     return result
 
 
-def _needs_action_error_import(module: ast.Module) -> bool:
-    """Mirror of :func:`_needs_action_import` for the ``ActionError`` name."""
+def _needs_runtime_name(module: ast.Module, name: str) -> bool:
+    """Whether ``name`` is undefined at module scope (so it needs importing).
+
+    Mirror of :func:`_needs_action_import`: a local def/class, a module-level
+    assignment, or an existing import of ``name`` (by name or alias) all count
+    as the user owning the name, and suppress auto-injection.
+    """
     for node in module.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "ActionError":
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
             return False
-        if isinstance(node, ast.ClassDef) and node.name == "ActionError":
+        if isinstance(node, ast.ClassDef) and node.name == name:
             return False
         if isinstance(node, ast.Assign):
             for target in node.targets:
-                if isinstance(target, ast.Name) and target.id == "ActionError":
+                if isinstance(target, ast.Name) and target.id == name:
                     return False
-        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.target.id == "ActionError":
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.target.id == name:
             return False
         if isinstance(node, ast.ImportFrom):
             for alias in node.names:
-                if alias.asname == "ActionError" or (
-                    alias.asname is None and alias.name == "ActionError"
+                if alias.asname == name or (
+                    alias.asname is None and alias.name == name
                 ):
                     return False
         if isinstance(node, ast.Import):
             for alias in node.names:
-                name = alias.asname or alias.name.split(".")[-1]
-                if name == "ActionError":
+                imported = alias.asname or alias.name.split(".")[-1]
+                if imported == name:
                     return False
     return True
 

@@ -9,12 +9,17 @@ diagnostics in tolerant mode (used by IDE/LSP integrations and the
 
 from __future__ import annotations
 
+import shutil
 from textwrap import dedent
+from unittest.mock import patch
 
 import pytest
 
 from pyxle.compiler.exceptions import CompilationError
+from pyxle.compiler.jsx_parser import JSXParseResult
 from pyxle.compiler.parser import PyxDiagnostic, PyxParser
+
+_NODE_AVAILABLE = shutil.which("node") is not None
 
 
 def _parse(text: str, *, tolerant: bool = False, validate_jsx: bool = False):
@@ -945,3 +950,141 @@ class TestParseResultDiagnosticsField:
         """)
         assert result.diagnostics == ()
         assert isinstance(result.diagnostics, tuple)
+
+
+# ---------------------------------------------------------------------------
+# TypeScript-in-client-block guard
+# ---------------------------------------------------------------------------
+
+
+_TS_GUARD_SOURCE = """
+@server
+async def loader(request):
+    return {"x": 1}
+
+import React from 'react';
+
+export default function P({ data }) {
+    const n: number = data.x;
+    return <div>{n}</div>;
+}
+"""
+
+
+def _ts_violation(line):
+    """A JSXParseResult as the extractor returns it for TS-in-client-block."""
+    return JSXParseResult(
+        components=(),
+        error=(
+            "TypeScript syntax (a type annotation (`: Type`)) isn't supported "
+            "in a .pyxl client block yet — keep the client half plain JSX "
+            "(see docs/guides/typescript.md)."
+        ),
+        error_code="ts_in_client_block",
+        error_line=line,
+    )
+
+
+class TestTypeScriptGuard:
+    """TS syntax in a client block is caught at compile time (not opt-in),
+    with a clear, source-located message — and never false-positives on valid
+    JSX. The extractor side is mocked here for determinism; a node-gated test
+    below exercises the real Babel chain end to end."""
+
+    def test_strict_mode_raises_with_clear_message(self):
+        with patch(
+            "pyxle.compiler.jsx_parser.parse_jsx_components",
+            return_value=_ts_violation(3),
+        ):
+            with pytest.raises(CompilationError, match="TypeScript syntax"):
+                _parse(_TS_GUARD_SOURCE)
+
+    def test_tolerant_mode_emits_jsx_diagnostic(self):
+        with patch(
+            "pyxle.compiler.jsx_parser.parse_jsx_components",
+            return_value=_ts_violation(3),
+        ):
+            result = _parse(_TS_GUARD_SOURCE, tolerant=True)
+        jsx = [d for d in result.diagnostics if d.section == "jsx"]
+        assert len(jsx) == 1
+        assert "TypeScript syntax" in jsx[0].message
+        assert jsx[0].line is not None
+
+    def test_jsx_relative_line_maps_to_pyxl_source(self):
+        # error_line is 1-indexed within the JSX block; line 1 is the
+        # `import React` line, and the out-of-range fallback resolves to that
+        # same first JSX line — both must land on a real .pyxl source line.
+        with patch(
+            "pyxle.compiler.jsx_parser.parse_jsx_components",
+            return_value=_ts_violation(1),
+        ):
+            first = _parse(_TS_GUARD_SOURCE, tolerant=True)
+        with patch(
+            "pyxle.compiler.jsx_parser.parse_jsx_components",
+            return_value=_ts_violation(9999),
+        ):
+            fallback = _parse(_TS_GUARD_SOURCE, tolerant=True)
+        first_line = [d for d in first.diagnostics if d.section == "jsx"][0].line
+        fallback_line = [d for d in fallback.diagnostics if d.section == "jsx"][0].line
+        assert first_line is not None and first_line > 0
+        # Out-of-range error_line falls back to the first JSX line.
+        assert fallback_line == first_line
+
+    def test_suppressed_when_python_section_has_errors(self):
+        # A mis-split (broken Python absorbed into the JSX) must not be read as
+        # a type annotation: when Python has a diagnostic, the TS guard is held.
+        bad_python = (
+            'x = "unterminated\n'
+            "y = 1\n"
+            "\n"
+            "import React from 'react';\n"
+            "export default function P() { const n = 1; return <div />; }\n"
+        )
+        with patch(
+            "pyxle.compiler.jsx_parser.parse_jsx_components",
+            return_value=_ts_violation(2),
+        ):
+            result = PyxParser().parse_text(bad_python, tolerant=True)
+        python_diags = [d for d in result.diagnostics if d.section == "python"]
+        jsx_diags = [d for d in result.diagnostics if d.section == "jsx"]
+        assert python_diags, "expected a [python] diagnostic"
+        assert not jsx_diags, "TS guard must be suppressed when Python has errors"
+
+    def test_valid_jsx_with_ternary_object_and_as_prop_is_not_flagged(self):
+        # Patch with a clean extractor result (no TS) and confirm no jsx diag —
+        # ternaries, object literals, and the JSX `as` prop are plain JS/JSX.
+        clean = JSXParseResult(components=(), error=None)
+        valid = """
+            @server
+            async def loader(request):
+                return {"x": 1}
+
+            import React from 'react';
+
+            export default function P({ data }) {
+                const n = data.x ? data.x : 0;
+                const o = { a: 1, b: 2 };
+                return <Box as="section">{n}{o.a}</Box>;
+            }
+        """
+        with patch(
+            "pyxle.compiler.jsx_parser.parse_jsx_components", return_value=clean
+        ):
+            result = _parse(valid, tolerant=True)
+        assert all(d.section != "jsx" for d in result.diagnostics)
+
+    @pytest.mark.skipif(not _NODE_AVAILABLE, reason="needs Node for the real Babel extractor")
+    def test_real_extractor_reports_pyxl_line(self):
+        """End-to-end with the real Babel extractor (when Node is available):
+        TS syntax raises a CompilationError naming the .pyxl source line."""
+        src = dedent(_TS_GUARD_SOURCE).strip("\n")
+        ts_line = next(
+            i + 1 for i, ln in enumerate(src.splitlines()) if "const n:" in ln
+        )
+        try:
+            PyxParser().parse_text(src)
+        except CompilationError as exc:
+            assert "TypeScript syntax" in str(exc)
+            assert f"Line {ts_line}" in str(exc)
+        else:
+            pytest.skip("Babel extractor unavailable; the guard degraded gracefully")

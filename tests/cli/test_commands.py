@@ -215,6 +215,28 @@ def test_init_generates_dev_secret_key(tmp_path, monkeypatch) -> None:
     assert ".env.local" in gitignore
 
 
+def test_scaffold_gitignore_commits_env_ignores_only_local(tmp_path, monkeypatch) -> None:
+    """`pyxle init` must NOT gitignore `.env` (the env doc says to commit it).
+
+    Only machine-local secret overrides (`.env.local`, `.env.*.local`) are
+    ignored; the shared `.env` / `.env.development` / `.env.production` files
+    stay committable, matching docs/guides/environment-variables.md.
+    """
+    from pyxle.cli.init import run_init
+
+    monkeypatch.chdir(tmp_path)
+    run_init("demo", force=False, template="default", logger=cli.ConsoleLogger(), log_steps=False)
+
+    lines = (tmp_path / "demo" / ".gitignore").read_text(encoding="utf-8").splitlines()
+    # Local secret overrides remain ignored.
+    assert ".env.local" in lines
+    assert ".env.*.local" in lines
+    # The committable env files must NOT appear as ignore patterns.
+    assert ".env" not in lines
+    assert ".env.development" not in lines
+    assert ".env.production" not in lines
+
+
 def test_scaffold_gitignore_excludes_build_dirs(tmp_path, monkeypatch) -> None:
     """`pyxle init` must gitignore BOTH build outputs — the dev cache
     (.pyxle-build/) and the production build dir (dist/) — so generated,
@@ -540,6 +562,44 @@ def test_dev_command_invokes_devserver(monkeypatch) -> None:
         assert captured.get("logger").__class__.__name__ == "ConsoleLogger"
 
 
+def test_dev_command_dashboard_flag(monkeypatch) -> None:
+    with runner.isolated_filesystem():
+        project = Path("demo")
+        (project / "pages").mkdir(parents=True)
+        (project / "public").mkdir(parents=True)
+
+        captured: dict[str, object] = {}
+
+        class StubDevServer:
+            def __init__(self, settings, logger, **kwargs):
+                captured.update(kwargs)
+
+            async def start(self) -> None:
+                pass
+
+        def fake_run(coro):
+            loop = asyncio.new_event_loop()
+            try:
+                return loop.run_until_complete(coro)
+            finally:
+                loop.close()
+
+        # dev() lazily initialises its DevServer / DevServerSettings globals and
+        # re-imports them when either is None, which would clobber the stub.
+        # Pin DevServerSettings to the real class so that block is skipped.
+        from pyxle.devserver import DevServerSettings as _RealSettings
+
+        monkeypatch.setattr("pyxle.cli.DevServerSettings", _RealSettings)
+        monkeypatch.setattr("pyxle.cli.DevServer", StubDevServer)
+        monkeypatch.setattr("pyxle.cli.asyncio.run", fake_run)
+
+        result = runner.invoke(
+            app, ["dev", "demo", "--dashboard"], catch_exceptions=False
+        )
+        assert result.exit_code == 0, result.stdout
+        assert captured.get("dashboard") is True
+
+
 def test_dev_command_respects_config_file(monkeypatch) -> None:
     with runner.isolated_filesystem():
         project = Path("demo")
@@ -660,6 +720,52 @@ def test_build_command_invokes_pipeline(monkeypatch) -> None:
         assert "Server modules" in result.stdout
         assert "Metadata" in result.stdout
         assert "Public assets" in result.stdout
+
+
+def test_build_command_static_flag_prerenders(monkeypatch) -> None:
+    with runner.isolated_filesystem():
+        project = Path("demo")
+        (project / "pages").mkdir(parents=True)
+        (project / "public").mkdir(parents=True)
+
+        def fake_run_build(settings, *, logger, dist_dir=None, force_rebuild=True):
+            from pyxle.build.pipeline import BuildResult
+            from pyxle.devserver.builder import BuildSummary
+            from pyxle.devserver.registry import MetadataRegistry
+
+            result_dist = dist_dir or settings.project_root / "dist"
+            for sub in ("client", "server", "metadata", "public"):
+                (result_dist / sub).mkdir(parents=True, exist_ok=True)
+            page_manifest_path = result_dist / "page-manifest.json"
+            page_manifest_path.write_text("{}", encoding="utf-8")
+            return BuildResult(
+                dist_dir=result_dist,
+                client_dir=result_dist / "client",
+                server_dir=result_dist / "server",
+                metadata_dir=result_dist / "metadata",
+                public_dir=result_dist / "public",
+                client_manifest_path=None,
+                page_manifest={},
+                page_manifest_path=page_manifest_path,
+                summary=BuildSummary(),
+                registry=MetadataRegistry(pages=[], apis=[]),
+            )
+
+        captured: dict[str, object] = {}
+
+        def fake_generate(settings, dist_dir, *, logger=None):
+            captured["dist_dir"] = dist_dir
+            return ["/", "/about"]
+
+        monkeypatch.setattr("pyxle.cli.run_build", fake_run_build)
+        monkeypatch.setattr("pyxle.build.static_gen.generate_static_site", fake_generate)
+
+        result = runner.invoke(app, ["build", "demo", "--static"], catch_exceptions=False)
+
+        assert result.exit_code == 0, result.stdout
+        assert captured["dist_dir"] == (project / "dist").resolve()
+        assert "Static pages" in result.stdout
+        assert "2 pre-rendered" in result.stdout
 
 
 def test_build_command_supports_incremental_flag(monkeypatch) -> None:
@@ -2682,3 +2788,37 @@ def test_check_command_with_package_json_skips_warning() -> None:
         assert result.exit_code == 0, result.stdout
         assert "No package.json found" not in result.stdout
         assert "passed" in result.stdout
+
+
+def test_dist_has_websocket_pages(tmp_path: Path) -> None:
+    """The multi-worker WS warning trigger: detects a websocket page in the
+    build's page-manifest.json (and is safe when the manifest is absent)."""
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    manifest = dist / "page-manifest.json"
+
+    # No manifest yet → no websocket pages.
+    assert cli._dist_has_websocket_pages(dist) is False
+
+    # Manifest with only ordinary pages → False.
+    manifest.write_text(
+        json.dumps({"/": {"client": {"file": "x"}}, "/about": {"server": {}}}),
+        encoding="utf-8",
+    )
+    assert cli._dist_has_websocket_pages(dist) is False
+
+    # Manifest with a websocket page → True.
+    manifest.write_text(
+        json.dumps(
+            {
+                "/": {"client": {"file": "x"}},
+                "/chat/{room}": {"websocket": {"name": "websocket", "line": 3}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert cli._dist_has_websocket_pages(dist) is True
+
+    # Malformed manifest → False (never raises).
+    manifest.write_text("not json", encoding="utf-8")
+    assert cli._dist_has_websocket_pages(dist) is False

@@ -338,7 +338,8 @@ the file watcher detects the change and rebuilds every route under
 that directory's subtree.
 
 A `layout.pyxl` looks like a regular page, but its component receives
-a `children` prop instead of `data`:
+a `children` prop, and a layout loader's data arrives on a separate
+`layoutData` prop (so it never collides with the page's own `data`):
 
 ```python
 # pages/layout.pyxl
@@ -349,11 +350,11 @@ async def load_root_layout(request):
 
 import React from 'react';
 
-export default function RootLayout({ data, children }) {
+export default function RootLayout({ children, layoutData }) {
     return (
         <html lang="en">
             <body>
-                <header>{data.appName}</header>
+                <header>{layoutData.appName}</header>
                 <main>{children}</main>
             </body>
         </html>
@@ -362,9 +363,14 @@ export default function RootLayout({ data, children }) {
 ```
 
 The layout *can* have its own `@server` loader — it runs in addition
-to the page's loader, and its data is available to the layout
-component via the `data` prop. (The page component still gets its own
-`data`.)
+to the page's loader, and its result is delivered to the layout
+component on the `layoutData` prop. (The page component still gets its
+own `data`.) For convenience the composed wrapper also aliases
+`layoutData` onto the layout's `data` prop, so a layout that
+destructures `data` keeps working — but `layoutData` is the canonical
+name and the one the reference apps use. Multiple ancestor layouts
+that each declare a loader are merged into one `layoutData` dict
+(on a key collision the outermost layout wins).
 
 ### Templates: layouts that don't persist
 
@@ -418,9 +424,11 @@ export default function ErrorBoundary({ error }) {
 }
 ```
 
-In dev mode, the error boundary also receives the Python traceback
-in `error.traceback` for debugging. In production this is omitted —
-production responses must not leak internal state.
+The `error` prop carries exactly `{ message, statusCode, type }`, plus
+an optional `data` field when a `LoaderError`/`ActionError` was raised
+with `data`. There is no `traceback` key — production responses must
+not leak internal state, and in production the `message` for an
+unexpected (non-author) fault is replaced with a generic string.
 
 The boundary discovery logic lives in
 `devserver/error_pages.py`.
@@ -462,36 +470,44 @@ pages/
         └── [id].py              →  /api/users/{id}
 ```
 
-An API route module exports an async function with a name matching
-the HTTP method:
+An API route module exports an `endpoint` callable. A single
+`endpoint` serves **all** HTTP methods — branch on `request.method`
+inside it. It receives a Starlette `Request` and must return a
+Starlette `Response` (e.g. `JSONResponse`):
 
 ```python
 # pages/api/health.py
-async def get(request):
-    return {"status": "ok"}
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
-async def post(request):
-    body = await request.json()
-    return {"received": body}
+
+async def endpoint(request: Request) -> JSONResponse:
+    if request.method == "POST":
+        body = await request.json()
+        return JSONResponse({"received": body})
+    return JSONResponse({"status": "ok"})
 ```
 
-The dev server inspects the module at registration time, finds the
-`get`, `post`, etc. functions, and registers a Starlette endpoint
-for each. There's no decorator — the function name *is* the contract.
+The dev server inspects the module at registration time and registers
+a single Starlette route for `endpoint`. There's no decorator and no
+`get`/`post`/`handle` method-name convention — the module-level
+`endpoint` attribute *is* the contract. A module that defines neither
+`endpoint`, a `websocket` callable, nor an `HTTPEndpoint` subclass
+raises an error at registration.
 
-If a single function should handle multiple methods, name it
-`handle` instead and Pyxle routes all methods to it:
+For a WebSocket route, export a module-scope `websocket` callable
+instead (or alongside `endpoint`):
 
 ```python
-async def handle(request):
-    if request.method == "GET":
-        return {"data": "..."}
-    elif request.method == "POST":
-        ...
+# pages/api/live.py
+async def websocket(ws):
+    await ws.accept()
+    ...
 ```
 
 API routes can use the same dynamic segment syntax as pages
-(`[id].py`, `[...slug].py`, etc.).
+(`[id].py`, `[...slug].py`, etc.); read params from
+`request.path_params`.
 
 ---
 

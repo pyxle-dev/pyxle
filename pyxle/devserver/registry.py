@@ -38,6 +38,10 @@ class PageRegistryEntry:
     images: tuple[dict, ...] = ()
     head_jsx_blocks: tuple[str, ...] = ()
     actions: tuple[dict, ...] = ()
+    websocket_name: Optional[str] = None
+    websocket_line: Optional[int] = None
+    cache_revalidate: float | None = None
+    uses_suspense: bool = False
 
     @property
     def has_loader(self) -> bool:
@@ -46,6 +50,10 @@ class PageRegistryEntry:
     @property
     def has_actions(self) -> bool:
         return bool(self.actions)
+
+    @property
+    def has_websocket(self) -> bool:
+        return self.websocket_name is not None
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,6 +107,10 @@ class MetadataRegistry:
                     "images": list(entry.images),
                     "head_jsx_blocks": list(entry.head_jsx_blocks),
                     "actions": list(entry.actions),
+                    "websocket_name": entry.websocket_name,
+                    "websocket_line": entry.websocket_line,
+                    "cache_revalidate": entry.cache_revalidate,
+                    "uses_suspense": entry.uses_suspense,
                 }
                 for entry in self.pages
             ],
@@ -190,6 +202,10 @@ def _build_page_entry(
         images=metadata.images,
         head_jsx_blocks=metadata.head_jsx_blocks,
         actions=metadata.actions,
+        websocket_name=metadata.websocket_name,
+        websocket_line=metadata.websocket_line,
+        cache_revalidate=metadata.cache_revalidate,
+        uses_suspense=metadata.uses_suspense,
     )
 
 
@@ -293,6 +309,28 @@ def _load_page_metadata(path: Path) -> Optional[PageMetadata]:
     else:
         actions = tuple()
 
+    # WebSocket handler metadata. Absent in builds produced before 2.5 — the
+    # defensive defaults keep `pyxle serve --skip-build` working against an old
+    # dist/ without a recompile.
+    websocket_name = payload.get("websocket_name")
+    if websocket_name is not None and not isinstance(websocket_name, str):
+        websocket_name = None
+
+    websocket_line = payload.get("websocket_line")
+    if not isinstance(websocket_line, int):
+        websocket_line = None
+
+    cache_revalidate_payload = payload.get("cache_revalidate")
+    cache_revalidate: float | None
+    if isinstance(cache_revalidate_payload, (int, float)) and not isinstance(
+        cache_revalidate_payload, bool
+    ):
+        cache_revalidate = float(cache_revalidate_payload)
+    else:
+        cache_revalidate = None
+
+    uses_suspense = payload.get("uses_suspense") is True
+
     return PageMetadata(
         route_path=route_path,
         alternate_route_paths=alternate_route_paths,
@@ -306,6 +344,10 @@ def _load_page_metadata(path: Path) -> Optional[PageMetadata]:
         images=images,
         head_jsx_blocks=head_jsx_blocks,
         actions=actions,
+        websocket_name=websocket_name,
+        websocket_line=websocket_line,
+        cache_revalidate=cache_revalidate,
+        uses_suspense=uses_suspense,
     )
 
 

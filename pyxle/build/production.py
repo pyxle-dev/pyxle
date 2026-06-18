@@ -160,6 +160,17 @@ def _resolve_pool_size(ssr_workers: int) -> int:
     return ssr_workers
 
 
+def resolve_server_workers(requested: int) -> int:
+    """Effective number of server worker processes.
+
+    ``0`` auto-detects from CPU cores (one worker per core, at least one); any
+    other value is used as-is (clamped to a minimum of one).
+    """
+    if requested == 0:
+        return max(1, os.cpu_count() or 1)
+    return max(1, requested)
+
+
 def _resolve_static_dirs(
     settings: DevServerSettings,
     resolved_dist: Path,
@@ -249,6 +260,10 @@ def build_production_app(
             client_root=settings.client_build_dir,
         )
 
+    # A `pyxle build --static` run leaves pre-rendered pages here; the app warms
+    # its cache from them on startup. Absent for a normal build (None-safe).
+    prerender_dir = resolved_dist / "prerendered"
+
     app = create_starlette_app(
         settings,
         route_table,
@@ -257,6 +272,7 @@ def build_production_app(
         public_static_dir=public_static_dir,
         client_static_dir=client_static_dir,
         serve_static=serve_static,
+        prerender_dir=prerender_dir if prerender_dir.exists() else None,
     )
     app.state.pyxle_ready = True
     return app, pool_size

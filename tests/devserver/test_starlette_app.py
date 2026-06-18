@@ -4,6 +4,7 @@ import json
 import sys
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -20,6 +21,7 @@ from pyxle.devserver.routes import build_route_table
 from pyxle.devserver.settings import DevServerSettings
 from pyxle.devserver.starlette_app import (
     ApiRouteError,
+    PageRouteError,
     build_api_router,
     build_page_router,
     build_static_files_mount,
@@ -178,6 +180,80 @@ def test_build_api_router_supports_http_and_ws_in_same_module(
         assert client.get("/api/dual").json() == {"ok": True}
         with client.websocket_connect("/api/dual") as ws:
             assert ws.receive_text() == "ws-hello"
+
+
+def test_build_page_router_registers_page_websocket(
+    project: DevServerSettings, monkeypatch
+) -> None:
+    """A page that declares ``async def websocket(ws)`` serves a WebSocket
+    route at its path, ALONGSIDE its HTTP GET — both on the same dynamic path,
+    with path params resolved for the WS upgrade too."""
+    write_file(
+        project.pages_dir / "chat/[room].pyxl",
+        "async def websocket(ws):\n"
+        "    await ws.accept()\n"
+        "    room = ws.path_params['room']\n"
+        "    msg = await ws.receive_text()\n"
+        "    await ws.send_text(f'{room}:{msg}')\n"
+        "    await ws.close()\n"
+        "\n"
+        "import React from 'react';\n"
+        "export default function Chat() { return <div>chat</div>; }\n",
+    )
+
+    build_once(project)
+    registry = load_metadata_registry(project)
+    table = build_route_table(registry)
+
+    async def fake_build_page_response(*, request, settings, page, renderer, overlay=None, **_kw):
+        return PlainTextResponse(f"SSR:{page.path}")
+
+    monkeypatch.setattr(
+        "pyxle.devserver.starlette_app.build_page_response",
+        fake_build_page_response,
+    )
+
+    router = build_page_router(table.pages, settings=project, renderer=object())
+    app = Starlette()
+    app.router.routes.extend(router.routes)
+
+    with TestClient(app) as client:
+        # The HTTP GET still renders on the same path…
+        assert client.get("/chat/lobby").text == "SSR:/chat/{room}"
+        # …and a WS upgrade to the same path resolves the [room] param.
+        with client.websocket_connect("/chat/lobby") as ws:
+            ws.send_text("hi")
+            assert ws.receive_text() == "lobby:hi"
+
+
+def test_page_without_websocket_has_no_ws_route(project: DevServerSettings) -> None:
+    """A page with no ``websocket`` handler exposes only its HTTP route — a WS
+    upgrade to its path is rejected."""
+    build_once(project)  # index.pyxl declares only a loader
+    registry = load_metadata_registry(project)
+    table = build_route_table(registry)
+
+    router = build_page_router(table.pages, settings=project, renderer=object())
+    app = Starlette()
+    app.router.routes.extend(router.routes)
+
+    with TestClient(app) as client:
+        with pytest.raises(WebSocketDisconnect):
+            with client.websocket_connect("/"):
+                pass
+
+
+def test_page_websocket_stale_metadata_raises(project: DevServerSettings) -> None:
+    """Metadata that names a websocket handler the server module doesn't expose
+    (a stale build) fails loudly at router build, not with a 500 on connect."""
+    build_once(project)
+    registry = load_metadata_registry(project)
+    table = build_route_table(registry)
+    index = next(page for page in table.pages if page.path == "/")
+    broken = replace(index, websocket_name="not_a_real_handler")
+
+    with pytest.raises(PageRouteError, match="no such callable"):
+        build_page_router([broken], settings=project, renderer=object())
 
 
 def test_build_page_router_invokes_build_page_response(project: DevServerSettings, monkeypatch) -> None:
@@ -1718,6 +1794,38 @@ def test_create_starlette_app_raises_on_bad_custom_middleware(
     assert errors  # the failure was surfaced through the logger
 
 
+def test_create_starlette_app_warns_base_http_middleware_with_streaming(
+    project: DevServerSettings,
+    monkeypatch,
+) -> None:
+    """A BaseHTTPMiddleware paired with a streaming-eligible route warns at boot.
+
+    Exercises the warning wiring in ``create_starlette_app`` (F28): the build
+    has a ``<Suspense>`` route and a configured ``BaseHTTPMiddleware``, so the
+    incompatibility is flagged.
+    """
+    build_once(project)
+    registry = load_metadata_registry(project)
+    table = build_route_table(registry)
+    # Mark a real page as streaming-eligible without authoring a Suspense page.
+    table.pages[0] = replace(table.pages[0], uses_suspense=True)
+
+    warnings: list[str] = []
+
+    class StubLogger(ConsoleLogger):
+        def warning(self, message: str) -> None:  # type: ignore[override]
+            warnings.append(message)
+
+    with_middleware = replace(
+        project,
+        custom_middlewares=("tests.devserver.sample_middlewares:HeaderCaptureMiddleware",),
+    )
+
+    create_starlette_app(with_middleware, table, logger=StubLogger())
+
+    assert any("BaseHTTPMiddleware" in w and "streaming" in w for w in warnings)
+
+
 def test_create_starlette_app_raises_on_bad_route_hook(
     project: DevServerSettings,
 ) -> None:
@@ -2038,6 +2146,69 @@ def test_create_starlette_app_csrf_secure_cookie_in_production(
         c for c in got.headers.get_list("set-cookie") if c.startswith("pyxle-csrf=")
     )
     assert "Secure" in csrf_cookie
+
+
+def test_create_starlette_app_installs_rate_limit_middleware(
+    project: DevServerSettings,
+    monkeypatch,
+) -> None:
+    """When ``settings.rate_limit`` is enabled the limiter is wired into the
+    stack: requests up to the capacity pass, the next is rejected with 429, and
+    because observability sits outside the limiter the 429 still carries the
+    correlation id header."""
+    from pyxle.config import RateLimitConfig
+
+    monkeypatch.setattr(
+        "pyxle.devserver.starlette_app.ComponentRenderer",
+        lambda: object(),
+    )
+
+    build_once(project)
+    registry = load_metadata_registry(project)
+    table = build_route_table(registry)
+
+    with_rl = replace(
+        project, rate_limit=RateLimitConfig(requests=2, window_seconds=60.0)
+    )
+    app = create_starlette_app(with_rl, table)
+    client = TestClient(app, raise_server_exceptions=False)
+
+    # The first two requests drain the bucket (real clock barely advances, so
+    # the ~0.03 tokens/sec refill is negligible across three rapid calls).
+    assert client.get("/api/pulse").status_code == 200
+    assert client.get("/api/pulse").status_code == 200
+
+    throttled = client.get("/api/pulse")
+    assert throttled.status_code == 429
+    assert int(throttled.headers["retry-after"]) >= 1
+    assert throttled.json() == {"ok": False, "error": "Too Many Requests"}
+    # Observability wraps the limiter: the rejected request is still tagged.
+    assert throttled.headers.get("x-request-id")
+
+
+def test_create_starlette_app_skips_rate_limit_when_disabled(
+    project: DevServerSettings,
+    monkeypatch,
+) -> None:
+    """A disabled ``RateLimitConfig`` (requests == 0) installs no limiter, so
+    far more requests than any bucket capacity all succeed."""
+    from pyxle.config import RateLimitConfig
+
+    monkeypatch.setattr(
+        "pyxle.devserver.starlette_app.ComponentRenderer",
+        lambda: object(),
+    )
+
+    build_once(project)
+    registry = load_metadata_registry(project)
+    table = build_route_table(registry)
+
+    with_rl = replace(project, rate_limit=RateLimitConfig(requests=0))
+    app = create_starlette_app(with_rl, table)
+    client = TestClient(app, raise_server_exceptions=False)
+
+    for _ in range(10):
+        assert client.get("/api/pulse").status_code == 200
 
 
 # ---------------------------------------------------------------------------
@@ -2650,3 +2821,111 @@ def test_create_starlette_app_enables_static_cache_only_in_production(
 
     prod_app = create_starlette_app(replace(project, debug=False), table)
     assert _static_kwargs(prod_app)["cache_in_memory"] is True
+
+
+def test_hot_route_refresh_keeps_streaming_wired(
+    project: DevServerSettings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: the dev-server hot route refresh must re-thread the pool's
+    render_stream. Without this, a hot reload rebuilt routes without it and every
+    <Suspense> page silently fell back from renderToPipeableStream to the
+    buffered renderToString (which can't stream Suspense)."""
+    import pyxle.devserver as devserver_pkg
+
+    build_once(project)
+    routes = build_route_table(load_metadata_registry(project))
+
+    def _render_stream(*args, **kwargs):  # pragma: no cover - identity sentinel
+        raise AssertionError("not invoked in this test")
+
+    pool = SimpleNamespace(render_stream=_render_stream)
+    app = create_starlette_app(project, routes, pool=pool)
+
+    # create_starlette_app stashes the pool's render_stream for later refreshes.
+    assert app.state.pyxle_stream_render is _render_stream
+
+    # ...and the hot route refresh threads it back into the rebuilt routes.
+    captured: dict = {}
+
+    def _spy_build_app_routes(**kwargs):
+        captured.update(kwargs)
+        return ([], object())
+
+    monkeypatch.setattr(
+        "pyxle.devserver.starlette_app._build_app_routes", _spy_build_app_routes
+    )
+    devserver_pkg._rebuild_app_routes(app, project)
+    assert captured["stream_render"] is _render_stream
+
+
+@pytest.mark.anyio
+async def test_loading_boundary_route_takes_streaming_path(
+    anyio_backend, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A page with a loading.pyxl boundary but NO in-page <Suspense> must still
+    enter the streaming path — otherwise the route-level loading shell is dead."""
+    from starlette.requests import Request
+    from starlette.responses import HTMLResponse
+
+    from pyxle.devserver.routes import PageRoute
+    from pyxle.devserver.starlette_app import ComponentRenderer, _build_cached_page_response
+
+    root = tmp_path / "project"
+    (root / "pages").mkdir(parents=True)
+    (root / "public").mkdir()
+    settings = DevServerSettings.from_project_root(root)
+
+    loading = PageRoute(
+        path="/dashboard/loading",
+        source_relative_path=Path("dashboard/loading.pyxl"),
+        source_absolute_path=root / "pages" / "dashboard" / "loading.pyxl",
+        server_module_path=root / "server" / "dashboard" / "loading.py",
+        client_module_path=root / "client" / "dashboard" / "loading.jsx",
+        metadata_path=root / "meta" / "dashboard" / "loading.json",
+        module_key="pyxle.server.pages.dashboard.loading",
+        client_asset_path="/pages/dashboard/loading.jsx",
+        server_asset_path="/pages/dashboard/loading.py",
+        content_hash="h",
+        loader_name=None,
+        loader_line=None,
+        head_elements=(),
+        head_is_dynamic=False,
+    )
+    route = replace(
+        loading,
+        path="/dashboard",
+        source_relative_path=Path("dashboard/index.pyxl"),
+        client_asset_path="/pages/dashboard/index.jsx",
+        uses_suspense=False,  # NO in-page Suspense — only the loading boundary
+        loading_boundary=loading,
+    )
+
+    called: dict = {}
+
+    async def _fake_streaming(**kwargs):
+        called["yes"] = True
+        return HTMLResponse("streamed")
+
+    monkeypatch.setattr(
+        "pyxle.devserver.starlette_app.build_streaming_page_response", _fake_streaming
+    )
+
+    async def _stream_render(*args, **kwargs):  # pragma: no cover - sentinel
+        yield {"type": "end"}
+
+    request = Request(
+        {"type": "http", "http_version": "1.1", "method": "GET", "path": "/dashboard",
+         "query_string": b"", "root_path": "", "headers": []}
+    )
+    response = await _build_cached_page_response(
+        request=request,
+        route=route,
+        settings=settings,
+        renderer=ComponentRenderer(),
+        overlay=None,
+        error_boundaries=None,
+        page_cache=None,
+        stream_render=_stream_render,
+    )
+    assert called.get("yes") is True
+    assert response.headers["Cache-Control"] == "private, no-cache"

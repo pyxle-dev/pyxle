@@ -1,0 +1,24 @@
+import React, { useState } from 'react';
+import { navigate } from 'pyxle/client';
+
+export default function Home() {
+  const [room, setRoom] = useState('lobby');
+  return (
+    <main style={{ maxWidth: 420, margin: '3rem auto', fontFamily: 'system-ui' }}>
+      <h1>Pyxle chat</h1>
+      <p>A two-file realtime chat: a page that also serves a WebSocket.</p>
+      <form
+        onSubmit={(e) => { e.preventDefault(); navigate('/chat/' + (room || 'lobby')); }}
+        style={{ display: 'flex', gap: 8 }}
+      >
+        <input
+          value={room}
+          onChange={(e) => setRoom(e.target.value.replace(/[^a-z0-9-]/gi, ''))}
+          placeholder="room name"
+          style={{ flex: 1, padding: 8 }}
+        />
+        <button type="submit">Join room</button>
+      </form>
+    </main>
+  );
+}

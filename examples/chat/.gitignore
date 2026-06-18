@@ -1,0 +1,4 @@
+# Generated locally — never commit build artifacts.
+.pyxle-build/
+dist/
+node_modules/

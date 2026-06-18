@@ -953,6 +953,46 @@ async def test_worker_script_exists_and_is_valid_mjs() -> None:
     assert returncode == 0, f"ssr_worker.mjs exited with code {returncode}"
 
 
+@pytest.mark.anyio
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js required for SSR worker integration test")
+async def test_worker_substitutes_public_env_during_ssr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The persistent worker bakes ``import.meta.env.PYXLE_PUBLIC_*`` (F4).
+
+    The pool forwards ``PYXLE_PUBLIC_*`` to the Node process; ``ssr_worker.mjs``
+    must add the matching esbuild ``define`` so server render agrees with the
+    Vite-substituted client bundle instead of emitting ``undefined``.
+    """
+    monkeypatch.setenv("PYXLE_PUBLIC_BRAND", "Pulse")
+
+    project_root = tmp_path / "project"
+    client_root = project_root / ".pyxle-build" / "client"
+    component = client_root / "pages" / "env.jsx"
+    component.parent.mkdir(parents=True, exist_ok=True)
+    component.write_text(
+        (
+            "import React from 'react';\n"
+            "export default function EnvProbe() {\n"
+            "  return <span data-brand={import.meta.env.PYXLE_PUBLIC_BRAND}>ok</span>;\n"
+            "}\n"
+        ),
+        encoding="utf-8",
+    )
+
+    ensure_test_node_modules(project_root)
+
+    pool = SsrWorkerPool(size=1, project_root=project_root, client_root=client_root)
+    try:
+        result = await pool.render(component, {})
+    finally:
+        await pool.stop()
+
+    assert result["ok"] is True
+    assert 'data-brand="Pulse"' in result["html"]
+    assert "undefined" not in result["html"]
+
+
 # ---------------------------------------------------------------------------
 # Invalidation tests
 # ---------------------------------------------------------------------------

@@ -3,7 +3,11 @@ from __future__ import annotations
 import pytest
 from starlette.middleware import Middleware
 
-from pyxle.devserver.middleware import MiddlewareHookError, load_custom_middlewares
+from pyxle.devserver.middleware import (
+    MiddlewareHookError,
+    find_base_http_middlewares,
+    load_custom_middlewares,
+)
 from tests.devserver.sample_middlewares import SimpleAsgiMiddleware
 
 
@@ -39,3 +43,24 @@ def test_load_custom_middlewares_accepts_asgi_classes() -> None:
 
     assert len(middlewares) == 1
     assert middlewares[0].cls is SimpleAsgiMiddleware
+
+
+def test_find_base_http_middlewares_detects_subclasses() -> None:
+    middlewares = load_custom_middlewares(
+        [
+            "tests.devserver.sample_middlewares:HeaderCaptureMiddleware",
+            "tests.devserver.sample_middlewares:SimpleAsgiMiddleware",
+        ]
+    )
+
+    offenders = find_base_http_middlewares(middlewares)
+    # Only the BaseHTTPMiddleware subclass is flagged; the pure-ASGI one is not.
+    assert offenders == ["HeaderCaptureMiddleware"]
+
+
+def test_find_base_http_middlewares_empty_for_pure_asgi() -> None:
+    middlewares = load_custom_middlewares(
+        ["tests.devserver.sample_middlewares:SimpleAsgiMiddleware"]
+    )
+
+    assert find_base_http_middlewares(middlewares) == []

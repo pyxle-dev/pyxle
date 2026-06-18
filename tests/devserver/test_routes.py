@@ -154,6 +154,151 @@ def test_build_route_table_generates_expected_descriptors(project: DevServerSett
         assert "[" not in route.path and "]" not in route.path
 
 
+def test_loading_pages_are_excluded_from_routing_and_collected(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    (root / "pages").mkdir(parents=True)
+    (root / "public").mkdir()
+    settings = DevServerSettings.from_project_root(root)
+
+    write_file(
+        settings.pages_dir / "index.pyxl",
+        "import React from 'react';\n\n"
+        "export default function Home() {\n  return <div>Home</div>;\n}\n",
+    )
+    write_file(
+        settings.pages_dir / "loading.pyxl",
+        "import React from 'react';\n\n"
+        "export default function Loading() {\n  return <p>Loading…</p>;\n}\n",
+    )
+    write_file(
+        settings.pages_dir / "dashboard/index.pyxl",
+        "import React from 'react';\n\n"
+        "export default function Dashboard() {\n  return <main>Dash</main>;\n}\n",
+    )
+    write_file(
+        settings.pages_dir / "dashboard/loading.pyxl",
+        "import React from 'react';\n\n"
+        "export default function DashLoading() {\n  return <p>Loading dash…</p>;\n}\n",
+    )
+
+    build_once(settings)
+    table = build_route_table(load_metadata_registry(settings))
+
+    # loading.pyxl is compiled but never served as a normal page.
+    page_paths = {route.path for route in table.pages}
+    assert "/loading" not in page_paths
+    assert "/dashboard/loading" not in page_paths
+    assert "/" in page_paths and "/dashboard" in page_paths
+
+    # ...and it is collected into the loading-boundary set instead.
+    loading_sources = {
+        route.source_relative_path.as_posix() for route in table.loading_boundary_pages
+    }
+    assert loading_sources == {"loading.pyxl", "dashboard/loading.pyxl"}
+
+
+def test_loading_boundary_is_stamped_on_nearest_pages(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    (root / "pages").mkdir(parents=True)
+    (root / "public").mkdir()
+    settings = DevServerSettings.from_project_root(root)
+
+    page = "import React from 'react';\n\nexport default function P() {{ return <main>{0}</main>; }}\n"
+    loading = "import React from 'react';\n\nexport default function L() {{ return <p>loading {0}</p>; }}\n"
+    write_file(settings.pages_dir / "index.pyxl", page.format("home"))
+    write_file(settings.pages_dir / "loading.pyxl", loading.format("root"))
+    write_file(settings.pages_dir / "dashboard/index.pyxl", page.format("dash"))
+    write_file(settings.pages_dir / "dashboard/settings.pyxl", page.format("settings"))
+    write_file(settings.pages_dir / "dashboard/loading.pyxl", loading.format("dash"))
+
+    build_once(settings)
+    table = build_route_table(load_metadata_registry(settings))
+    by_path = {route.path: route for route in table.pages}
+
+    # Root loading.pyxl applies to "/"; the nearer dashboard/loading.pyxl wins
+    # for "/dashboard" and "/dashboard/settings".
+    assert by_path["/"].loading_boundary is not None
+    assert by_path["/"].loading_boundary.source_relative_path.as_posix() == "loading.pyxl"
+    assert (
+        by_path["/dashboard"].loading_boundary.source_relative_path.as_posix()
+        == "dashboard/loading.pyxl"
+    )
+    assert (
+        by_path["/dashboard/settings"].loading_boundary.source_relative_path.as_posix()
+        == "dashboard/loading.pyxl"
+    )
+
+
+def test_no_loading_boundary_leaves_routes_unstamped(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    (root / "pages").mkdir(parents=True)
+    (root / "public").mkdir()
+    settings = DevServerSettings.from_project_root(root)
+    write_file(
+        settings.pages_dir / "index.pyxl",
+        "import React from 'react';\n\nexport default function P() { return <main>home</main>; }\n",
+    )
+
+    build_once(settings)
+    table = build_route_table(load_metadata_registry(settings))
+    assert all(route.loading_boundary is None for route in table.pages)
+
+
+def test_error_boundary_is_stamped_on_nearest_pages(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    (root / "pages").mkdir(parents=True)
+    (root / "public").mkdir()
+    settings = DevServerSettings.from_project_root(root)
+
+    page = "import React from 'react';\n\nexport default function P() {{ return <main>{0}</main>; }}\n"
+    error = "import React from 'react';\n\nexport default function E() {{ return <p>error {0}</p>; }}\n"
+    write_file(settings.pages_dir / "index.pyxl", page.format("home"))
+    write_file(settings.pages_dir / "error.pyxl", error.format("root"))
+    write_file(settings.pages_dir / "dashboard/index.pyxl", page.format("dash"))
+    write_file(settings.pages_dir / "dashboard/settings.pyxl", page.format("settings"))
+    write_file(settings.pages_dir / "dashboard/error.pyxl", error.format("dash"))
+
+    build_once(settings)
+    table = build_route_table(load_metadata_registry(settings))
+    by_path = {route.path: route for route in table.pages}
+
+    # error.pyxl is collected, not routed as a normal page.
+    page_paths = {route.path for route in table.pages}
+    assert "/error" not in page_paths and "/dashboard/error" not in page_paths
+    error_sources = {
+        route.source_relative_path.as_posix() for route in table.error_boundary_pages
+    }
+    assert error_sources == {"error.pyxl", "dashboard/error.pyxl"}
+
+    # Root error.pyxl applies to "/"; the nearer dashboard/error.pyxl wins for
+    # "/dashboard" and "/dashboard/settings" (closest-ancestor walk-up).
+    assert by_path["/"].error_boundary is not None
+    assert by_path["/"].error_boundary.source_relative_path.as_posix() == "error.pyxl"
+    assert (
+        by_path["/dashboard"].error_boundary.source_relative_path.as_posix()
+        == "dashboard/error.pyxl"
+    )
+    assert (
+        by_path["/dashboard/settings"].error_boundary.source_relative_path.as_posix()
+        == "dashboard/error.pyxl"
+    )
+
+
+def test_no_error_boundary_leaves_routes_unstamped(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    (root / "pages").mkdir(parents=True)
+    (root / "public").mkdir()
+    settings = DevServerSettings.from_project_root(root)
+    write_file(
+        settings.pages_dir / "index.pyxl",
+        "import React from 'react';\n\nexport default function P() { return <main>home</main>; }\n",
+    )
+
+    build_once(settings)
+    table = build_route_table(load_metadata_registry(settings))
+    assert all(route.error_boundary is None for route in table.pages)
+
+
 def test_build_route_table_falls_back_to_inferred_path(project: DevServerSettings) -> None:
     build_once(project)
 
@@ -170,4 +315,19 @@ def test_build_route_table_falls_back_to_inferred_path(project: DevServerSetting
 
     missing = table.find_api("/does-not-exist")
     assert missing is None
+
+
+def test_select_static_pages_filters_loaders_and_dynamic_routes() -> None:
+    from types import SimpleNamespace
+
+    from pyxle.devserver.routes import select_static_pages
+
+    pages = [
+        SimpleNamespace(path="/", has_loader=False),  # static
+        SimpleNamespace(path="/about", has_loader=False),  # static
+        SimpleNamespace(path="/feed", has_loader=True),  # has a loader -> skip
+        SimpleNamespace(path="/posts/{slug}", has_loader=False),  # dynamic -> skip
+    ]
+
+    assert [page.path for page in select_static_pages(pages)] == ["/", "/about"]
 

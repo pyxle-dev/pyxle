@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import inspect
+import math
 import mimetypes
 import sys
 import time
@@ -13,7 +14,7 @@ from email.utils import formatdate, parsedate
 from hashlib import md5
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 from starlette.applications import Starlette
 from starlette.datastructures import Headers
@@ -22,11 +23,17 @@ from starlette.exceptions import HTTPException
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, Response
 from starlette.routing import Mount, Route, Router, WebSocketRoute
 from starlette.staticfiles import NotModifiedResponse, StaticFiles
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from pyxle.cache import (
+    PageCache,
+    build_page_cache,
+    set_active_cache,
+    warm_page_cache,
+)
 from pyxle.cli.logger import ConsoleLogger
 from pyxle.ssr import (
     ComponentRenderer,
@@ -34,13 +41,22 @@ from pyxle.ssr import (
     build_page_response,
 )
 from pyxle.ssr.renderer import pool_render_factory
-from pyxle.ssr.view import build_not_found_response
+from pyxle.ssr.view import (
+    REVALIDATE_HEADER,
+    build_not_found_response,
+    build_streaming_page_response,
+)
 
 from .error_pages import ErrorBoundaryRegistry, build_error_boundary_registry
-from .middleware import MiddlewareHookError, load_custom_middlewares
+from .middleware import (
+    MiddlewareHookError,
+    find_base_http_middlewares,
+    load_custom_middlewares,
+)
 from .overlay import OverlayManager
 from .proxy import ViteProxy
 from .route_hooks import (
+    DEFAULT_ACTION_POLICIES,
     DEFAULT_API_POLICIES,
     DEFAULT_PAGE_POLICIES,
     RouteContext,
@@ -49,7 +65,7 @@ from .route_hooks import (
     load_route_hooks,
     wrap_with_route_hooks,
 )
-from .routes import ActionRoute, ApiRoute, PageRoute, RouteTable
+from .routes import ActionRoute, ApiRoute, PageRoute, RouteTable, select_static_pages
 from .settings import DevServerSettings
 
 _API_HTTP_METHODS: Sequence[str] = ("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS")
@@ -100,6 +116,10 @@ def _import_middleware_class(import_string: str) -> type:
 
 class ApiRouteError(RuntimeError):
     """Raised when an API module cannot be resolved to a valid handler."""
+
+
+class PageRouteError(RuntimeError):
+    """Raised when a page's ``websocket`` handler cannot be resolved."""
 
 
 class HttpOnlyStaticFiles(StaticFiles):
@@ -538,7 +558,12 @@ def _import_module(
 
     try:
         spec.loader.exec_module(module)
-    except Exception as exc:  # pragma: no cover - bubbled up for clarity
+    except Exception as exc:
+        # Don't leave a half-initialised module behind: a later debug=False
+        # import of the same key would return the broken partial silently
+        # instead of re-raising (and re-imports during debug expect a clean
+        # slate). Match importlib's own failure semantics.
+        sys.modules.pop(module_key, None)
         raise ApiRouteError(f"Failed to import API module {module_key}: {exc}") from exc
 
     return module
@@ -629,6 +654,8 @@ def build_page_router(
     overlay: OverlayManager | None = None,
     route_hooks: Sequence[RouteHookCallable] | None = None,
     error_boundaries: ErrorBoundaryRegistry | None = None,
+    page_cache: PageCache | None = None,
+    stream_render: Callable[..., Any] | None = None,
 ) -> Router:
     """Create a router serving compiled pages via server-side rendering."""
 
@@ -642,6 +669,8 @@ def build_page_router(
             renderer=renderer,
             overlay=overlay,
             error_boundaries=error_boundaries,
+            page_cache=page_cache,
+            stream_render=stream_render,
         )
         context = RouteContext(
             target="page",
@@ -657,7 +686,404 @@ def build_page_router(
         handler = wrap_with_route_hooks(handler, hooks=hooks, context=context)
         router.add_route(route.path, handler, methods=["GET"])
 
+        if route.has_websocket:
+            # A page that declares `async def websocket(ws)` also serves a
+            # WebSocket route at the SAME path. Starlette dispatches the HTTP
+            # Route for an http-scope request and this WebSocketRoute for a
+            # websocket-scope upgrade, so both coexist (path params resolve
+            # into ws.scope["path_params"]). Like the API WS path (see
+            # build_api_router), WS routes bypass the HTTP route-hook chain —
+            # hooks wrap a request→response callable, which the WS lifecycle
+            # (accept/send/recv/close) doesn't match. Any per-request work a WS
+            # upgrade needs (auth, origin checks) belongs in the handler body.
+            ws_handler = _resolve_page_websocket(route, settings=settings)
+            router.routes.append(WebSocketRoute(route.path, ws_handler))
+
     return router
+
+
+def _resolve_page_websocket(route: PageRoute, *, settings: DevServerSettings) -> Any:
+    """Import a page's server module and return its ``websocket`` handler.
+
+    Raises :class:`PageRouteError` when the metadata names a handler the module
+    doesn't actually expose (a stale build), so the developer gets a clear
+    message instead of a route that 500s on connect.
+    """
+    module = _import_module(
+        route.module_key, route.server_module_path, debug=settings.debug
+    )
+    handler = getattr(module, route.websocket_name, None)
+    if not callable(handler):
+        raise PageRouteError(
+            f"Page {route.path!r} declares a websocket handler "
+            f"{route.websocket_name!r}, but its server module exposes no such "
+            "callable. Re-run the build."
+        )
+    return handler
+
+
+# Page-cache status header set on responses the server-side cache touched:
+# HIT (served fresh from cache), STALE (served stale while revalidating), or
+# MISS (rendered now and stored).
+_CACHE_STATUS_HEADER = "x-pyxle-cache"
+
+
+def _record_cache_metric(request: Request, outcome: str) -> None:
+    """Record a page-cache outcome into the app's metrics registry, if present."""
+    from pyxle.observability.metrics import get_metrics  # noqa: PLC0415
+
+    registry = get_metrics(request)
+    if registry is not None:
+        registry.record_cache(outcome)
+
+
+def _record_action_metric(request: Request, duration_ms: float) -> None:
+    """Record an action's execution time into the metrics registry, if present."""
+    from pyxle.observability.metrics import get_metrics  # noqa: PLC0415
+
+    registry = get_metrics(request)
+    if registry is not None:
+        registry.observe_action(duration_ms)
+
+
+def _schedule_background_spec(background, spec) -> None:
+    """Add a ``{"background": [fn, *args]}`` action-return shorthand to *background*.
+
+    The spec is a non-empty list/tuple whose first element is the callable and
+    the rest are its positional arguments. Raises ``ValueError`` on a malformed
+    spec so the dispatcher can surface a clear error.
+    """
+    if not isinstance(spec, (list, tuple)) or not spec:
+        raise ValueError(
+            "Action 'background' must be a non-empty [callable, *args] list."
+        )
+    func, *args = spec
+    if not callable(func):
+        raise ValueError("Action 'background' first element must be callable.")
+    background.add_task(func, *args)
+
+# Fallback s-maxage for a cached entry with no explicit revalidate window
+# (cache-until-invalidated). Only reachable via the compile-time cache
+# directive; loader-envelope and edge-config entries always carry a number.
+_DEFAULT_CACHE_SECONDS = 3600
+
+
+def _public_cache_control(seconds: int) -> str:
+    """The shared-cache directive for a publicly cacheable page response."""
+
+    return f"public, s-maxage={seconds}, stale-while-revalidate={seconds * 5}"
+
+
+def _read_revalidate_header(response: Response) -> float | None:
+    """Pop the framework's internal revalidate header (set by a loader envelope).
+
+    Returns the declared cache lifetime in seconds, or ``None`` when the render
+    declared none. The header is stripped so it never reaches the client.
+    """
+
+    raw = response.headers.get(REVALIDATE_HEADER)
+    if raw is None:
+        return None
+    del response.headers[REVALIDATE_HEADER]
+    try:
+        return float(raw)
+    except ValueError:  # pragma: no cover - the header is framework-produced
+        return None
+
+
+def _effective_cache_ttl(
+    response: Response,
+    request: Request,
+    cache_config: object | None,
+    *,
+    directive_ttl: float | None = None,
+) -> float | None:
+    """Resolve a render's cache TTL.
+
+    Precedence: a loader ``{data, revalidate}`` envelope wins over a page's
+    compile-time ``CACHE = {"revalidate": N}`` directive, which wins over the
+    project's edge ``cache`` config. ``None`` means the route is not
+    server-cacheable for this request.
+    """
+
+    loader_ttl = _read_revalidate_header(response)
+    if loader_ttl is not None:
+        return loader_ttl
+    if directive_ttl is not None:
+        return directive_ttl
+    if cache_config is not None:
+        edge = cache_config.max_age_for(request.url.path)
+        if edge is not None:
+            return float(edge)
+    return None
+
+
+async def _read_response_body(response: Response) -> bytes:
+    """Materialise a page response (possibly a stream) into bytes for caching."""
+
+    body = getattr(response, "body", None)
+    if body is not None:
+        return bytes(body)
+    chunks: list[bytes] = []
+    async for chunk in response.body_iterator:
+        chunks.append(
+            chunk if isinstance(chunk, (bytes, bytearray)) else str(chunk).encode("utf-8")
+        )
+    return b"".join(chunks)
+
+
+def _if_none_match_matches(header: str | None, etag: str) -> bool:
+    """RFC 7232 §3.2 If-None-Match test for a cached page.
+
+    Handles a comma-separated list of validators, weak (``W/``) comparison
+    (the stored ETag is always strong, so this reduces to comparing the
+    opaque tag), and the ``*`` wildcard. A raw string-equality check would
+    wrongly re-send the full body for any of those forms.
+    """
+
+    if header is None:
+        return False
+    tokens = [token.strip() for token in header.split(",")]
+    if "*" in tokens:
+        return True
+
+    def _strong(tag: str) -> str:
+        return tag[2:] if tag.startswith("W/") else tag
+
+    target = _strong(etag)
+    return any(_strong(token) == target for token in tokens)
+
+
+def _serve_cache_entry(entry, *, request: Request, status_label: str) -> Response:
+    """Build a response from a stored render, answering If-None-Match with 304."""
+
+    if _if_none_match_matches(request.headers.get("if-none-match"), entry.etag):
+        response: Response = Response(status_code=304)
+    else:
+        response = Response(
+            content=entry.body, status_code=entry.status_code, media_type="text/html"
+        )
+    response.headers["ETag"] = entry.etag
+    response.headers["Vary"] = _NAVIGATION_HEADER
+    response.headers[_CACHE_STATUS_HEADER] = status_label
+    # ceil so a sub-second window never collapses to s-maxage=0.
+    seconds = math.ceil(entry.revalidate) if entry.revalidate is not None else _DEFAULT_CACHE_SECONDS
+    response.headers["Cache-Control"] = _public_cache_control(seconds)
+    return response
+
+
+def _synthetic_get_request(request: Request) -> Request:
+    """A standalone GET request cloned from ``request`` for background re-render.
+
+    ISR revalidation runs after the original response is sent, so it must not
+    reuse the live request's receive channel. The clone is also deliberately
+    stripped of per-user / per-request inputs — query string, ``Cookie``,
+    ``Authorization`` — so a background re-render produces the same shared bytes
+    no matter which user happened to observe staleness; it must never bake one
+    user's request into the entry every other user then receives.
+    """
+
+    scope = dict(request.scope)
+    scope["method"] = "GET"
+    scope["query_string"] = b""
+    scope["headers"] = [
+        (name, value)
+        for (name, value) in scope.get("headers", [])
+        if name.lower() not in (b"cookie", b"authorization")
+    ]
+    # Drop the per-user CSRF token so a background re-render never bakes the
+    # triggering user's token into the shared entry.
+    scope.pop("pyxle.csrf_token", None)
+
+    async def _receive() -> Message:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    return Request(scope, _receive)
+
+
+def _make_page_revalidator(
+    *,
+    request: Request,
+    route: PageRoute,
+    settings: DevServerSettings,
+    renderer: ComponentRenderer,
+    error_boundaries: ErrorBoundaryRegistry | None,
+    page_cache: PageCache,
+    cache_key: str,
+):
+    """Build the coroutine that re-renders a stale page and refreshes the cache."""
+
+    cache_config = getattr(settings, "cache", None)
+
+    async def _revalidate() -> None:
+        fresh = await build_page_response(
+            request=_synthetic_get_request(request),
+            settings=settings,
+            page=route,
+            renderer=renderer,
+            overlay=None,
+            error_boundaries=error_boundaries,
+        )
+        if fresh.status_code != 200:
+            return
+        ttl = _effective_cache_ttl(
+            fresh, request, cache_config, directive_ttl=route.cache_revalidate
+        )
+        if ttl is None:
+            return
+        body = await _read_response_body(fresh)
+        await page_cache.store(cache_key, body, status_code=200, revalidate=ttl)
+
+    return _revalidate
+
+
+async def _build_cached_page_response(
+    *,
+    request: Request,
+    route: PageRoute,
+    settings: DevServerSettings,
+    renderer: ComponentRenderer,
+    overlay: OverlayManager | None,
+    error_boundaries: ErrorBoundaryRegistry | None,
+    page_cache: PageCache | None,
+    stream_render: Callable[..., Any] | None = None,
+) -> Response:
+    """Render a page, or serve it from the server-side page cache.
+
+    Caching applies only to GET requests on routes that declared themselves
+    publicly cacheable -- a loader ``{data, revalidate}`` envelope or an edge
+    ``cache`` config entry -- the same "renders no per-user data" contract the
+    edge cache uses. A fresh hit skips both the loader and the Node SSR render;
+    a stale hit serves the stale bytes and refreshes in the background (ISR); a
+    miss renders now and stores the result.
+    """
+
+    cache_config = getattr(settings, "cache", None)
+    # Only GET requests with an empty query string are cacheable: the cache key
+    # is the route path, so a query-varying render (?q=, ?page=) must never share
+    # an entry with a different query. Requests carrying a query fall through to
+    # a live render.
+    cacheable_request = request.method == "GET" and not request.url.query
+    cache_key = PageCache.make_key(request.url.path)
+
+    if page_cache is not None and cacheable_request:
+        lookup = await page_cache.get(cache_key)
+        if lookup is not None:
+            if lookup.is_stale:
+                page_cache.schedule_revalidation(
+                    cache_key,
+                    _make_page_revalidator(
+                        request=request,
+                        route=route,
+                        settings=settings,
+                        renderer=renderer,
+                        error_boundaries=error_boundaries,
+                        page_cache=page_cache,
+                        cache_key=cache_key,
+                    ),
+                )
+            _record_cache_metric(request, "stale" if lookup.is_stale else "hit")
+            return _serve_cache_entry(
+                lookup.entry,
+                request=request,
+                status_label="STALE" if lookup.is_stale else "HIT",
+            )
+
+    # A route declared cacheable at compile time (a CACHE directive) or via the
+    # edge `cache` config renders no per-user data, so its per-user CSRF token is
+    # suppressed from the rendered HTML — a shared cached body must not carry one
+    # user's token. (A loader-envelope-only route, whose cacheability isn't known
+    # until after the render, is caught by the store-time guard below instead.)
+    statically_cacheable = route.cache_revalidate is not None or (
+        cache_config is not None
+        and cache_config.max_age_for(request.url.path) is not None
+    )
+
+    # Streaming SSR (opt-in): a page that uses <Suspense> — or one wrapped in a
+    # route-level loading.pyxl boundary — streams its shell before its async
+    # boundaries resolve, for a faster TTFB. It only applies to routes that are
+    # NOT publicly cacheable — a cacheable route must materialise its body to
+    # store + ETag it, so streaming would buy nothing and can't be cached. The
+    # buffered path stays the default for everything else.
+    if (
+        stream_render is not None
+        and (route.uses_suspense or route.loading_boundary is not None)
+        and not statically_cacheable
+    ):
+        streamed = await build_streaming_page_response(
+            request=request,
+            settings=settings,
+            page=route,
+            renderer=renderer,
+            stream_render=stream_render,
+            overlay=overlay,
+            error_boundaries=error_boundaries,
+        )
+        streamed.headers["Vary"] = _NAVIGATION_HEADER
+        streamed.headers["Cache-Control"] = "private, no-cache"
+        return streamed
+
+    response = await build_page_response(
+        request=request,
+        settings=settings,
+        page=route,
+        renderer=renderer,
+        overlay=overlay,
+        error_boundaries=error_boundaries,
+        suppress_per_user=statically_cacheable and cacheable_request,
+    )
+    # HTML page responses carry Vary so a browser that cached both the HTML and
+    # a nav-JSON payload for the same URL knows they are distinct entries.
+    response.headers["Vary"] = _NAVIGATION_HEADER
+
+    ttl = _effective_cache_ttl(
+        response, request, cache_config, directive_ttl=route.cache_revalidate
+    )
+    if ttl is not None:
+        # A route declared cacheable is served `public, s-maxage=N` so a
+        # CDN/proxy can absorb the load — the CSRF middleware drops its per-user
+        # cookie from such responses. Every other page stays `private,
+        # no-cache`, never shared between users.
+        response.headers["Cache-Control"] = _public_cache_control(math.ceil(ttl))
+    else:
+        response.headers["Cache-Control"] = "private, no-cache"
+
+    if (
+        page_cache is not None
+        and ttl is not None
+        and cacheable_request
+        and response.status_code == 200
+    ):
+        body = await _read_response_body(response)
+        # Safety net for a loader-envelope route that also renders a <Form>:
+        # never store a body that still carries the requester's CSRF token — it
+        # is per-user data and must not be shared. Such a page renders live each
+        # request instead of being cached.
+        token = request.scope.get("pyxle.csrf_token")
+        if isinstance(token, str) and token and token.encode("utf-8") in body:
+            return response
+        await page_cache.store(
+            cache_key, body, status_code=response.status_code, revalidate=ttl
+        )
+        served = Response(
+            content=body, status_code=response.status_code, media_type="text/html"
+        )
+        for key, value in response.headers.items():
+            if key.lower() != "content-length":
+                served.headers[key] = value
+        served.headers["ETag"] = PageCache.make_etag(body)
+        served.headers[_CACHE_STATUS_HEADER] = "MISS"
+        _record_cache_metric(request, "miss")
+        # Conditional GET: if the client already holds this exact render, 304.
+        if _if_none_match_matches(request.headers.get("if-none-match"), served.headers["ETag"]):
+            not_modified = Response(status_code=304)
+            for key, value in served.headers.items():
+                if key.lower() not in ("content-length", "content-type"):
+                    not_modified.headers[key] = value
+            return not_modified
+        return served
+
+    return response
 
 
 def _make_page_handler(
@@ -667,6 +1093,8 @@ def _make_page_handler(
     renderer: ComponentRenderer,
     overlay: OverlayManager | None,
     error_boundaries: ErrorBoundaryRegistry | None = None,
+    page_cache: PageCache | None = None,
+    stream_render: Callable[..., Any] | None = None,
 ):
     async def handler(request: Request):  # pragma: no cover - thin wrapper
         wants_navigation_payload = request.headers.get(_NAVIGATION_HEADER) == "1"
@@ -690,39 +1118,26 @@ def _make_page_handler(
             response.headers["Cache-Control"] = "no-store"
             return response
 
-        response = await build_page_response(
+        return await _build_cached_page_response(
             request=request,
+            route=route,
             settings=settings,
-            page=route,
             renderer=renderer,
             overlay=overlay,
             error_boundaries=error_boundaries,
+            page_cache=page_cache,
+            stream_render=stream_render,
         )
-        # HTML page responses also carry Vary so a browser that
-        # cached both the HTML and a nav-JSON payload for the same
-        # URL knows they are distinct entries.
-        response.headers["Vary"] = _NAVIGATION_HEADER
-        # A route the app explicitly declared cacheable (it renders no
-        # per-user data) is served `public, s-maxage=N` so a CDN/proxy can
-        # absorb the load — the CSRF middleware drops its per-user cookie from
-        # such responses. Every other page stays `private, no-cache`, never
-        # shared between users.
-        cache = getattr(settings, "cache", None)
-        max_age = cache.max_age_for(request.url.path) if cache is not None else None
-        if max_age is not None:
-            response.headers["Cache-Control"] = (
-                f"public, s-maxage={max_age}, stale-while-revalidate={max_age * 5}"
-            )
-        else:
-            response.headers["Cache-Control"] = "private, no-cache"
-        return response
 
     handler.__name__ = f"page_{route.module_key.replace('.', '_')}"
     return handler
 
 
 def build_action_router(
-    routes: Iterable[ActionRoute], *, debug: bool = False,
+    routes: Iterable[ActionRoute],
+    *,
+    debug: bool = False,
+    route_hooks: Sequence[RouteHookCallable] | None = None,
 ) -> Router:
     """Create a Starlette ``Router`` for auto-generated ``@action`` endpoints.
 
@@ -741,13 +1156,27 @@ def build_action_router(
     """
 
     router = Router()
+    hooks = list(route_hooks or [])
 
     for route in routes:
         if route.is_catchall:
             handler = _make_catchall_action_handler(route, debug=debug)
         else:
             handler = _make_action_handler(route, debug=debug)
-        router.add_route(route.path, handler, methods=["POST"])
+        # Run the action through the route-hook chain — the same per-route
+        # policy pipeline pages and API routes use — so an auth/policy hook
+        # actually fires for action POSTs instead of being bypassed.
+        context = RouteContext(
+            target="action",
+            path=route.path,
+            source_relative_path=route.source_relative_path,
+            source_absolute_path=route.source_absolute_path,
+            module_key=route.module_key,
+            content_hash=route.content_hash,
+            allowed_methods=("POST",),
+        )
+        wrapped = wrap_with_route_hooks(handler, hooks=hooks, context=context)
+        router.add_route(route.path, wrapped, methods=["POST"])
 
     return router
 
@@ -806,7 +1235,12 @@ async def _dispatch_action(
 ) -> JSONResponse:
     """Shared dispatch logic for both specific and catch-all action handlers."""
     from pyxle.devserver._security import SAFE_IDENTIFIER_RE
-    from pyxle.runtime import ActionError
+    from pyxle.devserver.validation import (
+        PydanticNotInstalledError,
+        get_cached_body_model,
+        validate_body,
+    )
+    from pyxle.runtime import ActionError, ValidationActionError
 
     # L-9: reject obviously invalid action names early.
     if not SAFE_IDENTIFIER_RE.match(action_name):
@@ -856,22 +1290,67 @@ async def _dispatch_action(
     # take the original Starlette path unchanged.
     _maybe_install_form_body_shim(request)
 
+    # When the action type-hints a Pydantic model as its body parameter, parse
+    # and validate the request body into the model and inject it; otherwise the
+    # action is called with just ``request`` (unchanged). Introspection is
+    # cached per function object.
     try:
-        result = await action_fn(request)
+        resolved = get_cached_body_model(action_fn)
+    except PydanticNotInstalledError as exc:
+        error_msg = str(exc) if debug else "Internal server error"
+        return JSONResponse({"ok": False, "error": error_msg}, status_code=500)
+
+    from pyxle.observability.otel import span  # noqa: PLC0415
+    from starlette.background import BackgroundTasks  # noqa: PLC0415
+
+    # Expose request.state.background so an action can schedule fire-and-forget
+    # work that runs after the response is sent (Starlette BackgroundTasks).
+    request.state.background = BackgroundTasks()
+
+    _action_start = time.perf_counter()
+    try:
+        with span("action"):
+            if resolved is None:
+                result = await action_fn(request)
+            else:
+                try:
+                    body_payload = await request.json()
+                except Exception:
+                    raise ValidationActionError(
+                        fields={"__root__": ["Request body must be valid JSON."]}
+                    ) from None
+                body = validate_body(resolved.model, body_payload)
+                result = await action_fn(request, **{resolved.param_name: body})
     except ActionError as exc:
         payload: dict[str, object] = {"ok": False, "error": exc.message}
         if exc.data:
             payload["data"] = exc.data
+        if exc.fields:
+            payload["fields"] = exc.fields
         return JSONResponse(payload, status_code=exc.status_code)
     except Exception as exc:
         error_msg = str(exc) if debug else "Internal server error"
         return JSONResponse({"ok": False, "error": error_msg}, status_code=500)
+
+    _record_action_metric(request, (time.perf_counter() - _action_start) * 1000.0)
 
     if not isinstance(result, dict):
         return JSONResponse(
             {"ok": False, "error": "Action must return a JSON-serializable dict"},
             status_code=500,
         )
+
+    # A ``{"background": [fn, *args]}`` return is shorthand for scheduling one
+    # post-response task; pop it so it isn't serialised into the body.
+    background_spec = result.pop("background", None)
+    if background_spec is not None:
+        try:
+            _schedule_background_spec(request.state.background, background_spec)
+        except ValueError as exc:
+            return JSONResponse(
+                {"ok": False, "error": str(exc) if debug else "Internal server error"},
+                status_code=500,
+            )
 
     # If the action used ``invalidate_routes(...)`` on a plain dict, the
     # invalidation targets were stashed under ``__pyxle_invalidate__``.
@@ -885,6 +1364,10 @@ async def _dispatch_action(
         joined = ", ".join(u for u in invalidate_hints if u)
         if joined:
             response.headers["x-pyxle-invalidate"] = joined
+    # Attach any scheduled post-response work; Starlette runs it after the body
+    # is sent. No-op when the action scheduled nothing.
+    if request.state.background.tasks:
+        response.background = request.state.background
     return response
 
 
@@ -960,6 +1443,9 @@ def _build_app_routes(
     overlay: OverlayManager | None,
     api_route_hooks: Sequence[RouteHookCallable],
     page_route_hooks: Sequence[RouteHookCallable],
+    action_route_hooks: Sequence[RouteHookCallable] = (),
+    page_cache: PageCache | None = None,
+    stream_render: Callable[..., Any] | None = None,
 ) -> tuple[list[Any], ErrorBoundaryRegistry]:
     """Build the ordered Starlette route list for a route table.
 
@@ -981,8 +1467,14 @@ def _build_app_routes(
         overlay=overlay,
         route_hooks=[*DEFAULT_PAGE_POLICIES, *page_route_hooks],
         error_boundaries=error_boundaries,
+        page_cache=page_cache,
+        stream_render=stream_render,
     )
-    action_router = build_action_router(routes.actions, debug=settings.debug)
+    action_router = build_action_router(
+        routes.actions,
+        debug=settings.debug,
+        route_hooks=[*DEFAULT_ACTION_POLICIES, *action_route_hooks],
+    )
 
     built: list[Any] = []
     built.extend(api_router.routes)
@@ -992,6 +1484,17 @@ def _build_app_routes(
         built.append(WebSocketRoute("/__pyxle__/overlay", overlay.websocket_endpoint))
     built.append(Route("/healthz", _healthz_endpoint, methods=["GET"]))
     built.append(Route("/readyz", _readyz_endpoint, methods=["GET"]))
+    # Opt-in Prometheus metrics endpoint. Off by default because it exposes
+    # internal state; an optional bearer token guards it when on.
+    _obs = getattr(settings, "observability", None)
+    if _obs is not None and getattr(_obs, "metrics_endpoint", False):
+        built.append(
+            Route(
+                getattr(_obs, "metrics_endpoint_path", "/api/__pyxle/metrics"),
+                _make_metrics_endpoint(getattr(_obs, "metrics_endpoint_token", None)),
+                methods=["GET"],
+            )
+        )
     # Catch-all 404 handler from not-found.pyxl boundaries — registered last so
     # it only matches when no concrete route does.
     if error_boundaries.has_not_found_pages:
@@ -1005,6 +1508,53 @@ def _build_app_routes(
     return built, error_boundaries
 
 
+def _has_streaming_eligible_routes(routes: RouteTable) -> bool:
+    """Return ``True`` if any route can produce a streamed SSR response.
+
+    A route streams when it uses ``<Suspense>`` or sits under a ``loading.pyxl``
+    boundary; the presence of any compiled ``loading.pyxl`` (carried on
+    ``routes.loading_boundary_pages``) also makes streaming reachable. This is
+    the gate that, combined with a ``BaseHTTPMiddleware``, triggers the
+    incompatibility warning below.
+    """
+    if any(page.uses_suspense or page.loading_boundary is not None for page in routes.pages):
+        return True
+    return bool(routes.loading_boundary_pages)
+
+
+def _warn_base_http_middleware_with_streaming(
+    user_middleware: Iterable[Middleware],
+    routes: RouteTable,
+    *,
+    logger: ConsoleLogger,
+) -> None:
+    """Warn when a ``BaseHTTPMiddleware`` is paired with streaming-eligible routes.
+
+    Starlette's ``BaseHTTPMiddleware`` buffers responses, so it cannot wrap a
+    streamed ``StreamingResponse``: when a ``<Suspense>`` boundary defers, the
+    request raises ``RuntimeError: No response returned.``. Both features are
+    advertised, so we flag the combination at startup — naming each offending
+    class — and point at the streaming-safe pure-ASGI middleware pattern. Pure
+    warning; nothing is mutated, so an app that never actually streams (every
+    eligible route stays buffered) keeps working.
+    """
+    offenders = find_base_http_middlewares(user_middleware)
+    if not offenders or not _has_streaming_eligible_routes(routes):
+        return
+
+    names = ", ".join(offenders)
+    plural = "es" if len(offenders) > 1 else ""
+    logger.warning(
+        f"Custom middleware class{plural} {names} subclass Starlette's "
+        "BaseHTTPMiddleware, which buffers the response and is incompatible "
+        "with streaming SSR: when a <Suspense> boundary defers, the request "
+        "fails with 'RuntimeError: No response returned.'. Rewrite it as a "
+        "pure-ASGI middleware (a callable taking (scope, receive, send) that "
+        "wraps the send channel) so streamed and buffered responses pass "
+        "through unchanged. See the middleware guide's streaming-safe pattern."
+    )
+
+
 def create_starlette_app(
     settings: DevServerSettings,
     routes: RouteTable,
@@ -1014,6 +1564,7 @@ def create_starlette_app(
     client_static_dir: Path | None = None,
     serve_static: bool = True,
     pool: object | None = None,
+    prerender_dir: Path | None = None,
 ) -> Starlette:
     """Assemble a Starlette application exposing API/page routes and optional static mounts.
 
@@ -1032,6 +1583,17 @@ def create_starlette_app(
         renderer = ComponentRenderer(factory=pool_render_factory(pool))
     else:
         renderer = ComponentRenderer()
+    # Streaming SSR needs the worker pool's multi-frame render_stream. Without a
+    # pool (single-process fallback) streaming is unavailable and every page
+    # renders buffered.
+    stream_render: Callable[..., Any] | None = getattr(pool, "render_stream", None)
+    # Server-side page cache: enabled for production serves, off in debug so a
+    # cached render never masks an edit during development. Only routes that
+    # declared themselves cacheable (a loader `revalidate` or an edge `cache`
+    # entry) are ever stored, so leaving it on in production is zero-config and
+    # safe. The backend (in-memory default, file, or Redis) is chosen by
+    # PYXLE_PAGE_CACHE_BACKEND; see pyxle.cache.build_page_cache.
+    page_cache: PageCache | None = build_page_cache(debug=settings.debug)
     overlay: OverlayManager | None = None
     vite_proxy: ViteProxy | None = None
     proxy_middleware: Middleware | None = None
@@ -1066,6 +1628,10 @@ def create_starlette_app(
     except MiddlewareHookError as exc:
         console_logger.error(str(exc))
         raise
+
+    _warn_base_http_middleware_with_streaming(
+        user_middleware, routes, logger=console_logger
+    )
 
     # --- CORS middleware ---
     cors_middleware: Middleware | None = None
@@ -1172,6 +1738,7 @@ def create_starlette_app(
     try:
         page_route_hooks = load_route_hooks(settings.page_route_hooks)
         api_route_hooks = load_route_hooks(settings.api_route_hooks)
+        action_route_hooks = load_route_hooks(getattr(settings, "action_route_hooks", ()))
     except RouteHookError as exc:
         console_logger.error(str(exc))
         raise
@@ -1199,6 +1766,16 @@ def create_starlette_app(
 
     @asynccontextmanager
     async def lifespan(app: Starlette):  # pragma: no cover - lifecycle orchestration
+        # Configure OpenTelemetry tracing once at startup when enabled. Raises
+        # if the [observability-otel] extra is missing, so a misconfiguration
+        # fails loudly rather than silently dropping traces.
+        if _obs is not None and getattr(_obs, "otel", False):
+            from pyxle.observability.otel import setup_otel  # noqa: PLC0415
+
+            setup_otel(
+                service_name=getattr(_obs, "otel_service_name", "pyxle-app"),
+                sample_ratio=getattr(_obs, "otel_sample_ratio", 0.05),
+            )
         if pool is not None:
             await pool.start()
         # Startup plugins AFTER the SSR pool so plugins that need
@@ -1217,11 +1794,54 @@ def create_starlette_app(
         #      preferred for most app code.
         app.state.pyxle_plugins = _plugin_ctx
         set_active_context(_plugin_ctx)
+        # Start the in-process background task queue and register it so
+        # ``pyxle.tasks.enqueue(...)`` works from any loader/action.
+        from pyxle.tasks import TaskQueue, set_active_queue  # noqa: PLC0415
+
+        task_queue = TaskQueue()
+        await task_queue.start()
+        app.state.pyxle_tasks = task_queue
+        set_active_queue(task_queue)
+        # Register the page cache so `pyxle.cache.invalidate(path)` can reach it
+        # from actions without threading a handle through the request.
+        if page_cache is not None:
+            app.state.pyxle_page_cache = page_cache
+            set_active_cache(page_cache)
+            # Warm the cache from any build-time pre-rendered pages
+            # (`pyxle build --static`) so their first request is a hit.
+            if prerender_dir is not None and prerender_dir.exists():
+                static_paths = [route.path for route in select_static_pages(routes.pages)]
+                warmed = await warm_page_cache(page_cache, static_paths, prerender_dir)
+                if warmed:
+                    console_logger.info(
+                        f"Warmed {warmed} pre-rendered page(s) from {prerender_dir}"
+                    )
+        # Open the realtime broker's connection + listener. For the default
+        # in-process broker this is a no-op; for PYXLE_REALTIME_BROKER=redis it
+        # connects to Redis and pings it, so a bad URL fails startup loudly.
+        # ``start``/``aclose`` aren't part of the minimal Broker Protocol
+        # (subscribe/unsubscribe/publish), so call them only if present — a
+        # user-supplied Protocol-only broker still works.
+        _broker_start = getattr(app.state.pyxle_broker, "start", None)
+        if _broker_start is not None:
+            await _broker_start()
         try:
             yield
         finally:
-            # Shutdown in reverse order — best-effort; individual
-            # failures are logged, not re-raised.
+            # Shutdown in reverse order. Each step's callee is itself
+            # exception-swallowing/best-effort, so a single failure won't abort
+            # the rest of teardown.
+            broker = getattr(app.state, "pyxle_broker", None)
+            broker_aclose = getattr(broker, "aclose", None)
+            if broker_aclose is not None:
+                await broker_aclose()
+            if page_cache is not None:
+                set_active_cache(None)
+                await page_cache.aclose()
+            # Drain and stop the task queue before tearing down plugins so
+            # in-flight tasks can still reach plugin services (e.g. the DB).
+            set_active_queue(None)
+            await task_queue.stop()
             set_active_context(None)
             await run_shutdown(_plugins, _plugin_ctx)
             if pool is not None:
@@ -1243,11 +1863,14 @@ def create_starlette_app(
 
     middleware_stack: list[Middleware] = []
 
-    # GZip compression in production mode (reduces bandwidth ~60-70%).
+    # GZip compression in production mode (reduces bandwidth ~60-70%). Uses the
+    # streaming-aware variant so gzip flushes per chunk — otherwise it buffers
+    # the whole streamed response and defeats streaming SSR (the page would
+    # arrive all at once instead of shell-first).
     if not settings.debug:
-        from starlette.middleware.gzip import GZipMiddleware  # noqa: PLC0415
+        from pyxle.middleware.gzip import StreamingGZipMiddleware  # noqa: PLC0415
 
-        middleware_stack.append(Middleware(GZipMiddleware, minimum_size=500))
+        middleware_stack.append(Middleware(StreamingGZipMiddleware, minimum_size=500))
 
     # Security response headers in production mode.
     if not settings.debug:
@@ -1289,12 +1912,85 @@ def create_starlette_app(
     if proxy_middleware is not None:
         middleware_stack.append(proxy_middleware)
 
+    # Token-bucket rate limit. Inserted at the front of the stack so it sits
+    # just inside observability (added next, also via insert(0, ...)): a
+    # throttled request is still assigned a correlation id and counted, but is
+    # rejected with 429 before CSRF, static serving, or the handler do any work.
+    # The store is in-memory/per-process — see the middleware guide for the
+    # multi-worker caveat.
+    _rl = getattr(settings, "rate_limit", None)
+    if _rl is not None and getattr(_rl, "enabled", False):
+        from pyxle.middleware import RateLimitMiddleware  # noqa: PLC0415
+
+        middleware_stack.insert(
+            0,
+            Middleware(
+                RateLimitMiddleware,
+                requests=_rl.requests,
+                window_seconds=_rl.window_seconds,
+                exempt_paths=_rl.exempt_paths,
+                trust_forwarded_for=_rl.trust_forwarded_for,
+            ),
+        )
+
+    # The per-process metrics registry is always present (it is cheap — a few
+    # int counters and fixed-bucket histograms) and recorded into from the
+    # request, render, loader, action, and cache sites. Exposure of those
+    # metrics is gated separately (the opt-in /api/__pyxle/metrics endpoint).
+    from pyxle.observability.metrics import MetricsRegistry  # noqa: PLC0415
+
+    metrics_registry = MetricsRegistry()
+
+    # Observability sits at the very top of the stack (outermost) so a request
+    # is assigned its correlation id and timed before any other middleware can
+    # short-circuit it — a CSRF rejection or security-header response is still
+    # tagged with an X-Request-Id and counted. Defaults (request-id + timing
+    # on) apply when no observability config is present.
+    _obs = getattr(settings, "observability", None)
+    _obs_request_id = True if _obs is None else bool(getattr(_obs, "request_id", True))
+    _obs_timing = True if _obs is None else bool(getattr(_obs, "timing", True))
+    _obs_metrics_ep = False if _obs is None else bool(getattr(_obs, "metrics_endpoint", False))
+    _obs_access_log = False if _obs is None else bool(getattr(_obs, "access_log", False))
+    if _obs_access_log:
+        from pyxle.observability.logging import configure_logging  # noqa: PLC0415
+
+        configure_logging(
+            log_format=getattr(_obs, "log_format", "console"),
+            log_level=getattr(_obs, "log_level", "INFO"),
+        )
+    # Add the middleware when anything needs it — request-id/timing, the metrics
+    # endpoint (which needs request totals recorded even if the correlation id
+    # and scope timing are off), or the structured access log.
+    if _obs_request_id or _obs_timing or _obs_metrics_ep or _obs_access_log:
+        from pyxle.observability import RequestIdMiddleware  # noqa: PLC0415
+
+        middleware_stack.insert(
+            0,
+            Middleware(
+                RequestIdMiddleware,
+                emit_request_id=_obs_request_id,
+                header_name=(
+                    "X-Request-Id" if _obs is None else getattr(_obs, "request_id_header", "X-Request-Id")
+                ),
+                trust_incoming=(
+                    False if _obs is None else bool(getattr(_obs, "trust_incoming_request_id", False))
+                ),
+                timing=_obs_timing,
+                metrics=metrics_registry,
+                access_log=_obs_access_log,
+            ),
+        )
+
     app = Starlette(
         debug=settings.debug,
         middleware=middleware_stack,
         lifespan=lifespan,
     )
 
+    app.state.pyxle_metrics = metrics_registry
+    # The SSR worker pool (None in subprocess/inline render mode) backs the
+    # /readyz dependency check — a server with no live workers can't render.
+    app.state.pyxle_ssr_pool = pool
     app.state.pyxle_started_at = time.time()
     app.state.pyxle_ready = False
 
@@ -1305,6 +2001,9 @@ def create_starlette_app(
         overlay=overlay,
         api_route_hooks=api_route_hooks,
         page_route_hooks=page_route_hooks,
+        action_route_hooks=action_route_hooks,
+        page_cache=page_cache,
+        stream_render=stream_render,
     )
     app.router.routes.extend(app_routes)
 
@@ -1315,7 +2014,19 @@ def create_starlette_app(
     # The dev-server hot route-table refresh reuses these to rebuild routes live
     # on a source change (see ``DevServer._handle_rebuild``). Config-derived
     # hooks are stable across rebuilds — config changes still need a restart.
-    app.state.pyxle_route_hooks = (api_route_hooks, page_route_hooks)
+    app.state.pyxle_route_hooks = (api_route_hooks, page_route_hooks, action_route_hooks)
+    # Streaming SSR's render_stream is bound to the worker pool, which outlives
+    # route-table refreshes — stash it so a hot rebuild keeps streaming wired.
+    app.state.pyxle_stream_render = stream_render
+    # One pub/sub broker per app process, shared by every WebSocket connection
+    # (pyxle.realtime.channel reads it off app.state). Defaults to the in-process
+    # broker; set PYXLE_REALTIME_BROKER=redis for cross-worker delivery under
+    # ``pyxle serve --workers N`` (needs the [redis] extra). Constructed here
+    # (cheap, no I/O); its connection + listener open in the lifespan via
+    # ``broker.start()`` and close via ``broker.aclose()``.
+    from pyxle.realtime import build_broker  # noqa: PLC0415 - lazy, optional path
+
+    app.state.pyxle_broker = build_broker()
 
     return app
 
@@ -1370,29 +2081,100 @@ def _maybe_attach_manifest(settings: DevServerSettings, logger: ConsoleLogger) -
     return replace(settings, page_manifest=manifest_data)
 
 
+def _readiness_checks(app: Starlette) -> dict[str, dict[str, object]]:
+    """Fast, non-blocking dependency checks that gate ``/readyz``.
+
+    Each check is a cheap attribute read — never a network round-trip — so the
+    probe stays well under the budget a liveness/readiness poller expects. A
+    dependency that isn't configured contributes no check (it can't be "down").
+    """
+    checks: dict[str, dict[str, object]] = {}
+
+    # SSR worker pool: in pool mode the server can't render a page if every
+    # worker has crashed, so at least one must be alive. Subprocess/inline mode
+    # has no pool and so contributes no check.
+    pool = getattr(app.state, "pyxle_ssr_pool", None)
+    if pool is not None:
+        alive = int(getattr(pool, "alive_count", 0))
+        checks["ssr_pool"] = {
+            "ok": alive >= 1,
+            "alive": alive,
+            "size": int(getattr(pool, "size", 0)),
+        }
+
+    return checks
+
+
+def _metrics_summary(app: Starlette) -> dict[str, object] | None:
+    registry = getattr(app.state, "pyxle_metrics", None)
+    if registry is None:
+        return None
+    snapshot = registry.snapshot()
+    return {
+        "requests_total": snapshot["requests_total"],
+        "cache_hit_ratio": snapshot["cache"]["hit_ratio"],
+    }
+
+
 def _health_payload(app: Starlette) -> dict[str, object]:
     started_at = getattr(app.state, "pyxle_started_at", None)
-    ready = bool(getattr(app.state, "pyxle_ready", False))
+    ready_flag = bool(getattr(app.state, "pyxle_ready", False))
     uptime = 0.0
     if isinstance(started_at, (int, float)):
         uptime = max(0.0, time.time() - float(started_at))
 
-    return {
+    checks = _readiness_checks(app)
+    # Ready only when the runner has finished warming up *and* every configured
+    # dependency check passes.
+    ready = ready_flag and all(check["ok"] for check in checks.values())
+
+    payload: dict[str, object] = {
         "status": "ok",
         "ready": ready,
         "uptime": uptime,
+        "checks": checks,
     }
+    metrics = _metrics_summary(app)
+    if metrics is not None:
+        payload["metrics"] = metrics
+    return payload
 
 
 async def _healthz_endpoint(request: Request) -> JSONResponse:
-    payload = _health_payload(request.app)
-    return JSONResponse(payload)
+    # Liveness: the process is up and serving. Always 200, never gated on
+    # dependencies (the readiness signal lives in the payload and /readyz).
+    return JSONResponse(_health_payload(request.app))
 
 
 async def _readyz_endpoint(request: Request) -> JSONResponse:
     payload = _health_payload(request.app)
     status_code = 200 if payload["ready"] else 503
     return JSONResponse(payload, status_code=status_code)
+
+
+def _make_metrics_endpoint(token: str | None):
+    """Build the opt-in Prometheus metrics endpoint, optionally bearer-guarded."""
+    import hmac  # noqa: PLC0415
+
+    expected = f"Bearer {token}" if token is not None else None
+
+    async def _metrics_endpoint(request: Request) -> Response:
+        if expected is not None:
+            # Constant-time comparison so the token can't be timing-probed.
+            provided = request.headers.get("authorization", "")
+            if not hmac.compare_digest(provided, expected):
+                return Response("Unauthorized", status_code=401)
+        registry = getattr(request.app.state, "pyxle_metrics", None)
+        if registry is None:  # pragma: no cover - registry is always set in app
+            return Response("metrics unavailable", status_code=503)
+        from pyxle.observability.exposition import (  # noqa: PLC0415
+            CONTENT_TYPE,
+            render_prometheus,
+        )
+
+        return Response(render_prometheus(registry), media_type=CONTENT_TYPE)
+
+    return _metrics_endpoint
 
 
 __all__ = [

@@ -36,7 +36,9 @@ pyxle serve --host 0.0.0.0 --port 8000
 
 In production mode (`debug=false`) the server also compresses responses larger
 than 500 bytes with gzip automatically — no reverse-proxy configuration needed
-for that.
+for that. The gzip middleware is **streaming-aware** (it flushes the compressor
+per chunk), so [streaming SSR](streaming.md) still delivers the shell first
+behind gzip in production rather than buffering the whole response.
 
 ### Serve options
 
@@ -68,10 +70,12 @@ CPU core. To use every core on a multi-core server, run one server worker
 process per core with `--workers` (requires Pyxle 0.4.3+):
 
 ```bash
-pyxle serve --workers $(nproc)
+pyxle serve --workers $(nproc)   # explicit
+pyxle serve --workers 0          # auto-detect from CPU cores (one per core)
 ```
 
-Each worker is an independent server process with its own SSR worker pool, all
+`--workers 0` auto-detects the core count, so you don't have to hard-code it for
+the target host. Each worker is an independent server process with its own SSR worker pool, all
 sharing one listening socket — incoming connections are balanced across them
 with no load balancer and no shared state to configure. Throughput on
 CPU-bound endpoints scales near-linearly with the worker count.
@@ -105,6 +109,58 @@ auto-sizes the pool to the machine's CPU count (capped at 4) per server worker.
 | SSR-heavy pages | `--workers $(nproc) --ssr-workers 1`, raise SSR workers if renders queue |
 | Small VPS (1–2 cores) | Defaults (`--workers 1`) are fine |
 | Memory-constrained | Each worker is a full process — reduce `--workers` before reducing `--ssr-workers` |
+
+### Per-worker state (multi-worker caveats)
+
+Each worker is a **separate process with no shared memory**, which is what makes
+multi-core serving trivial to operate — there's nothing to coordinate. The
+trade-off is that any **in-process** state is per-worker:
+
+| Feature | Per-worker behaviour | For cross-worker behaviour |
+|---------|----------------------|----------------------------|
+| [Page cache](caching.md) | Each worker has its own in-memory cache | Use the **Redis** backend (`PYXLE_PAGE_CACHE_BACKEND=redis`) — shared across workers and hosts |
+| [WebSocket pub/sub](websockets.md) | Messages reach only clients on the same worker | Use the **Redis** broker (`PYXLE_REALTIME_BROKER=redis`) — relays channels across workers and hosts |
+| [Metrics](observability.md) | `/metrics` reports that worker's numbers (with a `worker` label) | Aggregate at the Prometheus scraper |
+| [Background tasks](background-tasks.md) | `pyxle.tasks` queue is per-worker | Use a real job queue (Celery / ARQ / Dramatiq) |
+
+This is by design: Pyxle keeps the default path stateless so workers fork
+cleanly and scale linearly. The escape hatch is always a shared backend (Redis
+for cache/pub-sub) or an external service (a job queue, a Prometheus scraper),
+not a shared in-process resource — so the same code runs at one worker or fifty.
+
+> **Why not a single shared SSR pool across workers?** A shared Node pool over a
+> Unix socket would save some memory but add a coordination point and a single
+> contention bottleneck, undermining the share-nothing model. Per-worker pools
+> stay simple and isolated — a crashed render can't affect another worker. Size
+> with `--ssr-workers` instead.
+
+### Rolling deploys & graceful restart
+
+For zero-downtime deploys, don't restart Pyxle in place — drain and replace:
+
+1. **Behind a load balancer / reverse proxy:** start a new instance (new
+   `pyxle serve`) on a second port, wait for `/readyz` to return `200` (see
+   [Observability → health probes](observability.md#health-probes)), shift
+   traffic to it, then stop the old one. This gives true zero-downtime.
+2. **Single host, process manager:** run `pyxle serve` under **systemd** (or
+   supervisor). A `systemctl restart` cleanly stops the old workers (uvicorn
+   handles `SIGTERM`, finishing in-flight requests) and starts new ones — a
+   sub-second blip, fine for most apps. Point your readiness probe at `/readyz`
+   so the proxy only routes once a worker is actually ready.
+**Blue-green (option 1) is the recommended zero-downtime path** — and it
+sidesteps the question of preloading entirely.
+
+> **A note on preloading.** `pyxle serve` imports each worker's app *after*
+> forking (uvicorn's model), so there's no copy-on-write sharing of read-only
+> state between workers. In practice this rarely matters — Python's per-process
+> memory is dominated by the interpreter and the SSR Node pool, not your page
+> modules. If you specifically need import-once-then-fork, run the app under a
+> process manager that supports it (e.g. **gunicorn** with
+> `--worker-class uvicorn.workers.UvicornWorker --preload`), pointing at the
+> `pyxle.build.production:create_app` factory with `PYXLE_SERVE_PROJECT_ROOT`
+> set to your project directory — gunicorn then owns worker lifecycle and
+> graceful rolling restarts. This is an advanced setup; the blue-green approach
+> above is simpler and gives true zero-downtime.
 
 ## Environment configuration
 

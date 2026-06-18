@@ -37,17 +37,76 @@ export default function RootLayout({ children }) {
 
 ### Slots
 
-Layouts can export a `slots` object and a `createSlots` function for passing additional content from pages:
+Slots let a page (or a nested layout) inject content into a named placeholder a
+layout renders. There are two halves:
+
+1. A **layout renders a `<Slot>`** — the placeholder.
+2. A **page fills it** by exporting `slots`.
+
+**The layout renders the placeholder.** Import `Slot` from `pyxle/client`, give
+it a `name`, and optionally a `fallback`:
 
 ```jsx
 // pages/layout.pyxl
-export const slots = {};
-export const createSlots = () => slots;
+import { Slot } from 'pyxle/client';
 
 export default function RootLayout({ children }) {
-  return <div>{children}</div>;
+  return (
+    <div>
+      <header>
+        <strong>MyApp</strong>
+        {/* Pages fill this; falls back to null when no page provides it. */}
+        <Slot name="actions" fallback={<a href="/">Home</a>} />
+      </header>
+      <main>{children}</main>
+    </div>
+  );
 }
 ```
+
+**The page fills the slot.** Export a `slots` object whose values are
+**factory functions** that return JSX (`() => <jsx/>`):
+
+```jsx
+// pages/incidents/[id].pyxl
+import { Link } from 'pyxle/client';
+
+export const slots = {
+  actions: () => <Link href="/incidents">← All incidents</Link>,
+};
+
+export default function IncidentPage({ data }) {
+  return <article>{/* ... */}</article>;
+}
+```
+
+Now the `actions` slot in the layout renders the page's `<Link>` instead of the
+fallback, and reverts to the fallback on pages that don't export it.
+
+**`<Slot>` props:**
+
+| Prop | Type | Description |
+|------|------|-------------|
+| `name` | `string` (required) | The slot name to render. |
+| `fallback` | `ReactNode \| (props) => ReactNode` | Rendered when no filler exists. Defaults to `null`. |
+| `props` | `object` | Forwarded to each filler factory (and to a function `fallback`). |
+
+**Rules to know:**
+
+- Each `slots` value must be a **function** returning JSX. A non-function value
+  is silently ignored.
+- `createSlots` is **optional**. A static `export const slots = { ... }` is
+  enough. Use `export const createSlots = (props) => ({ ... })` only when a
+  slot's content depends on the component's props/loader data — it receives the
+  same props as the component (`{ data, layoutData, ... }`) and returns the
+  slots map.
+- Multiple fillers of the **same** slot name are **additive** — if a page and a
+  nested layout both fill `actions`, all of them render (not last-wins).
+
+> **Advanced:** `useSlot(name)` and `useSlots()` (both from `pyxle/client`) let
+> a layout react to whether a slot is filled — e.g. `useSlot('actions')` returns
+> the array of filler factories (or `null`), so you can hide a toolbar wrapper
+> when nothing fills it.
 
 ## Nesting layouts
 
@@ -110,7 +169,7 @@ export default function RootLayout({ children, data }) {
 }
 ```
 
-The layout component receives its loader's result on the **`data`** prop -- exactly like a page receives its loader's data. Details:
+The layout component receives its loader's result on the **`data`** prop -- exactly like a page receives its loader's data. (The same data is also available on `layoutData`, the alias-free name the page component reads; either prop works inside a layout.) Details:
 
 - The loader runs **once per request**, before the page renders, and must be `async` (same rules as a page loader).
 - In a nesting chain, every layout/template loader runs and their results are **merged** into one dict (on a key conflict, the outermost layout wins).

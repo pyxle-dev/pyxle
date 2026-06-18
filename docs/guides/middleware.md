@@ -15,7 +15,12 @@ Add Starlette-compatible middleware classes to your config:
 }
 ```
 
-Each entry is a string in `module.path:ClassName` format. The class must be a standard Starlette middleware or `BaseHTTPMiddleware` subclass.
+Each entry is a string in `module.path:ClassName` format. The resolved attribute can be any of:
+
+- a **class** (a standard Starlette middleware or `BaseHTTPMiddleware` subclass);
+- an already-constructed Starlette **`Middleware` instance**;
+- a **`(class, {options})` tuple** — the only way to pass constructor kwargs to a config-loaded middleware (the class must subclass `BaseHTTPMiddleware`);
+- a **zero-argument factory callable** returning any of the above.
 
 ### Writing a middleware
 
@@ -35,7 +40,43 @@ class TimingMiddleware(BaseHTTPMiddleware):
         return response
 ```
 
-Middleware is applied in the order listed in config. The first middleware in the list is the outermost wrapper.
+> `BaseHTTPMiddleware` is convenient but buffers the response, so it is **incompatible with streaming SSR**. If any route streams, use the pure-ASGI form below.
+
+### Streaming-safe (pure-ASGI) middleware
+
+A pure-ASGI middleware passes streamed and buffered responses through identically — it never buffers, so it works with a streaming `<Suspense>` render. Set headers at `http.response.start` by wrapping `send`:
+
+```python
+# myapp/middleware.py
+import time
+
+
+class TimingMiddleware:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        start = time.perf_counter()
+
+        async def send_wrapper(message):
+            if message["type"] == "http.response.start":
+                duration = time.perf_counter() - start
+                headers = message.setdefault("headers", [])
+                headers.append((b"server-timing", f"app;dur={duration * 1000:.1f}".encode()))
+            await send(message)
+
+        await self.app(scope, receive, send_wrapper)
+```
+
+This is the streaming-safe equivalent of the `BaseHTTPMiddleware` example above. Register it the same way (`"myapp.middleware:TimingMiddleware"`).
+
+Middleware is applied in the order listed in config: the first entry is the outermost wrapper *among your custom middleware*. The whole custom group runs **inside** the framework's CORS, CSRF, and static-serving layers — see [Middleware execution order](#middleware-execution-order) below.
+
+> **Streaming SSR caveat.** A middleware subclassing `BaseHTTPMiddleware` **buffers the whole response**, which breaks streaming SSR: when a `<Suspense>` boundary defers, the page becomes a chunked `StreamingResponse` and `BaseHTTPMiddleware` raises `RuntimeError: No response returned.` If you run streaming routes, write custom middleware as **pure ASGI** instead (see [Streaming-safe (pure-ASGI) middleware](#streaming-safe-pure-asgi-middleware) below).
 
 ## Route-level hooks
 
@@ -45,12 +86,17 @@ Route hooks run before and after specific route handlers. Configure them per rou
 {
   "routeMiddleware": {
     "pages": ["myapp.hooks:require_auth"],
-    "apis": ["myapp.hooks:rate_limit"]
+    "apis": ["myapp.hooks:rate_limit"],
+    "actions": ["myapp.hooks:require_auth_json"]
   }
 }
 ```
 
-> **Note:** Route hooks wrap function endpoints (`endpoint` in `pages/api/`) and page handlers. [`HTTPEndpoint` classes](api-routes.md#using-httpendpoint-classes) are dispatched natively by Starlette and bypass route hooks — as do WebSocket handlers — so auth or rate-limiting for class-based endpoints must live in the endpoint methods themselves or in application-level middleware.
+The three lists wrap **page** handlers, **API** route functions, and **`@action`** endpoints respectively. They run through the same hook pipeline, so an `@action` POST is subject to its own policy chain instead of bypassing it.
+
+> **Actions vs pages — return the right thing.** An action endpoint replies with JSON, so an action hook that rejects a request should return a JSON `401`/`403` (not an HTML redirect a page hook might use). That's why actions have a **separate** `actions` list rather than inheriting the page's hooks — protect a page *and* its actions, but with responses each side can parse.
+
+> **Note:** Route hooks wrap function endpoints (`endpoint` in `pages/api/`), page handlers, and `@action` endpoints. [`HTTPEndpoint` classes](api-routes.md#using-httpendpoint-classes) are dispatched natively by Starlette and bypass route hooks — as do WebSocket handlers — so auth or rate-limiting for class-based endpoints must live in the endpoint methods themselves or in application-level middleware.
 
 ### Writing a route hook (function style)
 
@@ -119,17 +165,62 @@ Pyxle applies two default hooks:
 - **`attach_route_metadata`** -- adds route info to `request.scope["pyxle"]["route"]`
 - **`enforce_allowed_methods`** -- returns 405 for disallowed API methods
 
+## Rate limiting
+
+Pyxle ships a dependency-free **token-bucket** rate limiter, `pyxle.middleware.RateLimitMiddleware`. Enable it from `pyxle.config.json` — no code required:
+
+```json
+{
+  "rateLimit": {
+    "requests": 100,
+    "window": 60,
+    "exemptPaths": ["/health"],
+    "trustForwardedFor": false
+  }
+}
+```
+
+Each client gets a bucket holding up to `requests` tokens that refills at `requests / window` tokens per second. A request spends one token; when the bucket is empty the request is rejected with `429 Too Many Requests` and a `Retry-After` header. This permits a short burst up to the capacity while bounding the sustained rate — friendlier than a hard fixed window, and it never blocks the event loop.
+
+The 429 response carries the JSON body `{"ok": false, "error": "Too Many Requests"}` with `Content-Type: application/json` and an integer `Retry-After` (seconds) header, so a client can detect and parse throttling.
+
+- **Client key** — the connection's remote IP, or the first `X-Forwarded-For` hop when `trustForwardedFor` is set. Only trust the header behind a proxy you control; otherwise a client can spoof it to dodge the limit.
+- **Exempt paths** — `exemptPaths` skips the limiter on segment boundaries (same matching as `csrf.exemptPaths`). List health checks and metrics scrapes here so monitors aren't throttled.
+- **Placement** — the limiter sits just inside request observability, so a throttled request is still assigned a correlation id and counted in metrics, but is rejected before CSRF, static serving, or your handler do any work.
+
+**Multi-worker caveat.** The bucket store is in-memory and **per-process**. Under `pyxle serve --workers N` each worker enforces the limit independently, so the effective global cap is `N × requests`. When you need one shared limit across workers or hosts, rate-limit at your reverse proxy / load balancer instead. See the full schema in the [configuration reference](../reference/configuration.md#rate-limiting).
+
+You can also apply it yourself in a custom ASGI stack:
+
+```python
+from pyxle.middleware import RateLimitMiddleware
+
+app = RateLimitMiddleware(app, requests=100, window_seconds=60.0)
+```
+
 ## Middleware execution order
 
 From outermost to innermost:
 
-1. Custom middleware (from `middleware` config)
-2. CORS middleware (if configured)
-3. CSRF middleware (if enabled)
-4. Vite proxy (dev mode)
-5. Static file serving
-6. Route hooks (from `routeMiddleware` config) — skipped for `HTTPEndpoint` classes and WebSocket handlers, which Starlette dispatches natively
-7. Page/API handler
+1. Request observability (correlation id + timing, on by default)
+2. Rate limiter (if `rateLimit.requests > 0`)
+3. GZip compression + security headers (production only)
+4. CORS middleware (if configured)
+5. CSRF middleware (if enabled)
+6. Static file serving
+7. **Custom middleware (from `middleware` config)**
+8. Plugin-contributed middleware
+9. Vite proxy (dev mode)
+10. Route hooks (from `routeMiddleware` config) — skipped for `HTTPEndpoint` classes and WebSocket handlers, which Starlette dispatches natively
+11. Page/API handler
+
+> **Custom middleware runs _inside_ CORS, CSRF, and static serving** — those
+> wrap it. Two consequences: a custom middleware **cannot** see or modify a CORS
+> or CSRF rejection response (the request was already rejected further out), and
+> it **never** observes static-asset requests (static serving responds and
+> returns before reaching it). The first middleware in your `middleware` list is
+> still the outermost *among your custom middleware*, but the whole custom group
+> sits inside the framework's security and static layers.
 
 ## Next steps
 

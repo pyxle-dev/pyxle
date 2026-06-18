@@ -31,12 +31,20 @@ Loads external scripts with configurable loading strategies:
 
 | Prop | Type | Default | Description |
 |------|------|---------|-------------|
-| `src` | `string` | (required) | Script URL |
+| `src` | `string` | (required for external) | Script URL |
 | `strategy` | `string` | `"afterInteractive"` | Loading strategy |
 | `async` | `boolean` | `false` | Add `async` attribute |
 | `defer` | `boolean` | `false` | Add `defer` attribute |
-| `onLoad` | `function` | -- | Called when script loads |
-| `onError` | `function` | -- | Called on load failure |
+| `module` | `boolean` | `false` | Load as `type="module"` |
+| `noModule` | `boolean` | `false` | Add the `nomodule` attribute (legacy-browser fallback) |
+| `crossOrigin` | `string` | -- | `crossorigin` attribute |
+| `integrity` | `string` | -- | Subresource Integrity (SRI) hash |
+| `referrerPolicy` | `string` | -- | `referrerpolicy` attribute |
+| `onLoad` | `() => void` | -- | Called when script loads |
+| `onError` | `(error: Error) => void` | -- | Called on load failure; receives the `Error` |
+| `children` | `string` | -- | Inline script source, used when `src` is omitted |
+
+Inline scripts (`children`, no `src`) honour only `module`; the other props apply to external (`src`) scripts. See the [`<Script>` reference](../reference/client-api.md#script) for the full behaviour.
 
 ### Loading strategies
 
@@ -48,24 +56,19 @@ Loads external scripts with configurable loading strategies:
 
 ## `<Image>`
 
-Renders an `<img>` tag with automatic lazy loading:
+An optimized `<img>` with lazy loading, layout-shift prevention, a blur
+placeholder, and — with a `loader` — responsive `srcset`:
 
 ```jsx
-<Image src="/photos/hero.jpg" alt="Hero image" width={800} height={600} />
+<Image src="/photos/hero.jpg" alt="Hero image" width={800} height={600} priority />
 ```
 
-### Props
-
-| Prop | Type | Default | Description |
-|------|------|---------|-------------|
-| `src` | `string` | (required) | Image URL |
-| `alt` | `string` | `""` | Alt text |
-| `width` | `number` | -- | Image width |
-| `height` | `number` | -- | Image height |
-| `priority` | `boolean` | `false` | Eager load (above the fold) |
-| `lazy` | `boolean` | `true` | Lazy load (below the fold) |
-
-When `priority` is `true`, the image uses `loading="eager"`. Otherwise, it uses `loading="lazy"`.
+`priority` loads the image eagerly with `fetchpriority="high"` (use it for the
+LCP image); everything else lazy-loads. Pass a `loader` (a CDN or build plugin)
+for responsive images, or `fill` to cover a positioned parent. See the
+[Build Optimization guide](build-optimization.md#image-optimization) for the
+full prop list and CDN/plugin integration, and the
+[`<Image>` reference](../reference/client-api.md#image).
 
 ## `<ClientOnly>`
 

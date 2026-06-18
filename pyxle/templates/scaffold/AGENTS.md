@@ -132,12 +132,37 @@ import { Form } from 'pyxle/client';
 </Form>
 ```
 
+**Optional — validate the body with Pydantic.** Annotate a parameter with a Pydantic model and
+Pyxle validates the request body before your action runs (install `pyxle-framework[pydantic]`):
+
+```python
+from pydantic import BaseModel
+
+class NewPost(BaseModel):
+    title: str
+
+@action
+async def create_post(request, body: NewPost):     # body is a validated NewPost
+    return {"id": 1, "title": body.title}
+```
+
+On failure the client gets `{ ok: false, error, fields }` (HTTP 422). Read `res.fields` (or
+`create.fields`) — `{ [field]: string[] }` — to show messages per input; `<Form>` passes them as
+`onError(msg, fields)`. For hand-rolled checks raise `ValidationActionError(fields={...})` (also
+auto-injected). Export an OpenAPI schema with `pyxle openapi`.
+
 If a mutation should refresh data shown elsewhere, re-run the current loader with `refresh()`
 (from `pyxle/client`); see the docs for invalidating other routes.
 
+**Background work — don't make the client wait.** To run work *after* the response (send an
+email, emit a webhook), use `request.state.background.add_task(fn, *args)` inside an `@action`,
+or return the shorthand `{"background": [fn, *args]}`. For fire-and-forget work from anywhere
+(loaders too), `from pyxle.tasks import enqueue; enqueue(fn, *args)`. Both run **in-process** —
+for durable/cross-worker jobs, hand off to Celery/ARQ/Dramatiq (see the Background Tasks guide).
+
 ## The client toolkit — `import { … } from 'pyxle/client'`
 
-- `useAction(name)` — bind to an `@action`; returns a callable with `.pending`, `.error`, `.data`.
+- `useAction(name)` — bind to an `@action`; returns a callable with `.pending`, `.error`, `.fields`, `.data`.
 - `<Form action="name" onSuccess onError>` — submit named inputs to an `@action`.
 - `<Head>` — set per-page `<title>`/`<meta>`/`<link>` (deduped + merged with layouts).
 - `<Link href="/path">` — client-side navigation; `navigate('/path')` to do it imperatively.
@@ -189,8 +214,9 @@ pyxle install  # (re)install Python + Node deps
 - **DON'T** call your own actions with `fetch` or write a route for them — use `useAction`/`<Form>`.
 - **DON'T** put emoji or other non-BMP characters in **server-rendered** JSX text — SSR can fail
   to encode them. Use them only in client-only paths, or stick to plain text.
-- **DON'T** import `server`/`action` to use the decorators (they're injected). **DO** import
-  `ActionError`/`LoaderError` before raising them.
+- **DON'T** import `server`/`action` to use the decorators (they're injected). In a file with an
+  `@action`, `ActionError`/`ValidationActionError` are injected too — don't import them. **DO**
+  import `LoaderError` (`from pyxle.runtime import LoaderError`) before raising it — it is *not* injected.
 - **DON'T** expose secrets: env vars reach the browser only with a `PYXLE_PUBLIC_` prefix, and
   loader/action return values are sent to the client.
 - **DON'T** add a `# --- JSX ---` / `# --- client ---` marker — the split is automatic.

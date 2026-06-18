@@ -41,7 +41,10 @@ class ActionError(Exception):
 
     The ``message`` is forwarded to the client. ``status_code`` controls the
     HTTP response status (default 400). ``data`` carries any additional
-    JSON-serializable payload included in the error response.
+    JSON-serializable payload included in the error response. ``fields``
+    carries per-field validation messages — a map of field path to a list of
+    messages — surfaced to the client as ``error.fields`` (see
+    :class:`ValidationActionError`).
     """
 
     def __init__(
@@ -49,11 +52,37 @@ class ActionError(Exception):
         message: str,
         status_code: int = 400,
         data: dict[str, Any] | None = None,
+        *,
+        fields: dict[str, list[str]] | None = None,
     ) -> None:
         super().__init__(message)
         self.message = message
         self.status_code = status_code
         self.data = data or {}
+        self.fields = fields or {}
+
+
+class ValidationActionError(ActionError):
+    """An :class:`ActionError` for request-body validation failures.
+
+    Defaults to HTTP 422 and always carries ``fields`` (a map of field path —
+    dotted for nested models, indexed for list items — to a list of human
+    messages). Pyxle raises this automatically when an ``@action`` declares a
+    Pydantic-typed ``body`` parameter and the request body fails validation;
+    you can also raise it yourself for hand-rolled field errors::
+
+        raise ValidationActionError(fields={"email": ["already taken"]})
+    """
+
+    def __init__(
+        self,
+        message: str = "Validation failed",
+        *,
+        fields: dict[str, list[str]],
+        status_code: int = 422,
+        data: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message, status_code=status_code, data=data, fields=fields)
 
 
 class LoaderError(Exception):
@@ -148,6 +177,7 @@ __all__ = [
     "server",
     "action",
     "ActionError",
+    "ValidationActionError",
     "LoaderError",
     "invalidate_routes",
 ]

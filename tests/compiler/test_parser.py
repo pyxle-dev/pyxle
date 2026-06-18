@@ -896,3 +896,38 @@ class TestModernPythonFeatures:
         )
         assert result.loader is not None
         assert result.loader.parameters == ("request",)
+
+
+class TestCacheDirective:
+    """The compile-time ``CACHE = {"revalidate": N}`` page-cache directive."""
+
+    @staticmethod
+    def _parse(python: str):
+        return PyxParser().parse_text(
+            python + "\n\nexport default function P() { return <div />; }\n"
+        )
+
+    def test_no_directive_yields_none(self):
+        assert self._parse("x = 1").cache_revalidate is None
+
+    def test_extracts_revalidate_seconds(self):
+        assert self._parse('CACHE = {"revalidate": 60}').cache_revalidate == 60.0
+
+    def test_zero_seconds_is_valid(self):
+        assert self._parse('CACHE = {"revalidate": 0}').cache_revalidate == 0.0
+
+    def test_float_seconds_is_valid(self):
+        assert self._parse('CACHE = {"revalidate": 1.5}').cache_revalidate == 1.5
+
+    def test_non_dict_raises(self):
+        with pytest.raises(CompilationError, match="CACHE must be a dict"):
+            self._parse("CACHE = 60")
+
+    def test_missing_revalidate_key_raises(self):
+        with pytest.raises(CompilationError, match="revalidate"):
+            self._parse('CACHE = {"ttl": 60}')
+
+    @pytest.mark.parametrize("literal", ['"60"', "-1", "True", "None"])
+    def test_invalid_revalidate_value_raises(self, literal):
+        with pytest.raises(CompilationError, match="revalidate"):
+            self._parse('CACHE = {"revalidate": ' + literal + "}")

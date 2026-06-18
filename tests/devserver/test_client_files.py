@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from pathlib import Path
 
@@ -16,8 +17,14 @@ from pyxle.devserver.client_files import (
     _render_slot_runtime,
     _render_slot_runtime_types,
     _render_tsconfig,
+    _render_use_action_component,
+    _render_use_action_component_types,
+    _render_use_auth_component,
+    _render_use_auth_component_types,
     _render_use_pathname_component,
     _render_use_pathname_component_types,
+    _render_use_websocket_component,
+    _render_use_websocket_component_types,
     _render_vite_config,
     write_client_bootstrap_files,
 )
@@ -56,6 +63,26 @@ def test_write_client_bootstrap_files_generates_expected_artifacts(tmp_path: Pat
     assert slot_types == _render_slot_runtime_types()
 
 
+def test_tsconfig_avoids_typescript_7_deprecated_options() -> None:
+    """The generated tsconfig must not use options TypeScript deprecates for 7.0:
+    ``moduleResolution: "node10"``/``"Node"`` (TS5107) and ``baseUrl`` (TS5101),
+    which make ``pyxle typecheck`` fail with deprecation errors on a current
+    TypeScript. A Vite/esbuild project should use ``bundler`` resolution, with
+    ``paths`` resolved relative to the tsconfig (so no ``baseUrl`` is needed)."""
+    options = json.loads(_render_tsconfig())["compilerOptions"]
+
+    assert options["moduleResolution"] == "Bundler"
+    assert options["moduleResolution"].lower() not in {"node", "node10"}
+    assert "baseUrl" not in options
+    # paths survive the baseUrl removal by being explicitly tsconfig-relative.
+    assert options["paths"]["pyxle/client"] == ["./pyxle/client"]
+    assert all(
+        target.startswith("./")
+        for targets in options["paths"].values()
+        for target in targets
+    )
+
+
 def test_client_entry_seeds_nav_cache_and_guards_self_prefetch(tmp_path: Path) -> None:
     settings = DevServerSettings.from_project_root(tmp_path)
     client_entry = _render_client_entry(settings)
@@ -74,6 +101,27 @@ def test_client_entry_seeds_nav_cache_and_guards_self_prefetch(tmp_path: Path) -
 
     # Belt-and-suspenders: prefetch never re-fetches the current page.
     assert "Never prefetch the page we're already on" in client_entry
+
+
+def test_client_entry_wraps_pages_in_error_boundary(tmp_path: Path) -> None:
+    settings = DevServerSettings.from_project_root(tmp_path)
+    client_entry = _render_client_entry(settings)
+
+    # A client-side React error boundary that renders the nearest error.pyxl on
+    # a render fault, keyed by pagePath so navigation clears the error state.
+    assert "class PyxleErrorBoundary extends React.Component" in client_entry
+    assert "getDerivedStateFromError" in client_entry
+    assert "fallbackComponent" in client_entry
+    # The error context is passed under the `error` prop key, matching the
+    # server's props={"error": ...} so one error.pyxl reads props.error on both.
+    assert "buildClientErrorContext" in client_entry
+    assert "error: buildClientErrorContext(this.state.error)" in client_entry
+
+    # The nearest error.pyxl asset is threaded through renderPage from both the
+    # navigation payload and the SSR-seeded global.
+    assert "errorAssetPath" in client_entry
+    assert "window.__PYXLE_ERROR_ASSET__" in client_entry
+    assert "payload.page?.errorAssetPath" in client_entry
 
 
 def test_write_client_bootstrap_files_is_idempotent(tmp_path: Path) -> None:
@@ -272,6 +320,17 @@ def test_vite_config_aliases_cover_client_runtime(tmp_path: Path) -> None:
     assert "find: /^pyxle\\/client$/" in vite_config
     assert "find: /^pyxle\\/client\\/(.+)$/" in vite_config
     assert "find: 'pyxle/client'" not in vite_config
+
+
+def test_vite_config_has_explicit_build_block(tmp_path: Path) -> None:
+    settings = create_project(tmp_path)
+    vite_config = _render_vite_config(settings)
+
+    assert "build: {" in vite_config
+    assert "target: 'es2020'" in vite_config
+    assert "cssCodeSplit: true" in vite_config
+    # We do our own --analyze, so Vite's slow gzip reporting is off.
+    assert "reportCompressedSize: false" in vite_config
 
 
 def test_vite_config_respects_base_environment(tmp_path: Path) -> None:
@@ -571,6 +630,54 @@ def test_image_component_types_model_new_api() -> None:
     assert "onError?:" in types
 
 
+def test_image_component_responsive_srcset_via_loader() -> None:
+    """A `loader` opts into responsive srcset; without one, no srcset is emitted
+    (resizing needs a real backend, so a fake srcset would just re-download the
+    full image at every width)."""
+    from pyxle.devserver.client_files import _render_image_component
+    source = _render_image_component()
+
+    # Loader-gated srcset generation across a responsive width ladder.
+    assert "usesLoader = typeof loader === 'function'" in source
+    assert "srcSet = usesLoader" in source
+    assert "candidateWidths" in source
+    assert "DEVICE_SIZES = [640, 750, 828, 1080, 1200, 1920, 2048, 3840]" in source
+    assert "IMAGE_SIZES" in source
+    # Fixed width -> 1x + 2x (retina); responsive -> full device ladder.
+    assert "atLeast(w)" in source and "atLeast(w * 2)" in source
+
+
+def test_image_component_fill_priority_and_sizes() -> None:
+    """Fill mode, priority (fetchpriority=high), and the sizes attribute."""
+    from pyxle.devserver.client_files import _render_image_component
+    source = _render_image_component()
+
+    assert "fill = false" in source
+    # Fill positions the image to cover a positioned ancestor.
+    assert "position: 'absolute'" in source
+    assert "objectFit: objectFit || 'cover'" in source
+    # LCP priority maps to the lowercase `fetchpriority` HTML attribute. React
+    # 18.3.1 does not recognise the camelCase `fetchPriority` prop and warns on
+    # it, so the component spreads the lowercase attribute only when priority is
+    # set (passed straight through to the DOM, no warning).
+    assert "fetchPriority" not in source
+    assert "{...(priority ? { fetchpriority: 'high' } : {})}" in source
+    # sizes defaults to 100vw under fill.
+    assert "resolvedSizes = sizes || (fill ? '100vw' : undefined)" in source
+    # Data/blob srcs bypass the loader.
+    assert "isPassthroughSrc" in source
+
+
+def test_image_component_types_model_responsive_api() -> None:
+    """The .d.ts exposes the Next.js-parity props and loader types."""
+    from pyxle.devserver.client_files import _render_image_component_types
+    types = _render_image_component_types()
+    for token in ("fill?:", "sizes?:", "quality?:", "loader?:", "objectFit?:"):
+        assert token in types
+    assert "ImageLoaderProps" in types
+    assert "export type ImageLoader" in types
+
+
 def test_resolve_action_url_reads_ssr_pathname_global() -> None:
     """useAction and Form must resolve the action URL against the real
     request path during SSR — otherwise the form emits a server URL
@@ -587,6 +694,36 @@ def test_resolve_action_url_reads_ssr_pathname_global() -> None:
         # The window-branch still comes first — we only hit the SSR branch
         # when there's no window (true SSR path).
         assert "typeof window !== 'undefined'" in source
+
+
+def test_use_action_surfaces_validation_field_errors() -> None:
+    """useAction must expose the server's per-field validation errors so a
+    form can render messages next to each input. The dispatcher returns a
+    top-level ``fields`` map (field path -> messages) on a 422; the hook
+    mirrors it into ``execute.fields`` and the resolved result object, and
+    clears it at the start of every new request."""
+    source = _render_use_action_component()
+
+    # Dedicated state for field errors, cleared on each new submit.
+    assert "const [fields, setFields] = useState(null);" in source
+    assert "setFields(null);" in source
+    # The error branch reads the server's ``fields`` key and surfaces it.
+    assert "json.fields ?? null" in source
+    assert "setFields(fieldErrors);" in source
+    # ``fields`` is attached to the callable and present in the result object.
+    assert "execute.fields = fields;" in source
+    assert "fields: fieldErrors" in source
+    # The framework's reserved key must not leak into the success ``data``.
+    assert "fields: _fields" in source
+
+
+def test_use_action_types_declare_fields() -> None:
+    """The .d.ts for useAction must declare the ``fields`` surface so editors
+    and typecheck see it."""
+    types = _render_use_action_component_types()
+    assert "fields" in types
+    assert "ActionFieldErrors" in types
+    assert "ActionInvoker" in types
 
 
 def test_csrf_runtime_honours_configured_names() -> None:
@@ -711,6 +848,149 @@ def test_write_client_bootstrap_files_generates_use_pathname(tmp_path: Path) -> 
 
     types = (settings.client_build_dir / "pyxle" / "use-pathname.d.ts").read_text(encoding="utf-8")
     assert "usePathname" in types
+
+
+# ---------------------------------------------------------------------------
+# useAuth hook
+
+
+def test_use_auth_component_exposes_full_surface() -> None:
+    """The hook exposes user state plus login/signup/logout/refresh."""
+    source = _render_use_auth_component()
+    assert "export function useAuth()" in source
+    for member in ("user", "isAuthenticated", "loading", "error", "login", "signup", "logout", "refresh"):
+        assert member in source
+    # Shared store via useSyncExternalStore so consumers stay in sync.
+    assert "useSyncExternalStore" in source
+
+
+def test_use_auth_component_is_ssr_safe() -> None:
+    """The hook must guard window access and use a stable server snapshot so
+    hydration never mismatches."""
+    source = _render_use_auth_component()
+    assert "typeof window === 'undefined'" in source
+    # A constant server snapshot keeps the hydration render identical on both
+    # sides; the client swaps to the seeded value after hydration.
+    assert "getServerSnapshot" in source
+    assert "SERVER_SNAPSHOT" in source
+
+
+def test_use_auth_component_seeds_from_window_global() -> None:
+    """The hook seeds from window.__PYXLE_AUTH__ so a signed-in user appears
+    on the first client frame with no round-trip."""
+    source = _render_use_auth_component()
+    assert "window.__PYXLE_AUTH__" in source
+    # Endpoints come from the seed with conventional /auth/* fallbacks.
+    assert "/auth/me" in source
+    assert "/auth/login" in source
+    assert "/auth/logout" in source
+
+
+def test_use_auth_component_sends_csrf_on_mutations() -> None:
+    """login/signup/logout POSTs must carry the CSRF token like useAction."""
+    source = _render_use_auth_component()
+    assert "csrfHeaderName()" in source
+    assert "getCsrfToken()" in source
+    assert "credentials: 'same-origin'" in source
+
+
+def test_use_auth_component_types() -> None:
+    """Type declaration exposes the user shape and the hook result."""
+    types = _render_use_auth_component_types()
+    assert "useAuth" in types
+    assert "PyxleUser" in types
+    assert "isAuthenticated" in types
+
+
+def test_write_client_bootstrap_files_generates_use_auth(tmp_path: Path) -> None:
+    """Bootstrap writes the useAuth hook, its types, and the barrel export."""
+    settings = create_project(tmp_path)
+    write_client_bootstrap_files(settings)
+
+    hook = (settings.client_build_dir / "pyxle" / "use-auth.jsx").read_text(encoding="utf-8")
+    assert "export function useAuth()" in hook
+
+    types = (settings.client_build_dir / "pyxle" / "use-auth.d.ts").read_text(encoding="utf-8")
+    assert "useAuth" in types
+
+    barrel = (settings.client_build_dir / "pyxle" / "client.js").read_text(encoding="utf-8")
+    assert "useAuth" in barrel
+
+
+# ---------------------------------------------------------------------------
+# useWebSocket hook
+
+
+def test_use_websocket_component_exposes_contract() -> None:
+    source = _render_use_websocket_component()
+    assert "export function useWebSocket(path, options" in source
+    for member in ("status", "send", "lastMessage", "error"):
+        assert member in source
+
+
+def test_use_websocket_component_is_ssr_safe() -> None:
+    """The hook must never open a socket during SSR — all socket code is gated
+    behind a typeof-window check inside useEffect."""
+    source = _render_use_websocket_component()
+    assert "typeof window === 'undefined'" in source
+    assert "useEffect" in source
+    # The window guard precedes any `new WebSocket(` construction.
+    assert source.index("typeof window === 'undefined'") < source.index("new WebSocket(")
+
+
+def test_use_websocket_component_reconnects_on_protocol_change() -> None:
+    """`protocols` must enter the effect deps (via a stable JSON key) so a
+    changed subprotocol reconnects, without an inline array literal causing a
+    reconnect on every render."""
+    source = _render_use_websocket_component()
+    assert "JSON.stringify(protocols" in source
+    assert "protocolsKey" in source
+    # The deps array includes the stable key.
+    assert "[path, reconnect, maxRetries, protocolsKey]" in source
+
+
+def test_use_websocket_component_uses_exponential_backoff() -> None:
+    """Reconnect must back off exponentially with jitter and a cap — not the
+    fixed-delay loop the dev overlay uses (which would thundering-herd a
+    restarting server)."""
+    source = _render_use_websocket_component()
+    assert "Math.pow(2, retries)" in source
+    assert "30000" in source  # 30s cap
+    assert "Math.random()" in source  # jitter
+
+
+def test_use_websocket_component_parses_json_safely() -> None:
+    source = _render_use_websocket_component()
+    assert "JSON.parse(data)" in source
+    # JSON.parse is wrapped so a non-JSON frame keeps the raw string.
+    assert "try {" in source
+
+
+def test_use_websocket_component_resolves_same_origin_url() -> None:
+    source = _render_use_websocket_component()
+    assert "wss:" in source and "ws:" in source
+    assert "window.location.protocol === 'https:'" in source
+
+
+def test_use_websocket_component_types() -> None:
+    types = _render_use_websocket_component_types()
+    assert "useWebSocket" in types
+    assert "WebSocketStatus" in types
+    assert "UseWebSocketResult" in types
+
+
+def test_write_client_bootstrap_files_generates_use_websocket(tmp_path: Path) -> None:
+    settings = create_project(tmp_path)
+    write_client_bootstrap_files(settings)
+
+    hook = (settings.client_build_dir / "pyxle" / "use-websocket.jsx").read_text(encoding="utf-8")
+    assert "export function useWebSocket" in hook
+
+    types = (settings.client_build_dir / "pyxle" / "use-websocket.d.ts").read_text(encoding="utf-8")
+    assert "useWebSocket" in types
+
+    barrel = (settings.client_build_dir / "pyxle" / "client.js").read_text(encoding="utf-8")
+    assert "useWebSocket" in barrel
 
 
 def test_navigation_scrolls_to_hash_after_cross_page_commit(tmp_path: Path) -> None:

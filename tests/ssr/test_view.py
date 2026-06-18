@@ -17,7 +17,42 @@ from pyxle.ssr.view import (
     HeadEvaluationError,
     build_page_navigation_response,
     build_page_response,
+    build_streaming_page_response,
 )
+
+
+def _stream_of(*frames):
+    """Build a fake ``render_stream`` async-generator callable yielding *frames*."""
+
+    async def _gen(
+        component_path,
+        props,
+        *,
+        request_pathname=None,
+        csrf_token=None,
+        fallback_path=None,
+    ):
+        for frame in frames:
+            yield frame
+
+    return _gen
+
+
+def test_auth_seed_for_request_returns_scope_value() -> None:
+    """An auth provider's scope blob is forwarded verbatim to the document."""
+    seed = {"user": {"email": "a@b.c"}, "endpoints": {"me": "/auth/me"}}
+    request = Request(
+        {"type": "http", "method": "GET", "path": "/", "headers": [], "pyxle.auth": seed}
+    )
+    assert ssr_view._auth_seed_for_request(request) is seed
+
+
+def test_auth_seed_for_request_absent_returns_sentinel() -> None:
+    """No auth provider → the ABSENT sentinel, so the document emits no seed."""
+    from pyxle.ssr.template import _AUTH_SEED_ABSENT
+
+    request = Request({"type": "http", "method": "GET", "path": "/", "headers": []})
+    assert ssr_view._auth_seed_for_request(request) is _AUTH_SEED_ABSENT
 
 
 @pytest.fixture
@@ -215,6 +250,38 @@ def test_resolve_nav_cache_ttl_without_cache_config() -> None:
     assert _resolve_nav_cache_ttl(SimpleNamespace(cache=None), "/") is None
 
 
+def test_resolve_nav_cache_ttl_dynamic_loader_page_never_caches() -> None:
+    """A loader page with no declared cache lifetime is dynamic → TTL 0, so a
+    mutation is visible immediately on client back/forward (not stale)."""
+    from types import SimpleNamespace
+
+    from pyxle.ssr.view import _resolve_nav_cache_ttl
+
+    settings = SimpleNamespace(cache=None)
+    dynamic = SimpleNamespace(cache_revalidate=None, has_loader=True)
+    assert _resolve_nav_cache_ttl(settings, "/incidents/x", page=dynamic) == 0
+
+    # A CACHE directive on the page wins over the dynamic default.
+    cached = SimpleNamespace(cache_revalidate=3600, has_loader=True)
+    assert _resolve_nav_cache_ttl(settings, "/about", page=cached) == 3600
+
+    # A static, loader-less page keeps the client default (None).
+    static = SimpleNamespace(cache_revalidate=None, has_loader=False)
+    assert _resolve_nav_cache_ttl(settings, "/static", page=static) is None
+
+
+def test_resolve_nav_cache_ttl_cache_config_wins_over_page() -> None:
+    """An explicit edge-cache entry takes priority over the per-page default."""
+    from types import SimpleNamespace
+
+    from pyxle.config import CacheConfig
+    from pyxle.ssr.view import _resolve_nav_cache_ttl
+
+    settings = SimpleNamespace(cache=CacheConfig(routes=(("/feed", 120),)))
+    dynamic = SimpleNamespace(cache_revalidate=None, has_loader=True)
+    assert _resolve_nav_cache_ttl(settings, "/feed", page=dynamic) == 120
+
+
 @pytest.mark.anyio
 async def test_build_page_response_with_loader(settings: DevServerSettings, tmp_path: Path) -> None:
     server_module = tmp_path / "server" / "index.py"
@@ -274,6 +341,108 @@ async def load_home(request):
     assert "<title>Home</title>" in body_text
     assert renderer.calls[-1][0] == page.client_module_path
     assert renderer.calls[-1][1]["data"]["value"] == "9"
+
+
+# --------------------------------------------------------------------------- #
+# Loader {data, revalidate} cache envelope (ROADMAP 2.1)
+# --------------------------------------------------------------------------- #
+
+
+def test_normalize_loader_result_plain_mapping_has_no_revalidate(tmp_path: Path) -> None:
+    page = _page_route(tmp_path, loader_name="load")
+    payload, status, revalidate = ssr_view._normalize_loader_result({"a": 1}, page)
+    assert payload == {"a": 1}
+    assert status == 200
+    assert revalidate is None
+
+
+def test_normalize_loader_result_unwraps_envelope(tmp_path: Path) -> None:
+    page = _page_route(tmp_path, loader_name="load")
+    payload, status, revalidate = ssr_view._normalize_loader_result(
+        {"data": {"a": 1}, "revalidate": 60}, page
+    )
+    assert payload == {"a": 1}
+    assert status == 200
+    assert revalidate == 60.0
+
+
+def test_normalize_loader_result_envelope_with_status_tuple(tmp_path: Path) -> None:
+    page = _page_route(tmp_path, loader_name="load")
+    payload, status, revalidate = ssr_view._normalize_loader_result(
+        ({"data": {"a": 1}, "revalidate": 30}, 201), page
+    )
+    assert payload == {"a": 1}
+    assert status == 201
+    assert revalidate == 30.0
+
+
+def test_normalize_loader_result_not_envelope_with_extra_keys(tmp_path: Path) -> None:
+    # A page that genuinely exposes data/revalidate *plus* another key is not a
+    # cache directive — it is returned verbatim as props.
+    page = _page_route(tmp_path, loader_name="load")
+    result = {"data": {"a": 1}, "revalidate": 60, "extra": True}
+    payload, _status, revalidate = ssr_view._normalize_loader_result(result, page)
+    assert payload == result
+    assert revalidate is None
+
+
+def test_normalize_loader_result_not_envelope_when_data_not_mapping(tmp_path: Path) -> None:
+    page = _page_route(tmp_path, loader_name="load")
+    result = {"data": [1, 2], "revalidate": 60}
+    payload, _status, revalidate = ssr_view._normalize_loader_result(result, page)
+    assert payload == result
+    assert revalidate is None
+
+
+@pytest.mark.parametrize("value,expected", [(None, None), (0, 0.0), (60, 60.0), (1.5, 1.5)])
+def test_coerce_revalidate_accepts_valid(tmp_path: Path, value, expected) -> None:
+    page = _page_route(tmp_path, loader_name="load")
+    assert ssr_view._coerce_revalidate(value, page) == expected
+
+
+@pytest.mark.parametrize("value", [-1, True, False, "60", [1]])
+def test_coerce_revalidate_rejects_invalid(tmp_path: Path, value) -> None:
+    page = _page_route(tmp_path, loader_name="load")
+    with pytest.raises(ssr_view.LoaderExecutionError):
+        ssr_view._coerce_revalidate(value, page)
+
+
+@pytest.mark.anyio
+async def test_build_page_response_sets_revalidate_header_from_envelope(
+    settings: DevServerSettings, tmp_path: Path
+) -> None:
+    server_module = tmp_path / "server" / "index.py"
+    server_module.parent.mkdir(parents=True, exist_ok=True)
+    server_module.write_text(
+        '\nasync def load_home(request):\n'
+        '    return {"data": {"value": "x"}, "revalidate": 90}\n',
+        encoding="utf-8",
+    )
+    page = replace(
+        _page_route(tmp_path, loader_name="load_home"), server_module_path=server_module
+    )
+
+    renderer = StubRenderer()
+    renderer.responses.append(RenderResult(html="<p>SSR</p>"))
+    request = Request(
+        {
+            "type": "http",
+            "http_version": "1.1",
+            "method": "GET",
+            "path": "/",
+            "root_path": "",
+            "headers": [],
+            "query_string": b"",
+        }
+    )
+
+    response = await build_page_response(
+        request=request, settings=settings, page=page, renderer=renderer
+    )
+
+    assert response.headers[ssr_view.REVALIDATE_HEADER] == "90"
+    # The inner data became the component props; envelope keys did not leak.
+    assert renderer.calls[-1][1]["data"] == {"value": "x"}
 
 
 @pytest.mark.anyio
@@ -2302,3 +2471,233 @@ def test_purge_page_modules_skips_modules_with_unresolvable_file(tmp_path: Path)
         assert "pyxle._test_poisoned_file" in sys.modules
     finally:
         sys.modules.pop("pyxle._test_poisoned_file", None)
+
+
+@pytest.mark.anyio
+async def test_build_streaming_page_response_streams_prefix_body_suffix(
+    settings: DevServerSettings, tmp_path: Path
+) -> None:
+    page = replace(_page_route(tmp_path, loader_name=None), uses_suspense=True)
+    renderer = StubRenderer()  # only used for an error-boundary fallback render
+    overlay = StubOverlay()
+    request = Request(
+        {"type": "http", "http_version": "1.1", "method": "GET", "path": "/", "root_path": "", "headers": []}
+    )
+
+    response = await build_streaming_page_response(
+        request=request,
+        settings=settings,
+        page=page,
+        renderer=renderer,
+        stream_render=_stream_of(
+            {"type": "chunk", "html": "<main>shell</main>"},
+            {"type": "end", "styles": [], "headElements": []},
+        ),
+        overlay=overlay,
+    )
+
+    body = (await _read_response_body(response)).decode()
+    assert response.status_code == 200
+    # Static head flushed in the prefix, the streamed chunk in the body, the
+    # hydration props script in the suffix.
+    assert "<title>Home</title>" in body
+    assert "<main>shell</main>" in body
+    assert "__PYXLE_PROPS__" in body
+    # The buffered renderer was never invoked — the stream produced the body.
+    assert renderer.calls == []
+    assert overlay.events == [("clear", "/")]
+
+
+@pytest.mark.anyio
+async def test_build_streaming_page_response_shell_error_falls_back(
+    settings: DevServerSettings, tmp_path: Path
+) -> None:
+    page = replace(_page_route(tmp_path, loader_name=None), uses_suspense=True)
+    renderer = StubRenderer()
+    overlay = StubOverlay()
+    request = Request(
+        {"type": "http", "http_version": "1.1", "method": "GET", "path": "/", "root_path": "", "headers": []}
+    )
+
+    # The very first frame is an error (renderToPipeableStream onShellError) —
+    # no bytes were sent yet, so it maps to the sanitized error document.
+    response = await build_streaming_page_response(
+        request=request,
+        settings=settings,
+        page=page,
+        renderer=renderer,
+        stream_render=_stream_of({"type": "error", "error": "shell exploded"}),
+        overlay=overlay,
+    )
+
+    assert response.status_code == 500
+    # An error before the first byte must never emit a partial streamed body.
+    body = (await _read_response_body(response)).decode()
+    assert "<main>shell</main>" not in body
+    assert any(event[0] == "error" for event in overlay.events)
+
+
+@pytest.mark.anyio
+async def test_build_streaming_page_response_without_manifest_falls_back_to_buffered(
+    settings: DevServerSettings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # When the streaming shell can't be built (no client manifest to link the
+    # hydration bundle), the request falls back to the buffered builder rather
+    # than emitting a broken document.
+    page = replace(_page_route(tmp_path, loader_name=None), uses_suspense=True)
+    renderer = StubRenderer()
+    renderer.responses.append(RenderResult(html="<main>buffered-fallback</main>"))
+    overlay = StubOverlay()
+    request = Request(
+        {"type": "http", "http_version": "1.1", "method": "GET", "path": "/", "root_path": "", "headers": []}
+    )
+
+    def _raise_manifest(*args, **kwargs):
+        raise ssr_view.ManifestLookupError
+
+    monkeypatch.setattr(ssr_view, "build_document_shell", _raise_manifest)
+
+    # stream_render must never be consumed once we've decided to buffer.
+    async def _never(*args, **kwargs):  # pragma: no cover - must not be called
+        yield {"type": "chunk", "html": "<should-not-appear/>"}
+
+    response = await build_streaming_page_response(
+        request=request,
+        settings=settings,
+        page=page,
+        renderer=renderer,
+        stream_render=_never,
+        overlay=overlay,
+    )
+
+    body = (await _read_response_body(response)).decode()
+    assert response.status_code == 200
+    assert "<main>buffered-fallback</main>" in body
+    assert "<should-not-appear/>" not in body
+
+
+@pytest.mark.anyio
+async def test_streaming_passes_loading_fallback_path(
+    settings: DevServerSettings, tmp_path: Path
+) -> None:
+    loading_route = replace(
+        _page_route(tmp_path, loader_name=None),
+        client_module_path=tmp_path / "client" / "loading.jsx",
+    )
+    page = replace(
+        _page_route(tmp_path, loader_name=None),
+        uses_suspense=True,
+        loading_boundary=loading_route,
+    )
+    captured: dict = {}
+
+    async def _capturing(component_path, props, *, request_pathname=None, csrf_token=None, fallback_path=None):
+        captured["fallback_path"] = fallback_path
+        yield {"type": "chunk", "html": "<main>x</main>"}
+        yield {"type": "end"}
+
+    request = Request(
+        {"type": "http", "http_version": "1.1", "method": "GET", "path": "/", "root_path": "", "headers": []}
+    )
+    await build_streaming_page_response(
+        request=request,
+        settings=settings,
+        page=page,
+        renderer=StubRenderer(),
+        stream_render=_capturing,
+        overlay=StubOverlay(),
+    )
+    # The page's nearest loading.pyxl is forwarded so the worker can wrap it.
+    assert captured["fallback_path"] == loading_route.client_module_path
+
+
+@pytest.mark.anyio
+async def test_nav_payload_for_streaming_page_uses_static_head_and_carries_loading_asset(
+    settings: DevServerSettings, tmp_path: Path
+) -> None:
+    # A streaming-eligible page's nav payload is built from the loader + static
+    # head WITHOUT a buffered render (renderToString throws on suspension).
+    loading_route = replace(
+        _page_route(tmp_path, loader_name=None),
+        client_asset_path="/pages/loading.jsx",
+    )
+    page = replace(
+        _page_route(tmp_path, loader_name=None),
+        uses_suspense=True,
+        loading_boundary=loading_route,
+    )
+    renderer = StubRenderer()
+    request = Request(
+        {"type": "http", "http_version": "1.1", "method": "GET", "path": "/", "root_path": "", "headers": []}
+    )
+
+    response = await build_page_navigation_response(
+        request=request,
+        settings=settings,
+        page=page,
+        renderer=renderer,
+        overlay=StubOverlay(),
+    )
+
+    body = json.loads((await _read_response_body(response)).decode())
+    assert body["ok"] is True
+    assert body["page"]["loadingAssetPath"] == "/pages/loading.jsx"
+    assert "<title>Home</title>" in body["headMarkup"]  # static HEAD
+    # No buffered render happened for the streaming nav payload.
+    assert renderer.calls == []
+
+
+@pytest.mark.anyio
+async def test_nav_payload_for_plain_page_has_null_loading_asset(
+    settings: DevServerSettings, tmp_path: Path
+) -> None:
+    page = _page_route(tmp_path, loader_name=None)  # no boundary, no suspense
+    renderer = StubRenderer()
+    renderer.responses.append(RenderResult(html="<main>plain</main>"))
+    request = Request(
+        {"type": "http", "http_version": "1.1", "method": "GET", "path": "/", "root_path": "", "headers": []}
+    )
+
+    response = await build_page_navigation_response(
+        request=request,
+        settings=settings,
+        page=page,
+        renderer=renderer,
+        overlay=StubOverlay(),
+    )
+    body = json.loads((await _read_response_body(response)).decode())
+    assert body["page"]["loadingAssetPath"] is None
+    assert body["page"]["errorAssetPath"] is None
+    # A plain page's nav payload still renders buffered for its runtime head.
+    assert renderer.calls != []
+
+
+@pytest.mark.anyio
+async def test_nav_payload_carries_error_asset_when_boundary_present(
+    settings: DevServerSettings, tmp_path: Path
+) -> None:
+    # A page with a nearest error.pyxl carries its client asset so the client
+    # error boundary can render the same error.pyxl the server would.
+    error_route = replace(
+        _page_route(tmp_path, loader_name=None),
+        client_asset_path="/pages/error.jsx",
+    )
+    page = replace(
+        _page_route(tmp_path, loader_name=None),
+        error_boundary=error_route,
+    )
+    renderer = StubRenderer()
+    renderer.responses.append(RenderResult(html="<main>plain</main>"))
+    request = Request(
+        {"type": "http", "http_version": "1.1", "method": "GET", "path": "/", "root_path": "", "headers": []}
+    )
+
+    response = await build_page_navigation_response(
+        request=request,
+        settings=settings,
+        page=page,
+        renderer=renderer,
+        overlay=StubOverlay(),
+    )
+    body = json.loads((await _read_response_body(response)).decode())
+    assert body["page"]["errorAssetPath"] == "/pages/error.jsx"

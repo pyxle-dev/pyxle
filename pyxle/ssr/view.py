@@ -8,6 +8,7 @@ import inspect
 import logging
 import secrets
 import sys
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,6 +24,7 @@ from pyxle.devserver.settings import DevServerSettings
 
 from .renderer import ComponentRenderer, ComponentRenderError, InlineStyleFragment
 from .template import (
+    _AUTH_SEED_ABSENT,
     ManifestLookupError,
     build_document_shell,
     render_document,
@@ -39,6 +41,13 @@ class HeadEvaluationError(RuntimeError):
     """Raised when HEAD cannot be resolved at runtime."""
 
 
+#: Response header carrying a render's cache lifetime (seconds) from the page
+#: handler's perspective. Set by :func:`build_page_response` when a loader
+#: declared a ``{data, revalidate}`` envelope; read and stripped by the page
+#: handler when it decides what TTL to store the rendered HTML under.
+REVALIDATE_HEADER = "x-pyxle-revalidate"
+
+
 @dataclass(slots=True)
 class PageArtifacts:
     component_props: dict[str, Any]
@@ -47,6 +56,24 @@ class PageArtifacts:
     head_markup: str
     inline_styles: tuple[InlineStyleFragment, ...]
     status_code: int
+    revalidate: float | None = None
+
+
+@dataclass(slots=True)
+class _StreamingPrelude:
+    """Everything a render needs that is known *before* the component renders.
+
+    Produced by running the loader and resolving the (static) HEAD, so the
+    streaming path can flush the document head before the React shell renders.
+    The buffered path reuses it and then renders + merges runtime ``<Head>``.
+    """
+
+    component_props: dict[str, Any]
+    head_elements: tuple[str, ...]
+    layout_head_jsx_blocks: tuple[str, ...]
+    status_code: int
+    revalidate: float | None
+    csrf_token: str | None
 
 
 _logger = logging.getLogger(__name__)
@@ -93,18 +120,50 @@ def _error_response(
     return HTMLResponse(fallback, status_code=status_code)
 
 
-def _resolve_nav_cache_ttl(settings: DevServerSettings, path: str) -> int | None:
-    """Return the configured edge-cache TTL (seconds) for ``path``, if any.
+def _resolve_nav_cache_ttl(
+    settings: DevServerSettings, path: str, page: PageRoute | None = None
+) -> int | None:
+    """Return the client navigation-cache lifetime (seconds) for ``path``.
 
     The client navigation cache reuses this per-page value so a page's
-    prefetch/seed freshness matches its declared edge-cache lifetime. Pages
-    with no ``cache`` entry return ``None`` and fall back to the client's
-    default navigation-cache lifetime.
+    prefetch/seed freshness matches the server's actual cacheability. Resolved in
+    priority order:
+
+    1. An explicit edge ``cache`` config entry for the path → its max-age (the
+       page is shared-cacheable for that long, so the client may reuse it too).
+    2. A page ``CACHE`` directive (``cache_revalidate``) → that lifetime.
+    3. A page with a ``@server`` loader but **no** declared cache lifetime is
+       dynamic — it renders ``private, no-cache`` and its data can change between
+       requests (live updates, per-user content). Return ``0`` ("never cache") so
+       a mutation is visible immediately on back/forward navigation instead of
+       being hidden behind the default window until it expires.
+    4. Otherwise (a static, loader-less page whose markup never varies) → ``None``
+       → the client's default navigation-cache lifetime.
+
+    Pages that want client navigation caching can opt in explicitly with a
+    ``cache`` config entry; the safe default is to stay fresh.
     """
     cache = getattr(settings, "cache", None)
-    if cache is None:
-        return None
-    return cache.max_age_for(path)
+    config_ttl = cache.max_age_for(path) if cache is not None else None
+    if config_ttl is not None:
+        return config_ttl
+    if page is not None:
+        if page.cache_revalidate is not None:
+            return page.cache_revalidate
+        if page.has_loader:
+            return 0
+    return None
+
+
+def _attach_revalidate(response: Response, revalidate: float | None) -> None:
+    """Stamp a render's cache lifetime onto the response for the page handler.
+
+    The page handler reads :data:`REVALIDATE_HEADER` to decide the TTL under
+    which it stores the rendered HTML, then strips it before the response
+    reaches the client.
+    """
+    if revalidate is not None:
+        response.headers[REVALIDATE_HEADER] = f"{revalidate:g}"
 
 
 async def build_page_response(
@@ -115,9 +174,8 @@ async def build_page_response(
     renderer: ComponentRenderer,
     overlay: OverlayManager | None = None,
     error_boundaries: ErrorBoundaryRegistry | None = None,
+    suppress_per_user: bool = False,
 ) -> Response:
-    from pyxle.runtime import LoaderError
-
     if settings.debug:
         _purge_page_modules(settings.pages_dir)
     loader_breadcrumb = _initial_loader_breadcrumb(page)
@@ -129,9 +187,10 @@ async def build_page_response(
             page=page,
             renderer=renderer,
             loader_breadcrumb=loader_breadcrumb,
+            suppress_per_user=suppress_per_user,
         )
         script_nonce = secrets.token_urlsafe(24)
-        nav_cache_ttl = _resolve_nav_cache_ttl(settings, request.url.path)
+        nav_cache_ttl = _resolve_nav_cache_ttl(settings, request.url.path, page=page)
         try:
             shell = build_document_shell(
                 settings=settings,
@@ -141,6 +200,7 @@ async def build_page_response(
                 head_elements=artifacts.head_elements,
                 inline_styles=artifacts.inline_styles,
                 nav_cache_ttl=nav_cache_ttl,
+                auth_seed=_auth_seed_for_request(request),
             )
         except ManifestLookupError:
             document = render_document(
@@ -152,10 +212,15 @@ async def build_page_response(
                 head_elements=artifacts.head_elements,
                 inline_styles=artifacts.inline_styles,
                 nav_cache_ttl=nav_cache_ttl,
+                auth_seed=_auth_seed_for_request(request),
             )
             if overlay is not None:
                 await overlay.notify_clear(route_path=page.path)
-            return HTMLResponse(document, status_code=artifacts.status_code)
+            fallback_response: Response = HTMLResponse(
+                document, status_code=artifacts.status_code
+            )
+            _attach_revalidate(fallback_response, artifacts.revalidate)
+            return fallback_response
 
         async def _document_stream():
             yield shell.prefix.encode("utf-8")
@@ -164,100 +229,57 @@ async def build_page_response(
 
         if overlay is not None:
             await overlay.notify_clear(route_path=page.path)
-        return StreamingResponse(
+        streamed_response: Response = StreamingResponse(
             _document_stream(),
             status_code=artifacts.status_code,
             media_type="text/html",
         )
-    except LoaderError as exc:
-        # Structured loader error — try the nearest error boundary.
+        _attach_revalidate(streamed_response, artifacts.revalidate)
+        return streamed_response
+    except Exception as exc:
+        return await _handle_render_exception(
+            exc,
+            request=request,
+            settings=settings,
+            page=page,
+            renderer=renderer,
+            error_boundaries=error_boundaries,
+            overlay=overlay,
+            loader_breadcrumb=loader_breadcrumb,
+        )
+
+
+async def _handle_render_exception(
+    exc: BaseException,
+    *,
+    request: Request,
+    settings: DevServerSettings,
+    page: PageRoute,
+    renderer: ComponentRenderer,
+    error_boundaries: ErrorBoundaryRegistry | None,
+    overlay: OverlayManager | None,
+    loader_breadcrumb: dict[str, str],
+) -> Response:
+    """Map a render-pipeline exception to an error-boundary or sanitized page.
+
+    Shared by the buffered and streaming page builders so both honour the same
+    error-boundary contract. Known render-stage exceptions try the nearest
+    ``error.pyxl`` first; any unexpected fault returns the sanitized fallback
+    without exposing internals.
+    """
+    from pyxle.runtime import LoaderError
+
+    if isinstance(exc, LoaderError):
+        stage, status_code = "loader", exc.status_code
         loader_breadcrumb = _make_loader_breadcrumb(page, status="failed", detail=str(exc))
-        if overlay is not None:
-            await overlay.notify_error(
-                route_path=page.path,
-                error=exc,
-                breadcrumbs=_compose_breadcrumbs(loader_breadcrumb, stage="loader", message=str(exc)),
-            )
-        boundary_response = await _try_error_boundary(
-            request=request,
-            settings=settings,
-            renderer=renderer,
-            error_boundaries=error_boundaries,
-            route_path=page.path,
-            error=exc,
-            status_code=exc.status_code,
-        )
-        if boundary_response is not None:
-            return boundary_response
-        return _error_response(
-            settings=settings, page=page, stage="loader", error=exc,
-            status_code=exc.status_code,
-        )
-    except LoaderExecutionError as exc:
+    elif isinstance(exc, LoaderExecutionError):
+        stage, status_code = "loader", 500
         loader_breadcrumb = _make_loader_breadcrumb(page, status="failed", detail=str(exc))
-        if overlay is not None:
-            await overlay.notify_error(
-                route_path=page.path,
-                error=exc,
-                breadcrumbs=_compose_breadcrumbs(loader_breadcrumb, stage="loader", message=str(exc)),
-            )
-        boundary_response = await _try_error_boundary(
-            request=request,
-            settings=settings,
-            renderer=renderer,
-            error_boundaries=error_boundaries,
-            route_path=page.path,
-            error=exc,
-            status_code=500,
-        )
-        if boundary_response is not None:
-            return boundary_response
-        return _error_response(
-            settings=settings, page=page, stage="loader", error=exc, status_code=500,
-        )
-    except HeadEvaluationError as exc:
-        if overlay is not None:
-            await overlay.notify_error(
-                route_path=page.path,
-                error=exc,
-                breadcrumbs=_compose_breadcrumbs(loader_breadcrumb, stage="server", message=str(exc)),
-            )
-        boundary_response = await _try_error_boundary(
-            request=request,
-            settings=settings,
-            renderer=renderer,
-            error_boundaries=error_boundaries,
-            route_path=page.path,
-            error=exc,
-            status_code=500,
-        )
-        if boundary_response is not None:
-            return boundary_response
-        return _error_response(
-            settings=settings, page=page, stage="server", error=exc, status_code=500,
-        )
-    except ComponentRenderError as exc:
-        if overlay is not None:
-            await overlay.notify_error(
-                route_path=page.path,
-                error=exc,
-                breadcrumbs=_compose_breadcrumbs(loader_breadcrumb, stage="renderer", message=str(exc)),
-            )
-        boundary_response = await _try_error_boundary(
-            request=request,
-            settings=settings,
-            renderer=renderer,
-            error_boundaries=error_boundaries,
-            route_path=page.path,
-            error=exc,
-            status_code=500,
-        )
-        if boundary_response is not None:
-            return boundary_response
-        return _error_response(
-            settings=settings, page=page, stage="renderer", error=exc, status_code=500,
-        )
-    except Exception as exc:  # pragma: no cover - defensive guardrail
+    elif isinstance(exc, HeadEvaluationError):
+        stage, status_code = "server", 500
+    elif isinstance(exc, ComponentRenderError):
+        stage, status_code = "renderer", 500
+    else:  # pragma: no cover - defensive guardrail for unexpected faults
         if overlay is not None:
             await overlay.notify_error(
                 route_path=page.path,
@@ -266,6 +288,170 @@ async def build_page_response(
             )
         return _error_response(
             settings=settings, page=page, stage="server", error=exc, status_code=500,
+        )
+
+    if overlay is not None:
+        await overlay.notify_error(
+            route_path=page.path,
+            error=exc,
+            breadcrumbs=_compose_breadcrumbs(loader_breadcrumb, stage=stage, message=str(exc)),
+        )
+    boundary_response = await _try_error_boundary(
+        request=request,
+        settings=settings,
+        renderer=renderer,
+        error_boundaries=error_boundaries,
+        route_path=page.path,
+        error=exc,
+        status_code=status_code,
+    )
+    if boundary_response is not None:
+        return boundary_response
+    return _error_response(
+        settings=settings, page=page, stage=stage, error=exc, status_code=status_code,
+    )
+
+
+async def _first_stream_frame(frames) -> dict[str, Any]:
+    """Pull the first frame from a render stream.
+
+    An empty stream is treated as a terminal ``end`` so the caller emits an
+    empty (but valid) document rather than hanging.
+    """
+    try:
+        return await frames.__anext__()
+    except StopAsyncIteration:  # pragma: no cover - a live worker always emits
+        return {"type": "end"}
+
+
+async def build_streaming_page_response(
+    *,
+    request: Request,
+    settings: DevServerSettings,
+    page: PageRoute,
+    renderer: ComponentRenderer,
+    stream_render: Callable[..., Any],
+    overlay: OverlayManager | None = None,
+    error_boundaries: ErrorBoundaryRegistry | None = None,
+    suppress_per_user: bool = False,
+) -> Response:
+    """Render *page* as a streamed HTML response via ``renderToPipeableStream``.
+
+    Used for pages that opt into streaming (a ``<Suspense>`` boundary or a
+    ``loading.pyxl``). The document head is flushed from the static HEAD before
+    the React shell renders; the shell and any Suspense boundaries stream in;
+    the hydration scripts come last. A shell-level failure (an error before the
+    first byte) falls back to the error boundary exactly like the buffered path
+    — no partial document is ever emitted in that case.
+
+    ``stream_render`` is the worker pool's ``render_stream`` async generator
+    callable. ``renderer`` is still used for the error-boundary fallback render.
+    """
+    if settings.debug:
+        _purge_page_modules(settings.pages_dir)
+    loader_breadcrumb = _initial_loader_breadcrumb(page)
+
+    try:
+        from pyxle.ssr.head_merger import merge_head_elements
+
+        prelude = await _create_streaming_prelude(
+            request=request,
+            settings=settings,
+            page=page,
+            loader_breadcrumb=loader_breadcrumb,
+            suppress_per_user=suppress_per_user,
+        )
+        # Streaming flushes the head before the component renders, so only the
+        # static HEAD (the HEAD variable + JSX/layout <Head> blocks) can appear.
+        # Runtime <Head> registered during render arrives too late and is
+        # intentionally omitted — a documented streaming limitation.
+        static_head = merge_head_elements(
+            head_variable=prelude.head_elements,
+            head_jsx_blocks=page.head_jsx_blocks,
+            layout_head_jsx_blocks=prelude.layout_head_jsx_blocks,
+            runtime_head_blocks=(),
+        )
+        script_nonce = secrets.token_urlsafe(24)
+        nav_cache_ttl = _resolve_nav_cache_ttl(settings, request.url.path, page=page)
+        try:
+            shell = build_document_shell(
+                settings=settings,
+                page=page,
+                props=prelude.component_props,
+                script_nonce=script_nonce,
+                head_elements=static_head,
+                inline_styles=(),
+                nav_cache_ttl=nav_cache_ttl,
+                auth_seed=_auth_seed_for_request(request),
+            )
+        except ManifestLookupError:
+            # No client manifest to link the hydration bundle — fall back to the
+            # buffered path, which has its own dev-mode document assembly.
+            return await build_page_response(
+                request=request,
+                settings=settings,
+                page=page,
+                renderer=renderer,
+                overlay=overlay,
+                error_boundaries=error_boundaries,
+                suppress_per_user=suppress_per_user,
+            )
+
+        # Await the first frame *before* sending any bytes so a shell error maps
+        # to the error boundary instead of a half-written document.
+        frames = stream_render(
+            page.client_module_path,
+            prelude.component_props,
+            request_pathname=request.url.path,
+            csrf_token=prelude.csrf_token,
+            fallback_path=(
+                page.loading_boundary.client_module_path
+                if page.loading_boundary is not None
+                else None
+            ),
+        )
+        first_frame = await _first_stream_frame(frames)
+        if first_frame.get("type") == "error":
+            await frames.aclose()
+            raise ComponentRenderError(
+                first_frame.get("error")
+                or "Streaming render failed before the first byte"
+            )
+
+        if overlay is not None:
+            await overlay.notify_clear(route_path=page.path)
+
+        async def _document_stream():
+            yield shell.prefix.encode("utf-8")
+            if first_frame.get("type") == "chunk":
+                yield first_frame["html"].encode("utf-8")
+            async for frame in frames:
+                if frame.get("type") == "chunk":
+                    yield frame["html"].encode("utf-8")
+                else:
+                    # Terminal end/error frame: the body is complete (React has
+                    # already streamed any Suspense fallbacks on a mid-stream
+                    # error). Stop reading the body.
+                    break
+            yield shell.suffix.encode("utf-8")
+
+        response: Response = StreamingResponse(
+            _document_stream(),
+            status_code=prelude.status_code,
+            media_type="text/html",
+        )
+        _attach_revalidate(response, prelude.revalidate)
+        return response
+    except Exception as exc:
+        return await _handle_render_exception(
+            exc,
+            request=request,
+            settings=settings,
+            page=page,
+            renderer=renderer,
+            error_boundaries=error_boundaries,
+            overlay=overlay,
+            loader_breadcrumb=loader_breadcrumb,
         )
 
 
@@ -285,32 +471,80 @@ async def build_page_navigation_response(
     loader_breadcrumb = _initial_loader_breadcrumb(page)
 
     try:
-        artifacts = await _create_page_artifacts(
-            request=request,
-            settings=settings,
-            page=page,
-            renderer=renderer,
-            loader_breadcrumb=loader_breadcrumb,
-        )
+        if page.uses_suspense or page.loading_boundary is not None:
+            # A streaming-eligible page can't be rendered buffered to extract its
+            # head — renderToString throws on a suspending component — and its
+            # runtime <Head> wouldn't reach the flushed head anyway. Build the nav
+            # payload from the loader + static head only, mirroring the initial
+            # streamed load. The client renders the body itself (wrapping in the
+            # loading boundary via loadingAssetPath), so no server body render is
+            # needed here.
+            from pyxle.ssr.head_merger import merge_head_elements
+
+            prelude = await _create_streaming_prelude(
+                request=request,
+                settings=settings,
+                page=page,
+                loader_breadcrumb=loader_breadcrumb,
+                suppress_per_user=False,
+            )
+            static_head = merge_head_elements(
+                head_variable=prelude.head_elements,
+                head_jsx_blocks=page.head_jsx_blocks,
+                layout_head_jsx_blocks=prelude.layout_head_jsx_blocks,
+                runtime_head_blocks=(),
+            )
+            nav_status_code = prelude.status_code
+            nav_component_props = prelude.component_props
+            nav_head_markup = render_head_markup(static_head)
+        else:
+            artifacts = await _create_page_artifacts(
+                request=request,
+                settings=settings,
+                page=page,
+                renderer=renderer,
+                loader_breadcrumb=loader_breadcrumb,
+            )
+            nav_status_code = artifacts.status_code
+            nav_component_props = artifacts.component_props
+            nav_head_markup = artifacts.head_markup
+
         if overlay is not None:
             await overlay.notify_clear(route_path=page.path)
         payload = {
             "ok": True,
             "routePath": page.path,
             "requestedPath": request.url.path,
-            "statusCode": artifacts.status_code,
+            "statusCode": nav_status_code,
             "page": {
                 "clientAssetPath": page.client_asset_path,
                 "moduleKey": page.module_key,
+                # The nearest loading.pyxl's client asset (or None). Carried
+                # per-route so a client-side navigation wraps the target page in
+                # the same loading boundary the server would — no stale global.
+                "loadingAssetPath": (
+                    page.loading_boundary.client_asset_path
+                    if page.loading_boundary is not None
+                    else None
+                ),
+                # The nearest error.pyxl's client asset (or None). Carried
+                # per-route so a client-side render fault on the navigated-to
+                # page renders the same error.pyxl the server would — the
+                # client error boundary's fallback, kept in lockstep per route.
+                "errorAssetPath": (
+                    page.error_boundary.client_asset_path
+                    if page.error_boundary is not None
+                    else None
+                ),
             },
-            "props": artifacts.component_props,
-            "headMarkup": artifacts.head_markup,
+            "props": nav_component_props,
+            "headMarkup": nav_head_markup,
             # Per-page client navigation-cache lifetime (seconds). Mirrors the
             # page's edge-cache TTL so prefetched data stays fresh exactly as
             # long as the CDN would serve it; ``None`` → client default.
-            "navCacheTtlSeconds": _resolve_nav_cache_ttl(settings, request.url.path),
+            "navCacheTtlSeconds": _resolve_nav_cache_ttl(settings, request.url.path, page=page),
         }
-        return JSONResponse(payload, status_code=artifacts.status_code)
+        return JSONResponse(payload, status_code=nav_status_code)
     except LoaderError as exc:
         loader_breadcrumb = _make_loader_breadcrumb(page, status="failed", detail=str(exc))
         return await _navigation_error_response(
@@ -407,6 +641,7 @@ async def build_not_found_response(
             script_nonce=script_nonce,
             head_elements=artifacts.head_elements,
             inline_styles=artifacts.inline_styles,
+            auth_seed=_auth_seed_for_request(request),
         )
         return HTMLResponse(document, status_code=404)
     except Exception:
@@ -415,15 +650,32 @@ async def build_not_found_response(
         return None
 
 
+def _record_render_metric(request: Request, kind: str, duration_ms: float) -> None:
+    """Record a loader or SSR-render duration into the metrics registry, if any.
+
+    ``kind`` is ``"loader"`` or ``"render"``. A no-op when no registry is bound
+    to the request's app (e.g. in unit tests that build a bare Starlette app).
+    """
+    from pyxle.observability.metrics import get_metrics  # noqa: PLC0415
+
+    registry = get_metrics(request)
+    if registry is None:
+        return
+    if kind == "loader":
+        registry.observe_loader(duration_ms)
+    else:
+        registry.observe_render(duration_ms)
+
+
 async def _execute_loader(
     page: PageRoute,
     request: Request,
     *,
     module: Any | None,
     debug: bool = False,
-) -> Tuple[dict[str, Any], int, Any | None]:
+) -> Tuple[dict[str, Any], int, float | None, Any | None]:
     if not page.has_loader:
-        return {}, 200, module
+        return {}, 200, None, module
 
     if module is None:
         module = _import_server_module(page.module_key, page.server_module_path, debug=debug)
@@ -433,12 +685,17 @@ async def _execute_loader(
             f"Loader '{page.loader_name}' not found in module {page.module_key}"
         )
 
-    result = loader(request)
-    if hasattr(result, "__await__"):
-        result = await result  # type: ignore[assignment]
+    from pyxle.observability.otel import span  # noqa: PLC0415
 
-    payload, status_code = _normalize_loader_result(result, page)
-    return payload, status_code, module
+    _loader_start = time.perf_counter()
+    with span("loader"):
+        result = loader(request)
+        if hasattr(result, "__await__"):
+            result = await result  # type: ignore[assignment]
+    _record_render_metric(request, "loader", (time.perf_counter() - _loader_start) * 1000.0)
+
+    payload, status_code, revalidate = _normalize_loader_result(result, page)
+    return payload, status_code, revalidate, module
 
 
 async def _execute_layout_loaders(
@@ -501,8 +758,33 @@ def _resolve_head_elements(
     return _normalize_head_entries(page, head_value)
 
 
-def _normalize_loader_result(result: Any, page: PageRoute) -> Tuple[dict[str, Any], int]:
+def _coerce_revalidate(value: Any, page: PageRoute) -> float | None:
+    """Validate a loader's ``revalidate`` hint.
+
+    ``None`` means "cache until explicitly invalidated"; a non-negative number
+    is the freshness window in seconds. Anything else (a bool, a negative, a
+    string) is a programming error surfaced as a structured loader failure
+    rather than silently caching forever or not at all.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise LoaderExecutionError(
+            f"Loader for {page.path} returned revalidate={value!r}; "
+            "expected a non-negative number of seconds or None"
+        )
+    if value < 0:
+        raise LoaderExecutionError(
+            f"Loader for {page.path} returned a negative revalidate ({value})"
+        )
+    return float(value)
+
+
+def _normalize_loader_result(
+    result: Any, page: PageRoute
+) -> Tuple[dict[str, Any], int, float | None]:
     status_code = 200
+    revalidate: float | None = None
     payload = result
 
     if isinstance(result, tuple) and result:
@@ -510,12 +792,24 @@ def _normalize_loader_result(result: Any, page: PageRoute) -> Tuple[dict[str, An
         if len(result) > 1:
             status_code = int(result[1])
 
+    # ``{data, revalidate}`` envelope: a loader may declare its own cache
+    # lifetime (ROADMAP 2.1). Recognised only in its exact two-key shape so an
+    # ordinary loader returning "data"/"revalidate" as page props is never
+    # mistaken for a cache directive.
+    if (
+        isinstance(payload, Mapping)
+        and set(payload) == {"data", "revalidate"}
+        and isinstance(payload["data"], Mapping)
+    ):
+        revalidate = _coerce_revalidate(payload["revalidate"], page)
+        payload = payload["data"]
+
     if not isinstance(payload, Mapping):
         raise LoaderExecutionError(
             f"Loader for {page.path} must return a mapping or (mapping, status_code) tuple"
         )
 
-    return dict(payload), status_code
+    return dict(payload), status_code, revalidate
 
 
 def _compose_component_props(
@@ -526,6 +820,25 @@ def _compose_component_props(
     if layout_data:
         props["layoutData"] = layout_data
     return props
+
+
+def _auth_seed_for_request(request: Request) -> Any:
+    """Pluck the auth seed an auth provider stashed on the request scope.
+
+    The pyxle-auth session middleware publishes ``scope["pyxle.auth"]`` as
+    ``{"user": ..., "endpoints": {...}}``. SSR forwards it to
+    ``window.__PYXLE_AUTH__`` so the client ``useAuth`` hook shows the
+    signed-in user on the first frame and finds the (possibly relocated) auth
+    endpoints.
+
+    Returns the ABSENT sentinel when no provider populated the scope (or set
+    it to a non-object value), so the document emits no seed script and
+    ``useAuth`` resolves over the network.
+    """
+    seed = request.scope.get("pyxle.auth")
+    if isinstance(seed, dict):
+        return seed
+    return _AUTH_SEED_ABSENT
 
 
 def _csrf_token_for_request(request: Request) -> str | None:
@@ -547,21 +860,28 @@ def _csrf_token_for_request(request: Request) -> str | None:
     return None
 
 
-async def _create_page_artifacts(
+async def _create_streaming_prelude(
     *,
     request: Request,
     settings: DevServerSettings,
     page: PageRoute,
-    renderer: ComponentRenderer,
     loader_breadcrumb: dict[str, str],
-) -> PageArtifacts:
+    suppress_per_user: bool,
+) -> _StreamingPrelude:
+    """Run the loader and resolve everything known before the component renders.
+
+    Shared by the buffered and streaming paths: the loader, the (static) HEAD,
+    layout data, composed props, and the per-request CSRF token. The streaming
+    path uses this to flush the document head before the React shell renders;
+    the buffered path follows it with a render and a runtime-``<Head>`` merge.
+    """
     module = None
     if page.head_is_dynamic:
         module = _import_server_module(
             page.module_key, page.server_module_path, debug=settings.debug,
         )
 
-    loader_props, status_code, module = await _execute_loader(
+    loader_props, status_code, revalidate, module = await _execute_loader(
         page,
         request,
         module=module,
@@ -574,9 +894,7 @@ async def _create_page_artifacts(
 
     head_elements = _resolve_head_elements(page, module, loader_props, debug=settings.debug)
 
-    # Merge HEAD variable with JSX Head blocks and layout head blocks
     from pyxle.devserver.registry import find_layout_head_jsx_blocks
-    from pyxle.ssr.head_merger import merge_head_elements
 
     layout_head_jsx_blocks = find_layout_head_jsx_blocks(settings, page.source_relative_path)
 
@@ -588,34 +906,74 @@ async def _create_page_artifacts(
     )
 
     component_props = _compose_component_props(loader_props, layout_data)
-    render_result = await renderer.render(
-        page.client_module_path,
-        component_props,
-        request_pathname=request.url.path,
-        csrf_token=_csrf_token_for_request(request),
+    # On a publicly-cacheable render, suppress the per-user CSRF token so the
+    # shared cached body never carries one user's token (<Form> falls back to
+    # the cookie/header JS path).
+    csrf_token = None if suppress_per_user else _csrf_token_for_request(request)
+
+    return _StreamingPrelude(
+        component_props=component_props,
+        head_elements=head_elements,
+        layout_head_jsx_blocks=layout_head_jsx_blocks,
+        status_code=status_code,
+        revalidate=revalidate,
+        csrf_token=csrf_token,
     )
+
+
+async def _create_page_artifacts(
+    *,
+    request: Request,
+    settings: DevServerSettings,
+    page: PageRoute,
+    renderer: ComponentRenderer,
+    loader_breadcrumb: dict[str, str],
+    suppress_per_user: bool = False,
+) -> PageArtifacts:
+    from pyxle.ssr.head_merger import merge_head_elements
+
+    prelude = await _create_streaming_prelude(
+        request=request,
+        settings=settings,
+        page=page,
+        loader_breadcrumb=loader_breadcrumb,
+        suppress_per_user=suppress_per_user,
+    )
+
+    from pyxle.observability.otel import span  # noqa: PLC0415
+
+    _render_start = time.perf_counter()
+    with span("ssr.render"):
+        render_result = await renderer.render(
+            page.client_module_path,
+            prelude.component_props,
+            request_pathname=request.url.path,
+            csrf_token=prelude.csrf_token,
+        )
+    _record_render_metric(request, "render", (time.perf_counter() - _render_start) * 1000.0)
     body_html = render_result.html
     inline_styles = render_result.inline_styles
-    
+
     # Convert runtime-extracted head elements (from <Head> components) to blocks
     runtime_head_blocks = list(render_result.head_elements)
-    
+
     merged_head_elements = merge_head_elements(
-        head_variable=head_elements,
+        head_variable=prelude.head_elements,
         head_jsx_blocks=page.head_jsx_blocks,
-        layout_head_jsx_blocks=layout_head_jsx_blocks,
+        layout_head_jsx_blocks=prelude.layout_head_jsx_blocks,
         runtime_head_blocks=tuple(runtime_head_blocks),
     )
-    
+
     head_markup = render_head_markup(merged_head_elements)
 
     return PageArtifacts(
-        component_props=component_props,
+        component_props=prelude.component_props,
         body_html=body_html,
         head_elements=merged_head_elements,
         head_markup=head_markup,
         inline_styles=inline_styles,
-        status_code=status_code,
+        status_code=prelude.status_code,
+        revalidate=prelude.revalidate,
     )
 
 
@@ -657,14 +1015,18 @@ async def _try_error_boundary(
         return None
 
     # Build error context that the error page component receives as props.
-    error_context = _build_error_context(error, status_code)
+    error_context = _build_error_context(error, status_code, debug=settings.debug)
 
     try:
+        _boundary_render_start = time.perf_counter()
         render_result = await renderer.render(
             boundary_page.client_module_path,
             {"error": error_context},
             request_pathname=request.url.path,
             csrf_token=_csrf_token_for_request(request),
+        )
+        _record_render_metric(
+            request, "render", (time.perf_counter() - _boundary_render_start) * 1000.0
         )
         script_nonce = secrets.token_urlsafe(24)
         head_elements = boundary_page.head_elements
@@ -676,6 +1038,7 @@ async def _try_error_boundary(
             script_nonce=script_nonce,
             head_elements=head_elements,
             inline_styles=render_result.inline_styles,
+            auth_seed=_auth_seed_for_request(request),
         )
         return HTMLResponse(document, status_code=status_code)
     except Exception:
@@ -684,8 +1047,22 @@ async def _try_error_boundary(
         return None
 
 
-def _build_error_context(error: BaseException, status_code: int) -> dict[str, Any]:
-    """Build the error context dict passed as component props to error.pyxl."""
+def _build_error_context(
+    error: BaseException, status_code: int, *, debug: bool
+) -> dict[str, Any]:
+    """Build the error context dict passed as component props to ``error.pyxl``.
+
+    Author-raised :class:`~pyxle.runtime.LoaderError` /
+    :class:`~pyxle.runtime.ActionError` messages are intentional, user-facing
+    copy, so they pass through verbatim in every environment (along with any
+    ``data`` payload). For any *other* exception the message originates inside
+    the framework or the Node SSR runtime and may carry a stack trace, file
+    path, row ID, or secret. In production (``debug=False``) such messages are
+    replaced with a generic string so an ``error.pyxl`` boundary never leaks
+    internals (CLAUDE.md rule 18); in development they are surfaced (redacted
+    for obvious secrets, mirroring the dev error overlay and
+    :func:`_navigation_error_response`).
+    """
     from pyxle.runtime import ActionError, LoaderError
 
     context: dict[str, Any] = {
@@ -698,6 +1075,21 @@ def _build_error_context(error: BaseException, status_code: int) -> dict[str, An
         context["message"] = error.message
         if error.data:
             context["data"] = error.data
+        return context
+
+    if debug:
+        from pyxle.devserver._security import redact_sensitive_patterns  # noqa: PLC0415
+
+        context["message"] = redact_sensitive_patterns(
+            str(error) or error.__class__.__name__
+        )
+    else:
+        context["message"] = "An unexpected error occurred."
+        # Hide the exception class name too: a third-party class
+        # (e.g. ``InsufficientPrivilege``) can itself disclose which internal
+        # subsystem failed. Mirror the JSON nav-error path, which uses
+        # "ServerError" in production for non-author exceptions.
+        context["type"] = "ServerError"
 
     return context
 

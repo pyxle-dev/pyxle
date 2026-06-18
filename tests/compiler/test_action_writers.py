@@ -8,6 +8,7 @@ from pyxle.compiler.writers import (
     ensure_action_error_import,
     ensure_action_import,
     ensure_server_action_import,
+    ensure_validation_action_error_import,
 )
 
 
@@ -215,3 +216,52 @@ class TestEnsureActionErrorImport:
         )
         func_idx = next(i for i, line in enumerate(lines) if "async def save" in line)
         assert future_idx < import_idx < func_idx
+
+
+class TestEnsureValidationActionErrorImport:
+    """Pages with ``@action`` also get ``ValidationActionError`` auto-imported,
+    so a handler can ``raise ValidationActionError(fields=...)`` for hand-rolled
+    field errors without an import. Independent of ``ActionError`` — a
+    user-owned name suppresses only its own injection."""
+
+    def test_adds_import_when_missing(self) -> None:
+        source = "async def save(request):\n    pass\n"
+        result = ensure_validation_action_error_import(source)
+        assert "from pyxle.runtime import ValidationActionError" in result
+
+    def test_no_duplicate_when_already_present(self) -> None:
+        source = (
+            "from pyxle.runtime import ValidationActionError\n"
+            "async def save(request):\n    pass\n"
+        )
+        result = ensure_validation_action_error_import(source)
+        assert result.count("from pyxle.runtime import ValidationActionError") == 1
+
+    def test_empty_source_returned_unchanged(self) -> None:
+        assert ensure_validation_action_error_import("") == ""
+
+    def test_respects_existing_combined_import(self) -> None:
+        source = (
+            "from pyxle.runtime import action, ValidationActionError\n"
+            "async def save(request):\n    pass\n"
+        )
+        assert ensure_validation_action_error_import(source) == source
+
+    def test_does_not_shadow_local_class(self) -> None:
+        source = (
+            "class ValidationActionError(Exception):\n    pass\n"
+            "async def save(request):\n    pass\n"
+        )
+        result = ensure_validation_action_error_import(source)
+        assert "from pyxle.runtime import ValidationActionError" not in result
+
+    def test_independent_of_action_error(self) -> None:
+        # A page that imports ActionError but not ValidationActionError still
+        # gets the validation subclass injected (and ActionError untouched).
+        source = (
+            "from pyxle.runtime import ActionError\n"
+            "async def save(request):\n    pass\n"
+        )
+        result = ensure_validation_action_error_import(source)
+        assert "from pyxle.runtime import ValidationActionError" in result
+        assert result.count("from pyxle.runtime import ActionError") == 1

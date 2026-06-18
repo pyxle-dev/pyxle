@@ -291,7 +291,12 @@ The Node.js worker:
 2. **Evaluates the bundle in a fresh context.** The default export is
    the React component function.
 3. **Calls `react-dom/server.renderToString`.** This produces a
-   plain HTML string from the component tree.
+   plain HTML string from the component tree. (A request flagged
+   `stream: true` instead drives `renderToPipeableStream` and replies
+   with a sequence of `chunk`/`end`/`error` frames sharing the request
+   id — see [Streaming SSR](../guides/streaming.md). The buffered
+   `renderToString` path described here remains the default for every
+   non-streaming, cacheable, and statically generated render.)
 4. **Collects head elements emitted by `<Head>` blocks.** When the
    component renders a `<Head>...</Head>` block, the runtime
    captures the children and returns them separately (so they can

@@ -35,6 +35,12 @@ class DocumentShell:
   suffix: str
 
 
+# Sentinel for "no auth seed on this request" — distinct from a seed whose
+# ``user`` is ``None`` (an authenticated-middleware request for an anonymous
+# visitor, which we DO emit so the client knows it is definitively logged out).
+_AUTH_SEED_ABSENT: Any = object()
+
+
 class ManifestLookupError(RuntimeError):
   """Raised when manifest-backed assets cannot be resolved."""
 
@@ -49,6 +55,7 @@ def render_document(
   head_elements: tuple[str, ...],
   inline_styles: tuple[InlineStyleFragment, ...] = tuple(),
   nav_cache_ttl: int | None = None,
+  auth_seed: Any = _AUTH_SEED_ABSENT,
 ) -> str:
   """Compose the HTML document for a rendered page."""
   try:
@@ -60,6 +67,7 @@ def render_document(
       head_elements=head_elements,
       inline_styles=inline_styles,
       nav_cache_ttl=nav_cache_ttl,
+      auth_seed=auth_seed,
     )
   except ManifestLookupError:
     return _render_manifest_error(page)
@@ -75,9 +83,30 @@ def build_document_shell(
   head_elements: tuple[str, ...],
   inline_styles: tuple[InlineStyleFragment, ...] = tuple(),
   nav_cache_ttl: int | None = None,
+  auth_seed: Any = _AUTH_SEED_ABSENT,
 ) -> DocumentShell:
   props_payload = _serialize_props(props)
   page_path_literal = json.dumps(page.client_asset_path)
+  # The nearest loading.pyxl's client asset (or null). The client hydration
+  # entry reads this to wrap the page in the SAME <Suspense fallback={<Loading/>}>
+  # the streaming server emitted — one descriptor drives both sides, so the
+  # boundary structure can never diverge.
+  loading_boundary = getattr(page, "loading_boundary", None)
+  loading_asset_literal = (
+    json.dumps(loading_boundary.client_asset_path)
+    if loading_boundary is not None
+    else "null"
+  )
+  # The nearest error.pyxl's client asset (or null). The client hydration entry
+  # reads this to wrap the page in a React error boundary whose fallback is that
+  # error.pyxl — client-side render faults then render the same page the server
+  # already renders on a loader/SSR failure.
+  error_boundary = getattr(page, "error_boundary", None)
+  error_asset_literal = (
+    json.dumps(error_boundary.client_asset_path)
+    if error_boundary is not None
+    else "null"
+  )
   head_injections = render_head_markup(head_elements)
   # Seed payload for the client navigation cache. Lets the page the user
   # landed on satisfy its own prefetch (the active self-link) from cache
@@ -102,6 +131,10 @@ def build_document_shell(
   # When the app customises ``csrf.cookieName`` / ``csrf.headerName``, expose
   # the names to the client runtime. Absent → the framework defaults.
   csrf_names_script = _render_csrf_names_script(settings, nonce_attr)
+  # When an auth provider published a seed on the request scope, expose the
+  # signed-in user + endpoint map to the client ``useAuth`` hook. Absent → no
+  # script (``useAuth`` resolves over the network).
+  auth_seed_script = _render_auth_seed_script(auth_seed, nonce_attr)
 
   if not settings.debug and settings.page_manifest is not None:
     manifest_entry = settings.page_manifest.get(page.path)
@@ -121,7 +154,22 @@ def build_document_shell(
           css_links.append(f'<link rel="stylesheet" href="/client/{asset.lstrip("/")}" />')
     css_html = "".join(f"\n    {link}" for link in css_links)
     js_src = f"/client/{js_file.lstrip('/')}"
-    
+
+    # Preload the entry module and the chunks it imports, so the browser fetches
+    # them in parallel with HTML parsing instead of after parsing the entry
+    # (the <script> tag sits at the end of the body). Vite's automatic
+    # modulePreload only applies to index.html builds, not our SSR output, so we
+    # inject these from the build manifest's import graph.
+    preload_links = [f'<link rel="modulepreload" href="{js_src}" />']
+    js_imports = client_info.get("imports", [])
+    if isinstance(js_imports, list):
+      for imp in js_imports:
+        if isinstance(imp, str) and imp:
+          preload_links.append(
+            f'<link rel="modulepreload" href="/client/{imp.lstrip("/")}" />'
+          )
+    preload_html = "".join(f"\n    {link}" for link in preload_links)
+
     before_interactive_scripts = _render_before_interactive_scripts(page.scripts, nonce_attr)
     scripts_metadata = _serialize_scripts_metadata(page.scripts)
 
@@ -129,10 +177,11 @@ def build_document_shell(
 <html lang=\"en\">
   <head>
   <meta charset=\"utf-8\" />
-  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />{css_html}{before_interactive_scripts}{global_styles}{inline_styles_markup}{head_block}
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />{preload_html}{css_html}{before_interactive_scripts}{global_styles}{inline_styles_markup}{head_block}
   </head>
   <body>
   <div id=\"root\">""".format(
+      preload_html=preload_html,
       css_html=css_html,
       before_interactive_scripts=before_interactive_scripts,
       global_styles=global_styles,
@@ -143,7 +192,9 @@ def build_document_shell(
   </div>
   <script id=\"__PYXLE_PROPS__\" type=\"application/json\"{nonce_attr}>{props_payload}</script>
   <script id=\"__PYXLE_NAV_SEED__\" type=\"application/json\"{nonce_attr}>{nav_seed_payload}</script>
-  <script{nonce_attr}>window.__PYXLE_PAGE_PATH__ = {page_path_literal};</script>{nav_stale_script}{csrf_names_script}
+  <script{nonce_attr}>window.__PYXLE_PAGE_PATH__ = {page_path_literal};</script>
+  <script{nonce_attr}>window.__PYXLE_LOADING_ASSET__ = {loading_asset_literal};</script>
+  <script{nonce_attr}>window.__PYXLE_ERROR_ASSET__ = {error_asset_literal};</script>{nav_stale_script}{csrf_names_script}{auth_seed_script}
   <script{nonce_attr}>window.__PYXLE_SCRIPTS__ = {scripts_metadata};</script>
   <script type=\"module\" src=\"{js_src}\"></script>
   </body>
@@ -153,9 +204,12 @@ def build_document_shell(
       props_payload=props_payload,
       nav_seed_payload=nav_seed_payload,
       page_path_literal=page_path_literal,
+      loading_asset_literal=loading_asset_literal,
+      error_asset_literal=error_asset_literal,
       scripts_metadata=scripts_metadata,
       nav_stale_script=nav_stale_script,
       csrf_names_script=csrf_names_script,
+      auth_seed_script=auth_seed_script,
       js_src=js_src,
     )
     return DocumentShell(prefix=prefix, suffix=suffix)
@@ -186,7 +240,9 @@ def build_document_shell(
   </div>
   <script id=\"__PYXLE_PROPS__\" type=\"application/json\"{nonce_attr}>{props_payload}</script>
   <script id=\"__PYXLE_NAV_SEED__\" type=\"application/json\"{nonce_attr}>{nav_seed_payload}</script>
-  <script{nonce_attr}>window.__PYXLE_PAGE_PATH__ = {page_path_literal};</script>{nav_stale_script}{csrf_names_script}
+  <script{nonce_attr}>window.__PYXLE_PAGE_PATH__ = {page_path_literal};</script>
+  <script{nonce_attr}>window.__PYXLE_LOADING_ASSET__ = {loading_asset_literal};</script>
+  <script{nonce_attr}>window.__PYXLE_ERROR_ASSET__ = {error_asset_literal};</script>{nav_stale_script}{csrf_names_script}{auth_seed_script}
   <script{nonce_attr}>window.__PYXLE_SCRIPTS__ = {scripts_metadata};</script>
   <script type=\"module\" src=\"{vite_origin}/client-entry.js\"></script>
   </body>
@@ -196,9 +252,12 @@ def build_document_shell(
     props_payload=props_payload,
     nav_seed_payload=nav_seed_payload,
     page_path_literal=page_path_literal,
+    loading_asset_literal=loading_asset_literal,
+    error_asset_literal=error_asset_literal,
     scripts_metadata=scripts_metadata,
     nav_stale_script=nav_stale_script,
     csrf_names_script=csrf_names_script,
+    auth_seed_script=auth_seed_script,
     vite_origin=vite_origin,
   )
   return DocumentShell(prefix=prefix, suffix=suffix)
@@ -253,6 +312,26 @@ def _render_csrf_names_script(settings: DevServerSettings, nonce_attr: str) -> s
     if not assignments:
         return ""
     return f"\n  <script{nonce_attr}>{' '.join(assignments)}</script>"
+
+
+def _render_auth_seed_script(auth_seed: Any, nonce_attr: str) -> str:
+    """Render the ``window.__PYXLE_AUTH__`` bootstrap script, or ``""``.
+
+    ``auth_seed`` is the JSON-serializable blob an auth provider published on
+    ``request.scope["pyxle.auth"]`` (the pyxle-auth plugin sets ``{"user":
+    ..., "endpoints": {...}}``). The client ``useAuth`` hook reads the global
+    to seed the signed-in user on the first frame and to discover the
+    (possibly relocated) auth endpoints. Absent → no script, and ``useAuth``
+    resolves the session over the network instead.
+    """
+    if auth_seed is _AUTH_SEED_ABSENT:
+        return ""
+    from pyxle.ssr._escape import escape_inline_json
+
+    payload = escape_inline_json(
+        json.dumps(auth_seed, ensure_ascii=False, separators=(",", ":"))
+    )
+    return f"\n  <script{nonce_attr}>window.__PYXLE_AUTH__ = {payload};</script>"
 
 
 def _serialize_js_string(value: str) -> str:

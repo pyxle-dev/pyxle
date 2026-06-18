@@ -97,6 +97,72 @@ class NavigationConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class RateLimitConfig:
+    """Token-bucket rate limit applied to incoming requests.
+
+    Disabled when ``requests`` is 0. ``requests`` is the burst capacity and
+    ``window_seconds`` the period over which a full bucket refills (so the
+    sustained rate is ``requests / window_seconds`` per second). The limit is
+    in-memory and per-process — see the middleware guide for the multi-worker
+    caveat.
+    """
+
+    requests: int = 0
+    window_seconds: float = 60.0
+    exempt_paths: tuple[str, ...] = ()
+    trust_forwarded_for: bool = False
+
+    @property
+    def enabled(self) -> bool:
+        return self.requests > 0
+
+
+@dataclass(frozen=True, slots=True)
+class ObservabilityConfig:
+    """Request observability: correlation IDs and request timing.
+
+    The defaults are deliberately *on* — generating a request id and reading
+    two ``perf_counter`` timestamps per request is sub-microsecond and adds no
+    I/O, while giving every request a correlation key (surfaced as the
+    ``request_id_header`` response header and on ``request.state.request_id``).
+
+    ``trust_incoming_request_id`` is off by default: echoing a client-supplied
+    id back into logs and downstream systems is a spoofing / log-injection
+    vector, so an incoming header is only honoured when an operator opts in
+    (typically behind a trusted reverse proxy). Heavier, exporter-style
+    observability (structured access logs, the metrics endpoint, OpenTelemetry)
+    is configured separately and stays off by default.
+    """
+
+    request_id: bool = True
+    request_id_header: str = "X-Request-Id"
+    trust_incoming_request_id: bool = False
+    timing: bool = True
+    # Prometheus metrics endpoint — off by default: it exposes internal state,
+    # so it must be turned on deliberately (and optionally bearer-guarded).
+    metrics_endpoint: bool = False
+    metrics_endpoint_path: str = "/api/__pyxle/metrics"
+    metrics_endpoint_token: str | None = None
+    # Structured access log — off by default so it doesn't surprise log
+    # scrapers. ``log_format`` is "console" or "json".
+    access_log: bool = False
+    log_format: str = "console"
+    log_level: str = "INFO"
+    # OpenTelemetry tracing — off by default and the heaviest dependency
+    # (requires the [observability-otel] extra). Sampling defaults low so a busy
+    # server isn't swamped; the exporter endpoint is read from the standard
+    # OTEL_EXPORTER_OTLP_ENDPOINT env var.
+    otel: bool = False
+    otel_service_name: str = "pyxle-app"
+    otel_sample_ratio: float = 0.05
+
+    @property
+    def enabled(self) -> bool:
+        """Whether any request-scoped instrumentation is active."""
+        return self.request_id or self.timing or self.metrics_endpoint or self.access_log
+
+
+@dataclass(frozen=True, slots=True)
 class PyxleConfig:
     """Resolved configuration values for a Pyxle project."""
 
@@ -111,12 +177,15 @@ class PyxleConfig:
     middleware: tuple[str, ...] = ()
     page_route_middleware: tuple[str, ...] = ()
     api_route_middleware: tuple[str, ...] = ()
+    action_route_middleware: tuple[str, ...] = ()
     global_styles: tuple[str, ...] = ()
     global_scripts: tuple[str, ...] = ()
     cors: CorsConfig = CorsConfig()
     csrf: CsrfConfig = CsrfConfig()
     cache: CacheConfig = CacheConfig()
     navigation: NavigationConfig = NavigationConfig()
+    rate_limit: RateLimitConfig = RateLimitConfig()
+    observability: ObservabilityConfig = ObservabilityConfig()
     # Plugin entries as the raw payload from ``pyxle.config.json`` —
     # either a bare string (``"pyxle-auth"``) or an object
     # (``{"name": "pyxle-auth", "settings": {...}}``). Resolved into
@@ -140,10 +209,13 @@ class PyxleConfig:
             "custom_middlewares": self.middleware,
             "page_route_hooks": self.page_route_middleware,
             "api_route_hooks": self.api_route_middleware,
+            "action_route_hooks": self.action_route_middleware,
             "cors": self.cors,
             "csrf": self.csrf,
             "cache": self.cache,
             "navigation": self.navigation,
+            "rate_limit": self.rate_limit,
+            "observability": self.observability,
             "plugins": self.plugins,
         }
 
@@ -161,6 +233,7 @@ class PyxleConfig:
             "routeMiddleware": {
                 "pages": list(self.page_route_middleware),
                 "apis": list(self.api_route_middleware),
+                "actions": list(self.action_route_middleware),
             },
             "styling": {
                 "globalStyles": list(self.global_styles),
@@ -249,6 +322,8 @@ def _parse_config_dict(data: Dict[str, Any], *, source: Path) -> PyxleConfig:
         "csrf",
         "cache",
         "navigation",
+        "rateLimit",
+        "observability",
         "plugins",
     }
     unknown_keys = set(data) - allowed_top_keys
@@ -273,7 +348,7 @@ def _parse_config_dict(data: Dict[str, Any], *, source: Path) -> PyxleConfig:
         )
 
     middleware_specs = _parse_middleware_list(data.get("middleware"), source=source)
-    page_route_specs, api_route_specs = _parse_route_middleware_block(
+    page_route_specs, api_route_specs, action_route_specs = _parse_route_middleware_block(
         data.get("routeMiddleware"),
         source=source,
     )
@@ -282,6 +357,8 @@ def _parse_config_dict(data: Dict[str, Any], *, source: Path) -> PyxleConfig:
     csrf_config = _parse_csrf_block(data.get("csrf"), source=source)
     cache_config = _parse_cache_block(data.get("cache"), source=source)
     navigation_config = _parse_navigation_block(data.get("navigation"), source=source)
+    rate_limit_config = _parse_rate_limit_block(data.get("rateLimit"), source=source)
+    observability_config = _parse_observability_block(data.get("observability"), source=source)
     plugins = _parse_plugins_block(data.get("plugins"), source=source)
 
     return PyxleConfig(
@@ -296,12 +373,15 @@ def _parse_config_dict(data: Dict[str, Any], *, source: Path) -> PyxleConfig:
         middleware=middleware_specs,
         page_route_middleware=page_route_specs,
         api_route_middleware=api_route_specs,
+        action_route_middleware=action_route_specs,
         global_styles=global_styles,
         global_scripts=global_scripts,
         cors=cors_config,
         csrf=csrf_config,
         cache=cache_config,
         navigation=navigation_config,
+        rate_limit=rate_limit_config,
+        observability=observability_config,
         plugins=plugins,
     )
 
@@ -352,6 +432,9 @@ def _parse_styling_block(value: Any, *, source: Path) -> tuple[tuple[str, ...], 
             f"Invalid value for 'styling' in '{source}': expected object with 'globalStyles'/'globalScripts' lists."
         )
 
+    _reject_unknown_keys(
+        value, allowed={"globalStyles", "globalScripts"}, block="styling", source=source
+    )
     styles = _parse_path_list(value.get("globalStyles"), source=source, field_name="styling.globalStyles")
     scripts = _parse_path_list(value.get("globalScripts"), source=source, field_name="styling.globalScripts")
     return (styles, scripts)
@@ -390,6 +473,7 @@ def _parse_network_block(value: Any, key: str, source: Path) -> tuple[str, int]:
             f"Invalid value for '{key}' in '{source}': expected object with 'host' and 'port'."
         )
 
+    _reject_unknown_keys(value, allowed={"host", "port"}, block=key, source=source)
     host = value.get("host", "127.0.0.1")
     if not isinstance(host, str) or not host.strip():
         raise ConfigError(
@@ -410,17 +494,43 @@ def _validate_port(value: Any, key: str) -> int:
     return value
 
 
-def _parse_route_middleware_block(value: Any, *, source: Path) -> tuple[tuple[str, ...], tuple[str, ...]]:
+def _reject_unknown_keys(
+    value: Mapping[str, Any], *, allowed: set[str], block: str, source: Path
+) -> None:
+    """Raise :class:`ConfigError` if *value* has keys outside *allowed*.
+
+    Catches typos in nested config blocks (e.g. a mis-cased ``cookieSamesite``
+    that would otherwise be silently dropped, leaving a security-relevant
+    default in place). Mirrors the top-level / ``navigation`` / ``rateLimit``
+    guards so every block rejects unknown keys consistently.
+    """
+    unknown = set(value) - allowed
+    if unknown:
+        formatted = ", ".join(sorted(str(key) for key in unknown))
+        raise ConfigError(f"Unknown keys in '{block}' block in '{source}': {formatted}.")
+
+
+def _parse_route_middleware_block(
+    value: Any, *, source: Path
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
     if value is None:
-        return ((), ())
+        return ((), (), ())
     if not isinstance(value, Mapping):
         raise ConfigError(
-            f"Invalid value for 'routeMiddleware' in '{source}': expected object with 'pages'/'apis' arrays."
+            f"Invalid value for 'routeMiddleware' in '{source}': "
+            "expected object with 'pages'/'apis'/'actions' arrays."
         )
+
+    _reject_unknown_keys(
+        value, allowed={"pages", "apis", "actions"}, block="routeMiddleware", source=source
+    )
 
     pages = _parse_middleware_list(value.get("pages"), source=source, field_name="routeMiddleware.pages")
     apis = _parse_middleware_list(value.get("apis"), source=source, field_name="routeMiddleware.apis")
-    return (pages, apis)
+    actions = _parse_middleware_list(
+        value.get("actions"), source=source, field_name="routeMiddleware.actions"
+    )
+    return (pages, apis, actions)
 
 
 def _parse_middleware_list(value: Any, *, source: Path, field_name: str = "middleware") -> tuple[str, ...]:
@@ -449,6 +559,13 @@ def _parse_cors_block(value: Any, *, source: Path) -> CorsConfig:
         raise ConfigError(
             f"Invalid value for 'cors' in '{source}': expected object with 'origins', 'methods', 'headers', 'credentials'."
         )
+
+    _reject_unknown_keys(
+        value,
+        allowed={"origins", "methods", "headers", "credentials", "maxAge"},
+        block="cors",
+        source=source,
+    )
 
     origins = _parse_string_list(value.get("origins"), source=source, field_name="cors.origins")
     methods = _parse_string_list(value.get("methods"), source=source, field_name="cors.methods")
@@ -566,6 +683,20 @@ def _parse_csrf_block(value: Any, *, source: Path) -> CsrfConfig:
             f"Invalid value for 'csrf' in '{source}': expected boolean or object."
         )
 
+    _reject_unknown_keys(
+        value,
+        allowed={
+            "enabled",
+            "cookieName",
+            "headerName",
+            "cookieSecure",
+            "cookieSameSite",
+            "exemptPaths",
+        },
+        block="csrf",
+        source=source,
+    )
+
     enabled = value.get("enabled", True)
     if not isinstance(enabled, bool):
         raise ConfigError(f"Invalid value for 'csrf.enabled' in '{source}': expected boolean.")
@@ -597,6 +728,201 @@ def _parse_csrf_block(value: Any, *, source: Path) -> CsrfConfig:
         cookie_secure=cookie_secure,
         cookie_samesite=cookie_samesite.lower(),
         exempt_paths=exempt_paths or (),
+    )
+
+
+def _parse_rate_limit_block(value: Any, *, source: Path) -> RateLimitConfig:
+    if value is None:
+        return RateLimitConfig()
+    if not isinstance(value, Mapping):
+        raise ConfigError(
+            f"Invalid value for 'rateLimit' in '{source}': expected object."
+        )
+
+    unknown = set(value) - {"requests", "window", "exemptPaths", "trustForwardedFor"}
+    if unknown:
+        formatted = ", ".join(sorted(str(key) for key in unknown))
+        raise ConfigError(
+            f"Unknown keys in 'rateLimit' block in '{source}': {formatted}."
+        )
+
+    requests = value.get("requests", 0)
+    if not isinstance(requests, int) or isinstance(requests, bool) or requests < 0:
+        raise ConfigError(
+            f"Invalid value for 'rateLimit.requests' in '{source}': "
+            "expected a non-negative integer (0 disables the limit)."
+        )
+
+    window = value.get("window", 60)
+    if (
+        not isinstance(window, (int, float))
+        or isinstance(window, bool)
+        or window <= 0
+    ):
+        raise ConfigError(
+            f"Invalid value for 'rateLimit.window' in '{source}': "
+            "expected a positive number of seconds."
+        )
+
+    exempt_paths = _parse_string_list(
+        value.get("exemptPaths"), source=source, field_name="rateLimit.exemptPaths"
+    )
+
+    trust_forwarded_for = value.get("trustForwardedFor", False)
+    if not isinstance(trust_forwarded_for, bool):
+        raise ConfigError(
+            f"Invalid value for 'rateLimit.trustForwardedFor' in '{source}': "
+            "expected boolean."
+        )
+
+    return RateLimitConfig(
+        requests=requests,
+        window_seconds=float(window),
+        exempt_paths=exempt_paths or (),
+        trust_forwarded_for=trust_forwarded_for,
+    )
+
+
+def _parse_observability_block(value: Any, *, source: Path) -> ObservabilityConfig:
+    if value is None:
+        return ObservabilityConfig()
+    if isinstance(value, bool):
+        # A bare boolean toggles both request-id and timing together.
+        return ObservabilityConfig(request_id=value, timing=value)
+    if not isinstance(value, Mapping):
+        raise ConfigError(
+            f"Invalid value for 'observability' in '{source}': expected boolean or object."
+        )
+
+    _reject_unknown_keys(
+        value,
+        allowed={
+            "requestId",
+            "requestIdHeader",
+            "trustIncomingRequestId",
+            "timing",
+            "metricsEndpoint",
+            "metricsEndpointPath",
+            "metricsEndpointToken",
+            "accessLog",
+            "logFormat",
+            "logLevel",
+            "otel",
+            "otelServiceName",
+            "otelSampleRatio",
+        },
+        block="observability",
+        source=source,
+    )
+
+    request_id = value.get("requestId", True)
+    if not isinstance(request_id, bool):
+        raise ConfigError(
+            f"Invalid value for 'observability.requestId' in '{source}': expected boolean."
+        )
+
+    request_id_header = value.get("requestIdHeader", "X-Request-Id")
+    if not isinstance(request_id_header, str) or not request_id_header.strip():
+        raise ConfigError(
+            f"Invalid value for 'observability.requestIdHeader' in '{source}': "
+            "expected non-empty string."
+        )
+
+    trust_incoming = value.get("trustIncomingRequestId", False)
+    if not isinstance(trust_incoming, bool):
+        raise ConfigError(
+            f"Invalid value for 'observability.trustIncomingRequestId' in '{source}': "
+            "expected boolean."
+        )
+
+    timing = value.get("timing", True)
+    if not isinstance(timing, bool):
+        raise ConfigError(
+            f"Invalid value for 'observability.timing' in '{source}': expected boolean."
+        )
+
+    metrics_endpoint = value.get("metricsEndpoint", False)
+    if not isinstance(metrics_endpoint, bool):
+        raise ConfigError(
+            f"Invalid value for 'observability.metricsEndpoint' in '{source}': "
+            "expected boolean."
+        )
+
+    metrics_path = value.get("metricsEndpointPath", "/api/__pyxle/metrics")
+    if not isinstance(metrics_path, str) or not metrics_path.startswith("/"):
+        raise ConfigError(
+            f"Invalid value for 'observability.metricsEndpointPath' in '{source}': "
+            "expected an absolute path starting with '/'."
+        )
+
+    metrics_token = value.get("metricsEndpointToken")
+    if metrics_token is not None and (
+        not isinstance(metrics_token, str) or not metrics_token.strip()
+    ):
+        raise ConfigError(
+            f"Invalid value for 'observability.metricsEndpointToken' in '{source}': "
+            "expected a non-empty string or null."
+        )
+
+    access_log = value.get("accessLog", False)
+    if not isinstance(access_log, bool):
+        raise ConfigError(
+            f"Invalid value for 'observability.accessLog' in '{source}': expected boolean."
+        )
+
+    log_format = value.get("logFormat", "console")
+    if not isinstance(log_format, str) or log_format not in {"console", "json"}:
+        raise ConfigError(
+            f"Invalid value for 'observability.logFormat' in '{source}': "
+            "expected 'console' or 'json'."
+        )
+
+    log_level = value.get("logLevel", "INFO")
+    _valid_levels = {"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"}
+    if not isinstance(log_level, str) or log_level.upper() not in _valid_levels:
+        raise ConfigError(
+            f"Invalid value for 'observability.logLevel' in '{source}': "
+            f"expected one of {sorted(_valid_levels)}."
+        )
+
+    otel = value.get("otel", False)
+    if not isinstance(otel, bool):
+        raise ConfigError(
+            f"Invalid value for 'observability.otel' in '{source}': expected boolean."
+        )
+
+    otel_service_name = value.get("otelServiceName", "pyxle-app")
+    if not isinstance(otel_service_name, str) or not otel_service_name.strip():
+        raise ConfigError(
+            f"Invalid value for 'observability.otelServiceName' in '{source}': "
+            "expected a non-empty string."
+        )
+
+    otel_sample_ratio = value.get("otelSampleRatio", 0.05)
+    if (
+        not isinstance(otel_sample_ratio, (int, float))
+        or isinstance(otel_sample_ratio, bool)
+        or not 0.0 <= float(otel_sample_ratio) <= 1.0
+    ):
+        raise ConfigError(
+            f"Invalid value for 'observability.otelSampleRatio' in '{source}': "
+            "expected a number between 0.0 and 1.0."
+        )
+
+    return ObservabilityConfig(
+        request_id=request_id,
+        request_id_header=request_id_header.strip(),
+        trust_incoming_request_id=trust_incoming,
+        timing=timing,
+        metrics_endpoint=metrics_endpoint,
+        metrics_endpoint_path=metrics_path,
+        metrics_endpoint_token=metrics_token,
+        access_log=access_log,
+        log_format=log_format,
+        log_level=log_level.upper(),
+        otel=otel,
+        otel_service_name=otel_service_name,
+        otel_sample_ratio=float(otel_sample_ratio),
     )
 
 

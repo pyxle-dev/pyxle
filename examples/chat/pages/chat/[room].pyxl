@@ -1,0 +1,68 @@
+from pyxle.realtime import channel
+
+
+@server
+async def load(request):
+    # The room name comes from the [room] path segment.
+    return {"room": request.path_params["room"]}
+
+
+async def websocket(ws):
+    # This page also serves a WebSocket at /chat/<room>. Each room is its own
+    # broadcast channel: a message from one client fans out to everyone else in
+    # the same room.
+    await ws.accept()
+    room = ws.path_params["room"]
+    async with channel(ws, f"room:{room}") as live:
+        async for text in ws.iter_text():
+            await live.publish(text)
+
+
+# --- JavaScript/PSX (Client + Server) ---
+
+import React, { useState } from 'react';
+import { useWebSocket } from 'pyxle/client';
+
+export default function Chat({ data }) {
+  const room = data.room;
+  const [messages, setMessages] = useState([]);
+  const [draft, setDraft] = useState('');
+
+  // The WS path is the page path — derived from the loader's `room`, so it's
+  // safe during SSR (no window access).
+  const { status, send } = useWebSocket('/chat/' + room, {
+    onMessage(text) {
+      setMessages((prev) => [...prev, String(text)]);
+    },
+  });
+
+  function submit(e) {
+    e.preventDefault();
+    if (draft && send(draft)) {
+      setDraft('');
+    }
+  }
+
+  return (
+    <main style={{ maxWidth: 520, margin: '2rem auto', fontFamily: 'system-ui' }}>
+      <h1>#{room}</h1>
+      <p data-testid="status">Connection: <strong>{status}</strong></p>
+
+      <ul data-testid="messages" style={{ minHeight: 120, padding: 0, listStyle: 'none' }}>
+        {messages.map((msg, i) => (
+          <li key={i} style={{ padding: '2px 0' }}>{msg}</li>
+        ))}
+      </ul>
+
+      <form onSubmit={submit} style={{ display: 'flex', gap: 8 }}>
+        <input
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          placeholder="Message…"
+          style={{ flex: 1, padding: 8 }}
+        />
+        <button type="submit" disabled={status !== 'open'}>Send</button>
+      </form>
+    </main>
+  );
+}

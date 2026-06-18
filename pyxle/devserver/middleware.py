@@ -23,6 +23,25 @@ def load_custom_middlewares(specs: Iterable[str]) -> List[Middleware]:
     return loaded
 
 
+def find_base_http_middlewares(middlewares: Iterable[Middleware]) -> List[str]:
+    """Return the names of configured ``BaseHTTPMiddleware`` subclasses.
+
+    Starlette's :class:`~starlette.middleware.base.BaseHTTPMiddleware` buffers
+    the full response before passing it downstream, so it is **incompatible with
+    streaming SSR**: when a ``<Suspense>`` boundary defers, the streamed
+    ``StreamingResponse`` never produces a buffered body and Starlette raises
+    ``RuntimeError: No response returned.`` We surface the offending class names
+    at startup (see :func:`create_starlette_app`) when the build also has
+    streaming-eligible routes, pointing users at the pure-ASGI pattern.
+    """
+    names: List[str] = []
+    for middleware in middlewares:
+        cls = getattr(middleware, "cls", None)
+        if inspect.isclass(cls) and issubclass(cls, BaseHTTPMiddleware):
+            names.append(cls.__name__)
+    return names
+
+
 def _load_single_middleware(spec: str) -> Middleware:
     module_name, separator, attribute = spec.partition(":")
     if not module_name or separator == "" or not attribute:
@@ -79,4 +98,8 @@ def _coerce_to_middleware(value: object, spec: str) -> Middleware | None:
     return None
 
 
-__all__ = ["MiddlewareHookError", "load_custom_middlewares"]
+__all__ = [
+    "MiddlewareHookError",
+    "find_base_http_middlewares",
+    "load_custom_middlewares",
+]

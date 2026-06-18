@@ -50,6 +50,22 @@ class ActionDetails:
 
 
 @dataclass(frozen=True)
+class WebsocketDetails:
+    """Metadata about a page's ``async def websocket(ws)`` handler.
+
+    Detected by convention (a module-scope coroutine named ``websocket``),
+    not a decorator — mirroring how API modules expose a ``websocket``
+    callable. A page that declares one also serves a WebSocket route at its
+    path.
+    """
+
+    name: str
+    line_number: int
+    is_async: bool
+    parameters: Sequence[str]
+
+
+@dataclass(frozen=True)
 class PyxDiagnostic:
     """A syntax or structural error found during parsing.
 
@@ -95,6 +111,9 @@ class PyxParseResult:
     image_declarations: tuple[dict, ...] = ()
     head_jsx_blocks: tuple[str, ...] = ()
     actions: tuple[ActionDetails, ...] = ()
+    websocket: WebsocketDetails | None = None
+    cache_revalidate: float | None = None
+    uses_suspense: bool = False
     diagnostics: tuple[PyxDiagnostic, ...] = ()
 
 
@@ -846,6 +865,72 @@ def _detect_actions(
     return tuple(actions)
 
 
+def _detect_websocket(
+    tree: ast.Module | None,
+    python_line_numbers: Sequence[int],
+    *,
+    collector: _DiagnosticCollector,
+) -> WebsocketDetails | None:
+    """Detect a module-scope ``async def websocket(ws)`` handler.
+
+    Detection is by **convention** — a single coroutine named ``websocket`` at
+    module scope — not a decorator. We scan only the module's direct children
+    (``ast.iter_child_nodes``), so a local helper named ``websocket`` nested
+    inside another function never false-matches and never breaks a page; only
+    a module-level definition (the one that can actually be served) counts.
+
+    A mis-shaped definition is reported so the developer isn't left with a
+    silent 404: a sync ``def websocket`` or a ``class websocket`` at module
+    scope is almost certainly a mistyped handler.
+    """
+    if tree is None:
+        return None
+
+    websocket_node: ast.AsyncFunctionDef | None = None
+
+    for node in ast.iter_child_nodes(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "websocket":
+            line = _map_lineno(node.lineno, python_line_numbers)
+            collector.emit(
+                "`websocket` handler must be declared as async", line
+            )
+            return None
+        if isinstance(node, ast.ClassDef) and node.name == "websocket":
+            line = _map_lineno(node.lineno, python_line_numbers)
+            collector.emit(
+                "`websocket` must be an async function, not a class", line
+            )
+            return None
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "websocket":
+            if websocket_node is not None:
+                line = _map_lineno(node.lineno, python_line_numbers)
+                collector.emit("Multiple `websocket` handlers detected", line)
+                return None
+            websocket_node = node
+
+    if websocket_node is None:
+        return None
+
+    all_pos_args = (
+        list(websocket_node.args.posonlyargs) + list(websocket_node.args.args)
+    )
+    if not all_pos_args:
+        line = _map_lineno(websocket_node.lineno, python_line_numbers)
+        collector.emit(
+            "`websocket` handler must accept a WebSocket argument", line
+        )
+        return None
+
+    parameters = tuple(arg.arg for arg in all_pos_args)
+    line = _map_lineno(websocket_node.lineno, python_line_numbers)
+    return WebsocketDetails(
+        name=websocket_node.name,
+        line_number=line,
+        is_async=True,
+        parameters=parameters,
+    )
+
+
 def _extract_head_literal(
     value: ast.AST, line: int | None, collector: _DiagnosticCollector
 ) -> list[str] | None:
@@ -917,50 +1002,141 @@ def _collect_head_elements(
     return tuple(elements), head_is_dynamic
 
 
+def _extract_cache_revalidate(
+    value: ast.AST, line: int | None, collector: _DiagnosticCollector
+) -> float | None:
+    """Pull the ``revalidate`` seconds out of a ``CACHE = {...}`` value."""
+    if not isinstance(value, ast.Dict):
+        collector.emit(
+            'CACHE must be a dict literal, e.g. CACHE = {"revalidate": 60}', line
+        )
+        return None
+
+    found: float | None = None
+    for key_node, val_node in zip(value.keys, value.values):
+        if not (isinstance(key_node, ast.Constant) and key_node.value == "revalidate"):
+            continue
+        if (
+            isinstance(val_node, ast.Constant)
+            and isinstance(val_node.value, (int, float))
+            and not isinstance(val_node.value, bool)
+            and val_node.value >= 0
+        ):
+            found = float(val_node.value)
+        else:
+            collector.emit(
+                "CACHE 'revalidate' must be a non-negative number of seconds", line
+            )
+            return None
+
+    if found is None:
+        collector.emit('CACHE must contain a "revalidate" key', line)
+        return None
+    return found
+
+
+def _detect_cache_directive(
+    tree: ast.Module | None,
+    python_line_numbers: Sequence[int],
+    *,
+    collector: _DiagnosticCollector,
+) -> float | None:
+    """Extract a module-level ``CACHE = {"revalidate": N}`` page-cache directive.
+
+    Returns the revalidate window in seconds, or ``None`` when no (valid)
+    directive is present. An invalid directive is reported as a compile
+    diagnostic and otherwise ignored (the page is treated as uncached).
+    """
+    if tree is None:
+        return None
+
+    revalidate: float | None = None
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(
+            isinstance(target, ast.Name) and target.id == "CACHE"
+            for target in node.targets
+        ):
+            continue
+        line = _map_lineno(node.lineno, python_line_numbers)
+        revalidate = _extract_cache_revalidate(node.value, line, collector)
+    return revalidate
+
+
 # ---------------------------------------------------------------------------
 # JSX metadata extraction (Babel-backed)
 # ---------------------------------------------------------------------------
 
 
-def _detect_script_declarations(jsx_code: str) -> tuple[dict, ...]:
+@dataclass(frozen=True)
+class _JsxMetadata:
+    """JSX component metadata extracted from a single Babel pass."""
+
+    script_declarations: tuple[dict, ...]
+    image_declarations: tuple[dict, ...]
+    head_jsx_blocks: tuple[str, ...]
+    uses_suspense: bool
+    #: ``(message, jsx_relative_line)`` when the extractor reported TypeScript
+    #: syntax in the client block, else ``None``. Surfaced by ``parse_text`` as a
+    #: source-located diagnostic once the Python section is confirmed clean.
+    ts_violation: tuple[str, int | None] | None = None
+
+
+# Element names that opt a page into streaming SSR. ``React.Suspense`` is the
+# member-expression form Babel reports for ``<React.Suspense>``.
+_SUSPENSE_ELEMENT_NAMES = ("Suspense", "React.Suspense")
+
+
+def _detect_jsx_metadata(jsx_code: str) -> _JsxMetadata:
+    """Extract all JSX component metadata the compiler needs in one Babel pass.
+
+    Scripts, images, ``<Head>`` blocks, and whether the page uses
+    ``<Suspense>`` (the implicit streaming-SSR opt-in) are all derived from a
+    single ``parse_jsx_components`` call. Babel is a Node.js subprocess, so
+    consolidating the targets keeps the compile to one spawn instead of one
+    per component kind.
+    """
     from .jsx_parser import parse_jsx_components
 
-    result = parse_jsx_components(jsx_code, target_components={"Script"})
+    result = parse_jsx_components(
+        jsx_code,
+        target_components={"Script", "Image", "Head", *_SUSPENSE_ELEMENT_NAMES},
+    )
     if result.error:
-        return ()
-    return tuple(
+        # TypeScript syntax in the client block is a real, surfaceable user
+        # error (Babel accepts it but esbuild later fails opaquely). Carry it
+        # out so ``parse_text`` can emit a source-located diagnostic. Every
+        # other extractor failure (unavailable toolchain, genuine JSX syntax
+        # error already surfaced elsewhere) keeps degrading silently here.
+        if result.error_code == "ts_in_client_block":
+            return _JsxMetadata(
+                (), (), (), False, ts_violation=(result.error, result.error_line)
+            )
+        return _JsxMetadata((), (), (), False)
+
+    components = result.components
+    scripts = tuple(
         component.props
-        for component in result.components
+        for component in components
         if component.name == "Script" and component.props
     )
-
-
-def _detect_image_declarations(jsx_code: str) -> tuple[dict, ...]:
-    from .jsx_parser import parse_jsx_components
-
-    result = parse_jsx_components(jsx_code, target_components={"Image"})
-    if result.error:
-        return ()
-    return tuple(
+    images = tuple(
         component.props
-        for component in result.components
+        for component in components
         if component.name == "Image" and component.props
     )
-
-
-def _detect_head_jsx_blocks(jsx_code: str) -> tuple[str, ...]:
-    from .jsx_parser import parse_jsx_components
-
-    result = parse_jsx_components(jsx_code, target_components={"Head"})
-    if result.error:
-        return ()
-    return tuple(
+    head_blocks = tuple(
         component.children.strip()
-        for component in result.components
+        for component in components
         if component.name == "Head"
         and component.children
         and component.children.strip()
     )
+    uses_suspense = any(
+        component.name in _SUSPENSE_ELEMENT_NAMES for component in components
+    )
+    return _JsxMetadata(scripts, images, head_blocks, uses_suspense)
 
 
 def _validate_jsx_syntax(
@@ -1093,14 +1269,21 @@ class PyxParser:
         actions = _detect_actions(
             tree, python_line_numbers, collector=collector
         )
+        websocket = _detect_websocket(
+            tree, python_line_numbers, collector=collector
+        )
         head_elements, head_is_dynamic = _collect_head_elements(
+            tree, python_line_numbers, collector=collector
+        )
+        cache_revalidate = _detect_cache_directive(
             tree, python_line_numbers, collector=collector
         )
 
         # Layer 5: JSX metadata + optional Babel validation.
-        script_declarations = _detect_script_declarations(jsx_code)
-        image_declarations = _detect_image_declarations(jsx_code)
-        head_jsx_blocks = _detect_head_jsx_blocks(jsx_code)
+        jsx_metadata = _detect_jsx_metadata(jsx_code)
+        script_declarations = jsx_metadata.script_declarations
+        image_declarations = jsx_metadata.image_declarations
+        head_jsx_blocks = jsx_metadata.head_jsx_blocks
 
         # Only run JSX validation when the Python section is clean.
         # If Python already has diagnostics, the broken Python content
@@ -1112,6 +1295,22 @@ class PyxParser:
         has_python_errors = any(
             d.section == "python" for d in collector.diagnostics
         )
+        # TypeScript syntax in the client block is surfaced on every compile
+        # (not just the opt-in ``validate_jsx`` path) because Babel accepts it
+        # but esbuild later fails opaquely — catching it here gives a clear,
+        # source-located error instead. Gated on a clean Python section so a
+        # mis-split (broken Python absorbed into ``jsx_code``) can't be misread
+        # as a type annotation.
+        if jsx_metadata.ts_violation is not None and not has_python_errors:
+            ts_message, ts_jsx_line = jsx_metadata.ts_violation
+            if (
+                ts_jsx_line is not None
+                and 0 <= ts_jsx_line - 1 < len(jsx_line_numbers)
+            ):
+                mapped_line: int | None = jsx_line_numbers[ts_jsx_line - 1]
+            else:
+                mapped_line = jsx_line_numbers[0] if jsx_line_numbers else None
+            collector.emit(ts_message, mapped_line, section="jsx")
         if validate_jsx and jsx_code.strip() and not has_python_errors:
             _validate_jsx_syntax(
                 jsx_code, jsx_line_numbers, collector=collector
@@ -1136,6 +1335,9 @@ class PyxParser:
             image_declarations=image_declarations,
             head_jsx_blocks=head_jsx_blocks,
             actions=actions,
+            websocket=websocket,
+            cache_revalidate=cache_revalidate,
+            uses_suspense=jsx_metadata.uses_suspense,
             diagnostics=diagnostics,
         )
 

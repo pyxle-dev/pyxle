@@ -28,6 +28,13 @@ class JSXParseResult:
 
     components: tuple[JSXComponent, ...]
     error: str | None
+    #: A machine-readable tag for the error, when the extractor sets one.
+    #: ``"ts_in_client_block"`` means TypeScript syntax was found in the JSX —
+    #: the compiler surfaces this as a clear, source-located error rather than
+    #: letting it fail later in the bundler.
+    error_code: str | None = None
+    #: 1-indexed line of the error within the JSX source, when known.
+    error_line: int | None = None
 
 
 def parse_jsx_components(jsx_code: str, *, target_components: set[str] | None = None) -> JSXParseResult:
@@ -138,7 +145,13 @@ def _run_babel_parser(source_path: str, target_components: set[str] | None) -> J
     # Check for errors
     if not payload.get("ok", False):
         error_msg = payload.get("message", "Unknown JSX parsing error")
-        return JSXParseResult(components=(), error=error_msg)
+        error_line = payload.get("line")
+        return JSXParseResult(
+            components=(),
+            error=error_msg,
+            error_code=payload.get("code"),
+            error_line=error_line if isinstance(error_line, int) else None,
+        )
 
     # Convert payload to JSXComponent objects
     components = []

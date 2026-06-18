@@ -322,6 +322,12 @@ def dev(
         help="Automatically run the Tailwind CSS watcher if tailwind.config.* is present.",
         show_default=True,
     ),
+    dashboard: bool = typer.Option(
+        False,
+        "--dashboard/--no-dashboard",
+        help="Periodically print a live observability panel (request/SSR metrics) to the terminal.",
+        show_default=True,
+    ),
 ) -> None:
     """Entry-point for the ``pyxle dev`` command."""
 
@@ -403,7 +409,7 @@ def dev(
         f" with Vite proxy at http://{settings.vite_host}:{settings.vite_port}"
     )
 
-    server = DevServer(settings, logger=logger, tailwind=tailwind)  # type: ignore[call-arg]
+    server = DevServer(settings, logger=logger, tailwind=tailwind, dashboard=dashboard)  # type: ignore[call-arg]
 
     try:
         asyncio.run(server.start())
@@ -435,6 +441,18 @@ def build(
         False,
         "--incremental/--no-incremental",
         help="Reuse cached artifacts to rebuild only changed files.",
+        show_default=True,
+    ),
+    static: bool = typer.Option(
+        False,
+        "--static/--no-static",
+        help="Pre-render pages with no per-request data to HTML at build time (SSG).",
+        show_default=True,
+    ),
+    analyze: bool = typer.Option(
+        False,
+        "--analyze/--no-analyze",
+        help="Print a JS/CSS bundle-size report (raw + gzip) after the build.",
         show_default=True,
     ),
 ) -> None:
@@ -530,6 +548,23 @@ def build(
     logger.step("Public assets", detail=public_detail)
     logger.step("Artifacts", detail=str(result.dist_dir))
 
+    if analyze:
+        from pyxle.build.analyze import analyze_bundle, format_bundle_report  # noqa: PLC0415
+
+        assets = analyze_bundle(result.dist_dir / "client")
+        for line in format_bundle_report(assets).splitlines():
+            logger.info(line)
+
+    if static:
+        from pyxle.build.static_gen import generate_static_site  # noqa: PLC0415
+
+        try:
+            rendered = generate_static_site(settings, result.dist_dir, logger=logger)
+        except Exception as exc:  # pragma: no cover - prerender boots the Node SSR pool
+            logger.error(f"Static prerender failed: {exc}")
+            raise typer.Exit(code=1) from exc
+        logger.step("Static pages", detail=f"{len(rendered)} pre-rendered")
+
 
 @app.command(help="Serve a production build without starting Vite.")
 def serve(
@@ -584,11 +619,11 @@ def serve(
         1,
         "--workers",
         "-w",
-        help="Number of server worker processes, one per CPU core. >1 serves the "
-        "build across that many uvicorn worker processes (multi-core); --ssr-workers "
-        "then applies per worker. Default 1 = single process.",
+        help="Number of server worker processes (multi-core). >1 serves the build "
+        "across that many uvicorn worker processes; --ssr-workers then applies per "
+        "worker. 0 = auto-detect from CPU cores. Default 1 = single process.",
         show_default=True,
-        min=1,
+        min=0,
     ),
 ) -> None:
     """Entry-point for the ``pyxle serve`` command."""
@@ -652,6 +687,14 @@ def serve(
     else:
         logger.warning("Skipping production build; using existing dist artifacts.")
 
+    # Resolve an auto-detect request (--workers 0) to a concrete core count.
+    from pyxle.build.production import resolve_server_workers  # noqa: PLC0415
+
+    requested_workers = workers
+    workers = resolve_server_workers(workers)
+    if requested_workers == 0:
+        logger.info(f"Auto-detected {workers} server worker(s) from CPU cores")
+
     # Multi-process serving: hand uvicorn an importable app factory and let it
     # supervise ``workers`` worker subprocesses. Each rebuilds its own app (and
     # SSR pool) from environment variables — see pyxle.build.production.
@@ -708,6 +751,26 @@ def serve(
         raise typer.Exit(code=1) from exc
 
 
+def _dist_has_websocket_pages(resolved_dist: Path) -> bool:
+    """Whether any compiled page in ``resolved_dist`` declares a WS handler.
+
+    Reads the build's ``page-manifest.json`` (a ``{route: entry}`` map) and
+    checks for a ``websocket`` entry. Used to warn, at multi-worker serve time,
+    that the in-process broker doesn't span workers.
+    """
+    manifest_path = resolved_dist / "page-manifest.json"
+    try:
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    return any(
+        isinstance(entry, dict) and "websocket" in entry
+        for entry in data.values()
+    )
+
+
 def _serve_multiworker(
     project_root: Path,
     *,
@@ -749,6 +812,21 @@ def _serve_multiworker(
         f"Serving Pyxle build on http://{host}:{port} across {workers} worker "
         f"process(es) (dist: {resolved_dist})"
     )
+    # Only warn when the in-process broker is in use; a configured Redis broker
+    # (PYXLE_REALTIME_BROKER=redis) already spans workers, so the warning would
+    # falsely tell a correctly-configured user their realtime is broken.
+    _broker_is_inprocess = (
+        os.environ.get("PYXLE_REALTIME_BROKER") or "memory"
+    ).strip().lower() not in ("redis",)
+    if _broker_is_inprocess and _dist_has_websocket_pages(resolved_dist):
+        logger.warning(
+            "This build has WebSocket page(s) and is running with "
+            f"{workers} workers. The default in-process realtime broker does "
+            "NOT span worker processes — a client on one worker won't receive "
+            "messages published on another. Use a shared broker "
+            "(PYXLE_REALTIME_BROKER=redis) or sticky-session load balancing for "
+            "cross-worker realtime."
+        )
     try:
         # loop is left at uvicorn's default ("auto" → uvloop). Forcing the pure
         # asyncio loop here adds a ~40-50ms per-request stall on Linux when
@@ -1137,6 +1215,86 @@ def routes(
     total = len(table.pages) + len(table.apis)
     logger.info("")
     logger.success(f"{total} route(s) found")
+
+
+@app.command(help="Export an OpenAPI 3.1 schema generated from @action request models.")
+def openapi(
+    directory: Path = typer.Argument(
+        Path("."),
+        help="Project root containing pages/ directory.",
+        show_default=True,
+    ),
+    config_file: Optional[Path] = typer.Option(
+        None, "--config", help="Path to a pyxle.config.json file."
+    ),
+    out: Optional[Path] = typer.Option(
+        None, "--out", "-o", help="Write the schema to this file (default: stdout)."
+    ),
+    title: str = typer.Option("Pyxle API", "--title", help="OpenAPI info.title."),
+    api_version: str = typer.Option(
+        "0.1.0", "--api-version", help="OpenAPI info.version."
+    ),
+) -> None:
+    """Generate an OpenAPI document from every ``@action``'s Pydantic body model."""
+    logger = get_logger()
+    project_root = directory.expanduser().resolve()
+
+    global DevServerSettings
+    if DevServerSettings is None:  # noqa: PLC0206 - module-level caching
+        from pyxle.devserver import DevServerSettings as _DevServerSettings
+
+        DevServerSettings = _DevServerSettings
+
+    if not project_root.exists() or not project_root.is_dir():
+        logger.error(f"Project directory '{project_root}' does not exist.")
+        raise typer.Exit(code=1)
+
+    try:
+        file_config: PyxleConfig = load_config(project_root, config_path=config_file)
+    except ConfigError as exc:
+        logger.error(str(exc))
+        raise typer.Exit(code=1) from exc
+
+    try:
+        settings = DevServerSettings.from_project_root(  # type: ignore[union-attr]
+            project_root, **file_config.to_devserver_kwargs()
+        )
+    except Exception as exc:
+        logger.error(f"Failed to create settings: {exc}")
+        raise typer.Exit(code=1) from exc
+
+    from pyxle.devserver.builder import build_once
+
+    try:
+        build_once(settings)
+    except Exception as exc:
+        logger.error(f"Build failed: {exc}")
+        raise typer.Exit(code=1) from exc
+
+    from pyxle.devserver.openapi import build_openapi_document
+    from pyxle.devserver.validation import PydanticNotInstalledError
+
+    try:
+        result = build_openapi_document(
+            settings, title=title, version=api_version
+        )
+    except PydanticNotInstalledError as exc:
+        logger.error(str(exc))
+        raise typer.Exit(code=1) from exc
+
+    if result.import_errors:
+        for problem in result.import_errors:
+            logger.error(f"Could not import page module: {problem}")
+        raise typer.Exit(code=1)
+
+    payload = json.dumps(result.document, indent=2)
+    if out is not None:
+        out_path = out.expanduser()
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(payload + "\n", encoding="utf-8")
+        logger.success(f"Wrote OpenAPI schema to {out_path}")
+    else:
+        typer.echo(payload)
 
 
 @app.command(name="compile", help="Compile a single .pyxl file (developer utility).", hidden=True)

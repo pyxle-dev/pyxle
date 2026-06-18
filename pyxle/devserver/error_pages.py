@@ -18,6 +18,8 @@ from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Any, Optional, Sequence
 
+from ._boundary import resolve_nearest
+
 
 _ERROR_FILENAMES = frozenset({"error.pyxl"})
 _NOT_FOUND_FILENAMES = frozenset({"not-found.pyxl"})
@@ -66,11 +68,11 @@ class ErrorBoundaryRegistry:
 
     def find_error_boundary(self, route_path: str) -> Optional[Any]:
         """Find the nearest ``error.pyxl`` for *route_path* by walking up the tree."""
-        return _walk_up(route_path, self.error_pages)
+        return resolve_nearest(route_path, self.error_pages)
 
     def find_not_found_boundary(self, route_path: str) -> Optional[Any]:
         """Find the nearest ``not-found.pyxl`` for *route_path*."""
-        return _walk_up(route_path, self.not_found_pages)
+        return resolve_nearest(route_path, self.not_found_pages)
 
 
 def build_error_boundary_registry(
@@ -101,33 +103,6 @@ def build_error_boundary_registry(
         error_pages=error_pages,
         not_found_pages=not_found_pages,
     )
-
-
-def _walk_up(route_path: str, registry: dict[str, Any]) -> Optional[Any]:
-    """Walk up directory segments of *route_path* looking for a matching page.
-
-    For ``/dashboard/settings/profile`` the lookup order is:
-
-        1. ``"dashboard/settings/profile"``
-        2. ``"dashboard/settings"``
-        3. ``"dashboard"``
-        4. ``"."``  (root)
-    """
-
-    # Normalise: strip leading/trailing slashes, collapse empty to root.
-    stripped = route_path.strip("/")
-    if not stripped:
-        return registry.get(".")
-
-    parts = stripped.split("/")
-
-    # Walk from the deepest directory towards root.
-    for end in range(len(parts), 0, -1):
-        candidate = "/".join(parts[:end])
-        if candidate in registry:
-            return registry[candidate]
-
-    return registry.get(".")
 
 
 __all__ = [
