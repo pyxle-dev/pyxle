@@ -202,6 +202,13 @@ In production, place Pyxle behind a reverse proxy (Nginx, Caddy, etc.) for TLS t
 ### Nginx example
 
 ```nginx
+# Maps the Upgrade header so a WebSocket request sends "Connection: upgrade"
+# while an ordinary request sends "Connection: close".
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
 server {
     listen 443 ssl;
     server_name example.com;
@@ -215,6 +222,14 @@ server {
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
+
+        # Required if any page exposes a `websocket` handler / uses useWebSocket.
+        # Without these, nginx proxies the wss:// handshake as a plain GET and the
+        # connection silently never upgrades (the client just sees the page HTML).
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_read_timeout 3600s;   # keep long-lived WebSockets from idling out
     }
 
     # Cache static assets
@@ -226,6 +241,12 @@ server {
 }
 ```
 
+> **WebSocket apps:** the `proxy_http_version 1.1` + `Upgrade`/`Connection` lines
+> above are what let `wss://` connections through. A reverse proxy that omits them
+> serves the page fine but every WebSocket silently fails to connect. (Browsers do
+> the WebSocket handshake over HTTP/1.1 even when the listener also speaks HTTP/2 —
+> that's expected; the headers above handle it.)
+
 ### Caddy example
 
 ```
@@ -233,6 +254,9 @@ example.com {
     reverse_proxy localhost:8000
 }
 ```
+
+Caddy's `reverse_proxy` upgrades WebSocket connections automatically — no extra
+configuration is needed.
 
 ## CDN and edge caching
 

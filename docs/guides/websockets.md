@@ -249,6 +249,15 @@ Options: `onMessage(data, event)`, `protocols`, `reconnect` (default `true`),
 current origin with the matching scheme (`wss:` on `https:`); an absolute
 `ws://` / `wss://` URL passes through.
 
+## Behind a reverse proxy
+
+If you serve Pyxle behind nginx (or any proxy), the proxy must be told to pass
+the WebSocket **upgrade** through — otherwise the `wss://` handshake is proxied
+as an ordinary request, the page still loads, and every WebSocket silently fails
+to connect. See [Deployment → Reverse proxy setup](deployment.md#reverse-proxy-setup)
+for the `proxy_set_header Upgrade` / `Connection` lines. (Caddy upgrades
+WebSockets automatically.)
+
 ## See also
 
 - [API routes](api-routes.md) — `pages/api/**` modules can export a `websocket`
