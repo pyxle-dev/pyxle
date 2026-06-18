@@ -59,3 +59,12 @@ Thumbs.db
 # Internal docs (kept locally, not published)
 PYXLE_AUDIT.md
 ROADMAP.md
+CORE_FINDINGS.md
+.audit-2026-06-17.json
+# Root-anchored so it can't shadow docs/guides/deployment.md (case-insensitive FS)
+/DEPLOYMENT.md
+
+# Database files (defense-in-depth — never commit a local DB)
+*.db
+*.db-wal
+*.db-shm

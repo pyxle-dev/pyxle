@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pyxle-framework"
-version = "0.4.5"
+version = "0.5.0"
 description = "Python-first full-stack framework with an intelligent CLI."
 readme = "README.md"
 authors = [
@@ -53,9 +53,10 @@ PyPI = "https://pypi.org/project/pyxle-framework/"
 langkit = [
   "pyxle-langkit>=0.2.0",
 ]
-# Shared Redis backend for the server-side page cache
-# (PYXLE_PAGE_CACHE_BACKEND=redis). Optional — the default in-memory and the
-# file backends need nothing extra.
+# Shared Redis backends — the server-side page cache
+# (PYXLE_PAGE_CACHE_BACKEND=redis) and the cross-worker realtime broker
+# (PYXLE_REALTIME_BROKER=redis). Optional — the in-memory/file page cache and the
+# in-process realtime broker (the defaults) need nothing extra.
 redis = [
   "redis>=5.0,<6.0",
 ]
