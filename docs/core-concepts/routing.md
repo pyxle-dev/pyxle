@@ -26,6 +26,10 @@ Wrap a filename segment in square brackets to create a dynamic route parameter:
 | `pages/users/[id].pyxl` | `/users/:id` | `/users/42` |
 | `pages/[category]/[id].pyxl` | `/:category/:id` | `/electronics/99` |
 
+> The `:slug` notation above is illustrative. The actual registered
+> path uses Starlette's `{slug}` (and `{slug:path}` for catch-alls)
+> placeholders — this is what `pyxle routes` prints.
+
 Access dynamic parameters in your loader via `request.path_params`:
 
 ```python
@@ -99,6 +103,11 @@ Python files under `pages/api/` become API endpoints:
 | `pages/api/pulse.py` | `/api/pulse` |
 | `pages/api/users.py` | `/api/users` |
 | `pages/api/users/[id].py` | `/api/users/:id` |
+
+API routes must live under the top-level `pages/api/` directory; use
+`pages/api/<nested>/file.py` to nest within the API tree. A `.py` file
+placed elsewhere under `pages/` is ignored — it becomes neither an API
+route nor a page.
 
 API routes are standard Python files (not `.pyxl`). See [API Routes](../guides/api-routes.md) for details.
 

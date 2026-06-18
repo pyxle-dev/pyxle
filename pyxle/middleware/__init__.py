@@ -1,12 +1,14 @@
 """Reusable framework middleware.
 
-Currently ships :class:`RateLimitMiddleware`, a dependency-free token-bucket
-rate limiter. Enable it from ``pyxle.config.json`` via the ``rateLimit`` block,
-or apply it yourself in a custom ASGI stack.
+Ships :class:`RateLimitMiddleware`, a dependency-free token-bucket rate limiter
+(enable it from ``pyxle.config.json`` via the ``rateLimit`` block), and
+:class:`StreamingGZipMiddleware`, a streaming-aware gzip compressor used in
+production so gzip doesn't buffer streaming-SSR responses.
 """
 
 from __future__ import annotations
 
+from pyxle.middleware.gzip import StreamingGZipMiddleware
 from pyxle.middleware.rate_limit import RateLimitMiddleware
 
-__all__ = ["RateLimitMiddleware"]
+__all__ = ["RateLimitMiddleware", "StreamingGZipMiddleware"]

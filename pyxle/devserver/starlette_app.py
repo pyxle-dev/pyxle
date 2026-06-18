@@ -48,7 +48,11 @@ from pyxle.ssr.view import (
 )
 
 from .error_pages import ErrorBoundaryRegistry, build_error_boundary_registry
-from .middleware import MiddlewareHookError, load_custom_middlewares
+from .middleware import (
+    MiddlewareHookError,
+    find_base_http_middlewares,
+    load_custom_middlewares,
+)
 from .overlay import OverlayManager
 from .proxy import ViteProxy
 from .route_hooks import (
@@ -1504,6 +1508,53 @@ def _build_app_routes(
     return built, error_boundaries
 
 
+def _has_streaming_eligible_routes(routes: RouteTable) -> bool:
+    """Return ``True`` if any route can produce a streamed SSR response.
+
+    A route streams when it uses ``<Suspense>`` or sits under a ``loading.pyxl``
+    boundary; the presence of any compiled ``loading.pyxl`` (carried on
+    ``routes.loading_boundary_pages``) also makes streaming reachable. This is
+    the gate that, combined with a ``BaseHTTPMiddleware``, triggers the
+    incompatibility warning below.
+    """
+    if any(page.uses_suspense or page.loading_boundary is not None for page in routes.pages):
+        return True
+    return bool(routes.loading_boundary_pages)
+
+
+def _warn_base_http_middleware_with_streaming(
+    user_middleware: Iterable[Middleware],
+    routes: RouteTable,
+    *,
+    logger: ConsoleLogger,
+) -> None:
+    """Warn when a ``BaseHTTPMiddleware`` is paired with streaming-eligible routes.
+
+    Starlette's ``BaseHTTPMiddleware`` buffers responses, so it cannot wrap a
+    streamed ``StreamingResponse``: when a ``<Suspense>`` boundary defers, the
+    request raises ``RuntimeError: No response returned.``. Both features are
+    advertised, so we flag the combination at startup — naming each offending
+    class — and point at the streaming-safe pure-ASGI middleware pattern. Pure
+    warning; nothing is mutated, so an app that never actually streams (every
+    eligible route stays buffered) keeps working.
+    """
+    offenders = find_base_http_middlewares(user_middleware)
+    if not offenders or not _has_streaming_eligible_routes(routes):
+        return
+
+    names = ", ".join(offenders)
+    plural = "es" if len(offenders) > 1 else ""
+    logger.warning(
+        f"Custom middleware class{plural} {names} subclass Starlette's "
+        "BaseHTTPMiddleware, which buffers the response and is incompatible "
+        "with streaming SSR: when a <Suspense> boundary defers, the request "
+        "fails with 'RuntimeError: No response returned.'. Rewrite it as a "
+        "pure-ASGI middleware (a callable taking (scope, receive, send) that "
+        "wraps the send channel) so streamed and buffered responses pass "
+        "through unchanged. See the middleware guide's streaming-safe pattern."
+    )
+
+
 def create_starlette_app(
     settings: DevServerSettings,
     routes: RouteTable,
@@ -1577,6 +1628,10 @@ def create_starlette_app(
     except MiddlewareHookError as exc:
         console_logger.error(str(exc))
         raise
+
+    _warn_base_http_middleware_with_streaming(
+        user_middleware, routes, logger=console_logger
+    )
 
     # --- CORS middleware ---
     cors_middleware: Middleware | None = None
@@ -1761,11 +1816,25 @@ def create_starlette_app(
                     console_logger.info(
                         f"Warmed {warmed} pre-rendered page(s) from {prerender_dir}"
                     )
+        # Open the realtime broker's connection + listener. For the default
+        # in-process broker this is a no-op; for PYXLE_REALTIME_BROKER=redis it
+        # connects to Redis and pings it, so a bad URL fails startup loudly.
+        # ``start``/``aclose`` aren't part of the minimal Broker Protocol
+        # (subscribe/unsubscribe/publish), so call them only if present — a
+        # user-supplied Protocol-only broker still works.
+        _broker_start = getattr(app.state.pyxle_broker, "start", None)
+        if _broker_start is not None:
+            await _broker_start()
         try:
             yield
         finally:
-            # Shutdown in reverse order — best-effort; individual
-            # failures are logged, not re-raised.
+            # Shutdown in reverse order. Each step's callee is itself
+            # exception-swallowing/best-effort, so a single failure won't abort
+            # the rest of teardown.
+            broker = getattr(app.state, "pyxle_broker", None)
+            broker_aclose = getattr(broker, "aclose", None)
+            if broker_aclose is not None:
+                await broker_aclose()
             if page_cache is not None:
                 set_active_cache(None)
                 await page_cache.aclose()
@@ -1794,11 +1863,14 @@ def create_starlette_app(
 
     middleware_stack: list[Middleware] = []
 
-    # GZip compression in production mode (reduces bandwidth ~60-70%).
+    # GZip compression in production mode (reduces bandwidth ~60-70%). Uses the
+    # streaming-aware variant so gzip flushes per chunk — otherwise it buffers
+    # the whole streamed response and defeats streaming SSR (the page would
+    # arrive all at once instead of shell-first).
     if not settings.debug:
-        from starlette.middleware.gzip import GZipMiddleware  # noqa: PLC0415
+        from pyxle.middleware.gzip import StreamingGZipMiddleware  # noqa: PLC0415
 
-        middleware_stack.append(Middleware(GZipMiddleware, minimum_size=500))
+        middleware_stack.append(Middleware(StreamingGZipMiddleware, minimum_size=500))
 
     # Security response headers in production mode.
     if not settings.debug:
@@ -1946,13 +2018,15 @@ def create_starlette_app(
     # Streaming SSR's render_stream is bound to the worker pool, which outlives
     # route-table refreshes — stash it so a hot rebuild keeps streaming wired.
     app.state.pyxle_stream_render = stream_render
-    # One in-process pub/sub broker per app process, shared by every WebSocket
-    # connection (pyxle.realtime.channel reads it off app.state). In-process
-    # only — see the multi-worker caveat documented in pyxle.realtime.channels
-    # and logged at serve time when --workers > 1.
-    from pyxle.realtime import InProcessBroker  # noqa: PLC0415 - lazy, optional path
+    # One pub/sub broker per app process, shared by every WebSocket connection
+    # (pyxle.realtime.channel reads it off app.state). Defaults to the in-process
+    # broker; set PYXLE_REALTIME_BROKER=redis for cross-worker delivery under
+    # ``pyxle serve --workers N`` (needs the [redis] extra). Constructed here
+    # (cheap, no I/O); its connection + listener open in the lifespan via
+    # ``broker.start()`` and close via ``broker.aclose()``.
+    from pyxle.realtime import build_broker  # noqa: PLC0415 - lazy, optional path
 
-    app.state.pyxle_broker = InProcessBroker()
+    app.state.pyxle_broker = build_broker()
 
     return app
 

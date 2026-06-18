@@ -118,3 +118,51 @@ async def test_prerender_skips_missing_manifest_placeholder(monkeypatch, tmp_pat
 
     assert rendered == []
     assert await FileCacheBackend(prerender_dir).get(PageCache.make_key("/x")) is None
+
+
+@pytest.mark.anyio
+async def test_prerender_ambient_activates_plugin_context(monkeypatch) -> None:
+    """The build-time prerender environment must expose the active plugin
+    context so a page/layout loader that uses a plugin service (e.g. pyxle-db's
+    ``get_database()``) resolves at build time instead of raising
+    ``PluginServiceError`` (regression for F36 — ``--static`` pre-rendered 0
+    pages because no plugin context was active)."""
+    import pyxle.plugins as plugins_mod
+    from pyxle.plugins import (
+        PluginContext,
+        PluginServiceError,
+        PyxlePlugin,
+        plugin,
+    )
+
+    class _DbStub(PyxlePlugin):
+        name = "db"
+        version = "0.0.1"
+
+        def __init__(self) -> None:
+            self.started = False
+            self.shut = False
+
+        async def on_startup(self, ctx: PluginContext) -> None:
+            self.started = True
+            ctx.register("db.database", "<connection>")
+
+        async def on_shutdown(self, ctx: PluginContext) -> None:
+            self.shut = True
+
+    stub = _DbStub()
+    # Bypass module import: the ambient manager builds specs from settings then
+    # calls load_plugins — return our stub so no real plugin module is needed.
+    monkeypatch.setattr(plugins_mod, "load_plugins", lambda specs: (stub,))
+    settings = SimpleNamespace(project_root="/tmp/app", plugins=["pyxle-db"])
+
+    async with static_gen._prerender_ambient(settings):
+        # Startup ran and the service resolves through the *active* context,
+        # exactly as a loader's get_database() would at request time.
+        assert stub.started is True
+        assert plugin("db.database") == "<connection>"
+
+    # Torn down: plugins shut down and the active context is cleared.
+    assert stub.shut is True
+    with pytest.raises(PluginServiceError):
+        plugin("db.database")

@@ -323,6 +323,28 @@ def test_load_config_rejects_invalid_route_middleware_block(tmp_path: Path) -> N
         load_config(tmp_path)
 
 
+def test_load_config_rejects_unknown_route_middleware_key(tmp_path: Path) -> None:
+    write_config(tmp_path, {"routeMiddleware": {"page": ["package:policy"]}})
+
+    with pytest.raises(ConfigError, match="Unknown keys in 'routeMiddleware'"):
+        load_config(tmp_path)
+
+
+def test_load_config_rejects_unknown_styling_key(tmp_path: Path) -> None:
+    # A singular-typo'd key (globalStyle) must fail loudly, not be silently dropped.
+    write_config(tmp_path, {"styling": {"globalStyle": ["styles/global.css"]}})
+
+    with pytest.raises(ConfigError, match="Unknown keys in 'styling'"):
+        load_config(tmp_path)
+
+
+def test_load_config_rejects_unknown_network_key(tmp_path: Path) -> None:
+    write_config(tmp_path, {"starlette": {"prot": 9000}})
+
+    with pytest.raises(ConfigError, match="Unknown keys in 'starlette'"):
+        load_config(tmp_path)
+
+
 def test_load_config_parses_styling_block(tmp_path: Path) -> None:
     write_config(
         tmp_path,

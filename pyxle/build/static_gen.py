@@ -15,8 +15,9 @@ from __future__ import annotations
 
 import asyncio
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import AsyncIterator, Callable, Iterable
 
 from starlette.requests import Request
 from starlette.responses import Response
@@ -31,6 +32,47 @@ from pyxle.ssr.renderer import ComponentRenderer, pool_render_factory
 
 #: Sub-directory of ``dist`` holding pre-rendered page-cache entries.
 PRERENDER_DIRNAME = "prerendered"
+
+
+@asynccontextmanager
+async def _prerender_ambient(settings: DevServerSettings) -> AsyncIterator[None]:
+    """Stand up the plugin context that page/layout loaders see at request time.
+
+    Static pre-rendering runs loaders at build time (Next's ``getStaticProps``
+    hits its data source at build, too). A loader that calls a plugin service --
+    e.g. ``get_database()`` from a ``pyxle-db`` app, or a layout loader that does
+    -- resolves it through the **active plugin context** (``pyxle.plugins.plugin``).
+    Without this, ``--static`` raises ``PluginServiceError: No active plugin
+    context`` and pre-renders nothing. This mirrors the serve lifespan
+    (``starlette_app`` lifespan): load the configured plugins, run their startup
+    so services register (DB connections open, migrations apply), set the active
+    context, and tear it all down afterwards.
+    """
+    from pyxle.plugins import (
+        PluginContext,
+        PluginSpec,
+        load_plugins,
+        run_shutdown,
+        run_startup,
+        set_active_context,
+    )
+
+    specs = tuple(
+        PluginSpec.from_config_entry(entry, source=str(settings.project_root))
+        for entry in settings.plugins
+    )
+    plugins = load_plugins(specs)
+    ctx = PluginContext(settings=settings)
+    # run_startup is INSIDE the try so that if one plugin's on_startup fails, the
+    # plugins that already started (e.g. opened a DB connection) are still torn
+    # down by run_shutdown in the finally, rather than leaked.
+    try:
+        await run_startup(plugins, ctx)
+        set_active_context(ctx)
+        yield
+    finally:
+        set_active_context(None)
+        await run_shutdown(plugins, ctx)
 
 
 def _request_for(path: str) -> Request:
@@ -144,13 +186,17 @@ def generate_static_site(
         )
         await pool.start()
         try:
-            renderer = ComponentRenderer(factory=pool_render_factory(pool))
-            return await prerender_pages(
-                settings=dist_settings,
-                pages=static_pages,
-                renderer=renderer,
-                prerender_dir=dist_dir / PRERENDER_DIRNAME,
-            )
+            # Establish the same plugin context a request would see, so static
+            # pages whose page/layout loaders use a plugin service (e.g. the
+            # pyxle-db `get_database()`) pre-render instead of raising.
+            async with _prerender_ambient(dist_settings):
+                renderer = ComponentRenderer(factory=pool_render_factory(pool))
+                return await prerender_pages(
+                    settings=dist_settings,
+                    pages=static_pages,
+                    renderer=renderer,
+                    prerender_dir=dist_dir / PRERENDER_DIRNAME,
+                )
         finally:
             await pool.stop()
 

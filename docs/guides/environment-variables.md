@@ -66,6 +66,8 @@ export default function Page() {
 }
 ```
 
+The value is substituted at build time into **both** the server (SSR) and client bundles, so it's safe to render directly into initial HTML — the server and client agree, with no hydration mismatch.
+
 **Server-only variables** (without the `PYXLE_PUBLIC_` prefix) are **never** exposed to the client. They are only available via `os.environ` in your Python code.
 
 ## `PYXLE_` config overrides
@@ -109,6 +111,20 @@ HTML. The default needs no configuration.
 The cache is active only for production serves (`pyxle serve`); `pyxle dev`
 never caches. The `redis` backend needs `pip install 'pyxle-framework[redis]'`.
 
+## Realtime broker
+
+These select the [WebSocket pub/sub broker](websockets.md#cross-worker-realtime-with-redis).
+The default in-process broker needs no configuration; switch to Redis for
+cross-worker delivery under `pyxle serve --workers N`.
+
+| Variable | Meaning |
+|----------|---------|
+| `PYXLE_REALTIME_BROKER` | `memory` (default, in-process) or `redis` (cross-worker) |
+| `PYXLE_REALTIME_REDIS_URL` | redis broker: connection URL (default `redis://localhost:6379`) |
+| `PYXLE_REALTIME_CHANNEL_PREFIX` | redis broker: channel namespace (default `pyxle:rt:`) |
+
+The `redis` broker needs `pip install 'pyxle-framework[redis]'`.
+
 ## Using environment variables in loaders
 
 ```python
@@ -120,6 +136,8 @@ async def load_page(request):
     # Use api_key to call an external service
     return {"data": "..."}
 ```
+
+> `.env` files are loaded by the Pyxle CLI at startup (`pyxle dev`/`serve`/`build`). Outside the CLI — e.g. a loader unit-tested in isolation, or `python app.py` — they are **not** auto-loaded; set the variables in the process environment yourself or call `pyxle.env.load_env_files()` first.
 
 ## `.gitignore` recommendations
 

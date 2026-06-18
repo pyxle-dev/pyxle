@@ -6,10 +6,12 @@ The `pyxle` CLI manages Pyxle projects from scaffolding to production.
 
 | Flag | Description |
 |------|-------------|
-| `--version` | Print Pyxle version and exit |
+| `--version` | Show Pyxle version and exit |
 | `--log-format [console\|json]` | Output format (default: `console`) |
 | `--verbose` / `-v` | Show debug-level output |
 | `--quiet` / `-q` | Suppress informational output; show only warnings and errors |
+| `--install-completion` | Install shell completion for the current shell |
+| `--show-completion` | Print shell completion (to copy or customize) |
 
 ## `pyxle init`
 

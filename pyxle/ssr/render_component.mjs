@@ -13,6 +13,30 @@ const _pyxleSsrLocale = process.env.PYXLE_SSR_LOCALE || 'en-US.UTF-8';
 if (!process.env.LANG) process.env.LANG = _pyxleSsrLocale;
 if (!process.env.LC_ALL) process.env.LC_ALL = _pyxleSsrLocale;
 
+// Mirrors SAFE_IDENTIFIER_RE in pyxle/devserver/_security.py so the SSR esbuild
+// define accepts exactly the PYXLE_PUBLIC_* keys the client Vite define does.
+const _PYXLE_SAFE_IDENTIFIER_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+/**
+ * Build the esbuild ``define`` map for ``import.meta.env.PYXLE_PUBLIC_*``.
+ *
+ * Vite substitutes these public env vars into the *client* bundle; without a
+ * matching define here the same expression renders as ``undefined`` on the
+ * server, so any public env var baked into the initial HTML mismatches the
+ * hydrated client (blank first paint). Reading the same keys from
+ * ``process.env`` keeps server and client output identical. Values are
+ * JSON-stringified because esbuild treats ``define`` values as raw expressions.
+ */
+function buildPublicEnvDefine() {
+  const define = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (!key.startsWith('PYXLE_PUBLIC_')) continue;
+    if (!_PYXLE_SAFE_IDENTIFIER_RE.test(key)) continue;
+    define[`import.meta.env.${key}`] = JSON.stringify(value ?? '');
+  }
+  return define;
+}
+
 /**
  * Verify that a resolved path stays within the given boundary directory.
  *
@@ -101,6 +125,9 @@ async function render() {
       sourcemap: false,
       logLevel: 'silent',
       absWorkingDir: workingDir,
+      // Substitute import.meta.env.PYXLE_PUBLIC_* the same way Vite does for the
+      // client bundle, so server-rendered HTML agrees with the hydrated client.
+      define: buildPublicEnvDefine(),
       plugins: [
         {
           name: 'pyxle-pages-alias',

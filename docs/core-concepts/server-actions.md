@@ -174,9 +174,11 @@ Pydantic is an **optional dependency**. Install it with the extra:
 pip install "pyxle-framework[pydantic]"
 ```
 
-If an action declares a Pydantic body but Pydantic isn't installed, the request
+If an action declares a **required** Pydantic body but Pydantic isn't installed, the request
 fails with a clear `500` (and the dev server logs why) — actions without a model
-parameter are unaffected.
+parameter are unaffected. An **optional** body (`Model | None` with a default) silently
+skips validation when Pydantic is absent: the action runs with the body never validated
+and the parameter left at its default.
 
 ### What the client receives on a validation failure
 
@@ -195,7 +197,9 @@ When the body fails validation, the action is **not** called. The client gets a
 ```
 
 Field paths are dotted for nested models (`address.zip`) and indexed for list
-items (`tags.0`).
+items (`tags.0`). Whole-body errors — a malformed JSON body, or a root-level
+model error — use the key `__root__` rather than a field name; render it as a
+form-level message.
 
 ### Showing field errors in the UI
 

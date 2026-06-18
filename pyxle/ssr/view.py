@@ -120,18 +120,39 @@ def _error_response(
     return HTMLResponse(fallback, status_code=status_code)
 
 
-def _resolve_nav_cache_ttl(settings: DevServerSettings, path: str) -> int | None:
-    """Return the configured edge-cache TTL (seconds) for ``path``, if any.
+def _resolve_nav_cache_ttl(
+    settings: DevServerSettings, path: str, page: PageRoute | None = None
+) -> int | None:
+    """Return the client navigation-cache lifetime (seconds) for ``path``.
 
     The client navigation cache reuses this per-page value so a page's
-    prefetch/seed freshness matches its declared edge-cache lifetime. Pages
-    with no ``cache`` entry return ``None`` and fall back to the client's
-    default navigation-cache lifetime.
+    prefetch/seed freshness matches the server's actual cacheability. Resolved in
+    priority order:
+
+    1. An explicit edge ``cache`` config entry for the path → its max-age (the
+       page is shared-cacheable for that long, so the client may reuse it too).
+    2. A page ``CACHE`` directive (``cache_revalidate``) → that lifetime.
+    3. A page with a ``@server`` loader but **no** declared cache lifetime is
+       dynamic — it renders ``private, no-cache`` and its data can change between
+       requests (live updates, per-user content). Return ``0`` ("never cache") so
+       a mutation is visible immediately on back/forward navigation instead of
+       being hidden behind the default window until it expires.
+    4. Otherwise (a static, loader-less page whose markup never varies) → ``None``
+       → the client's default navigation-cache lifetime.
+
+    Pages that want client navigation caching can opt in explicitly with a
+    ``cache`` config entry; the safe default is to stay fresh.
     """
     cache = getattr(settings, "cache", None)
-    if cache is None:
-        return None
-    return cache.max_age_for(path)
+    config_ttl = cache.max_age_for(path) if cache is not None else None
+    if config_ttl is not None:
+        return config_ttl
+    if page is not None:
+        if page.cache_revalidate is not None:
+            return page.cache_revalidate
+        if page.has_loader:
+            return 0
+    return None
 
 
 def _attach_revalidate(response: Response, revalidate: float | None) -> None:
@@ -169,7 +190,7 @@ async def build_page_response(
             suppress_per_user=suppress_per_user,
         )
         script_nonce = secrets.token_urlsafe(24)
-        nav_cache_ttl = _resolve_nav_cache_ttl(settings, request.url.path)
+        nav_cache_ttl = _resolve_nav_cache_ttl(settings, request.url.path, page=page)
         try:
             shell = build_document_shell(
                 settings=settings,
@@ -351,7 +372,7 @@ async def build_streaming_page_response(
             runtime_head_blocks=(),
         )
         script_nonce = secrets.token_urlsafe(24)
-        nav_cache_ttl = _resolve_nav_cache_ttl(settings, request.url.path)
+        nav_cache_ttl = _resolve_nav_cache_ttl(settings, request.url.path, page=page)
         try:
             shell = build_document_shell(
                 settings=settings,
@@ -521,7 +542,7 @@ async def build_page_navigation_response(
             # Per-page client navigation-cache lifetime (seconds). Mirrors the
             # page's edge-cache TTL so prefetched data stays fresh exactly as
             # long as the CDN would serve it; ``None`` → client default.
-            "navCacheTtlSeconds": _resolve_nav_cache_ttl(settings, request.url.path),
+            "navCacheTtlSeconds": _resolve_nav_cache_ttl(settings, request.url.path, page=page),
         }
         return JSONResponse(payload, status_code=nav_status_code)
     except LoaderError as exc:
@@ -994,7 +1015,7 @@ async def _try_error_boundary(
         return None
 
     # Build error context that the error page component receives as props.
-    error_context = _build_error_context(error, status_code)
+    error_context = _build_error_context(error, status_code, debug=settings.debug)
 
     try:
         _boundary_render_start = time.perf_counter()
@@ -1026,8 +1047,22 @@ async def _try_error_boundary(
         return None
 
 
-def _build_error_context(error: BaseException, status_code: int) -> dict[str, Any]:
-    """Build the error context dict passed as component props to error.pyxl."""
+def _build_error_context(
+    error: BaseException, status_code: int, *, debug: bool
+) -> dict[str, Any]:
+    """Build the error context dict passed as component props to ``error.pyxl``.
+
+    Author-raised :class:`~pyxle.runtime.LoaderError` /
+    :class:`~pyxle.runtime.ActionError` messages are intentional, user-facing
+    copy, so they pass through verbatim in every environment (along with any
+    ``data`` payload). For any *other* exception the message originates inside
+    the framework or the Node SSR runtime and may carry a stack trace, file
+    path, row ID, or secret. In production (``debug=False``) such messages are
+    replaced with a generic string so an ``error.pyxl`` boundary never leaks
+    internals (CLAUDE.md rule 18); in development they are surfaced (redacted
+    for obvious secrets, mirroring the dev error overlay and
+    :func:`_navigation_error_response`).
+    """
     from pyxle.runtime import ActionError, LoaderError
 
     context: dict[str, Any] = {
@@ -1040,6 +1075,21 @@ def _build_error_context(error: BaseException, status_code: int) -> dict[str, An
         context["message"] = error.message
         if error.data:
             context["data"] = error.data
+        return context
+
+    if debug:
+        from pyxle.devserver._security import redact_sensitive_patterns  # noqa: PLC0415
+
+        context["message"] = redact_sensitive_patterns(
+            str(error) or error.__class__.__name__
+        )
+    else:
+        context["message"] = "An unexpected error occurred."
+        # Hide the exception class name too: a third-party class
+        # (e.g. ``InsufficientPrivilege``) can itself disclose which internal
+        # subsystem failed. Mirror the JSON nav-error path, which uses
+        # "ServerError" in production for non-author exceptions.
+        context["type"] = "ServerError"
 
     return context
 

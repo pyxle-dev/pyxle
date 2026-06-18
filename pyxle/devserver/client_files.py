@@ -2276,7 +2276,7 @@ def _render_tsconfig() -> str:
                 "target": "ESNext",
                 "useDefineForClassFields": true,
                 "module": "ESNext",
-                "moduleResolution": "Node",
+                "moduleResolution": "Bundler",
                 "strict": true,
                 "jsx": "react-jsx",
                 "esModuleInterop": true,
@@ -2285,12 +2285,11 @@ def _render_tsconfig() -> str:
                 "resolveJsonModule": true,
                 "isolatedModules": true,
                 "skipLibCheck": true,
-                "baseUrl": ".",
                 "paths": {
-                  "/pages/*": ["pages/*"],
-                  "/routes/*": ["routes/*"],
-                  "pyxle/client": ["pyxle/client"],
-                  "pyxle/client/*": ["pyxle/*"]
+                  "/pages/*": ["./pages/*"],
+                  "/routes/*": ["./routes/*"],
+                  "pyxle/client": ["./pyxle/client"],
+                  "pyxle/client/*": ["./pyxle/*"]
                 },
                 "types": ["vite/client"]
               },
@@ -2631,7 +2630,7 @@ def _render_image_component() -> str:
                   height={fill ? undefined : height}
                   loading={priority ? 'eager' : lazy ? 'lazy' : 'eager'}
                   decoding={priority ? 'sync' : 'async'}
-                  fetchPriority={priority ? 'high' : undefined}
+                  {...(priority ? { fetchpriority: 'high' } : {})}
                   onLoad={handleLoad}
                   onError={handleError}
                   className={className}

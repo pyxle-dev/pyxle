@@ -131,6 +131,12 @@ class TestCorsConfigParsing:
         config = load_config(tmp_path, config_path=config_file)
         assert not config.cors.enabled
 
+    def test_unknown_cors_key_raises(self, tmp_path: Path):
+        config_file = tmp_path / "pyxle.config.json"
+        config_file.write_text(json.dumps({"cors": {"orgins": ["*"]}}))
+        with pytest.raises(ConfigError, match="Unknown keys in 'cors'"):
+            load_config(tmp_path, config_path=config_file)
+
 
 # ---------------------------------------------------------------------------
 # Config JSON parsing — CSRF
@@ -208,6 +214,23 @@ class TestCsrfConfigParsing:
         config_file.write_text("{}")
         config = load_config(tmp_path, config_path=config_file)
         assert config.csrf.enabled is True
+
+    def test_unknown_csrf_key_raises(self, tmp_path: Path):
+        config_file = tmp_path / "pyxle.config.json"
+        config_file.write_text(json.dumps({"csrf": {"headerNme": "x"}}))
+        with pytest.raises(ConfigError, match="Unknown keys in 'csrf'"):
+            load_config(tmp_path, config_path=config_file)
+
+    def test_miscased_same_site_typo_raises_not_silently_downgraded(self, tmp_path: Path):
+        # The exact F3 regression: a mis-cased 'cookieSamesite' used to be
+        # silently dropped, leaving SameSite=lax (a security downgrade). It must
+        # now raise instead of quietly keeping the default.
+        config_file = tmp_path / "pyxle.config.json"
+        config_file.write_text(
+            json.dumps({"csrf": {"cookieSamesite": "strict"}})
+        )
+        with pytest.raises(ConfigError, match="Unknown keys in 'csrf'"):
+            load_config(tmp_path, config_path=config_file)
 
 
 # ---------------------------------------------------------------------------
@@ -441,6 +464,12 @@ class TestObservabilityConfigParsing:
         config_file = tmp_path / "pyxle.config.json"
         config_file.write_text(json.dumps({"observability": 42}))
         with pytest.raises(ConfigError, match="observability"):
+            load_config(tmp_path, config_path=config_file)
+
+    def test_unknown_observability_key_raises(self, tmp_path: Path):
+        config_file = tmp_path / "pyxle.config.json"
+        config_file.write_text(json.dumps({"observability": {"requestid": True}}))
+        with pytest.raises(ConfigError, match="Unknown keys in 'observability'"):
             load_config(tmp_path, config_path=config_file)
 
     def test_invalid_request_id_type_raises(self, tmp_path: Path):

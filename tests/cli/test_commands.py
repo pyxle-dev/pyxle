@@ -215,6 +215,28 @@ def test_init_generates_dev_secret_key(tmp_path, monkeypatch) -> None:
     assert ".env.local" in gitignore
 
 
+def test_scaffold_gitignore_commits_env_ignores_only_local(tmp_path, monkeypatch) -> None:
+    """`pyxle init` must NOT gitignore `.env` (the env doc says to commit it).
+
+    Only machine-local secret overrides (`.env.local`, `.env.*.local`) are
+    ignored; the shared `.env` / `.env.development` / `.env.production` files
+    stay committable, matching docs/guides/environment-variables.md.
+    """
+    from pyxle.cli.init import run_init
+
+    monkeypatch.chdir(tmp_path)
+    run_init("demo", force=False, template="default", logger=cli.ConsoleLogger(), log_steps=False)
+
+    lines = (tmp_path / "demo" / ".gitignore").read_text(encoding="utf-8").splitlines()
+    # Local secret overrides remain ignored.
+    assert ".env.local" in lines
+    assert ".env.*.local" in lines
+    # The committable env files must NOT appear as ignore patterns.
+    assert ".env" not in lines
+    assert ".env.development" not in lines
+    assert ".env.production" not in lines
+
+
 def test_scaffold_gitignore_excludes_build_dirs(tmp_path, monkeypatch) -> None:
     """`pyxle init` must gitignore BOTH build outputs — the dev cache
     (.pyxle-build/) and the production build dir (dist/) — so generated,

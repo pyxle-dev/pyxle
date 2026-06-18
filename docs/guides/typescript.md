@@ -66,21 +66,26 @@ The scaffolded config turns on strict mode and wires the import aliases Pyxle us
     "strict": true,
     "jsx": "react-jsx",
     "module": "ESNext",
-    "moduleResolution": "Node",
-    "allowJs": true,            // your pages are .jsx, checked against the .d.ts
+    "moduleResolution": "Bundler", // your code is bundled by Vite/esbuild
+    "allowJs": true,               // your pages are .jsx, checked against the .d.ts
     "skipLibCheck": true,
     "types": ["vite/client"],
-    "baseUrl": ".",
-    "paths": {
-      "/pages/*": ["pages/*"],
-      "/routes/*": ["routes/*"],
-      "pyxle/client": ["pyxle/client"],
-      "pyxle/client/*": ["pyxle/*"]
+    "paths": {                     // resolved relative to this tsconfig (no baseUrl)
+      "/pages/*": ["./pages/*"],
+      "/routes/*": ["./routes/*"],
+      "pyxle/client": ["./pyxle/client"],
+      "pyxle/client/*": ["./pyxle/*"]
     }
   },
   "include": ["./client-entry.js", "./pages/**/*.jsx", "./pyxle/**/*"]
 }
 ```
+
+Resolution is `"bundler"` (not the legacy `"node"`/`node10`) because your code is
+bundled by Vite + esbuild, not resolved by Node at runtime — and TypeScript 7.0
+deprecates `node10` resolution and `baseUrl` outright, so a current `tsc` would
+reject them. `paths` work without `baseUrl`: they resolve relative to the
+`tsconfig.json`.
 
 Two honest notes on coverage:
 

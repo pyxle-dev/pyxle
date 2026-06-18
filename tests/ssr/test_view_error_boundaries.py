@@ -57,34 +57,79 @@ def _stub_request(path: str = "/test"):
 
 
 class TestBuildErrorContext:
-    def test_generic_exception(self):
+    def test_generic_exception_in_dev_shows_message(self):
         err = RuntimeError("something failed")
-        ctx = _build_error_context(err, 500)
+        ctx = _build_error_context(err, 500, debug=True)
         assert ctx["message"] == "something failed"
         assert ctx["statusCode"] == 500
         assert ctx["type"] == "RuntimeError"
 
-    def test_loader_error_uses_message_field(self):
+    def test_generic_exception_in_prod_hides_message(self):
+        # A framework / SSR-runtime exception in production must not leak its
+        # raw message (CLAUDE.md rule 18): the boundary gets a generic string.
+        err = RuntimeError("Traceback: /srv/app/pages/dash.py line 42 boom")
+        ctx = _build_error_context(err, 500, debug=False)
+        assert ctx["message"] == "An unexpected error occurred."
+        assert ctx["statusCode"] == 500
+        # The class name is also sanitized in prod (it can itself disclose the
+        # failing subsystem), mirroring the JSON nav-error path's "ServerError".
+        assert ctx["type"] == "ServerError"
+
+    def test_custom_exception_class_name_sanitized_in_prod(self):
+        # A third-party / custom exception class name (e.g. a DB driver's
+        # InsufficientPrivilege) must not reach the browser in production.
+        class StripeWebhookSignatureError(RuntimeError):
+            pass
+
+        err = StripeWebhookSignatureError("sig mismatch from host 10.0.0.5")
+        ctx = _build_error_context(err, 500, debug=False)
+        assert ctx["message"] == "An unexpected error occurred."
+        assert ctx["type"] == "ServerError"
+        # In dev the real class name is kept (it's useful while debugging).
+        assert _build_error_context(err, 500, debug=True)["type"] == "StripeWebhookSignatureError"
+
+    def test_generic_exception_in_dev_redacts_secrets(self):
+        # In dev the message is surfaced but obvious secrets are redacted,
+        # mirroring the dev error overlay and _navigation_error_response.
+        err = RuntimeError("connect failed for postgres://user:hunter2@db:5432/app")
+        ctx = _build_error_context(err, 500, debug=True)
+        assert "hunter2" not in ctx["message"]
+
+    def test_generic_exception_in_dev_falls_back_to_type_name(self):
+        # An empty message becomes the class name in dev (never empty).
+        err = RuntimeError()
+        ctx = _build_error_context(err, 500, debug=True)
+        assert ctx["message"] == "RuntimeError"
+
+    def test_loader_error_passes_through_in_prod(self):
+        # Author-raised LoaderError copy is intentional, user-facing, and must
+        # survive verbatim even in production.
         err = LoaderError("not authorized", status_code=403, data={"reason": "no token"})
-        ctx = _build_error_context(err, 403)
+        ctx = _build_error_context(err, 403, debug=False)
         assert ctx["message"] == "not authorized"
         assert ctx["statusCode"] == 403
         assert ctx["data"] == {"reason": "no token"}
 
+    def test_loader_error_passes_through_in_dev(self):
+        err = LoaderError("not authorized", status_code=403, data={"reason": "no token"})
+        ctx = _build_error_context(err, 403, debug=True)
+        assert ctx["message"] == "not authorized"
+        assert ctx["data"] == {"reason": "no token"}
+
     def test_loader_error_without_data(self):
         err = LoaderError("oops")
-        ctx = _build_error_context(err, 500)
+        ctx = _build_error_context(err, 500, debug=False)
         assert "data" not in ctx
 
-    def test_action_error(self):
+    def test_action_error_passes_through_in_prod(self):
         err = ActionError("bad request", status_code=400, data={"field": "email"})
-        ctx = _build_error_context(err, 400)
+        ctx = _build_error_context(err, 400, debug=False)
         assert ctx["message"] == "bad request"
         assert ctx["data"] == {"field": "email"}
 
     def test_action_error_without_data(self):
         err = ActionError("forbidden", status_code=403)
-        ctx = _build_error_context(err, 403)
+        ctx = _build_error_context(err, 403, debug=False)
         assert "data" not in ctx
 
 
@@ -189,6 +234,68 @@ class TestTryErrorBoundary:
         )
         assert result is not None
         assert result.status_code == 404
+
+    def test_boundary_hides_internals_in_prod(self):
+        # End-to-end: a non-author exception routed through the boundary must
+        # hand the error.pyxl component a generic message in production, never
+        # the raw internal detail.
+        mock_renderer = MagicMock()
+        mock_render_result = MagicMock()
+        mock_render_result.html = "<div>Error Page</div>"
+        mock_render_result.inline_styles = ()
+        mock_render_result.head_elements = ()
+        mock_renderer.render = AsyncMock(return_value=mock_render_result)
+
+        settings = MagicMock()
+        settings.debug = False
+        settings.vite_host = "127.0.0.1"
+        settings.vite_port = 5173
+        settings.page_manifest = None
+        settings.global_stylesheets = ()
+
+        asyncio.run(
+            _try_error_boundary(
+                request=_stub_request(),
+                settings=settings,
+                renderer=mock_renderer,
+                error_boundaries=self._registry_with_root(),
+                route_path="/test",
+                error=RuntimeError("/srv/secret/path.py exploded"),
+                status_code=500,
+            )
+        )
+        props = mock_renderer.render.call_args.args[1]
+        assert props["error"]["message"] == "An unexpected error occurred."
+        assert "secret" not in props["error"]["message"]
+
+    def test_boundary_shows_internals_in_dev(self):
+        mock_renderer = MagicMock()
+        mock_render_result = MagicMock()
+        mock_render_result.html = "<div>Error Page</div>"
+        mock_render_result.inline_styles = ()
+        mock_render_result.head_elements = ()
+        mock_renderer.render = AsyncMock(return_value=mock_render_result)
+
+        settings = MagicMock()
+        settings.debug = True
+        settings.vite_host = "127.0.0.1"
+        settings.vite_port = 5173
+        settings.page_manifest = None
+        settings.global_stylesheets = ()
+
+        asyncio.run(
+            _try_error_boundary(
+                request=_stub_request(),
+                settings=settings,
+                renderer=mock_renderer,
+                error_boundaries=self._registry_with_root(),
+                route_path="/test",
+                error=RuntimeError("dev detail here"),
+                status_code=500,
+            )
+        )
+        props = mock_renderer.render.call_args.args[1]
+        assert props["error"]["message"] == "dev detail here"
 
     def test_returns_none_when_boundary_itself_fails(self):
         mock_renderer = MagicMock()

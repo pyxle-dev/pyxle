@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from pathlib import Path
 
@@ -60,6 +61,26 @@ def test_write_client_bootstrap_files_generates_expected_artifacts(tmp_path: Pat
     assert index_types == _render_client_runtime_index_types()
     assert link_types == _render_client_runtime_link_types()
     assert slot_types == _render_slot_runtime_types()
+
+
+def test_tsconfig_avoids_typescript_7_deprecated_options() -> None:
+    """The generated tsconfig must not use options TypeScript deprecates for 7.0:
+    ``moduleResolution: "node10"``/``"Node"`` (TS5107) and ``baseUrl`` (TS5101),
+    which make ``pyxle typecheck`` fail with deprecation errors on a current
+    TypeScript. A Vite/esbuild project should use ``bundler`` resolution, with
+    ``paths`` resolved relative to the tsconfig (so no ``baseUrl`` is needed)."""
+    options = json.loads(_render_tsconfig())["compilerOptions"]
+
+    assert options["moduleResolution"] == "Bundler"
+    assert options["moduleResolution"].lower() not in {"node", "node10"}
+    assert "baseUrl" not in options
+    # paths survive the baseUrl removal by being explicitly tsconfig-relative.
+    assert options["paths"]["pyxle/client"] == ["./pyxle/client"]
+    assert all(
+        target.startswith("./")
+        for targets in options["paths"].values()
+        for target in targets
+    )
 
 
 def test_client_entry_seeds_nav_cache_and_guards_self_prefetch(tmp_path: Path) -> None:
@@ -635,8 +656,12 @@ def test_image_component_fill_priority_and_sizes() -> None:
     # Fill positions the image to cover a positioned ancestor.
     assert "position: 'absolute'" in source
     assert "objectFit: objectFit || 'cover'" in source
-    # LCP priority maps to fetchpriority high (plus eager + sync decode).
-    assert "fetchPriority={priority ? 'high' : undefined}" in source
+    # LCP priority maps to the lowercase `fetchpriority` HTML attribute. React
+    # 18.3.1 does not recognise the camelCase `fetchPriority` prop and warns on
+    # it, so the component spreads the lowercase attribute only when priority is
+    # set (passed straight through to the DOM, no warning).
+    assert "fetchPriority" not in source
+    assert "{...(priority ? { fetchpriority: 'high' } : {})}" in source
     # sizes defaults to 100vw under fill.
     assert "resolvedSizes = sizes || (fill ? '100vw' : undefined)" in source
     # Data/blob srcs bypass the loader.

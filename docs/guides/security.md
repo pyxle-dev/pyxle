@@ -93,7 +93,11 @@ verify_cookie(token)                    # "user-42"
 verify_cookie("user-42.deadbeef")       # None  (bad signature → reject)
 ```
 
-The signature is a full HMAC-SHA256 digest, compared in constant time. The secret is read from the `PYXLE_SECRET_KEY` environment variable, or passed explicitly as `secret_key=`. Signing is meaningless without a secret, so a missing one raises `MissingSecretKeyError` rather than returning an unprotected value — it **fails closed**.
+The signature is a full HMAC-SHA256 digest, compared in constant time. The secret is read from the `PYXLE_SECRET_KEY` environment variable, or passed explicitly as `secret_key=`. Signing is meaningless without a secret, so a missing one raises `MissingSecretKeyError` rather than returning an unprotected value — it **fails closed**. Import the exception from `pyxle.security` (it is not re-exported from the top-level `pyxle` package):
+
+```python
+from pyxle.security import MissingSecretKeyError
+```
 
 Use `salt=` to namespace signatures by purpose, so a token signed for one flow can't be replayed in another even under the same secret:
 

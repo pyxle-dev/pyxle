@@ -6,7 +6,7 @@ All client-side components and hooks are importable from `pyxle/client`:
 import {
   Head, Script, Image, ClientOnly,
   Form, useAction, useAuth, useWebSocket,
-  Link, navigate, prefetch, refresh, usePathname
+  Link, navigate, prefetch, refresh, invalidate, usePathname
 } from 'pyxle/client';
 ```
 
@@ -57,7 +57,8 @@ Loads external scripts with configurable loading strategies.
 | `integrity` | `string` | -- | Subresource Integrity (SRI) hash |
 | `referrerPolicy` | `string` | -- | `referrerpolicy` attribute |
 | `onLoad` | `() => void` | -- | Callback on successful load |
-| `onError` | `() => void` | -- | Callback on load failure |
+| `onError` | `(error: Error) => void` | -- | Callback on load failure; receives the `Error` |
+| `children` | `string` | -- | Inline script source, used when `src` is omitted |
 
 **Strategies:**
 
@@ -67,7 +68,9 @@ Loads external scripts with configurable loading strategies.
 | `"afterInteractive"` | Loaded after React hydration (default) |
 | `"lazyOnload"` | Loaded during browser idle time |
 
-**Behaviour:** Renders `null`. The SSR pipeline extracts `<Script>` declarations and handles loading according to the strategy.
+**Behaviour:** Renders `null`. For a **statically written** `<Script>` with a `src`, the SSR pipeline extracts the declaration at build time and the bootstrap loader honours its `strategy`. A `<Script>` rendered dynamically (conditionally, in a mapped list, or with a runtime `src`) is not seen by the compiler and is loaded by the runtime component on mount; `strategy="beforeInteractive"` is impossible in that case — it logs a `[Pyxle Script]` warning and degrades to `afterInteractive`.
+
+**Inline scripts** (`children` with no `src`) are appended to `<head>` on mount and honour only `module` (rendered as `type="module"`); `strategy`, `async`, `defer`, `noModule`, `crossOrigin`, `integrity`, `referrerPolicy`, and `onError` apply to external (`src`) scripts only, and `onLoad` fires synchronously after the inline element is inserted. For an inline script that must run **before** hydration, use a native `<script>` in a layout's `<Head>` (preserved verbatim) instead.
 
 ---
 
@@ -93,15 +96,19 @@ priority loading, layout-shift prevention, and a blur placeholder. See the
 | `sizes` | `string` | -- | `sizes` attribute — which srcset candidate the browser picks |
 | `loader` | `({src,width,quality}) => string` | -- | Builds optimized URLs per width; **enables a responsive `srcset`**. Without it, a plain `<img>` |
 | `quality` | `number` | -- | 1–100, passed to the `loader` |
-| `objectFit` | `string` | `cover` (under fill) | CSS `object-fit` |
+| `objectFit` | `string` | `cover` (under fill) | CSS `object-fit`. Applied whether or not `fill` is set; the `cover` default only kicks in under `fill` |
 | `priority` | `boolean` | `false` | Eager + `decoding="sync"` + `fetchpriority="high"` — use for the LCP image |
 | `lazy` | `boolean` | `true` | Native lazy loading (ignored when `priority`) |
 | `placeholder` | `string` | `"empty"` | `"blur"` shows a blur-up placeholder while loading |
 | `blurDataURL` | `string` | -- | Data URL used for the `placeholder="blur"` preview |
 | `placeholderColor` | `string` | `"#e5e5e5"` | Solid placeholder colour before the image loads |
 | `fallbackSrc` | `string` | -- | Image swapped in automatically if `src` fails to load |
+| `onLoad` | `(event) => void` | -- | Fires when the image loads. On a cache hit it receives a synthetic `{ nativeEvent, target, fromCache }` object rather than a React event |
+| `onError` | `(event) => void` | -- | Fires only **after** `fallbackSrc` (if set) has also failed |
 
 **Responsive images:** provide a `loader` (a CDN such as Cloudinary/imgix, or a build plugin) and `<Image>` emits a `srcset` across a device-size ladder. Without a loader it stays a plain `<img>` — resizing needs a real backend, so Pyxle never emits a fake srcset that re-downloads the full image. All additional props are forwarded to the `<img>`.
+
+**Behaviour:** `<Image>` always renders `data-pyxle-image-state="loading" | "loaded" | "error"` on the underlying `<img>`, so you can target it from CSS or end-to-end tests (e.g. `[data-pyxle-image-state="loading"]` to style the placeholder).
 
 ---
 
@@ -150,7 +157,7 @@ Progressive-enhancement form component for calling server actions.
 
 **Behaviour:**
 - With JavaScript: intercepts submit, serialises form data to JSON, POSTs to the action endpoint
-- Without JavaScript: falls back to a standard HTML form POST
+- Without JavaScript: falls back to a standard HTML form POST. The POST reaches the action and runs it, but action endpoints always return JSON, so a no-JS submit navigates to a page showing the raw JSON response (e.g. `{"ok":true,...}`) — there is no redirect or re-render. Full no-JS form flows that re-render the page are not yet supported; treat the no-JS path as a graceful-degradation safety net, not a primary UX.
 - Displays inline error messages on failure
 - For an action with a [Pydantic body model](../core-concepts/server-actions.md#validating-request-bodies-with-pydantic), a `422` passes the field map to `onError` so you can render messages next to inputs
 - Automatically resolves the action endpoint URL
@@ -175,6 +182,13 @@ Imported from `pyxle/client`. Renders an `<a>` tag that intercepts clicks for cl
 | `href` | `string` | -- | Target path (required) |
 | `prefetch` | `boolean` | `true` | Prefetch the target page's data and module before the click |
 | `replace` | `boolean` | `false` | Replace the current history entry instead of pushing |
+| `scroll` | `boolean \| 'preserve'` | -- | Scroll behaviour after navigation (`'preserve'` keeps the current scroll position) |
+| `shallow` | `boolean` | -- | Update the URL without re-running the loader |
+| `passHref` | `boolean` | -- | Pass `href` through to a custom child anchor |
+| `onClick` | `(event) => void` | -- | Called before navigation; calling `preventDefault()` cancels client-side nav |
+| `onMouseEnter` | `(event) => void` | -- | Called on hover (alongside prefetch) |
+
+All standard anchor attributes — `className`, `target`, `rel`, `style`, `key`, `aria-*`, and so on — are forwarded to the underlying `<a>`.
 
 **Behaviour:**
 - With `prefetch` enabled (the default), the target page's data (its `@server` loader) and component module are prefetched when the link scrolls into view (within 200px) or is hovered — before any click
@@ -399,15 +413,24 @@ function Chat({ room }) {
 
 ## Functions
 
-### `navigate(path)`
+### `navigate(path, options?)`
 
-Trigger client-side navigation programmatically.
+Trigger client-side navigation programmatically. Returns a `Promise<boolean>` that resolves `true` once the navigation completes, or `false` when there is no router or the target is not client-navigable (in which case it falls back to a full page load).
 
 ```jsx
 import { navigate } from 'pyxle/client';
 
-navigate('/dashboard');
+await navigate('/dashboard');
+await navigate('/dashboard', { replace: true, scroll: 'preserve' });
 ```
+
+**Options:**
+
+| Option | Type | Description |
+|--------|------|-------------|
+| `replace` | `boolean` | Replace the current history entry instead of pushing |
+| `scroll` | `boolean \| 'preserve'` | Scroll behaviour after navigation |
+| `shallow` | `boolean` | Update the URL without re-running the loader |
 
 ### `prefetch(path)`
 
@@ -453,7 +476,13 @@ async function handleDelete(id) {
 
 ### Navigation cache TTL
 
-Client-side loader payloads are cached per URL so back/forward navigation is instant while data stays reasonably fresh. A route listed in the `cache` block of `pyxle.config.json` reuses its edge-cache TTL as its navigation-cache lifetime; all other routes default to **2 minutes**. Tune the default with [`navigation.defaultPrefetchTtl`](configuration.md#navigation) (seconds) in `pyxle.config.json`:
+Client-side loader payloads are cached per URL so back/forward navigation is instant while data stays reasonably fresh. The lifetime for a route is resolved to mirror the server's real cacheability:
+
+- A route listed in the `cache` block of `pyxle.config.json` (or with a `CACHE` directive) reuses that **edge-cache TTL** as its navigation-cache lifetime.
+- A **dynamic page** — one with a `@server` loader but **no** declared cache lifetime — is **not** navigation-cached (TTL `0`). It renders `private, no-cache` and its data can change between requests (live updates, per-user content), so back/forward always refetches and a mutation shows immediately instead of being hidden behind a stale window.
+- A **static, loader-less page** falls back to the client default of **2 minutes**.
+
+So navigation caching for a loader page is **opt-in**: add a `cache` entry to give it a TTL. Tune the static default with [`navigation.defaultPrefetchTtl`](configuration.md#navigation) (seconds) in `pyxle.config.json`:
 
 ```json
 {
@@ -463,18 +492,28 @@ Client-side loader payloads are cached per URL so back/forward navigation is ins
 }
 ```
 
-Useful values:
+This default applies to **static, loader-less** routes only — dynamic loader pages without a `cache` entry are never navigation-cached regardless of this value. Useful values:
 
-- `0` — disable caching for routes without a `cache` entry; every navigation hits the server.
-- `120` (default) — keep prefetched and seeded payloads fresh for 2 minutes.
-- a large number — cache for the lifetime of the tab.
+- `0` — disable caching for static routes too; every navigation hits the server.
+- `120` (default) — keep static-page prefetched and seeded payloads fresh for 2 minutes.
+- a large number — cache static pages for the lifetime of the tab.
 
-As a runtime escape hatch, the default can also be overridden by setting a global (in milliseconds) before Pyxle's client runtime boots (e.g. in a `<Script strategy="beforeInteractive">` block) — note it does not affect routes with a `cache` entry:
+As a runtime escape hatch, the default can also be overridden by setting a global (in milliseconds) before Pyxle's client runtime boots — note it does not affect routes with a `cache` entry. Put it in a native inline `<script>` inside a layout's `<Head>` (head `<script>` content is preserved verbatim and runs before hydration). Do **not** use an inline `<Script>{...}` component for this — the compiler discards `<Script>` children and only injects scripts that have a `src`, so an inline `<Script>` runs on mount (after boot), too late to set this global:
 
 ```jsx
-<Script strategy="beforeInteractive">
-  {`window.__PYXLE_NAV_STALE_MS__ = 60000;`}  {/* 60s */}
-</Script>
+// pages/layout.pyxl
+import { Head } from 'pyxle/client';
+
+export default function RootLayout({ children }) {
+  return (
+    <>
+      <Head>
+        <script>{`window.__PYXLE_NAV_STALE_MS__ = 60000;`}</script>  {/* 60s */}
+      </Head>
+      {children}
+    </>
+  );
+}
 ```
 
 For per-mutation control, prefer [`invalidate(url)`](#invalidateurl) or the `x-pyxle-invalidate` response header over global TTL tuning.

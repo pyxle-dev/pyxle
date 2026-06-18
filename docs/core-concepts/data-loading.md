@@ -18,10 +18,11 @@ export default function MyPage({ data }) {
 
 The `@server` function:
 
-1. Receives a Starlette [`Request`](https://www.starlette.io/requests/) object
-2. Must be `async` (enforced at compile time)
+1. Receives a Starlette [`Request`](https://www.starlette.io/requests/) object. Its first parameter **must be named exactly `request`** (enforced at compile time)
+2. Must be `async` (enforced at compile time) and declared at module scope
 3. Must return a JSON-serializable `dict`
 4. The return value is available as `props.data` in the React component
+5. Only **one** `@server` function is allowed per `.pyxl` file
 
 ## Accessing request data
 
@@ -80,6 +81,8 @@ window in seconds. **Only do this for pages that render no per-user data** — a
 cached render is shared with every visitor. See [Caching](../guides/caching.md)
 for invalidation, incremental regeneration, and the full contract.
 
+The envelope is recognized only in its **exact two-key shape** (`{"data", "revalidate"}`) **and** when `data` is itself a dict/mapping. To cache a list, wrap it: `{"data": {"items": [...]}, "revalidate": N}` — a top-level list (`{"data": [...], "revalidate": N}`) is *not* treated as an envelope and is passed through as ordinary props. `revalidate` must be `None` or a non-negative number of seconds; a bool, a negative number, or a string raises a loader error.
+
 ## Error handling in loaders
 
 Raise `LoaderError` to trigger the nearest error boundary:
@@ -100,8 +103,16 @@ async def load_page(request):
 When `LoaderError` is raised:
 
 1. Pyxle searches up the directory tree for the nearest `error.pyxl`
-2. If found, it renders the error boundary with the error context as props
+2. If found, it renders the error boundary, passing the error context on the **`error`** prop (not `data`)
 3. If not found, a default error page is shown
+
+The boundary therefore destructures `error`, and the context keys are `error.message`, `error.statusCode` (camelCase), `error.type`, and optional `error.data` (present only when the `LoaderError` carried non-empty `data`):
+
+```jsx
+export default function Error({ error }) {
+  return <h1>{error.statusCode} — {error.message}</h1>;
+}
+```
 
 See [Error Handling](../guides/error-handling.md) for full details.
 

@@ -23,6 +23,11 @@ boundary's real content streams in when it resolves.
 ```jsx
 import React, { Suspense } from 'react';
 
+// React.lazy makes ActivityFeed suspend until its module loads, so the
+// boundary actually defers and streams in. A plain synchronous component
+// inside <Suspense> never suspends — it renders straight into the shell.
+const ActivityFeed = React.lazy(() => import('./ActivityFeed.jsx'));
+
 export default function Dashboard({ data }) {
   return (
     <main>
@@ -40,12 +45,22 @@ The compiler detects the `<Suspense>` at build time and marks the page as
 streamable — there's no configuration and no flag to set. A page with no
 `<Suspense>` is never affected.
 
+> **Import `Suspense` under that exact name.** The compiler keys streaming off
+> the literal element name `Suspense` (or `React.Suspense`). A page that aliases
+> the import — `import { Suspense as Boundary } from 'react'` and writes
+> `<Boundary>` — compiles fine but is **not** marked streamable and renders
+> buffered, with no warning.
+
 `<Suspense>` works the way it does in any React 18 app: a child suspends by
-throwing a promise (via `React.lazy`, a `use(promise)` call, or your own
-promise-throwing data source), and React shows the `fallback` until it
-resolves. Pyxle's `@server` loader still runs first and passes its result as
-`data` props, exactly as for a buffered page — streaming governs how the
-**rendered** page is delivered, not how the loader runs.
+throwing a promise (via `React.lazy` or your own promise-throwing data source),
+and React shows the `fallback` until it resolves. Pyxle's `@server` loader still
+runs first and passes its result as `data` props, exactly as for a buffered page
+— streaming governs how the **rendered** page is delivered, not how the loader
+runs.
+
+> Pyxle ships React 18.3.1, which does **not** have `React.use` — that hook is
+> React 19 only. Don't reach for `use(promise)` to suspend; use `React.lazy` (the
+> zero-effort mechanism) or a hand-thrown promise.
 
 ## Route-level loading states with `loading.pyxl`
 
@@ -83,7 +98,7 @@ anything it doesn't catch bubbles up to the `loading.pyxl` shell. A
 > entirely from the loader has its props ready by render time and **never
 > suspends** — so the fallback never appears, and the full page streams at once.
 > The loading state shows only when the render itself suspends: a child using
-> `React.lazy`, `use(promise)`, or a thrown promise. This is the honest
+> `React.lazy` or a thrown promise. This is the honest
 > consequence of Pyxle's loader-first model; if you want a loading state for slow
 > *loader* data, that data isn't what `loading.pyxl` defers.
 
@@ -125,10 +140,21 @@ Streaming is deliberately narrow. A page falls back to the buffered render when:
   render buffered. Streaming helps the dynamic, per-request pages that *can't*
   be cached.
 - **The server is running without an SSR worker pool.** Streaming needs the
-  pool's multi-frame transport. `pyxle serve` runs the pool by default.
+  pool's multi-frame transport. Both `pyxle dev` and `pyxle serve` run the pool
+  by default (`--ssr-workers 1`), so streaming works in development too; only
+  `--ssr-workers 0` (per-request subprocess mode) disables it.
 
 A streamed response is always `Cache-Control: private, no-cache` — it is a
 per-request render and is never shared between visitors.
+
+### Streaming survives gzip in production
+
+Production builds enable gzip compression. Pyxle uses a streaming-aware gzip
+middleware that flushes the compressor after **every** chunk, so the shell's
+compressed bytes reach the browser immediately instead of being held back until
+the whole response finishes. Streaming SSR therefore works shell-first behind
+gzip under `pyxle serve` — no configuration needed, and no need to disable
+compression to keep the streaming benefit.
 
 ## The head is static while streaming
 
@@ -142,6 +168,21 @@ as it renders — arrives too late to reach the already-flushed head and is
 omitted from a streamed page. Put meta tags a streamed page needs in the `HEAD`
 variable, not in a runtime-rendered `<Head>`. This only affects pages that opt
 into streaming; buffered pages merge runtime `<Head>` exactly as before.
+
+## Custom middleware and streaming
+
+A custom middleware that subclasses Starlette's `BaseHTTPMiddleware` **buffers
+the whole response** before passing it on, which is fundamentally incompatible
+with a streamed render. When a `<Suspense>` boundary genuinely defers, the page
+becomes a chunked `StreamingResponse`, and a `BaseHTTPMiddleware` in the stack
+raises `RuntimeError: No response returned.` (This can be intermittent in dev —
+a warm chunk cache resolves the boundary in a single flush — but it fails every
+time a boundary defers on real async data, e.g. in production.)
+
+If you run streaming routes, write custom middleware as **pure ASGI** instead of
+subclassing `BaseHTTPMiddleware`. A pure-ASGI middleware passes streamed and
+buffered responses through identically. See
+[Middleware → Streaming-safe middleware](middleware.md) for the pattern.
 
 ## Errors
 

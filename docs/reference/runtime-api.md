@@ -1,6 +1,8 @@
 # Runtime API Reference
 
-The `pyxle.runtime` module provides decorators and error classes used in `.pyxl` files. These are automatically available in the Python section of every `.pyxl` file -- you do not need to import them (the compiler injects the import).
+The `pyxle.runtime` module provides decorators and error classes used in `.pyxl` files. The compiler **auto-injects** a small set: the `@server` decorator, and — in any file that declares at least one `@action` — the `@action` decorator plus `ActionError` and `ValidationActionError`. You do not import those.
+
+Other `pyxle.runtime` symbols, including **`LoaderError`**, are **not** auto-injected — import them explicitly: `from pyxle.runtime import LoaderError`.
 
 ## `@server`
 

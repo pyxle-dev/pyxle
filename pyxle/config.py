@@ -432,6 +432,9 @@ def _parse_styling_block(value: Any, *, source: Path) -> tuple[tuple[str, ...], 
             f"Invalid value for 'styling' in '{source}': expected object with 'globalStyles'/'globalScripts' lists."
         )
 
+    _reject_unknown_keys(
+        value, allowed={"globalStyles", "globalScripts"}, block="styling", source=source
+    )
     styles = _parse_path_list(value.get("globalStyles"), source=source, field_name="styling.globalStyles")
     scripts = _parse_path_list(value.get("globalScripts"), source=source, field_name="styling.globalScripts")
     return (styles, scripts)
@@ -470,6 +473,7 @@ def _parse_network_block(value: Any, key: str, source: Path) -> tuple[str, int]:
             f"Invalid value for '{key}' in '{source}': expected object with 'host' and 'port'."
         )
 
+    _reject_unknown_keys(value, allowed={"host", "port"}, block=key, source=source)
     host = value.get("host", "127.0.0.1")
     if not isinstance(host, str) or not host.strip():
         raise ConfigError(
@@ -490,6 +494,22 @@ def _validate_port(value: Any, key: str) -> int:
     return value
 
 
+def _reject_unknown_keys(
+    value: Mapping[str, Any], *, allowed: set[str], block: str, source: Path
+) -> None:
+    """Raise :class:`ConfigError` if *value* has keys outside *allowed*.
+
+    Catches typos in nested config blocks (e.g. a mis-cased ``cookieSamesite``
+    that would otherwise be silently dropped, leaving a security-relevant
+    default in place). Mirrors the top-level / ``navigation`` / ``rateLimit``
+    guards so every block rejects unknown keys consistently.
+    """
+    unknown = set(value) - allowed
+    if unknown:
+        formatted = ", ".join(sorted(str(key) for key in unknown))
+        raise ConfigError(f"Unknown keys in '{block}' block in '{source}': {formatted}.")
+
+
 def _parse_route_middleware_block(
     value: Any, *, source: Path
 ) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
@@ -500,6 +520,10 @@ def _parse_route_middleware_block(
             f"Invalid value for 'routeMiddleware' in '{source}': "
             "expected object with 'pages'/'apis'/'actions' arrays."
         )
+
+    _reject_unknown_keys(
+        value, allowed={"pages", "apis", "actions"}, block="routeMiddleware", source=source
+    )
 
     pages = _parse_middleware_list(value.get("pages"), source=source, field_name="routeMiddleware.pages")
     apis = _parse_middleware_list(value.get("apis"), source=source, field_name="routeMiddleware.apis")
@@ -535,6 +559,13 @@ def _parse_cors_block(value: Any, *, source: Path) -> CorsConfig:
         raise ConfigError(
             f"Invalid value for 'cors' in '{source}': expected object with 'origins', 'methods', 'headers', 'credentials'."
         )
+
+    _reject_unknown_keys(
+        value,
+        allowed={"origins", "methods", "headers", "credentials", "maxAge"},
+        block="cors",
+        source=source,
+    )
 
     origins = _parse_string_list(value.get("origins"), source=source, field_name="cors.origins")
     methods = _parse_string_list(value.get("methods"), source=source, field_name="cors.methods")
@@ -652,6 +683,20 @@ def _parse_csrf_block(value: Any, *, source: Path) -> CsrfConfig:
             f"Invalid value for 'csrf' in '{source}': expected boolean or object."
         )
 
+    _reject_unknown_keys(
+        value,
+        allowed={
+            "enabled",
+            "cookieName",
+            "headerName",
+            "cookieSecure",
+            "cookieSameSite",
+            "exemptPaths",
+        },
+        block="csrf",
+        source=source,
+    )
+
     enabled = value.get("enabled", True)
     if not isinstance(enabled, bool):
         raise ConfigError(f"Invalid value for 'csrf.enabled' in '{source}': expected boolean.")
@@ -748,6 +793,27 @@ def _parse_observability_block(value: Any, *, source: Path) -> ObservabilityConf
         raise ConfigError(
             f"Invalid value for 'observability' in '{source}': expected boolean or object."
         )
+
+    _reject_unknown_keys(
+        value,
+        allowed={
+            "requestId",
+            "requestIdHeader",
+            "trustIncomingRequestId",
+            "timing",
+            "metricsEndpoint",
+            "metricsEndpointPath",
+            "metricsEndpointToken",
+            "accessLog",
+            "logFormat",
+            "logLevel",
+            "otel",
+            "otelServiceName",
+            "otelSampleRatio",
+        },
+        block="observability",
+        source=source,
+    )
 
     request_id = value.get("requestId", True)
     if not isinstance(request_id, bool):

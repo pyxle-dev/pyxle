@@ -36,6 +36,7 @@ from __future__ import annotations
 import asyncio
 import json
 from contextlib import asynccontextmanager
+from collections.abc import Mapping
 from typing import Any, AsyncIterator, Protocol, runtime_checkable
 
 from starlette.websockets import WebSocket
@@ -152,6 +153,14 @@ class InProcessBroker:
         """Number of channels with at least one subscriber (introspection)."""
         return len(self._channels)
 
+    async def start(self) -> None:
+        """No-op: the in-process broker holds no external connection. Present so
+        the app can drive every broker's lifecycle uniformly (the Redis broker
+        opens its connection + listener here)."""
+
+    async def aclose(self) -> None:
+        """No-op teardown, the counterpart to :meth:`start`."""
+
 
 class ChannelHandle:
     """A subscription returned by :func:`channel` — publish to its channel."""
@@ -216,10 +225,42 @@ async def channel(
         await resolved.unsubscribe(name, ws)
 
 
+def build_broker(env: "Mapping[str, str] | None" = None) -> Broker:
+    """Construct the realtime broker selected by ``PYXLE_REALTIME_BROKER``.
+
+    * ``memory`` (default) — :class:`InProcessBroker`; correct for ``pyxle dev``
+      and single-worker ``pyxle serve``.
+    * ``redis`` — a Redis-pub/sub :class:`RedisBroker` that spans worker
+      processes (needs the ``pyxle-framework[redis]`` extra). The connection URL
+      comes from ``PYXLE_REALTIME_REDIS_URL`` (default ``redis://localhost:6379``)
+      and an optional key namespace from ``PYXLE_REALTIME_CHANNEL_PREFIX``.
+
+    The app awaits ``broker.start()`` after construction and ``broker.aclose()``
+    on shutdown; the in-process broker's are no-ops.
+    """
+    import os  # noqa: PLC0415 - lazy, only when wiring the app
+
+    resolved = os.environ if env is None else env
+    name = (resolved.get("PYXLE_REALTIME_BROKER") or "memory").strip().lower()
+    if name in ("memory", "inprocess", "in-process", ""):
+        return InProcessBroker()
+    if name == "redis":
+        from pyxle.realtime.redis_broker import RedisBroker  # noqa: PLC0415 - optional
+
+        return RedisBroker(
+            resolved.get("PYXLE_REALTIME_REDIS_URL") or "redis://localhost:6379",
+            channel_prefix=resolved.get("PYXLE_REALTIME_CHANNEL_PREFIX") or "pyxle:rt:",
+        )
+    raise ValueError(
+        f"Unknown PYXLE_REALTIME_BROKER={name!r}; expected 'memory' or 'redis'."
+    )
+
+
 __all__ = [
     "Broker",
     "InProcessBroker",
     "ChannelHandle",
+    "build_broker",
     "channel",
     "broker_for",
     "Message",

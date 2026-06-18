@@ -812,13 +812,20 @@ def _serve_multiworker(
         f"Serving Pyxle build on http://{host}:{port} across {workers} worker "
         f"process(es) (dist: {resolved_dist})"
     )
-    if _dist_has_websocket_pages(resolved_dist):
+    # Only warn when the in-process broker is in use; a configured Redis broker
+    # (PYXLE_REALTIME_BROKER=redis) already spans workers, so the warning would
+    # falsely tell a correctly-configured user their realtime is broken.
+    _broker_is_inprocess = (
+        os.environ.get("PYXLE_REALTIME_BROKER") or "memory"
+    ).strip().lower() not in ("redis",)
+    if _broker_is_inprocess and _dist_has_websocket_pages(resolved_dist):
         logger.warning(
             "This build has WebSocket page(s) and is running with "
             f"{workers} workers. The default in-process realtime broker does "
             "NOT span worker processes — a client on one worker won't receive "
-            "messages published on another. Use a shared broker (e.g. Redis) or "
-            "sticky-session load balancing for cross-worker realtime."
+            "messages published on another. Use a shared broker "
+            "(PYXLE_REALTIME_BROKER=redis) or sticky-session load balancing for "
+            "cross-worker realtime."
         )
     try:
         # loop is left at uvicorn's default ("auto" → uvloop). Forcing the pure

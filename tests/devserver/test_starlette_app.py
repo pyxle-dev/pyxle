@@ -1794,6 +1794,38 @@ def test_create_starlette_app_raises_on_bad_custom_middleware(
     assert errors  # the failure was surfaced through the logger
 
 
+def test_create_starlette_app_warns_base_http_middleware_with_streaming(
+    project: DevServerSettings,
+    monkeypatch,
+) -> None:
+    """A BaseHTTPMiddleware paired with a streaming-eligible route warns at boot.
+
+    Exercises the warning wiring in ``create_starlette_app`` (F28): the build
+    has a ``<Suspense>`` route and a configured ``BaseHTTPMiddleware``, so the
+    incompatibility is flagged.
+    """
+    build_once(project)
+    registry = load_metadata_registry(project)
+    table = build_route_table(registry)
+    # Mark a real page as streaming-eligible without authoring a Suspense page.
+    table.pages[0] = replace(table.pages[0], uses_suspense=True)
+
+    warnings: list[str] = []
+
+    class StubLogger(ConsoleLogger):
+        def warning(self, message: str) -> None:  # type: ignore[override]
+            warnings.append(message)
+
+    with_middleware = replace(
+        project,
+        custom_middlewares=("tests.devserver.sample_middlewares:HeaderCaptureMiddleware",),
+    )
+
+    create_starlette_app(with_middleware, table, logger=StubLogger())
+
+    assert any("BaseHTTPMiddleware" in w and "streaming" in w for w in warnings)
+
+
 def test_create_starlette_app_raises_on_bad_route_hook(
     project: DevServerSettings,
 ) -> None:

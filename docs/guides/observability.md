@@ -111,6 +111,7 @@ on a Prometheus endpoint:
 
 ```
 $ curl http://localhost:8000/api/__pyxle/metrics
+# HELP pyxle_requests_total Total HTTP requests handled.
 # TYPE pyxle_requests_total counter
 pyxle_requests_total{worker="40123"} 1843
 # TYPE pyxle_cache_hit_ratio gauge
@@ -119,6 +120,8 @@ pyxle_cache_hit_ratio{worker="40123"} 0.92
 pyxle_render_duration_ms_bucket{worker="40123",le="50"} 1201
 ...
 ```
+
+The real output prepends a `# HELP <name> <description>` line before each `# TYPE` (elided above for brevity), and `worker` is the OS process id of the emitting worker.
 
 Guard it with a bearer token, and serve it on a custom path, if you like:
 

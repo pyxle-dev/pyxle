@@ -105,7 +105,7 @@ When an error occurs, Pyxle walks up the directory tree from the page that faile
 
 The same `error.pyxl` is also a **client-side React error boundary**. The server renders the nearest `error.pyxl` when a loader or the initial render fails; once the page is interactive, that boundary keeps working in the browser. If a component throws while re-rendering — after a state update, during a client-side navigation, or on a hydration fault — the boundary catches it and renders the nearest `error.pyxl` in place, instead of React unmounting the page to a blank screen.
 
-It receives the same `error` prop on both sides (`message`, `statusCode`, `type`), so one `error.pyxl` renders identically whether the fault happened on the server or in the browser. The boundary is transparent until something throws, so it never affects hydration, and it resets on the next navigation. In `pyxle dev` the [error overlay](#dev-mode-error-overlay) still surfaces the full stack on top; in production the boundary is the user-facing fallback.
+It receives an `error` prop with the same keys on both sides (`message`, `statusCode`, `type`), so one `error.pyxl` renders consistently whether the fault happened on the server or in the browser. The *values* differ for a client-caught render fault: there is no HTTP status in the browser, so the client boundary always reports `statusCode: 500` and `type` = the JS error name, and never carries `data` (which is server-only). Keep `error.pyxl` tolerant of `statusCode` being `500` on the client. The boundary is transparent until something throws, so it never affects hydration, and it resets on the next navigation. In `pyxle dev` the [error overlay](#dev-mode-error-overlay) still surfaces the full stack on top; in production the boundary is the user-facing fallback.
 
 This catches *render* faults. An error thrown in an event handler or an `await` (e.g. a failed `fetch`) is not a render error — handle those where they occur (a `try/catch`, or surfacing an `ActionError` from `useAction`).
 
@@ -127,6 +127,17 @@ export default function NotFoundPage() {
 ```
 
 Like error boundaries, not-found pages follow directory scoping -- a `not-found.pyxl` in `pages/docs/` handles 404s within `/docs/*`.
+
+> **`not-found.pyxl` vs a loader 404.** `not-found.pyxl` fires only for a request whose path matches **no** route. A `LoaderError(status_code=404)` raised from a real route does **not** render `not-found.pyxl` — it renders the nearest `error.pyxl` with `error.statusCode === 404`. Branch on the status inside `error.pyxl` if you want a 404-specific message there:
+>
+> ```jsx
+> export default function ErrorPage({ error }) {
+>   if (error.statusCode === 404) return <h1>Not found</h1>;
+>   return <h1>Something went wrong</h1>;
+> }
+> ```
+
+`not-found.pyxl` is a **normal page**, not an error boundary: it receives **no** `error` prop, and it may declare its own `@server` loader (it gets that loader's props). Use `error.pyxl` when you need the `error` context; use `not-found.pyxl` for an unmatched-route landing page.
 
 ## Dev mode error overlay
 

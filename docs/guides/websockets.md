@@ -77,9 +77,25 @@ A published message reaches **every** subscriber, including the sender — a cha
 UI that doesn't want to echo the sender's own messages filters them client-side.
 `bytes` are delivered as binary frames, `str` as text, anything else as JSON.
 
-The broker lives on `app.state.pyxle_broker` (one per process). For a custom
-backend, implement the `Broker` protocol (`subscribe` / `unsubscribe` /
-`publish`) and set your own.
+`channel()` accepts a keyword-only `broker=` to use an explicit broker for that
+call — `channel(ws, name, broker=my_broker)` — useful in tests or against a
+non-default backend without touching `app.state`.
+
+The broker lives on `app.state.pyxle_broker` (one per process). Reach it inside a
+handler with `broker_for(ws)` (the intended accessor) rather than digging into
+`ws.app.state`. The default `InProcessBroker` also offers `broadcast(message)`
+(send to every connection across all channels) and `channel_count()` for
+introspection — extras beyond the core `Broker` protocol. For a custom backend,
+implement the `Broker` protocol (`subscribe` / `unsubscribe` / `publish`) and set
+your own:
+
+```python
+from pyxle.realtime import broker_for
+
+async def websocket(ws):
+    await ws.accept()
+    await broker_for(ws).broadcast({"type": "ping"})
+```
 
 > **Multi-worker caveat.** The default `InProcessBroker` lives in **one
 > process**. Under `pyxle serve --workers N`, each worker has its own broker —
@@ -88,6 +104,52 @@ backend, implement the `Broker` protocol (`subscribe` / `unsubscribe` /
 > realtime, use a shared backend (Redis pub/sub) or sticky-session routing at
 > the load balancer. The default is correct for `pyxle dev` and single-worker
 > `pyxle serve`.
+>
+> **Why you may not see this locally.** Workers share one listening socket and the
+> OS load-balances new connections across them via `accept()`. Under light,
+> bursty-by-hand load — opening a couple of browser tabs — the kernel keeps
+> handing consecutive connections to the **same** "hot" worker, so two tabs almost
+> always land together and you'll see them share state (e.g. a presence count of
+> 2). The split across brokers only shows up reliably under **concurrent** load.
+> So "it works on my machine with `--workers 2`" is not evidence that cross-worker
+> realtime is safe — assume separate workers can't see each other and plan a
+> shared broker accordingly.
+
+### Cross-worker realtime with Redis
+
+For multi-worker (or multi-machine) realtime, switch the broker to Redis — no
+code change, just configuration:
+
+```bash
+pip install 'pyxle-framework[redis]'
+
+export PYXLE_REALTIME_BROKER=redis
+export PYXLE_REALTIME_REDIS_URL=redis://localhost:6379   # default if unset
+pyxle serve --workers 4
+```
+
+Every worker now relays `channel()` / `room.publish()` traffic through Redis
+pub/sub: a message published on any worker reaches every subscriber on every
+worker (and every machine pointed at the same Redis), delivered to each
+connection exactly once. Your handler code is **identical** — `channel(ws,
+"room")` and `room.publish(...)` work the same; only the broker behind
+`app.state.pyxle_broker` changes. The connection is pinged at startup, so a
+wrong URL fails loudly rather than silently dropping messages, and the listener
+reconnects automatically if Redis blips.
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `PYXLE_REALTIME_BROKER` | `memory` | `memory` (in-process) or `redis` |
+| `PYXLE_REALTIME_REDIS_URL` | `redis://localhost:6379` | Redis connection URL |
+| `PYXLE_REALTIME_CHANNEL_PREFIX` | `pyxle:rt:` | namespace for the Redis channels |
+
+> **Presence counts are still per-process unless you share that state too.** The
+> broker makes *message delivery* span workers, but a "users online" counter you
+> keep in a module-level dict is per-process — derive presence from a shared
+> store (e.g. a Redis counter) if you need an exact cross-worker count. The Redis
+> broker is the default in-process broker's drop-in replacement (`PSUBSCRIBE`s the
+> namespace and filters locally); for very high channel counts, a per-channel
+> subscription variant is a future optimisation.
 
 ## Authentication in a WebSocket handler
 
@@ -110,6 +172,28 @@ async def websocket(ws):
 
 It returns `None` (doing zero work) when [`pyxle-auth`](../plugins/pyxle-auth.md)
 isn't installed or no session cookie is present.
+
+**Gating specific actions on a public socket.** A socket can stay open to
+everyone (read-only) while restricting *writes* to authenticated users. Call
+`authenticate_websocket(ws)` when a privileged frame arrives, and take the
+identity from the session — never from the client payload, which can be forged:
+
+```python
+from pyxle.realtime import authenticate_websocket, channel
+
+async def websocket(ws):
+    await ws.accept()                         # anyone may connect and watch
+    async with channel(ws, "incident:42") as room:
+        async for raw in ws.iter_text():
+            msg = json.loads(raw)
+            if msg["type"] == "update":       # posting is privileged
+                user = await authenticate_websocket(ws)
+                if user is None:
+                    continue                  # ignore (or close) anonymous writes
+                await room.publish({"type": "update",
+                                    "author": user.email,   # trust the session, not msg
+                                    "text": msg["text"]})
+```
 
 **Origin checking.** CSRF doesn't apply to a WebSocket upgrade, so a cross-site
 origin check is the equivalent guard against a hostile page opening a socket

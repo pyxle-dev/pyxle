@@ -239,6 +239,47 @@ async def test_renderer_default_factory_produces_html(tmp_path: Path) -> None:
 
 
 @pytest.mark.anyio
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is required for SSR rendering tests")
+async def test_renderer_substitutes_public_env_during_ssr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``import.meta.env.PYXLE_PUBLIC_*`` must resolve during SSR (F4).
+
+    Vite substitutes these public env vars into the client bundle. Without a
+    matching esbuild ``define`` on the server, the expression rendered as
+    ``undefined`` -> a blank first paint and a hydration mismatch. The SSR
+    build must now bake the same value the client will see.
+    """
+    monkeypatch.setenv("PYXLE_PUBLIC_API_URL", "https://api.example.com")
+
+    project_root = tmp_path / "project"
+    component = project_root / ".pyxle-build" / "client" / "pages" / "env.jsx"
+    component.parent.mkdir(parents=True, exist_ok=True)
+    component.write_text(
+        dedent(
+            """
+            import React from 'react';
+
+            export default function EnvProbe() {
+                return <span data-api={import.meta.env.PYXLE_PUBLIC_API_URL}>ok</span>;
+            }
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    ensure_test_node_modules(project_root)
+
+    renderer = ComponentRenderer()
+    result = await renderer.render(component, {})
+
+    # The value is baked in -- not "undefined" -- so server and client agree.
+    assert 'data-api="https://api.example.com"' in result.html
+    assert "undefined" not in result.html
+
+
+@pytest.mark.anyio
 async def test_renderer_clear_resets_cache(tmp_path: Path) -> None:
     calls = 0
 

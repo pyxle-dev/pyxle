@@ -59,9 +59,11 @@ export default function About() {
 
 `revalidate` is the freshness window in seconds, exactly as in the loader
 envelope (`0` means "serve cached but re-render every request"). It is validated
-at compile time — a non-numeric or negative value is a build error. If a page
-declares *both* a loader envelope and a `CACHE` directive, the loader's
-`revalidate` wins.
+at compile time: an invalid `CACHE` directive (non-numeric or negative value, or
+a malformed shape) is reported as a **compile diagnostic** and the page is
+treated as **uncached** — whether that diagnostic blocks the build depends on
+your strict/non-strict diagnostic mode. If a page declares *both* a loader
+envelope and a `CACHE` directive, the loader's `revalidate` wins.
 
 ## Incremental regeneration (stale-while-revalidate)
 
@@ -87,10 +89,21 @@ already a cache hit — no cold SSR render, even for the very first visitor.
 pyxle build --static
 ```
 
-This pre-renders every loader-less, non-dynamic page into `dist/prerendered/`;
+This pre-renders every loader-less, non-dynamic page into the build output's
+`prerendered/` subdirectory (`dist/prerendered/` by default; `dist` here means
+the configured build/output directory, i.e. `pyxle build -o/--out-dir`);
 on startup `pyxle serve` warms its page cache from that directory. Pages with a
 loader (or a `{param}` route) are skipped — they still render live and cache at
-runtime as before. Pre-rendered entries have no expiry until you
+runtime as before.
+
+A static page's **layout** loader still runs at build time — its result is baked
+into the pre-rendered HTML, so a layout loader used by static pages should return
+the same data for everyone (global status, navigation), not per-user state. Build-
+time loaders run with the same plugin context a request has, so a layout (or page)
+loader that reads from a plugin like `pyxle-db` pre-renders correctly — the static
+builder opens your plugins' connections at build time, just as a server would.
+
+Pre-rendered entries have no expiry until you
 `cache.invalidate(...)` the route. With the default in-memory backend they are
 re-warmed from the new `dist/prerendered/` on every restart; with a **shared
 file/redis backend**, warmed copies persist in that store, so if a later deploy
@@ -130,6 +143,22 @@ Cached page responses carry a strong `ETag`, so a conditional request
 (`If-None-Match`) gets a `304 Not Modified`, and an `x-pyxle-cache` response
 header reports `HIT`, `STALE`, or `MISS` for debugging.
 
+## Client navigation cache
+
+Separately from the server-side page cache, the browser keeps a per-URL
+**navigation cache** of loader payloads so back/forward navigation is instant.
+Its lifetime mirrors a page's real cacheability:
+
+- A page with a `cache` entry (or `CACHE` directive) reuses that TTL.
+- A **dynamic page** — a `@server` loader with no declared cache lifetime — is
+  **not** navigation-cached by default (TTL `0`), so a fresh navigation always
+  refetches and a just-made mutation is visible immediately rather than hidden
+  behind a stale window. **Opt in** by giving the route a `cache` entry.
+- A static, loader-less page uses the client default (2 minutes).
+
+See [Navigation cache TTL](../reference/client-api.md#navigation-cache-ttl) for
+the full client-side details.
+
 ## Where the cache lives
 
 The cache is enabled automatically for production serves (`pyxle serve`) and
@@ -142,7 +171,7 @@ environment variable:
 | `memory` *(default)* | bounded in-process memory (LRU) | single process, or any deploy where per-worker caches are fine |
 | `file` | local disk (`PYXLE_PAGE_CACHE_DIR`) | one host, multiple workers sharing a cache that survives restarts |
 | `redis` | shared Redis (`PYXLE_PAGE_CACHE_REDIS_URL`) | multiple hosts, or cross-worker invalidation |
-| `off` | nothing — caching disabled | you want it off in production |
+| `off` | nothing — caching disabled | you want it off in production (`none` and `disabled` are accepted aliases for `off`) |
 
 The in-memory backend is **bounded** by entry count (`PYXLE_PAGE_CACHE_MAX_ENTRIES`,
 default 512) and total body bytes (`PYXLE_PAGE_CACHE_MAX_BYTES`, default 64 MiB)

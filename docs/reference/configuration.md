@@ -172,7 +172,7 @@ Route-level hooks applied to specific route types.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `cors.origins` | `string[]` | `[]` | Allowed origins. CORS is disabled if empty. |
-| `cors.methods` | `string[]` | `["GET","POST","PUT","PATCH","DELETE","OPTIONS"]` | Allowed HTTP methods |
+| `cors.methods` | `string[]` | `["GET","POST","PUT","PATCH","DELETE","OPTIONS"]` | Allowed HTTP methods. An empty or omitted list falls back to the six defaults — it is **not** a way to disallow every method. |
 | `cors.headers` | `string[]` | `[]` | Allowed request headers |
 | `cors.credentials` | `boolean` | `false` | Allow cookies and auth headers |
 | `cors.maxAge` | `integer` | `600` | Preflight cache duration (seconds) |
@@ -234,7 +234,7 @@ Each key is a route pattern; each value is the shared-cache lifetime in seconds:
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `cache` | `object` | `{}` | Map of route pattern → shared-cache lifetime. Empty = no shared caching (every page stays `private, no-cache`). |
-| `cache."<pattern>"` | `integer` \| `{ "sMaxage": integer }` | -- | Lifetime in seconds (≥ 0) for the matched route. |
+| `cache."<pattern>"` | `integer` \| `{ "sMaxage": integer }` | -- | Lifetime in seconds (≥ 0) for the matched route. The object-form key is `sMaxage` (camelCase); `maxAge` is accepted as a legacy alias. |
 
 > **Turning it on at the edge.** These headers make a response *eligible* for shared caching, but some CDNs don't cache HTML by default. On Cloudflare, you must also add a Cache Rule ("Cache Everything") for the cached paths -- the headers alone are necessary but not sufficient. See [Deployment → CDN and edge caching](../guides/deployment.md#cdn-and-edge-caching).
 
@@ -253,9 +253,9 @@ Pyxle's client keeps an in-memory **navigation cache** so client-side navigation
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `navigation` | `object` | `{}` | Client navigation/prefetch cache settings. |
-| `navigation.defaultPrefetchTtl` | `integer` | `120` | Lifetime in seconds (≥ 0) that a prefetched or seeded page stays fresh in the client navigation cache, for routes **without** a `cache` entry. `0` disables navigation caching. |
+| `navigation.defaultPrefetchTtl` | `integer` | `120` | Lifetime in seconds (≥ 0) that a prefetched or seeded **static, loader-less** page stays fresh in the client navigation cache. `0` disables navigation caching for those pages. |
 
-A route listed in the [`cache`](#edge-caching) block **reuses its edge-cache TTL** as its navigation-cache lifetime, overriding `defaultPrefetchTtl` for that route -- so a page's client freshness matches how long a CDN would serve it. (Consequence: raising a route's `cache` TTL also lengthens its edge cache, so purge the CDN on deploy -- which you should do regardless.) After a mutation, the client router's `invalidate(href)` drops a cached entry so the next navigation refetches.
+A route listed in the [`cache`](#edge-caching) block **reuses its edge-cache TTL** as its navigation-cache lifetime, overriding `defaultPrefetchTtl` for that route -- so a page's client freshness matches how long a CDN would serve it. (Consequence: raising a route's `cache` TTL also lengthens its edge cache, so purge the CDN on deploy -- which you should do regardless.) A **dynamic page** -- a `@server` loader with no `cache` entry -- is **not** navigation-cached at all (it renders `private, no-cache`), so back/forward always refetches and `defaultPrefetchTtl` does not apply to it; add a `cache` entry to opt such a page into navigation caching. After a mutation, the client router's `invalidate(href)` drops a cached entry so the next navigation refetches.
 
 ## Rate limiting
 
@@ -275,7 +275,7 @@ A built-in [token-bucket](../guides/middleware.md#rate-limiting) limiter. **Disa
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `rateLimit.requests` | `integer` | `0` | Bucket capacity = max burst. `0` disables the limiter. |
-| `rateLimit.window` | `number` | `60` | Seconds for a full bucket to refill, so the sustained rate is `requests / window` per second. |
+| `rateLimit.window` | `number` | `60` | Seconds for a full bucket to refill, so the sustained rate is `requests / window` per second. Fractional seconds are allowed (the value is stored as a float). The JSON key is `window`. |
 | `rateLimit.exemptPaths` | `string[]` | `[]` | Paths skipped by the limiter, matched on segment boundaries (same rules as [`csrf.exemptPaths`](#csrf)). Use for health checks and metrics scrapes. |
 | `rateLimit.trustForwardedFor` | `boolean` | `false` | Key clients by the first `X-Forwarded-For` hop instead of the socket IP. **Only enable behind a trusted proxy** — a client can otherwise spoof the header to dodge the limit. |
 

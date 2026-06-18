@@ -36,7 +36,9 @@ pyxle serve --host 0.0.0.0 --port 8000
 
 In production mode (`debug=false`) the server also compresses responses larger
 than 500 bytes with gzip automatically — no reverse-proxy configuration needed
-for that.
+for that. The gzip middleware is **streaming-aware** (it flushes the compressor
+per chunk), so [streaming SSR](streaming.md) still delivers the shell first
+behind gzip in production rather than buffering the whole response.
 
 ### Serve options
 
@@ -117,7 +119,7 @@ trade-off is that any **in-process** state is per-worker:
 | Feature | Per-worker behaviour | For cross-worker behaviour |
 |---------|----------------------|----------------------------|
 | [Page cache](caching.md) | Each worker has its own in-memory cache | Use the **Redis** backend (`PYXLE_PAGE_CACHE_BACKEND=redis`) — shared across workers and hosts |
-| [WebSocket pub/sub](websockets.md) | Broadcasts reach only clients on the same worker | Implement the `Broker` protocol against Redis/NATS |
+| [WebSocket pub/sub](websockets.md) | Messages reach only clients on the same worker | Use the **Redis** broker (`PYXLE_REALTIME_BROKER=redis`) — relays channels across workers and hosts |
 | [Metrics](observability.md) | `/metrics` reports that worker's numbers (with a `worker` label) | Aggregate at the Prometheus scraper |
 | [Background tasks](background-tasks.md) | `pyxle.tasks` queue is per-worker | Use a real job queue (Celery / ARQ / Dramatiq) |
 

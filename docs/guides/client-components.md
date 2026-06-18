@@ -31,12 +31,20 @@ Loads external scripts with configurable loading strategies:
 
 | Prop | Type | Default | Description |
 |------|------|---------|-------------|
-| `src` | `string` | (required) | Script URL |
+| `src` | `string` | (required for external) | Script URL |
 | `strategy` | `string` | `"afterInteractive"` | Loading strategy |
 | `async` | `boolean` | `false` | Add `async` attribute |
 | `defer` | `boolean` | `false` | Add `defer` attribute |
-| `onLoad` | `function` | -- | Called when script loads |
-| `onError` | `function` | -- | Called on load failure |
+| `module` | `boolean` | `false` | Load as `type="module"` |
+| `noModule` | `boolean` | `false` | Add the `nomodule` attribute (legacy-browser fallback) |
+| `crossOrigin` | `string` | -- | `crossorigin` attribute |
+| `integrity` | `string` | -- | Subresource Integrity (SRI) hash |
+| `referrerPolicy` | `string` | -- | `referrerpolicy` attribute |
+| `onLoad` | `() => void` | -- | Called when script loads |
+| `onError` | `(error: Error) => void` | -- | Called on load failure; receives the `Error` |
+| `children` | `string` | -- | Inline script source, used when `src` is omitted |
+
+Inline scripts (`children`, no `src`) honour only `module`; the other props apply to external (`src`) scripts. See the [`<Script>` reference](../reference/client-api.md#script) for the full behaviour.
 
 ### Loading strategies
 

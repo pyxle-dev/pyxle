@@ -57,6 +57,10 @@ All settings are optional — with none, you get SQLite at `./data/app.db`.
 | `url` | — | Full database URL (takes precedence over `path`). Supports `env:` indirection. |
 | `migrationsDir` | `"migrations"` | Directory of migration files, applied at startup. |
 | `waitForFileMs` | `0` | Milliseconds to wait for a SQLite file to appear before failing (useful when another process creates it). |
+| `autoTransactions` | `true` | Wrap each unsafe-method (POST/PUT/PATCH/DELETE) request's writes in one auto-commit transaction; set `false` to manage every transaction by hand. |
+| `orm` | — | Enable the SQLAlchemy ORM path, e.g. `{ "metadata": "app.models:Base", "pool": { ... } }`. Requires the `[sqlalchemy]` extra. See [The ORM path](#the-orm-path-sqlalchemy) below. |
+
+All of the above are keys inside the plugin's `settings` object (not at the config root).
 
 **Never commit credentials.** The `url` setting supports `env:` indirection — the committed config names an environment variable, the deploy environment supplies the secret:
 
@@ -70,7 +74,7 @@ All settings are optional — with none, you get SQLite at `./data/app.db`.
 
 Startup fails with a clear error if the named variable is unset, rather than silently falling back to SQLite.
 
-The plugin registers three services: `db.database` (the `Database`), `db.url` (the connection URL with credentials redacted), and — for SQLite — `db.path` (the resolved file path).
+The plugin registers three services: `db.database` (the `Database`), `db.url` (the connection URL with credentials redacted), and — for SQLite — `db.path` (the resolved file path, registered as a `pathlib.Path`). Note this is distinct from the `Database.path` property, which returns a redaction-safe `str`.
 
 ## Database URLs
 
@@ -148,13 +152,15 @@ With the plugin installed, every loader and action gets a lazy database handle o
 @server
 async def load(request):
     rows = await request.state.db.fetchall("SELECT * FROM posts ORDER BY id DESC")
-    return {"posts": rows}
+    return {"posts": [r.asdict() for r in rows]}
 
 @action
 async def create_post(request):
     await request.state.db.execute("INSERT INTO posts (title) VALUES (?)", (title,))
     return {"ok": True}   # committed automatically on success
 ```
+
+> Loader and action return values are serialized with `json.dumps`, so they must be plain JSON types. A `Row` is **not** JSON-serializable — convert it with `r.asdict()` (or `dict(r)`) before returning, as above. Returning raw `Row` objects raises a `TypeError` at render time.
 
 On an unsafe method (`POST`/`PUT`/`PATCH`/`DELETE`) the request's writes run inside **one transaction that commits when the action succeeds and rolls back when it fails** — where "fails" means the action raised `ActionError` (or any exception), which Pyxle turns into a non-2xx response. You never call `commit()`/`rollback()`, and a failed action never leaves a partial write behind. `GET`/`HEAD` run read-only.
 

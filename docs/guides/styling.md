@@ -1,10 +1,19 @@
 # Styling
 
-Pyxle ships with Tailwind CSS out of the box. The recommended way to load
-your stylesheets is to **import them from a JSX module** so Vite can compile,
-bundle, and content-hash them — exactly like it does for JavaScript modules.
-This means you never have to hand-bump a `?v=N` query string after a deploy
-to invalidate stale browser caches.
+Pyxle ships with Tailwind CSS configured in a fresh `pyxle init` project. The
+recommended way to load your stylesheets is to **import them from a JSX module**
+so Vite can compile, bundle, and content-hash them — exactly like it does for
+JavaScript modules. This means you never have to hand-bump a `?v=N` query string
+after a deploy to invalidate stale browser caches.
+
+> **Prerequisite: a project-root `postcss.config.*` is required for Tailwind.**
+> Vite compiles your CSS through PostCSS, and it only loads the Tailwind plugin
+> when it discovers a `postcss.config.{cjs,js,mjs,ts}` at the project root. The
+> scaffold ships this file, so a fresh project works immediately — but a
+> **hand-built or upgraded project with no `postcss.config.*` silently fails**:
+> the raw `@tailwind base/components/utilities` directives are inlined uncompiled
+> and the page renders **unstyled, with no error**. If your Tailwind classes do
+> nothing, check for this file first.
 
 ## Recommended: Vite-managed CSS (auto-hashed)
 
@@ -40,11 +49,13 @@ module.exports = {
 };
 ```
 
-**2. Make sure `autoprefixer` and `postcss` are in `devDependencies`:**
+**2. Make sure `tailwindcss`, `autoprefixer`, and `postcss` are in `devDependencies`:**
 
 ```bash
-npm install --save-dev autoprefixer postcss
+npm install --save-dev tailwindcss autoprefixer postcss
 ```
+
+(The `postcss.config.cjs` above references `tailwindcss: {}`, so all three must be installed.)
 
 **3. Import your stylesheet from a JSX module.** The cleanest place is the
 root `pages/layout.pyxl` so every route picks it up via the layout wrapper:
@@ -212,6 +223,14 @@ If you don't want Vite-managed CSS (e.g. you're integrating with an external
 build pipeline), you can use the standalone Tailwind CLI watcher instead.
 **Skip the `postcss.config.*` file** — its presence is what tells Pyxle to
 defer to Vite — and add the watcher scripts to `package.json`:
+
+> **The legacy watcher does not compile JSX-imported CSS.** It writes a separate
+> compiled file (e.g. `public/styles/tailwind.css`) that you must link manually
+> (below). A stylesheet you `import './styles/tailwind.css'` from a JSX module is
+> **not** processed by this watcher — without a `postcss.config.*`, that import
+> is inlined with its `@tailwind` directives uncompiled, so the page renders
+> unstyled. Use this path only when you link the watcher's output by hand and do
+> **not** rely on JSX CSS imports.
 
 ```json
 {

@@ -2,7 +2,7 @@
 
 `pyxle-auth` is Pyxle's official authentication plugin: email + password accounts, sliding sessions, password-reset and email-verification flows, role-based access control, and scoped API tokens — wired into your app with one config entry. It never sends email and never renders UI; it gives you hardened primitives and stays out of your templates.
 
-> **Version 0.2.0.** Runs on [pyxle-db](pyxle-db.md) (SQLite, PostgreSQL, or MySQL — the full account lifecycle is tested against real servers in CI), or on any database layer satisfying the `DatabaseLike` contract.
+> **Version 0.3.0.** Runs on [pyxle-db](pyxle-db.md) (SQLite, PostgreSQL, or MySQL — the full account lifecycle is tested against real servers in CI), or on any database layer satisfying the `DatabaseLike` contract.
 
 ## Install
 
@@ -31,7 +31,6 @@ Protect a page with a guard in its `@server` loader:
 
 ```python
 # pages/dashboard.pyxl — Python section
-from pyxle.runtime import server
 from pyxle_auth import require_user_page
 
 
@@ -113,15 +112,34 @@ The middleware also serves the endpoints the client [`useAuth()`](../reference/c
 
 `/login` and `/signup` reuse `AuthService.sign_in` / `sign_up` — same rate limiting, same enumeration-safe errors — and map failures to status codes (`401` invalid credentials, `409` account exists, `422` weak password, `403` unverified email, `429` rate limited with `Retry-After`). They are state-changing POSTs, so the framework's CSRF protection applies; `useAuth` sends the token for you. Set `enableCredentialsApi: false` to turn them off and drive sign-in from your own `@action` instead (then call `useAuth().refresh()`); `/me` and `/logout` stay available.
 
+`useAuth()` returns the full auth surface:
+
+| Field | Type | Description |
+|---|---|---|
+| `user` | `object \| null` | The signed-in user, or `null`. |
+| `isAuthenticated` | `boolean` | Whether a user is signed in. |
+| `loading` | `boolean` | `true` while an auth request is in flight. |
+| `error` | `string \| null` | The last auth error message, or `null`. |
+| `login` | `({ email, password }) => Promise` | Sign in via `POST /auth/login`. |
+| `signup` | `({ email, password }) => Promise` | Create an account via `POST /auth/signup`. |
+| `logout` | `() => Promise` | Revoke the session and clear the cookie. |
+| `refresh` | `() => Promise` | Re-fetch `/auth/me` (call after driving sign-in from your own `@action`). |
+
 ```jsx
 // A whole auth UI, client-side:
 import { useAuth } from 'pyxle/client';
 
 function Account() {
-  const { user, isAuthenticated, login, logout } = useAuth();
-  return isAuthenticated
-    ? <button onClick={() => logout()}>Sign out {user.email}</button>
-    : <button onClick={() => login({ email, password })}>Sign in</button>;
+  const { user, isAuthenticated, login, signup, logout } = useAuth();
+  if (isAuthenticated) {
+    return <button onClick={() => logout()}>Sign out {user.email}</button>;
+  }
+  return (
+    <>
+      <button onClick={() => login({ email, password })}>Sign in</button>
+      <button onClick={() => signup({ email, password })}>Create account</button>
+    </>
+  );
 }
 ```
 
@@ -389,7 +407,9 @@ Two endpoints appear (sign with `PYXLE_AUTH_SECRET` / `PYXLE_SECRET_KEY`):
 > **CSRF:** these endpoints authenticate from the request body (not a cookie),
 > so they aren't CSRF-vulnerable — but the framework's CSRF middleware still
 > guards POSTs. Add `/auth/token` and `/auth/token/refresh` to
-> `csrf.exempt_paths` so non-browser clients can reach them.
+> `csrf.exemptPaths` (camelCase) so non-browser clients can reach them. A
+> snake-cased `exempt_paths` key is silently ignored, so the token endpoints
+> would keep rejecting requests.
 
 Resolve a bearer token in a loader or API route with the guards, which try
 **JWT then PAT** (and `authenticate` tries the **session** first):

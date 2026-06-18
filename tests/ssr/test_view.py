@@ -250,6 +250,38 @@ def test_resolve_nav_cache_ttl_without_cache_config() -> None:
     assert _resolve_nav_cache_ttl(SimpleNamespace(cache=None), "/") is None
 
 
+def test_resolve_nav_cache_ttl_dynamic_loader_page_never_caches() -> None:
+    """A loader page with no declared cache lifetime is dynamic → TTL 0, so a
+    mutation is visible immediately on client back/forward (not stale)."""
+    from types import SimpleNamespace
+
+    from pyxle.ssr.view import _resolve_nav_cache_ttl
+
+    settings = SimpleNamespace(cache=None)
+    dynamic = SimpleNamespace(cache_revalidate=None, has_loader=True)
+    assert _resolve_nav_cache_ttl(settings, "/incidents/x", page=dynamic) == 0
+
+    # A CACHE directive on the page wins over the dynamic default.
+    cached = SimpleNamespace(cache_revalidate=3600, has_loader=True)
+    assert _resolve_nav_cache_ttl(settings, "/about", page=cached) == 3600
+
+    # A static, loader-less page keeps the client default (None).
+    static = SimpleNamespace(cache_revalidate=None, has_loader=False)
+    assert _resolve_nav_cache_ttl(settings, "/static", page=static) is None
+
+
+def test_resolve_nav_cache_ttl_cache_config_wins_over_page() -> None:
+    """An explicit edge-cache entry takes priority over the per-page default."""
+    from types import SimpleNamespace
+
+    from pyxle.config import CacheConfig
+    from pyxle.ssr.view import _resolve_nav_cache_ttl
+
+    settings = SimpleNamespace(cache=CacheConfig(routes=(("/feed", 120),)))
+    dynamic = SimpleNamespace(cache_revalidate=None, has_loader=True)
+    assert _resolve_nav_cache_ttl(settings, "/feed", page=dynamic) == 120
+
+
 @pytest.mark.anyio
 async def test_build_page_response_with_loader(settings: DevServerSettings, tmp_path: Path) -> None:
     server_module = tmp_path / "server" / "index.py"

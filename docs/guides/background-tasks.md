@@ -39,6 +39,11 @@ function (run in a threadpool). The task runs after the response — a failure i
 it can't change what the client already received, so log inside the task if you
 need to know it ran.
 
+> `request.state.background` exists **only inside an `@action`**. A `@server`
+> loader or a plain API route never gets it, so `request.state.background` raises
+> `AttributeError` there — use `pyxle.tasks.enqueue` (below) from a loader or API
+> route instead.
+
 ### The `{"background": [...]}` shorthand
 
 For a single task, you can return it from the action instead of touching
@@ -52,8 +57,10 @@ async def signup(request, body: Signup):
 ```
 
 The value is `[callable, *args]`; Pyxle strips the `background` key from the
-response body and schedules `callable(*args)` to run after the response. For
-more than one task, use `request.state.background.add_task(...)`.
+response body and schedules `callable(*args)` to run after the response. The
+shorthand passes **positional args only** — there's no way to express keyword
+args in the flat list. For keyword args or more than one task, use
+`request.state.background.add_task(...)`.
 
 ## Fire-and-forget work — `pyxle.tasks`
 
