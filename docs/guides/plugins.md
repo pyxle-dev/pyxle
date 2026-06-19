@@ -2,7 +2,7 @@
 
 Pyxle plugins are reusable pieces of functionality — database layers, auth systems, storage adapters — that a host app composes via `pyxle.config.json` rather than hand-wiring in its entry point. The design is deliberately Django-inspired: declare what you want, and the framework handles discovery, startup order, and lifecycle.
 
-> **Status (0.4.0).** This guide covers the Phase A plugin surface: lifecycle hooks, named services, and middleware contribution. Page contribution (plugins shipping their own `.pyxl` pages that get merged into the host's route tree — the "pyxle-auth ships a default `/sign-in` page" use case) is a Phase B follow-up. Everything documented here is stable; the additions in Phase B will be strictly additive.
+> **Status (0.5.0).** This guide covers the Phase A plugin surface: lifecycle hooks, named services, and middleware contribution. Page contribution (plugins shipping their own `.pyxl` pages that get merged into the host's route tree — the "pyxle-auth ships a default `/sign-in` page" use case) is a Phase B follow-up. Everything documented here is stable; the additions in Phase B will be strictly additive.
 
 ## TL;DR
 

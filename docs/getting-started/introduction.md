@@ -2,7 +2,7 @@
 
 Pyxle is a Python-first full-stack web framework that brings the Next.js developer experience to the Python ecosystem. You write your server logic in Python, your UI in React, and ship them together in a single `.pyxl` file — no separate API layer, no second service, no glue code between them.
 
-**Current version:** 0.4.0 (beta)
+**Current version:** 0.5.0 (beta)
 
 ## One file, two languages
 
@@ -43,7 +43,7 @@ The loader's return value *is* the component's `data` prop. There's no `fetch`, 
 
 ## What's new
 
-Pyxle 0.4.0 adds **edge caching**, **hardened production errors**, and **faster static serving**. See the full [Changelog](../changelog.md) for release notes.
+Pyxle 0.5.0 — the **depth release** — adds server-side **caching, SSG & ISR**, **streaming SSR**, **realtime WebSockets** (with a cross-worker Redis broker), **Pydantic-validated actions**, **observability**, **background tasks**, image optimization, and **multi-worker serving**. See the full [Changelog](../changelog.md) for release notes.
 
 ---
 
