@@ -2,7 +2,18 @@
 
 Pyxle is a Python-first full-stack web framework that brings the Next.js developer experience to the Python ecosystem. Write server logic in Python, UI in React, and ship them together in `.pyxl` files.
 
-**Current version:** 0.4.5 (beta)
+**Current version:** 0.5.0 (beta)
+
+## What's new in 0.5.0
+
+The **depth release** — going deep on the production path.
+
+- **Server-side caching, SSG & ISR.** A `@server` loader can cache its rendered HTML (`{"data", "revalidate": N}`), `pyxle build --static` pre-renders loader-less pages, and stale pages revalidate in the background. See [Caching](guides/caching.md).
+- **Streaming SSR.** `<Suspense>` pages flush the shell first, then stream boundaries as they resolve — and it survives production gzip. See [Streaming SSR](guides/streaming.md).
+- **Realtime WebSockets.** Page `websocket` handlers, a `useWebSocket` hook, and `pyxle.realtime` pub/sub, with a **cross-worker Redis broker** for multi-process serving. See [WebSockets](guides/websockets.md).
+- **Pydantic-validated actions.** Annotate an `@action` body with a Pydantic model for automatic parse/validate/`422`, plus `pyxle openapi`. See [Server Actions](core-concepts/server-actions.md).
+- **Observability.** Request IDs, timing, Prometheus metrics, structured logging, a dev dashboard, and opt-in OpenTelemetry. See [Observability](guides/observability.md).
+- **Background tasks, image optimization, and multi-worker serving** (`pyxle serve --workers N`). See the [Changelog](changelog.md) for the full list.
 
 ## What's new in 0.4.0
 
