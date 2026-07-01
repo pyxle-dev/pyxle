@@ -2929,3 +2929,43 @@ async def test_loading_boundary_route_takes_streaming_path(
     )
     assert called.get("yes") is True
     assert response.headers["Cache-Control"] == "private, no-cache"
+
+
+def test_build_app_routes_registers_llms_routes_when_enabled(
+    project: DevServerSettings,
+) -> None:
+    from dataclasses import replace
+
+    from pyxle.config import LlmsConfig
+    from pyxle.devserver.starlette_app import _build_app_routes
+
+    build_once(project)
+    registry = load_metadata_registry(project)
+    table = build_route_table(registry)
+
+    enabled = replace(project, llms=LlmsConfig(enabled=True))
+    built, _eb = _build_app_routes(
+        settings=enabled,
+        routes=table,
+        renderer=object(),  # type: ignore[arg-type]
+        overlay=None,
+        api_route_hooks=[],
+        page_route_hooks=[],
+    )
+    paths = {getattr(route, "path", None) for route in built}
+    assert "/index.md" in paths
+    assert "/posts/{id}.md" in paths
+    assert "/llms.txt" in paths
+
+    # Off by default: no markdown routes or index.
+    built_off, _ = _build_app_routes(
+        settings=project,
+        routes=table,
+        renderer=object(),  # type: ignore[arg-type]
+        overlay=None,
+        api_route_hooks=[],
+        page_route_hooks=[],
+    )
+    paths_off = {getattr(route, "path", None) for route in built_off}
+    assert "/index.md" not in paths_off
+    assert "/llms.txt" not in paths_off

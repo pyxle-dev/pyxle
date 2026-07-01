@@ -2,6 +2,10 @@
 
 Release notes for Pyxle. While we're in beta (`0.x`), minor versions may include breaking changes — those are called out explicitly here. To upgrade, run `pip install --upgrade pyxle-framework`.
 
+## 0.6.0 — 2026-07-01
+
+- **AI accessibility — serve your app as markdown, plus `llms.txt`.** A new opt-in `llms` config block makes every Pyxle app legible to AI assistants and coding agents. Enable it (`"llms": true`) and the framework serves a clean **markdown** rendition of each page at its URL with `.md` appended (`/docs/routing.md`), returns markdown from the same URL to requests that send `Accept: text/markdown` (browsers are unaffected), serves an **`/llms.txt`** index, and advertises it with `Link`/`X-Llms-Txt` discovery headers. A page's markdown is resolved from your project — a co-located `<page>.md` file, a `to_markdown` handler in the page's server module, or a `to_markdown` in the nearest ancestor `llms.py` (which scopes to a whole route subtree; `pages/llms.py` is app-wide) — with an opt-in `autoConvert` HTML→markdown fallback and a redirect-to-the-page fallback when nothing resolves. `/llms.txt` comes from a static `public/llms.txt`, a `llms_txt` hook in `pages/llms.py`, or a generated index, and a `wrap_markdown` hook in `pages/llms.py` can frame every `.md` response with a header/footer (e.g. agent navigation hints). Off by default; adds nothing to the page hot path. See the [AI accessibility guide](guides/llms.md) and [Configuration → AI accessibility](reference/configuration.md#ai-accessibility).
+
 ## 0.5.0 — 2026-06-18
 
 The depth release: caching/SSG/ISR, streaming SSR, realtime (WebSockets + a

@@ -301,6 +301,49 @@ Whether the upgrade's `Origin` is permitted. CSRF doesn't apply to a WebSocket,
 so checking the origin is the equivalent guard. An empty `allowed_origins`
 allows all; a missing `Origin` header (same-origin / non-browser) is allowed.
 
+## AI accessibility hooks
+
+Conventions Pyxle recognizes when the [`llms`](configuration.md#ai-accessibility) feature is enabled, so your app can serve a Markdown rendition of each page. None are imported — they're functions you define by name in your `.pyxl` server sections or in `llms.py` files. See the [AI accessibility guide](../guides/llms.md) for the full model.
+
+### `to_markdown(ctx)`
+
+Returns the Markdown for a page. Define it in a page's server section (scopes to that page) or in an `llms.py` file (scopes to that directory's subtree; nearest ancestor wins). Sync or async.
+
+```python
+def to_markdown(ctx):        # ctx: MarkdownContext
+    return f"# {title}\n\n{body}\n"      # str  -> served
+    # return None            # -> decline, fall through to the next source
+```
+
+### `llms_txt(ctx)`
+
+Generates `/llms.txt`. Define it in the **root** `pages/llms.py`. Sync or async. Return a string, or `None` to use the generated default. `ctx` is an `LlmsTxtContext`.
+
+### `wrap_markdown(ctx, markdown)`
+
+Frames every resolved `.md` response with a header/footer. Define it in the **root** `pages/llms.py`. Sync or async. Return the wrapped string, or `None` to leave `markdown` unchanged. `ctx` is a `MarkdownContext`.
+
+### Context objects
+
+**`MarkdownContext`** — passed to `to_markdown` and `wrap_markdown`:
+
+| Member | Type | Description |
+|--------|------|-------------|
+| `ctx.request` | `starlette.requests.Request` | The request. `ctx.request.path_params` holds route params (e.g. `slug`). |
+| `ctx.path` | `str` | Canonical page path, always without `.md` (e.g. `/docs/routing`, `/`). Prefer this over `request.url.path`. |
+| `await ctx.run_loader()` | `Any` | Runs only the page's `@server` loader and returns its data (no render). `{}` if the page has no loader. |
+| `await ctx.render_html()` | `str` | Renders the page (loader + SSR) and returns the body HTML. Lazy; only call if you need it. |
+
+**`LlmsTxtContext`** — passed to `llms_txt`:
+
+| Member | Type | Description |
+|--------|------|-------------|
+| `ctx.request` | `Request` | The request. |
+| `ctx.pages` | `tuple[LlmsPageInfo, ...]` | The app's concrete pages. |
+| `ctx.render_default()` | `str` | The framework's generated `/llms.txt`. |
+
+**`LlmsPageInfo`** — each entry in `ctx.pages`: `path` (e.g. `/about`), `md_url` (`/about.md`), `title` (humanized label).
+
 ## Document `<head>` elements
 
 Pyxle offers two ways to contribute elements to the document `<head>`: the `<Head>` component (**recommended**) and the `HEAD` Python variable (lower-level alternative). Both are merged with automatic deduplication.

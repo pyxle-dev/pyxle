@@ -23,7 +23,7 @@ from starlette.exceptions import HTTPException
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response
+from starlette.responses import JSONResponse, PlainTextResponse, Response
 from starlette.routing import Mount, Route, Router, WebSocketRoute
 from starlette.staticfiles import NotModifiedResponse, StaticFiles
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
@@ -65,6 +65,7 @@ from .route_hooks import (
     load_route_hooks,
     wrap_with_route_hooks,
 )
+from . import llms
 from .routes import ActionRoute, ApiRoute, PageRoute, RouteTable, select_static_pages
 from .settings import DevServerSettings
 
@@ -1086,6 +1087,51 @@ async def _build_cached_page_response(
     return response
 
 
+def _merge_vary(response: Response, value: str) -> None:
+    """Add ``value`` to a response's ``Vary`` header without dropping existing tokens."""
+    existing = response.headers.get("vary")
+    if not existing:
+        response.headers["vary"] = value
+        return
+    tokens = {token.strip().lower() for token in existing.split(",")}
+    if value.lower() not in tokens:
+        response.headers["vary"] = f"{existing}, {value}"
+
+
+async def _maybe_markdown_response(
+    request: Request,
+    route: PageRoute,
+    *,
+    settings: DevServerSettings,
+    renderer: ComponentRenderer,
+    llms_cfg: Any,
+) -> Response | None:
+    """Return a markdown response for an ``Accept: text/markdown`` request, else None.
+
+    Content negotiation on the canonical page URL: agents that opt into markdown
+    get the page's ``.md`` rendition; browsers (which never send that Accept)
+    fall through to HTML. Any failure resolving markdown also falls through to
+    HTML, where a genuine render error still surfaces via the error boundary.
+    """
+    if not (llms.is_enabled(llms_cfg) and llms.wants_markdown(request)):
+        return None
+    try:
+        markdown = await llms.resolve_page_markdown(
+            request=request,
+            page=route,
+            settings=settings,
+            renderer=renderer,
+            config=llms_cfg,
+        )
+    except Exception:
+        return None
+    if markdown is None:
+        return None
+    response = PlainTextResponse(markdown, media_type=llms.MARKDOWN_MEDIA_TYPE)
+    response.headers["Vary"] = "Accept"
+    return response
+
+
 def _make_page_handler(
     route: PageRoute,
     *,
@@ -1096,6 +1142,9 @@ def _make_page_handler(
     page_cache: PageCache | None = None,
     stream_render: Callable[..., Any] | None = None,
 ):
+    llms_cfg = getattr(settings, "llms", None)
+    llms_on = llms.is_enabled(llms_cfg)
+
     async def handler(request: Request):  # pragma: no cover - thin wrapper
         wants_navigation_payload = request.headers.get(_NAVIGATION_HEADER) == "1"
         if wants_navigation_payload:
@@ -1118,7 +1167,14 @@ def _make_page_handler(
             response.headers["Cache-Control"] = "no-store"
             return response
 
-        return await _build_cached_page_response(
+        if llms_on:
+            md_response = await _maybe_markdown_response(
+                request, route, settings=settings, renderer=renderer, llms_cfg=llms_cfg
+            )
+            if md_response is not None:
+                return md_response
+
+        response = await _build_cached_page_response(
             request=request,
             route=route,
             settings=settings,
@@ -1128,6 +1184,11 @@ def _make_page_handler(
             page_cache=page_cache,
             stream_render=stream_render,
         )
+        if llms_on:
+            # The canonical URL now varies by Accept (HTML vs markdown), so a
+            # shared cache must key on it.
+            _merge_vary(response, "Accept")
+        return response
 
     handler.__name__ = f"page_{route.module_key.replace('.', '_')}"
     return handler
@@ -1479,6 +1540,20 @@ def _build_app_routes(
     built: list[Any] = []
     built.extend(api_router.routes)
     built.extend(action_router.routes)
+    # AI accessibility: per-page ``.md`` routes + ``/llms.txt``, registered
+    # BEFORE the page routes so ``/x.md`` resolves here rather than being
+    # captured by a dynamic page route (e.g. ``/docs/{slug:path}`` would
+    # otherwise match ``/docs/x.md`` with ``slug="x.md"``). Off unless the
+    # ``llms`` config block is enabled; a static ``public/llms.txt`` (served by
+    # the static middleware) still takes precedence over the generated index.
+    _llms_cfg = getattr(settings, "llms", None)
+    if llms.is_enabled(_llms_cfg):
+        built.extend(
+            llms.build_markdown_routes(
+                routes, settings=settings, renderer=renderer, config=_llms_cfg
+            )
+        )
+        built.append(llms.make_llms_txt_route(routes, settings=settings))
     built.extend(page_router.routes)
     if overlay is not None:
         built.append(WebSocketRoute("/__pyxle__/overlay", overlay.websocket_endpoint))
@@ -1875,6 +1950,11 @@ def create_starlette_app(
     # Security response headers in production mode.
     if not settings.debug:
         middleware_stack.append(Middleware(_SecurityHeadersMiddleware))
+
+    # Advertise the /llms.txt index on every response via Link + X-Llms-Txt
+    # headers when AI accessibility is enabled (pure ASGI, streaming-safe).
+    if llms.is_enabled(getattr(settings, "llms", None)):
+        middleware_stack.append(Middleware(llms.LlmsDiscoveryMiddleware))
 
     if cors_middleware is not None:
         middleware_stack.append(cors_middleware)
