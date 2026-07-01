@@ -163,6 +163,39 @@ class ObservabilityConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class LlmsConfig:
+    """AI-accessibility settings: per-page markdown and an ``llms.txt`` index.
+
+    When ``enabled``, the framework serves a markdown rendition of each page at
+    the page's URL with ``.md`` appended (and when a request sends
+    ``Accept: text/markdown``), advertises the index via ``Link``/``X-Llms-Txt``
+    discovery headers, and serves ``/llms.txt``. Everything here is **off by
+    default** — an opt-in feature for making an app legible to AI assistants and
+    coding agents.
+
+    A page's markdown is resolved in this order, first hit wins:
+
+    1. A co-located ``<page>.md`` file next to the ``.pyxl`` source.
+    2. A ``to_markdown`` handler in the page's own server module (a function
+       ``fn(ctx) -> str | None``, sync or async).
+    3. A ``to_markdown`` in the nearest ancestor ``llms.py`` — a per-directory
+       module covering a whole route subtree (closest ancestor wins, like
+       ``layout.pyxl``); ``pages/llms.py`` is the app-wide handler.
+    4. Only if ``auto_convert`` is on: a best-effort HTML→markdown conversion of
+       the rendered page.
+    5. If none apply: the ``.md`` URL redirects to the page itself.
+
+    ``/llms.txt`` is served from a static ``public/llms.txt`` if present, else
+    from a ``llms_txt`` function in the root ``pages/llms.py``, else from a
+    generated index of the app's pages. ``auto_convert`` defaults off because the
+    conversion is lossy — prefer author-provided markdown or a handler.
+    """
+
+    enabled: bool = False
+    auto_convert: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class PyxleConfig:
     """Resolved configuration values for a Pyxle project."""
 
@@ -186,6 +219,7 @@ class PyxleConfig:
     navigation: NavigationConfig = NavigationConfig()
     rate_limit: RateLimitConfig = RateLimitConfig()
     observability: ObservabilityConfig = ObservabilityConfig()
+    llms: LlmsConfig = LlmsConfig()
     # Plugin entries as the raw payload from ``pyxle.config.json`` —
     # either a bare string (``"pyxle-auth"``) or an object
     # (``{"name": "pyxle-auth", "settings": {...}}``). Resolved into
@@ -216,6 +250,7 @@ class PyxleConfig:
             "navigation": self.navigation,
             "rate_limit": self.rate_limit,
             "observability": self.observability,
+            "llms": self.llms,
             "plugins": self.plugins,
         }
 
@@ -324,6 +359,7 @@ def _parse_config_dict(data: Dict[str, Any], *, source: Path) -> PyxleConfig:
         "navigation",
         "rateLimit",
         "observability",
+        "llms",
         "plugins",
     }
     unknown_keys = set(data) - allowed_top_keys
@@ -359,6 +395,7 @@ def _parse_config_dict(data: Dict[str, Any], *, source: Path) -> PyxleConfig:
     navigation_config = _parse_navigation_block(data.get("navigation"), source=source)
     rate_limit_config = _parse_rate_limit_block(data.get("rateLimit"), source=source)
     observability_config = _parse_observability_block(data.get("observability"), source=source)
+    llms_config = _parse_llms_block(data.get("llms"), source=source)
     plugins = _parse_plugins_block(data.get("plugins"), source=source)
 
     return PyxleConfig(
@@ -382,6 +419,7 @@ def _parse_config_dict(data: Dict[str, Any], *, source: Path) -> PyxleConfig:
         navigation=navigation_config,
         rate_limit=rate_limit_config,
         observability=observability_config,
+        llms=llms_config,
         plugins=plugins,
     )
 
@@ -422,6 +460,48 @@ def _parse_plugins_block(value: Any, *, source: Path) -> tuple[Any, ...]:
             f"got {type(entry).__name__}."
         )
     return tuple(entries)
+
+
+def _parse_llms_block(value: Any, *, source: Path) -> LlmsConfig:
+    """Parse the ``llms`` block — AI/markdown accessibility settings.
+
+    Accepts a boolean shorthand (``"llms": true`` enables the feature with
+    defaults) or an object with ``enabled`` and ``autoConvert`` keys. When the
+    object form is used, the feature is enabled unless ``enabled: false`` is set
+    explicitly. Markdown handlers and the ``llms.txt`` index live in ``llms.py``
+    files, not in config.
+    """
+    if value is None:
+        return LlmsConfig()
+    if isinstance(value, bool):
+        return LlmsConfig(enabled=value)
+    if not isinstance(value, Mapping):
+        raise ConfigError(
+            f"Invalid value for 'llms' in '{source}': expected an object or boolean."
+        )
+
+    _reject_unknown_keys(
+        value,
+        allowed={"enabled", "autoConvert"},
+        block="llms",
+        source=source,
+    )
+
+    enabled = value.get("enabled", True)
+    if not isinstance(enabled, bool):
+        raise ConfigError(
+            f"Invalid 'llms.enabled' in '{source}': expected boolean, "
+            f"got {type(enabled).__name__}."
+        )
+
+    auto_convert = value.get("autoConvert", False)
+    if not isinstance(auto_convert, bool):
+        raise ConfigError(
+            f"Invalid 'llms.autoConvert' in '{source}': expected boolean, "
+            f"got {type(auto_convert).__name__}."
+        )
+
+    return LlmsConfig(enabled=enabled, auto_convert=auto_convert)
 
 
 def _parse_styling_block(value: Any, *, source: Path) -> tuple[tuple[str, ...], tuple[str, ...]]:

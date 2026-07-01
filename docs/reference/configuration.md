@@ -66,6 +66,10 @@ Pyxle is configured via `pyxle.config.json` in the project root. All fields are 
     "otelServiceName": "pyxle-app",
     "otelSampleRatio": 0.05
   },
+  "llms": {
+    "enabled": false,
+    "autoConvert": false
+  },
   "plugins": []
 }
 ```
@@ -319,6 +323,29 @@ Request correlation IDs and timing. Both are **on by default** -- generating an 
 | `observability.otelSampleRatio` | `number` | `0.05` | Trace sampling ratio (0.0–1.0). Low by default so tracing can't swamp a busy server. The exporter endpoint comes from the standard `OTEL_EXPORTER_OTLP_ENDPOINT` env var. |
 
 Shorthand to disable request-id and timing: `"observability": false`. The page-cache hit-ratio metric requires the [server-side page cache](../guides/caching.md) (active under `pyxle serve`). **Multi-worker note:** under `pyxle serve --workers N` each worker process exposes its own metrics (with a `worker` label), so aggregate across workers at the scraper.
+
+## AI accessibility
+
+Serve a clean **markdown** rendition of every page — at its URL with `.md` appended, and to requests that send `Accept: text/markdown` — plus an `/llms.txt` index, so AI assistants and coding agents can read your app as text instead of parsing HTML. **Off by default.** See the [AI accessibility guide](../guides/llms.md) for the full model.
+
+```json
+{
+  "llms": {
+    "enabled": true,
+    "autoConvert": false
+  }
+}
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `llms` | `object` \| `boolean` | `{}` | AI-accessibility settings. `true` enables with defaults; an object enables unless `enabled: false`. |
+| `llms.enabled` | `boolean` | `false` | Turn the feature on: register `<page>.md` routes, negotiate `Accept: text/markdown`, serve `/llms.txt`, and add `Link`/`X-Llms-Txt` discovery headers. |
+| `llms.autoConvert` | `boolean` | `false` | Last-resort fallback: when a page has no markdown source, convert its rendered HTML to markdown. **Off by default** — the conversion is lossy; prefer author-provided markdown. |
+
+**Where the markdown comes from** is *not* config — it lives in your project, resolved in this order (first hit wins): a co-located `<page>.md` file → a `to_markdown` handler in the page's server module → a `to_markdown` in the nearest ancestor `llms.py` (covers a route subtree; `pages/llms.py` is app-wide) → `autoConvert` (if on) → otherwise the `.md` URL redirects to the page. A root `pages/llms.py` may also define `wrap_markdown(ctx, markdown)` to frame every `.md` response with a header/footer. Likewise `/llms.txt` comes from a static `public/llms.txt`, else a `llms_txt` function in the root `pages/llms.py`, else a generated index. See the [guide](../guides/llms.md).
+
+> **Deploying handlers.** Co-located `.md` files and `llms.py` handlers are part of your source, so they must be present alongside `pages/` when you `pyxle serve`. (A page's own `to_markdown`, compiled into the build, works regardless.)
 
 ## Plugins
 

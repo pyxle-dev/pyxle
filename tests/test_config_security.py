@@ -12,6 +12,7 @@ from pyxle.config import (
     ConfigError,
     CorsConfig,
     CsrfConfig,
+    LlmsConfig,
     ObservabilityConfig,
     PyxleConfig,
     load_config,
@@ -590,3 +591,68 @@ class TestObservabilityConfigParsing:
         # bool is a subclass of int — must not be accepted as a ratio.
         with pytest.raises(ConfigError, match="otelSampleRatio"):
             self._load(tmp_path, {"otelSampleRatio": True})
+
+
+# ---------------------------------------------------------------------------
+# LlmsConfig — AI accessibility (per-page markdown + /llms.txt)
+# ---------------------------------------------------------------------------
+
+
+class TestLlmsConfigDefaults:
+    def test_default_disabled(self):
+        cfg = LlmsConfig()
+        assert cfg.enabled is False
+        assert cfg.auto_convert is False
+
+    def test_default_in_pyxle_config(self):
+        assert PyxleConfig().llms == LlmsConfig()
+
+
+class TestLlmsConfigParsing:
+    def _load(self, tmp_path: Path, llms_data) -> LlmsConfig:
+        config_file = tmp_path / "pyxle.config.json"
+        config_file.write_text(json.dumps({"llms": llms_data}))
+        return load_config(tmp_path, config_path=config_file).llms
+
+    def test_no_block_returns_defaults(self, tmp_path: Path):
+        config_file = tmp_path / "pyxle.config.json"
+        config_file.write_text(json.dumps({}))
+        assert load_config(tmp_path, config_path=config_file).llms == LlmsConfig()
+
+    def test_boolean_true_enables(self, tmp_path: Path):
+        assert self._load(tmp_path, True).enabled is True
+
+    def test_boolean_false_disables(self, tmp_path: Path):
+        assert self._load(tmp_path, False).enabled is False
+
+    def test_object_enables_by_default(self, tmp_path: Path):
+        assert self._load(tmp_path, {"autoConvert": True}).enabled is True
+
+    def test_object_explicit_disable(self, tmp_path: Path):
+        cfg = self._load(tmp_path, {"enabled": False, "autoConvert": True})
+        assert cfg.enabled is False
+        assert cfg.auto_convert is True
+
+    def test_auto_convert_flag(self, tmp_path: Path):
+        assert self._load(tmp_path, {"enabled": True}).auto_convert is False
+        assert self._load(tmp_path, {"autoConvert": True}).auto_convert is True
+
+    def test_unknown_key_rejected(self, tmp_path: Path):
+        with pytest.raises(ConfigError, match="llms"):
+            self._load(tmp_path, {"handler": "app:conv"})
+
+    def test_invalid_type_rejected(self, tmp_path: Path):
+        with pytest.raises(ConfigError, match="llms"):
+            self._load(tmp_path, ["not", "an", "object"])
+
+    def test_invalid_enabled_type_rejected(self, tmp_path: Path):
+        with pytest.raises(ConfigError, match="llms.enabled"):
+            self._load(tmp_path, {"enabled": "yes"})
+
+    def test_invalid_auto_convert_type_rejected(self, tmp_path: Path):
+        with pytest.raises(ConfigError, match="llms.autoConvert"):
+            self._load(tmp_path, {"autoConvert": "sure"})
+
+    def test_carried_into_devserver_kwargs(self):
+        kwargs = PyxleConfig(llms=LlmsConfig(enabled=True)).to_devserver_kwargs()
+        assert kwargs["llms"] == LlmsConfig(enabled=True)

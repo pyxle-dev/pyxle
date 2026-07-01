@@ -249,6 +249,54 @@ async def build_page_response(
         )
 
 
+async def render_page_body_html(
+    *,
+    request: Request,
+    settings: DevServerSettings,
+    page: PageRoute,
+    renderer: ComponentRenderer,
+    suppress_per_user: bool = False,
+) -> tuple[str, int]:
+    """Render a page and return ``(body_html, status_code)``.
+
+    Runs the same loader + SSR path as :func:`build_page_response` but returns
+    the rendered component HTML *without* the surrounding document shell, so
+    callers (such as the ``.md`` markdown resolver) can post-process the
+    content. Propagates the same render-stage exceptions as the page pipeline.
+    """
+    breadcrumb = _initial_loader_breadcrumb(page)
+    artifacts = await _create_page_artifacts(
+        request=request,
+        settings=settings,
+        page=page,
+        renderer=renderer,
+        loader_breadcrumb=breadcrumb,
+        suppress_per_user=suppress_per_user,
+    )
+    return artifacts.body_html, artifacts.status_code
+
+
+async def run_page_loader(
+    *,
+    request: Request,
+    settings: DevServerSettings,
+    page: PageRoute,
+) -> Any:
+    """Run a page's ``@server`` loader and return its data — no SSR render.
+
+    A lighter-weight counterpart to :func:`render_page_body_html` for callers
+    (such as the ``.md`` markdown resolver) that only need the loader's return
+    value. Returns the loader's data dict; a page with no loader returns ``{}``.
+    Propagates loader exceptions.
+    """
+    if settings.debug:
+        _purge_page_modules(settings.pages_dir)
+    payload, _status, _revalidate, _module = await _execute_loader(
+        page, request, module=None, debug=settings.debug
+    )
+    return payload
+
+
 async def _handle_render_exception(
     exc: BaseException,
     *,

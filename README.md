@@ -122,6 +122,7 @@ from the very first prompt — no priming, no setup.
 - **Vite HMR** — instant hot reload in development
 - **Tailwind** — preconfigured out of the box
 - **Production build** — `pyxle build` + `pyxle serve`; deploy anywhere Python runs
+- **AI accessibility** — serve any page as clean Markdown (append `.md`, or `Accept: text/markdown`) plus an `llms.txt` index, so AI agents read your app as text — one flag, agent-friendly out of the box
 - **Editor tooling** — LSP, linter, and a [VS Code extension](https://marketplace.visualstudio.com/items?itemName=pyxle.pyxle-language-tools)
 
 ## Status

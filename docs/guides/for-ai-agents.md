@@ -633,6 +633,20 @@ instead of scanning the full source tree.
 
 ---
 
+## Serve your whole app as Markdown
+
+There's a second half to "agent-first": not just *writing* code an agent can reason about, but *serving* content an agent can read. Pyxle ships that too. Enable the [`llms`](llms.md) feature and every page of your app is available as clean Markdown — append `.md` to any URL, or send `Accept: text/markdown` — plus an [`/llms.txt`](https://llmstxt.org/) index and discovery headers:
+
+```json
+{ "llms": true }
+```
+
+Now a developer can paste `yourapp.com/docs/anything.md` straight into Claude, Cursor, or ChatGPT and get clean, token-efficient context instead of HTML. You decide where each page's Markdown comes from — a co-located `.md` file, a `to_markdown` handler, or a directory-wide `llms.py` — and a `wrap_markdown` hook can frame every page with instructions for the agent reading it. This very handbook is served that way: append `.md` to this page's URL to see it.
+
+See the [AI accessibility guide](llms.md) for the full model.
+
+---
+
 ## Next steps
 
 - **New to Pyxle?** Start with the [quick start](../getting-started/quick-start.md).
