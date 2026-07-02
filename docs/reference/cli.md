@@ -48,6 +48,7 @@ pyxle install [directory] [options]
 | `directory` | `.` | Project directory |
 | `--python` / `--no-python` | `true` | Install Python deps via `pip` |
 | `--node` / `--no-node` | `true` | Install Node deps via `npm` |
+| `--break-system-packages` | `false` | Pass `--break-system-packages` to `pip`, for externally-managed (PEP 668) environments without a virtualenv. Use with care. |
 
 **Examples:**
 
@@ -55,7 +56,10 @@ pyxle install [directory] [options]
 pyxle install
 pyxle install --no-python    # Node only
 pyxle install ./my-app
+pyxle install --break-system-packages   # PEP 668 system Python, no venv
 ```
+
+Outside a virtualenv, `pyxle install` warns about PEP 668 ("externally-managed-environment") and recommends creating a venv first; pass `--break-system-packages` to install anyway.
 
 ## `pyxle dev`
 
@@ -160,7 +164,11 @@ sizing guidance.
 
 ## `pyxle check`
 
-Validate `.pyxl` syntax, configuration, and dependencies.
+Validate `.pyxl` files, configuration, and dependencies without starting the server. Each `.pyxl` file is checked at three levels:
+
+- **Python syntax** (via `ast`) and Pyxle structural rules (loader/action shape, `HEAD`, …).
+- **Python semantics** (via pyflakes): undefined names — e.g. a symbol you `raise` but never imported — unused imports, redefinitions. Compiler-injected runtime names (`server`, `action`, `LoaderError`, `ActionError`, …) are recognized, so the idiomatic patterns never read as undefined.
+- **JSX syntax** (via Babel): unclosed tags/expressions, mismatched braces, TypeScript in a client block, and **duplicate `export default`** (which Babel accepts but the build rejects).
 
 ```bash
 pyxle check [directory] [options]

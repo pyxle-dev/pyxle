@@ -18,6 +18,8 @@ _ACTION_IMPORT = "from pyxle.runtime import action"
 _SERVER_ACTION_IMPORT = "from pyxle.runtime import server, action"
 _ACTION_ERROR_IMPORT = "from pyxle.runtime import ActionError"
 _VALIDATION_ACTION_ERROR_IMPORT = "from pyxle.runtime import ValidationActionError"
+_LOADER_ERROR_IMPORT = "from pyxle.runtime import LoaderError"
+_INVALIDATE_ROUTES_IMPORT = "from pyxle.runtime import invalidate_routes"
 
 
 @dataclass
@@ -68,6 +70,17 @@ class ArtifactWriter:
         if has_actions and python_code.strip():
             python_code = ensure_action_error_import(python_code)
             python_code = ensure_validation_action_error_import(python_code)
+            # ``invalidate_routes`` is the action-side helper that evicts a
+            # route's cached navigation payload after a mutation — inject it
+            # alongside ``ActionError`` for the same no-surprise reason.
+            python_code = ensure_invalidate_routes_import(python_code)
+        # A ``@server`` loader raises ``LoaderError`` to trigger the nearest
+        # ``error.pyxl`` boundary, exactly as an ``@action`` raises
+        # ``ActionError`` — so auto-import it for parity. Without this, the first
+        # ``raise LoaderError(...)`` fails with a bewildering NameError even
+        # though the equivalent action pattern works out of the box.
+        if has_loader and python_code.strip():
+            python_code = ensure_loader_error_import(python_code)
         jsx_code = (
             parse_result.jsx_code
             if parse_result.jsx_code.strip()
@@ -307,6 +320,30 @@ def ensure_validation_action_error_import(source: str) -> str:
     """
     return _ensure_runtime_name_import(
         source, "ValidationActionError", _VALIDATION_ACTION_ERROR_IMPORT
+    )
+
+
+def ensure_loader_error_import(source: str) -> str:
+    """Ensure ``from pyxle.runtime import LoaderError`` is present.
+
+    Called whenever the source declares a ``@server`` loader, so the idiomatic
+    ``raise LoaderError(...)`` pattern — which renders the nearest ``error.pyxl``
+    boundary — works without a manual import. Parity with
+    :func:`ensure_action_error_import`. A user who already owns the name is
+    detected and this is a no-op.
+    """
+    return _ensure_runtime_name_import(source, "LoaderError", _LOADER_ERROR_IMPORT)
+
+
+def ensure_invalidate_routes_import(source: str) -> str:
+    """Ensure ``from pyxle.runtime import invalidate_routes`` is present.
+
+    Auto-imported for pages with at least one ``@action`` — the helper that
+    evicts a route's cached navigation payload after a mutation. A user-defined
+    name still takes precedence.
+    """
+    return _ensure_runtime_name_import(
+        source, "invalidate_routes", _INVALIDATE_ROUTES_IMPORT
     )
 
 

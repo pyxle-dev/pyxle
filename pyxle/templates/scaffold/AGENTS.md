@@ -17,9 +17,10 @@ frameworks — most mistakes come from not understanding the one-file Python+Rea
    route to write — the `@action` *is* the endpoint.
 4. `@server`/`@action` return a **plain dict.** On the client, an action's result arrives
    **wrapped** as `{ ok: true, ...yourDict }` (or `{ ok: false, error }`). Always check `res.ok`.
-5. To raise a handled error you **must import it**: `from pyxle.runtime import ActionError,
-   LoaderError`. (The decorators are auto-injected; these exception classes are not — forgetting
-   this is the #1 `NameError`.)
+5. Raise a handled error with `raise LoaderError(...)` (in a loader) or `raise ActionError(...)`
+   (in an action) — **no import needed.** Like the decorators, these runtime classes
+   (`LoaderError`, `ActionError`, `ValidationActionError`, `invalidate_routes`) are auto-injected.
+   `pyxle check` reports any name you genuinely left undefined, and any duplicate `export default`.
 6. Secrets stay server-side. An env var is exposed to the browser **only** if it is prefixed
    `PYXLE_PUBLIC_`. Never return secrets/tokens from a loader or action (they're serialized to
    the client).
@@ -32,7 +33,7 @@ frameworks — most mistakes come from not understanding the one-file Python+Rea
 # pages/index.pyxl
 
 # ── Python (server) ─────────────────────────────────────────────
-# @server / @action need no import. ActionError/LoaderError DO (see below).
+# @server / @action / LoaderError / ActionError all work without imports (auto-injected).
 
 @server
 async def load(request):
@@ -94,16 +95,14 @@ async def load(request):              # any function name works; @server marks i
   JSON-safe values.
 - `request` is a Starlette `Request`: `request.path_params`, `request.query_params`,
   `request.headers`, `request.cookies`, `request.url`.
-- To fail with a status code: `from pyxle.runtime import LoaderError` then
-  `raise LoaderError("Not found", status_code=404)`.
+- To fail with a status code: `raise LoaderError("Not found", status_code=404)` (auto-injected,
+  no import needed).
 - A page **without** a `@server` loader is fine — it just renders statically (the component
   takes no `data`).
 
 ## Mutations — `@action`
 
 ```python
-from pyxle.runtime import ActionError    # required to raise it
-
 @action
 async def create_post(request):
     body = await request.json()

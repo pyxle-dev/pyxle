@@ -1088,3 +1088,134 @@ class TestTypeScriptGuard:
             assert f"Line {ts_line}" in str(exc)
         else:
             pytest.skip("Babel extractor unavailable; the guard degraded gracefully")
+
+
+class TestSemanticValidation:
+    """``validate_semantics=True`` runs pyflakes over the Python section."""
+
+    def _sem(self, text: str):
+        return PyxParser().parse_text(
+            dedent(text).strip("\n"), tolerant=True, validate_semantics=True
+        )
+
+    def test_undefined_name_flagged(self):
+        result = self._sem(
+            """
+            @server
+            async def load(request):
+                return {"x": compute_total(request)}
+
+            import React from 'react'
+
+            export default function P({ data }) {
+                return <div>{data.x}</div>
+            }
+            """
+        )
+        assert any(
+            d.section == "python" and "undefined name 'compute_total'" in d.message
+            for d in result.diagnostics
+        )
+
+    def test_injected_runtime_names_not_flagged(self):
+        # @server/@action + LoaderError/ActionError/invalidate_routes used with
+        # no imports must NOT read as undefined — the compiler injects them.
+        result = self._sem(
+            """
+            @server
+            async def load(request):
+                if request is None:
+                    raise LoaderError("x")
+                return {}
+
+            @action
+            async def save(request):
+                if not request:
+                    raise ActionError("y")
+                return invalidate_routes({"ok": True}, "/posts")
+
+            import React from 'react'
+
+            export default function P() {
+                return <div/>
+            }
+            """
+        )
+        assert not any(d.section == "python" for d in result.diagnostics)
+
+    def test_off_by_default(self):
+        result = PyxParser().parse_text(
+            dedent(
+                """
+                @server
+                async def load(request):
+                    return {"x": mystery()}
+
+                import React from 'react'
+
+                export default function P({ data }) {
+                    return <div>{data.x}</div>
+                }
+                """
+            ).strip("\n"),
+            tolerant=True,
+        )
+        assert not any("undefined name" in d.message for d in result.diagnostics)
+
+    def test_line_maps_to_pyxl_source(self):
+        result = self._sem(
+            """
+            @server
+            async def load(request):
+                value = 1
+                return {"x": nope(value)}
+
+            import React from 'react'
+
+            export default function P({ data }) {
+                return <div>{data.x}</div>
+            }
+            """
+        )
+        diags = [d for d in result.diagnostics if "undefined name 'nope'" in d.message]
+        assert diags and diags[0].line == 4
+
+
+class TestJsxErrorLineMapping:
+    """A Babel error must map to the real .pyxl line, not the JSX block start."""
+
+    def _run(self, monkeypatch, error_line):
+        from pyxle.compiler import jsx_parser
+        from pyxle.compiler.jsx_parser import JSXParseResult
+
+        monkeypatch.setattr(
+            jsx_parser,
+            "parse_jsx_components",
+            lambda jsx_code, *, target_components=None: JSXParseResult(
+                components=(), error="boom", error_line=error_line
+            ),
+        )
+        return PyxParser().parse_text(
+            dedent(
+                """
+                import React from 'react'
+
+                export default function P() {
+                    return <div>ok</div>
+                }
+                """
+            ).strip("\n"),
+            tolerant=True,
+            validate_jsx=True,
+        )
+
+    def test_error_maps_to_reported_line(self, monkeypatch):
+        result = self._run(monkeypatch, error_line=3)
+        jsx = [d for d in result.diagnostics if d.section == "jsx"]
+        # snippet line 3 -> file line 3 (the export line), NOT the block start (1).
+        assert jsx and jsx[0].line == 3
+
+    def test_missing_line_falls_back_to_block_start(self, monkeypatch):
+        result = self._run(monkeypatch, error_line=None)
+        jsx = [d for d in result.diagnostics if d.section == "jsx"]
+        assert jsx and jsx[0].line == 1

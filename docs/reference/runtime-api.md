@@ -1,8 +1,11 @@
 # Runtime API Reference
 
-The `pyxle.runtime` module provides decorators and error classes used in `.pyxl` files. The compiler **auto-injects** a small set: the `@server` decorator, and — in any file that declares at least one `@action` — the `@action` decorator plus `ActionError` and `ValidationActionError`. You do not import those.
+The `pyxle.runtime` module provides decorators and error classes used in `.pyxl` files. The compiler **auto-injects** the ones you use in the idiomatic patterns, so you rarely import from `pyxle.runtime` at all:
 
-Other `pyxle.runtime` symbols, including **`LoaderError`**, are **not** auto-injected — import them explicitly: `from pyxle.runtime import LoaderError`.
+- a file with a `@server` loader gets `server` and **`LoaderError`**;
+- a file with an `@action` gets `action`, **`ActionError`**, **`ValidationActionError`**, and **`invalidate_routes`**.
+
+So `raise LoaderError(...)` / `raise ActionError(...)` work without an import. You can still import any of them explicitly (a name you define or import yourself always takes precedence over the auto-injection). `pyxle check` reports any name you genuinely left undefined.
 
 ## `@server`
 
@@ -89,11 +92,9 @@ Requires the `[pydantic]` extra (`pip install "pyxle-framework[pydantic]"`). On 
 
 ## `LoaderError`
 
-Exception class for structured loader errors. Triggers the nearest `error.pyxl` boundary.
+Exception class for structured loader errors. Triggers the nearest `error.pyxl` boundary. Auto-injected in any file with a `@server` loader — no import needed.
 
 ```python
-from pyxle.runtime import LoaderError
-
 @server
 async def load_page(request):
     raise LoaderError("Not found", status_code=404, data={"id": 42})
@@ -396,10 +397,8 @@ The callable receives the loader's return value. Must return a string or list of
 
 ## Explicit imports
 
-While the compiler auto-injects `@server` and `@action`, you can also import explicitly:
+The compiler auto-injects the names you use in the idiomatic patterns (see the top of this page), so you usually import nothing. You can still import any of them explicitly — useful for type checking and IDE support, and a name you import or define yourself always takes precedence over the auto-injection:
 
 ```python
-from pyxle.runtime import server, action, LoaderError, ActionError, ValidationActionError
+from pyxle.runtime import server, action, LoaderError, ActionError, ValidationActionError, invalidate_routes
 ```
-
-This is useful for type checking and IDE support.

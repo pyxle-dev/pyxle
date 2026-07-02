@@ -7,6 +7,8 @@ from textwrap import dedent
 from pyxle.compiler.writers import (
     ensure_action_error_import,
     ensure_action_import,
+    ensure_invalidate_routes_import,
+    ensure_loader_error_import,
     ensure_server_action_import,
     ensure_validation_action_error_import,
 )
@@ -265,3 +267,55 @@ class TestEnsureValidationActionErrorImport:
         result = ensure_validation_action_error_import(source)
         assert "from pyxle.runtime import ValidationActionError" in result
         assert result.count("from pyxle.runtime import ActionError") == 1
+
+
+class TestEnsureLoaderErrorImport:
+    """A ``@server`` loader can ``raise LoaderError(...)`` to hit the nearest
+    ``error.pyxl`` boundary without a manual import — parity with ActionError."""
+
+    def test_adds_import_when_missing(self) -> None:
+        source = "async def load(request):\n    raise LoaderError('x')\n"
+        result = ensure_loader_error_import(source)
+        assert "from pyxle.runtime import LoaderError" in result
+
+    def test_no_duplicate_when_already_present(self) -> None:
+        source = (
+            "from pyxle.runtime import LoaderError\n"
+            "async def load(request):\n    pass\n"
+        )
+        result = ensure_loader_error_import(source)
+        assert result.count("from pyxle.runtime import LoaderError") == 1
+
+    def test_empty_source_returned_unchanged(self) -> None:
+        assert ensure_loader_error_import("") == ""
+
+    def test_respects_existing_combined_import(self) -> None:
+        source = (
+            "from pyxle.runtime import server, LoaderError\n"
+            "async def load(request):\n    pass\n"
+        )
+        assert ensure_loader_error_import(source) == source
+
+    def test_does_not_shadow_local_class(self) -> None:
+        source = "class LoaderError(Exception):\n    pass\n"
+        assert ensure_loader_error_import(source) == source
+
+
+class TestEnsureInvalidateRoutesImport:
+    """Pages with an ``@action`` get ``invalidate_routes`` auto-imported."""
+
+    def test_adds_import_when_missing(self) -> None:
+        source = "async def save(request):\n    pass\n"
+        result = ensure_invalidate_routes_import(source)
+        assert "from pyxle.runtime import invalidate_routes" in result
+
+    def test_no_duplicate_when_already_present(self) -> None:
+        source = (
+            "from pyxle.runtime import invalidate_routes\n"
+            "async def save(request):\n    pass\n"
+        )
+        result = ensure_invalidate_routes_import(source)
+        assert result.count("from pyxle.runtime import invalidate_routes") == 1
+
+    def test_empty_source_returned_unchanged(self) -> None:
+        assert ensure_invalidate_routes_import("") == ""
