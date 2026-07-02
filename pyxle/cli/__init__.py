@@ -195,21 +195,26 @@ def _install_dependencies(
     logger: ConsoleLogger,
     install_python: bool = True,
     install_node: bool = True,
+    break_system_packages: bool = False,
 ) -> None:
     if not install_python and not install_node:
         logger.warning("Skipping dependency installation (both installers disabled).")
         return
 
     if install_python:
-        if not _in_virtualenv():
+        if not _in_virtualenv() and not break_system_packages:
             logger.warning(
                 "No virtual environment detected. Installing into the system "
-                "Python can fail on modern Linux (PEP 668 'externally-managed-"
+                "Python can fail on modern distros (PEP 668 'externally-managed-"
                 "environment'). Recommended: create one first — "
                 "`python -m venv .venv && source .venv/bin/activate` "
-                "(Windows: `.venv\\Scripts\\activate`) — then run `pyxle install`."
+                "(Windows: `.venv\\Scripts\\activate`) — then run `pyxle install`. "
+                "To install into this environment anyway, re-run with "
+                "`--break-system-packages`."
             )
         python_cmd = [sys.executable, "-m", "pip", "install", "-r", "requirements.txt"]
+        if break_system_packages:
+            python_cmd.append("--break-system-packages")
         _run_subprocess(
             python_cmd,
             cwd=project_root,
@@ -248,6 +253,14 @@ def install(
         help="Install Node dependencies via npm.",
         show_default=True,
     ),
+    break_system_packages: bool = typer.Option(
+        False,
+        "--break-system-packages",
+        help=(
+            "Pass --break-system-packages to pip, for externally-managed "
+            "(PEP 668) environments without a virtualenv. Use with care."
+        ),
+    ),
 ) -> None:
     """Install project dependencies inside the specified directory."""
 
@@ -258,6 +271,7 @@ def install(
         logger=logger,
         install_python=python_deps,
         install_node=node_deps,
+        break_system_packages=break_system_packages,
     )
 
 
@@ -912,7 +926,10 @@ def check(
             # diagnostics for every file that follows.
             try:
                 result = parser.parse(
-                    pyxl_file, tolerant=True, validate_jsx=True
+                    pyxl_file,
+                    tolerant=True,
+                    validate_jsx=True,
+                    validate_semantics=True,
                 )
             except Exception as exc:  # noqa: BLE001 — defensive CLI boundary
                 diagnostics.append(

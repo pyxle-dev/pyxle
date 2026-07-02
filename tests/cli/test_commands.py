@@ -93,6 +93,7 @@ def test_install_invokes_dependency_helper(monkeypatch) -> None:
             logger,
             install_python=True,
             install_node=True,
+            break_system_packages=False,
         ):
             called["root"] = project_root.resolve()
             called["python"] = install_python
@@ -474,6 +475,7 @@ def test_init_optionally_installs_dependencies(monkeypatch) -> None:
             logger,
             install_python=True,
             install_node=True,
+            break_system_packages=False,
         ):
             called["root"] = project_root.resolve()
 
@@ -1499,7 +1501,9 @@ def test_check_command_survives_per_file_parser_crash(monkeypatch) -> None:
     real_parse = parser_module.PyxParser.parse
     crash_target = "crashy.pyxl"
 
-    def fake_parse(self, source_path, *, tolerant=False, validate_jsx=False):
+    def fake_parse(
+        self, source_path, *, tolerant=False, validate_jsx=False, validate_semantics=False
+    ):
         if source_path.name == crash_target:
             raise RuntimeError("simulated parser crash")
         return real_parse(
@@ -1507,6 +1511,7 @@ def test_check_command_survives_per_file_parser_crash(monkeypatch) -> None:
             source_path,
             tolerant=tolerant,
             validate_jsx=validate_jsx,
+            validate_semantics=validate_semantics,
         )
 
     monkeypatch.setattr(parser_module.PyxParser, "parse", fake_parse)
@@ -1564,7 +1569,9 @@ def test_check_command_handles_diagnostic_without_line() -> None:
     # and verify the CLI formats it without crashing on the missing line.
     from pyxle.compiler.parser import PyxDiagnostic, PyxParseResult
 
-    def fake_parse(self, path, *, tolerant=False, validate_jsx=False):
+    def fake_parse(
+        self, path, *, tolerant=False, validate_jsx=False, validate_semantics=False
+    ):
         return PyxParseResult(
             python_code="",
             jsx_code="",
@@ -2822,3 +2829,25 @@ def test_dist_has_websocket_pages(tmp_path: Path) -> None:
     # Malformed manifest → False (never raises).
     manifest.write_text("not json", encoding="utf-8")
     assert cli._dist_has_websocket_pages(dist) is False
+
+
+def test_install_dependencies_break_system_packages(monkeypatch, tmp_path) -> None:
+    """--break-system-packages threads through to the pip command for PEP-668."""
+    calls: list[list[str]] = []
+    monkeypatch.setattr(cli.subprocess, "run", lambda command, *, cwd, check: calls.append(command))
+    monkeypatch.setattr(cli, "_in_virtualenv", lambda: False)
+    cli._install_dependencies(
+        tmp_path,
+        logger=cli.ConsoleLogger(),
+        install_node=False,
+        break_system_packages=True,
+    )
+    assert "--break-system-packages" in calls[0]
+
+
+def test_install_no_break_flag_by_default(monkeypatch, tmp_path) -> None:
+    calls: list[list[str]] = []
+    monkeypatch.setattr(cli.subprocess, "run", lambda command, *, cwd, check: calls.append(command))
+    monkeypatch.setattr(cli, "_in_virtualenv", lambda: True)
+    cli._install_dependencies(tmp_path, logger=cli.ConsoleLogger(), install_node=False)
+    assert "--break-system-packages" not in calls[0]

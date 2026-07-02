@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pyxle-framework"
-version = "0.6.0"
+version = "0.6.1"
 description = "Python-first full-stack framework with an intelligent CLI."
 readme = "README.md"
 authors = [
@@ -39,7 +39,12 @@ dependencies = [
   # (no-JS submissions sending ``application/x-www-form-urlencoded`` /
   # ``multipart/form-data``). Without it Starlette raises ``AssertionError``
   # the first time form parsing is attempted.
-  "python-multipart>=0.0.9,<1.0"
+  "python-multipart>=0.0.9,<1.0",
+  # pyflakes powers the semantic layer of ``pyxle check`` (undefined names,
+  # unused imports, redefinitions) beyond the parser's syntax check. Tiny and
+  # pure-Python with zero transitive dependencies; imported lazily so it only
+  # loads for ``pyxle check``, never on the compile/serve hot path.
+  "pyflakes>=3.1,<4.0"
 ]
 
 [project.urls]

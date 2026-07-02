@@ -1159,10 +1159,74 @@ def _validate_jsx_syntax(
     if not result.error:
         return
 
-    line = jsx_line_numbers[0] if jsx_line_numbers else None
+    # Map Babel's 1-indexed line (within the extracted JSX section) back to the
+    # real .pyxl line via ``jsx_line_numbers`` — mirroring the TS-violation
+    # mapping above. Fall back to the section's first line when Babel reports no
+    # line or one out of range, so a diagnostic never points nowhere.
+    line: int | None = jsx_line_numbers[0] if jsx_line_numbers else None
+    if (
+        result.error_line is not None
+        and 0 <= result.error_line - 1 < len(jsx_line_numbers)
+    ):
+        line = jsx_line_numbers[result.error_line - 1]
     collector.emit(
         f"JSX syntax error: {result.error}", line, section="jsx"
     )
+
+
+#: Runtime names the compiler auto-injects into the server module (see
+#: ``compiler/writers.py``). pyflakes must treat them as defined so ``@server`` /
+#: ``@action`` / ``raise ActionError(...)`` / ``raise LoaderError(...)`` never
+#: read as undefined even when the user hasn't written an import.
+_INJECTED_RUNTIME_NAMES = frozenset(
+    {
+        "server",
+        "action",
+        "ActionError",
+        "ValidationActionError",
+        "LoaderError",
+        "invalidate_routes",
+    }
+)
+
+
+def _validate_python_semantics(
+    tree: ast.Module | None,
+    python_line_numbers: Sequence[int],
+    *,
+    collector: _DiagnosticCollector,
+) -> None:
+    """Run pyflakes over the Python section for semantic issues.
+
+    Opt-in via ``validate_semantics=True``. This is the layer beyond
+    ``ast.parse``'s syntax check: it catches undefined names (e.g. a handler
+    that ``raise``s a symbol it never imported), unused imports, redefinitions,
+    and the rest of pyflakes' analysis. Compiler-injected runtime names are
+    whitelisted so the idiomatic decorators and error classes never read as
+    undefined.
+
+    pyflakes is imported lazily so the fast compile/build path never pays for
+    it; if it isn't installed the check is silently skipped.
+    """
+    if tree is None:
+        return
+    try:
+        from pyflakes.checker import Checker  # lazy: only for `pyxle check`
+    except ImportError:  # pragma: no cover - pyflakes is a declared dependency
+        return
+
+    try:
+        checker = Checker(tree, filename="<pyxl>", builtins=_INJECTED_RUNTIME_NAMES)
+    except Exception:  # noqa: BLE001 — never let a linter crash the parse
+        return
+
+    for message in checker.messages:
+        try:
+            text = message.message % message.message_args
+        except (TypeError, ValueError):  # pragma: no cover - defensive
+            text = str(message.message)
+        line = _map_lineno(getattr(message, "lineno", None), python_line_numbers)
+        collector.emit(text, line, section="python")
 
 
 # ---------------------------------------------------------------------------
@@ -1179,6 +1243,7 @@ class PyxParser:
         *,
         tolerant: bool = False,
         validate_jsx: bool = False,
+        validate_semantics: bool = False,
     ) -> PyxParseResult:
         """Parse a ``.pyxl`` file from disk into a :class:`PyxParseResult`.
 
@@ -1201,7 +1266,12 @@ class PyxParser:
             (~200ms per call).
         """
         text = source_path.read_text(encoding="utf-8-sig")
-        return self.parse_text(text, tolerant=tolerant, validate_jsx=validate_jsx)
+        return self.parse_text(
+            text,
+            tolerant=tolerant,
+            validate_jsx=validate_jsx,
+            validate_semantics=validate_semantics,
+        )
 
     def parse_text(
         self,
@@ -1209,6 +1279,7 @@ class PyxParser:
         *,
         tolerant: bool = False,
         validate_jsx: bool = False,
+        validate_semantics: bool = False,
     ) -> PyxParseResult:
         """Parse a ``.pyxl`` source string into a :class:`PyxParseResult`."""
         lines = _normalize_newlines(text)
@@ -1314,6 +1385,13 @@ class PyxParser:
         if validate_jsx and jsx_code.strip() and not has_python_errors:
             _validate_jsx_syntax(
                 jsx_code, jsx_line_numbers, collector=collector
+            )
+        # Semantic (name-level) analysis of the Python section — the layer past
+        # ``ast.parse``. Gated on a clean Python parse so pyflakes analyses real
+        # code, not content a mis-split absorbed into the wrong section.
+        if validate_semantics and python_code.strip() and not has_python_errors:
+            _validate_python_semantics(
+                tree, python_line_numbers, collector=collector
             )
 
         diagnostics = tuple(

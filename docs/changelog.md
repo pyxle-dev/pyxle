@@ -2,6 +2,16 @@
 
 Release notes for Pyxle. While we're in beta (`0.x`), minor versions may include breaking changes — those are called out explicitly here. To upgrade, run `pip install --upgrade pyxle-framework`.
 
+## 0.6.1 — 2026-07-01
+
+A sharper `pyxle check` — the edit → check → fix loop now catches classes of mistake it used to wave through.
+
+- **`pyxle check` gained a semantic layer.** Beyond Python syntax, it now runs pyflakes over the Python section and reports **undefined names** — e.g. a handler that `raise`s a symbol it never imported — plus unused imports and redefinitions. Compiler-injected runtime names are recognized, so the idiomatic decorators and error classes never read as undefined.
+- **Duplicate `export default` is now caught.** `@babel/parser` accepts two default exports even though the build (esbuild) rejects them — so a build-breaking mistake used to pass `check` and only fail later, pointing into a generated path. It's now flagged at check time, at the real source line.
+- **JSX error lines are now accurate.** A JSX syntax error was always reported at the first line of the JSX section; it now points at the actual line. Babel's misleading "Unterminated regular expression" (its lexer's guess for an unclosed `{ }`) also carries a plain-language hint about the real cause.
+- **`LoaderError` and `invalidate_routes` are now auto-injected**, matching `ActionError` / `ValidationActionError`. `raise LoaderError(...)` in a loader just works with no import — closing an inconsistency where the action-side equivalent already did. A name you import or define yourself still takes precedence. See [Runtime API](reference/runtime-api.md).
+- **`pyxle install --break-system-packages`.** For externally-managed (PEP 668) Python environments without a virtualenv, `pyxle install` now offers the flag and points to it in the no-venv warning. See [CLI → pyxle install](reference/cli.md#pyxle-install).
+
 ## 0.6.0 — 2026-07-01
 
 - **AI accessibility — serve your app as markdown, plus `llms.txt`.** A new opt-in `llms` config block makes every Pyxle app legible to AI assistants and coding agents. Enable it (`"llms": true`) and the framework serves a clean **markdown** rendition of each page at its URL with `.md` appended (`/docs/routing.md`), returns markdown from the same URL to requests that send `Accept: text/markdown` (browsers are unaffected), serves an **`/llms.txt`** index, and advertises it with `Link`/`X-Llms-Txt` discovery headers. A page's markdown is resolved from your project — a co-located `<page>.md` file, a `to_markdown` handler in the page's server module, or a `to_markdown` in the nearest ancestor `llms.py` (which scopes to a whole route subtree; `pages/llms.py` is app-wide) — with an opt-in `autoConvert` HTML→markdown fallback and a redirect-to-the-page fallback when nothing resolves. `/llms.txt` comes from a static `public/llms.txt`, a `llms_txt` hook in `pages/llms.py`, or a generated index, and a `wrap_markdown` hook in `pages/llms.py` can frame every `.md` response with a header/footer (e.g. agent navigation hints). Off by default; adds nothing to the page hot path. See the [AI accessibility guide](guides/llms.md) and [Configuration → AI accessibility](reference/configuration.md#ai-accessibility).

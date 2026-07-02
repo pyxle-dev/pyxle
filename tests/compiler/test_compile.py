@@ -155,7 +155,12 @@ def test_compile_injects_import_after_docstring(tmp_path: Path) -> None:
     server_lines = result.server_output.read_text(encoding="utf-8").splitlines()
     non_empty = [line for line in server_lines if line.strip()]
     assert non_empty[0] == '"""Demo docstring."""'
-    assert non_empty[1] == "from pyxle.runtime import server"
+    # A loader page auto-injects both `server` and `LoaderError` — always AFTER
+    # the docstring (injecting before it would demote the docstring to a plain
+    # string expression). Order between the two isn't contractual.
+    injected = {non_empty[1], non_empty[2]}
+    assert "from pyxle.runtime import server" in injected
+    assert "from pyxle.runtime import LoaderError" in injected
 
 
 def test_compile_preserves_existing_server_import(tmp_path: Path) -> None:
