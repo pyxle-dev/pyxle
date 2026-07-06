@@ -1,6 +1,6 @@
 # pyxle-auth
 
-`pyxle-auth` is Pyxle's official authentication plugin: email + password accounts, sliding sessions, password-reset and email-verification flows, role-based access control, and scoped API tokens — wired into your app with one config entry. It never sends email and never renders UI; it gives you hardened primitives and stays out of your templates.
+`pyxle-auth` is Pyxle's official authentication plugin: email- **or** username-based password accounts, sliding sessions, password-reset and email-verification flows, role-based access control, and scoped API tokens — wired into your app with one config entry. It never sends email and never renders UI; it gives you hardened primitives and stays out of your templates.
 
 > **Version 0.3.0.** Runs on [pyxle-db](pyxle-db.md) (SQLite, PostgreSQL, or MySQL — the full account lifecycle is tested against real servers in CI), or on any database layer satisfying the `DatabaseLike` contract.
 
@@ -78,6 +78,35 @@ async def endpoint(request: Request) -> JSONResponse:
 
 `sign_up` has the same shape and also returns `(user, cookie)`. `sign_out(cookie_value=...)` returns a cookie that clears the browser's copy — set it the same way.
 
+## Identity model: email or username
+
+By default accounts are identified by **email** — exactly as the examples above. To build a username-based app (any available handle, no email or phone required), set `identifier` to `"username"`:
+
+```json
+{
+  "plugins": [
+    "pyxle-db",
+    { "name": "pyxle-auth", "settings": { "identifier": "username" } }
+  ]
+}
+```
+
+Now the services, the credential endpoints, and `useAuth()` take a `username` instead of an `email`:
+
+```python
+user, cookie = await auth.sign_up(username="ada", password="…")            # email optional
+user          = await auth.verify_credentials(username="ADA", password="…") # case-insensitive
+is_free       = await auth.username_available("ada")                        # False
+```
+
+- **Normalised:** usernames are trimmed and lowercased, so uniqueness is case-insensitive on every backend (`Ada` and `ada` are one account).
+- **Policy (configurable):** `usernameMinLength` / `usernameMaxLength` (3–30), `usernamePattern` (`^[a-z0-9_-]+$`), and a reserved-name block-list (~90 system/route names like `admin`, `api`, `login`) that blocks impersonation and route collisions.
+- **Availability is public** but **per-IP rate-limited** (`rateLimitUsernameCheckPerHour`, default 120) so it can't bulk-scrape the user list: `GET /auth/username-available?u=<name>` returns `{ "available": true | false }`, so a picker can check live as the user types. Sign-in stays enumeration-safe — a missing or malformed handle is an ordinary `InvalidCredentials`, never a distinct error.
+- **Optional email:** username mode may still accept an email at sign-up (e.g. for a future reset) — pass both; only the configured identifier is required.
+- **No per-person limit:** anyone can register as many usernames as they like; tune `rateLimitSignUpPerHour` if you want to throttle.
+
+Internally `users.email` and `users.username` are both nullable, UNIQUE columns, so switching modes is a config change — existing email apps are untouched. Email-only flows (verification, password reset) simply go unused in username mode.
+
 ## Plugin services
 
 | Service name | Type | What it does |
@@ -111,6 +140,8 @@ The middleware also serves the endpoints the client [`useAuth()`](../reference/c
 | `POST /auth/logout` | Revoke the session and clear the cookie. |
 
 `/login` and `/signup` reuse `AuthService.sign_in` / `sign_up` — same rate limiting, same enumeration-safe errors — and map failures to status codes (`401` invalid credentials, `409` account exists, `422` weak password, `403` unverified email, `429` rate limited with `Retry-After`). They are state-changing POSTs, so the framework's CSRF protection applies; `useAuth` sends the token for you. Set `enableCredentialsApi: false` to turn them off and drive sign-in from your own `@action` instead (then call `useAuth().refresh()`); `/me` and `/logout` stay available.
+
+In **username mode** (`identifier: "username"`, see [Identity model](#identity-model-email-or-username)) these endpoints take `{ username, password }` instead of `{ email, password }`, and a third endpoint — `GET /auth/username-available?u=<name>` — is served for live availability checks. The SSR seed publishes the active `identifier` so `useAuth()` and your form know which field to render.
 
 `useAuth()` returns the full auth surface:
 
@@ -293,8 +324,14 @@ Configure in `pyxle.config.json` (camelCase), override per environment with `PYX
 | `emailVerifyTtlSeconds` | `PYXLE_AUTH_EMAIL_VERIFY_TTL_SECONDS` | `86400` (24 h) |
 | `rateLimitSignInPerHour` | `PYXLE_AUTH_RL_SIGN_IN_PER_HOUR` | `10` |
 | `rateLimitSignUpPerHour` | `PYXLE_AUTH_RL_SIGN_UP_PER_HOUR` | `5` |
+| `rateLimitUsernameCheckPerHour` | `PYXLE_AUTH_RL_USERNAME_CHECK_PER_HOUR` | `120` |
 | `rateLimitPasswordResetPerHour` | `PYXLE_AUTH_RATE_LIMIT_PASSWORD_RESET_PER_HOUR` | `3` |
 | `requireEmailVerified` | `PYXLE_AUTH_REQUIRE_VERIFIED` | `false` |
+| `identifier` | `PYXLE_AUTH_IDENTIFIER` | `email` |
+| `usernameMinLength` | `PYXLE_AUTH_USERNAME_MIN` | `3` |
+| `usernameMaxLength` | `PYXLE_AUTH_USERNAME_MAX` | `30` |
+| `usernamePattern` | — | `^[a-z0-9_-]+$` |
+| `usernameReserved` | — | ~90 names |
 | `strict` | `PYXLE_AUTH_STRICT` | `true` |
 
 **Strict mode** is the production posture and the default: it requires `cookieSecure: true` and enforces the argon2 strength floors, refusing to boot otherwise. Local HTTP development relaxes it through the environment — never in the committed config:
