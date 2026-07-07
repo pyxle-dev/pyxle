@@ -94,7 +94,7 @@ Two honest notes on coverage:
 
 ## `pyxle typecheck`
 
-`pyxle typecheck` compiles your `.pyxl` files to `.jsx` and runs `tsc --noEmit` against the generated `tsconfig.json`, surfacing any type errors against the framework declarations. It looks for `tsc` in your local `node_modules/.bin`, then globally, then via `npx`, so install `typescript` (locally is recommended) to use it. It's the recommended CI gate for catching framework-API misuse. See the [CLI reference](../reference/cli.md).
+`pyxle typecheck` compiles your `.pyxl` files to `.jsx` and runs `tsc --noEmit` against the generated `tsconfig.json`, surfacing any type errors against the framework declarations. It looks for `tsc` in your local `node_modules/.bin`, then globally — TypeScript must actually be installed (locally is recommended: `npm install --save-dev typescript`); if it isn't, the command fails fast with that instruction rather than invoking anything. It's the recommended CI gate for catching framework-API misuse. See the [CLI reference](../reference/cli.md).
 
 ## Editor setup
 
