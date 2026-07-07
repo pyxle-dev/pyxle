@@ -338,7 +338,7 @@ curl -X POST http://localhost:8000/api/__actions/blog/new/create_post \
   -d '{"title": "Hello"}'
 ```
 
-CSRF protection is on by default, so a raw `curl` like this is rejected with `403` unless you either exempt the action path in [`pyxle.config.json`](../reference/configuration.md#csrf) (`"csrf": { "exemptPaths": ["/api/__actions/"] }`) or send a valid `X-CSRF-Token` header matching the `pyxle-csrf` cookie.
+CSRF protection is on by default, so a raw `curl` like this is rejected with `403` unless you either exempt the action path in [`pyxle.config.json`](../reference/configuration.md#csrf) (`"csrf": { "exemptPaths": ["/api/__actions/"] }`) or send a valid `X-CSRF-Token` header matching the CSRF cookie (`pyxle-csrf-<port>` by default, e.g. `pyxle-csrf-8000` — see [Security](../guides/security.md#csrf-protection)).
 
 ## CSRF protection
 

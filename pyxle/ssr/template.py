@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from html import escape
 from typing import Any
 
+from pyxle.config import default_csrf_cookie_name
 from pyxle.devserver.routes import PageRoute
 from pyxle.devserver.settings import DevServerSettings
 from pyxle.devserver.styles import load_inline_stylesheets
@@ -278,10 +279,10 @@ def _render_nav_stale_script(settings: DevServerSettings, nonce_attr: str) -> st
     return f"\n  <script{nonce_attr}>window.__PYXLE_NAV_STALE_MS__ = {int(ttl_seconds) * 1000};</script>"
 
 
-# Framework defaults baked into the generated client runtime
+# Framework fallbacks baked into the generated client runtime
 # (``pyxle/devserver/client_files.py``). Names matching these need no
 # bootstrap script — the client falls back to them on its own.
-_CSRF_DEFAULT_COOKIE_NAME = "pyxle-csrf"
+_CSRF_FALLBACK_COOKIE_NAME = "pyxle-csrf"
 _CSRF_DEFAULT_HEADER_NAME = "x-csrf-token"
 
 
@@ -290,18 +291,30 @@ def _render_csrf_names_script(settings: DevServerSettings, nonce_attr: str) -> s
     bootstrap script, or ``""``.
 
     The client runtime (``useAction`` / ``Form``) resolves the CSRF cookie
-    and header names from these globals, falling back to the framework
-    defaults. Without this script a customised ``csrf.cookieName`` /
-    ``csrf.headerName`` never reaches the browser: the middleware sets the
-    cookie under the configured name while the client keeps looking for
-    ``pyxle-csrf``, so every action POST is rejected with 403. Only
-    non-default names are emitted, keeping default-config pages unchanged.
+    and header names from these globals, falling back to the baked-in
+    ``pyxle-csrf`` / ``x-csrf-token``. Without this script the effective
+    names never reach the browser: the middleware sets the cookie under one
+    name while the client keeps looking for another, so every action POST
+    is rejected with 403.
+
+    The effective cookie name is resolved exactly as the CSRF middleware
+    resolves it: an explicit ``csrf.cookieName`` wins; otherwise the default
+    is namespaced by the app's bind port (``pyxle-csrf-<port>``) so two
+    Pyxle apps on one host never read each other's token. Because that
+    auto-namespaced name differs from the client's baked-in fallback, it is
+    injected too — only a pinned ``pyxle-csrf`` (or default header name)
+    needs no script.
     """
     csrf = getattr(settings, "csrf", None)
     assignments: list[str] = []
-    cookie_name = getattr(csrf, "cookie_name", None)
-    if isinstance(cookie_name, str) and cookie_name and cookie_name != _CSRF_DEFAULT_COOKIE_NAME:
-        assignments.append(f"window.__PYXLE_CSRF_COOKIE__ = {_serialize_js_string(cookie_name)};")
+    if csrf is not None:
+        cookie_name = getattr(csrf, "cookie_name", None)
+        if not (isinstance(cookie_name, str) and cookie_name):
+            cookie_name = default_csrf_cookie_name(getattr(settings, "starlette_port", None))
+        if cookie_name != _CSRF_FALLBACK_COOKIE_NAME:
+            assignments.append(
+                f"window.__PYXLE_CSRF_COOKIE__ = {_serialize_js_string(cookie_name)};"
+            )
     header_name = getattr(csrf, "header_name", None)
     if (
         isinstance(header_name, str)

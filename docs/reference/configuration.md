@@ -37,7 +37,6 @@ Pyxle is configured via `pyxle.config.json` in the project root. All fields are 
   },
   "csrf": {
     "enabled": true,
-    "cookieName": "pyxle-csrf",
     "headerName": "x-csrf-token",
     "cookieSecure": false,
     "cookieSameSite": "lax",
@@ -187,7 +186,7 @@ Route-level hooks applied to specific route types.
 {
   "csrf": {
     "enabled": true,
-    "cookieName": "pyxle-csrf",
+    "cookieName": "my-app-csrf",
     "headerName": "x-csrf-token",
     "cookieSecure": true,
     "cookieSameSite": "strict",
@@ -199,11 +198,13 @@ Route-level hooks applied to specific route types.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `csrf.enabled` | `boolean` | `true` | Enable CSRF protection |
-| `csrf.cookieName` | `string` | `"pyxle-csrf"` | CSRF cookie name |
+| `csrf.cookieName` | `string` | auto: `"pyxle-csrf-<port>"` | CSRF cookie name; unset → namespaced by the app's bind port |
 | `csrf.headerName` | `string` | `"x-csrf-token"` | CSRF header name |
 | `csrf.cookieSecure` | `boolean` | `false` | Set `Secure` flag on cookie |
 | `csrf.cookieSameSite` | `string` | `"lax"` | `SameSite` attribute (`"strict"`, `"lax"`, `"none"`) |
 | `csrf.exemptPaths` | `string[]` | `[]` | Paths exempt from CSRF checks (matched on segment boundaries) |
+
+**Cookie naming.** Browsers scope cookies to a host, ignoring the port, so a fixed cookie name would collide between two Pyxle apps on the same host (e.g. two dev servers on `127.0.0.1`) — each would overwrite the other's token and every action in the other app would fail with `403`. When `cookieName` is unset, Pyxle namespaces the cookie with the app's bind port (`pyxle-csrf-8000`), which is stable per app in development and behind a production reverse proxy. Set `cookieName` to pin an explicit name instead. Full details and the upgrade note: [Security → CSRF protection](../guides/security.md#csrf-protection).
 
 **Exemption matching.** An entry matches its exact path and anything beneath it at a `/` segment boundary: `/api/webhooks` exempts `/api/webhooks` and `/api/webhooks/stripe`, but not `/api/webhooks-admin`. Request paths are normalised first (`.`/`..` resolved, repeated slashes collapsed), so `/api/webhooks/../other` is checked as `/api/other`. An entry of `/` (or an empty string) is ignored rather than disabling CSRF site-wide — use `"csrf": false` to disable CSRF entirely.
 

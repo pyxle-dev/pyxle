@@ -395,7 +395,9 @@ class TestProgressiveEnhancement:
                 Route("/page", lambda r: PlainTextResponse("ok"), methods=["GET"]),
                 Route("/echo", echo_handler, methods=["POST"]),
             ],
-            middleware=[Middleware(CsrfMiddleware, secret="test-secret")],
+            middleware=[
+                Middleware(CsrfMiddleware, secret="test-secret", cookie_name="pyxle-csrf")
+            ],
         )
         client = TestClient(app)
         csrf_token = client.get("/page").cookies["pyxle-csrf"]
@@ -425,7 +427,9 @@ class TestProgressiveEnhancement:
 
         app = Starlette(
             routes=[Route("/page", handler, methods=["GET"])],
-            middleware=[Middleware(CsrfMiddleware, secret="test-secret")],
+            middleware=[
+                Middleware(CsrfMiddleware, secret="test-secret", cookie_name="pyxle-csrf")
+            ],
         )
         client = TestClient(app)
         client.get("/page")  # primes the cookie
@@ -446,110 +450,41 @@ class TestProgressiveEnhancement:
 
 
 # ---------------------------------------------------------------------------
-# Stdlib body parsers (``_extract_csrf_form_field``)
+# Urlencoded body parser (``_urlencoded_field_value``)
 # ---------------------------------------------------------------------------
 
 
-class TestExtractCsrfFormField:
-    """Direct coverage for the stdlib parsers used by the middleware.
+class TestUrlencodedFieldValue:
+    """Direct coverage for the stdlib urlencoded parser the middleware uses.
 
-    These run BEFORE Starlette's ``request.form()`` so the CSRF check
-    can't accidentally depend on optional dependencies and silently
-    return 'token missing' if one is unavailable.
+    This runs BEFORE Starlette's ``request.form()`` so the CSRF check never
+    re-consumes the receive stream that was already drained. Multipart bodies
+    take the streaming scanner path (``_scan_multipart_for_token``), covered
+    separately below.
     """
 
     def test_urlencoded_extracts_field(self):
-        from pyxle.devserver.csrf import _extract_csrf_form_field
+        from pyxle.devserver.csrf import _urlencoded_field_value
 
         body = b"name=Shivam&_csrf_token=abc123&tier=pro"
-        out = _extract_csrf_form_field(
-            body,
-            content_type="application/x-www-form-urlencoded",
-            field_name="_csrf_token",
-        )
-        assert out == "abc123"
+        assert _urlencoded_field_value(body, "_csrf_token") == "abc123"
 
     def test_urlencoded_returns_empty_when_field_absent(self):
-        from pyxle.devserver.csrf import _extract_csrf_form_field
+        from pyxle.devserver.csrf import _urlencoded_field_value
 
-        body = b"name=Shivam&tier=pro"
-        out = _extract_csrf_form_field(
-            body,
-            content_type="application/x-www-form-urlencoded",
-            field_name="_csrf_token",
-        )
-        assert out == ""
-
-    def test_multipart_extracts_field(self):
-        from pyxle.devserver.csrf import _extract_csrf_form_field
-
-        boundary = "----pyxleboundary"
-        body = (
-            f"--{boundary}\r\n"
-            'Content-Disposition: form-data; name="name"\r\n\r\n'
-            "Shivam\r\n"
-            f"--{boundary}\r\n"
-            'Content-Disposition: form-data; name="_csrf_token"\r\n\r\n'
-            "tok-xyz\r\n"
-            f"--{boundary}--\r\n"
-        ).encode()
-        out = _extract_csrf_form_field(
-            body,
-            content_type=f"multipart/form-data; boundary={boundary}",
-            field_name="_csrf_token",
-        )
-        assert out == "tok-xyz"
+        assert _urlencoded_field_value(b"name=Shivam&tier=pro", "_csrf_token") == ""
 
     def test_empty_body_returns_empty(self):
-        from pyxle.devserver.csrf import _extract_csrf_form_field
+        from pyxle.devserver.csrf import _urlencoded_field_value
 
-        out = _extract_csrf_form_field(
-            b"",
-            content_type="application/x-www-form-urlencoded",
-            field_name="_csrf_token",
-        )
-        assert out == ""
+        assert _urlencoded_field_value(b"", "_csrf_token") == ""
 
-    def test_unsupported_content_type_returns_empty(self):
-        from pyxle.devserver.csrf import _extract_csrf_form_field
+    def test_blank_value_is_preserved(self):
+        """``keep_blank_values`` matters: an empty token must read as empty
+        (→ 'token missing'), not silently fall through to another field."""
+        from pyxle.devserver.csrf import _urlencoded_field_value
 
-        out = _extract_csrf_form_field(
-            b"_csrf_token=abc",
-            content_type="application/json",
-            field_name="_csrf_token",
-        )
-        assert out == ""
-
-    def test_multipart_without_boundary_header_returns_empty(self):
-        """Garbage multipart body (no boundary in content-type) shouldn't
-        crash the middleware — it should just say 'no token'."""
-        from pyxle.devserver.csrf import _extract_csrf_form_field
-
-        out = _extract_csrf_form_field(
-            b"--anything\r\nContent-Disposition: form-data\r\n\r\nstuff\r\n--anything--",
-            content_type="multipart/form-data",  # boundary omitted
-            field_name="_csrf_token",
-        )
-        # No boundary => stdlib email parser produces a non-multipart
-        # message → we fall through and return "".
-        assert out == ""
-
-    def test_multipart_field_absent_returns_empty(self):
-        from pyxle.devserver.csrf import _extract_csrf_form_field
-
-        boundary = "abcboundary"
-        body = (
-            f"--{boundary}\r\n"
-            'Content-Disposition: form-data; name="other"\r\n\r\n'
-            "value\r\n"
-            f"--{boundary}--\r\n"
-        ).encode()
-        out = _extract_csrf_form_field(
-            body,
-            content_type=f"multipart/form-data; boundary={boundary}",
-            field_name="_csrf_token",
-        )
-        assert out == ""
+        assert _urlencoded_field_value(b"_csrf_token=&name=x", "_csrf_token") == ""
 
 
 # ---------------------------------------------------------------------------
@@ -875,7 +810,9 @@ def _build_cacheable_app() -> Starlette:
             Route("/cached", cached_handler, methods=["GET"]),
             Route("/dynamic", dynamic_handler, methods=["GET"]),
         ],
-        middleware=[Middleware(CsrfMiddleware, secret="test-secret")],
+        middleware=[
+            Middleware(CsrfMiddleware, secret="test-secret", cookie_name="pyxle-csrf")
+        ],
     )
 
 
@@ -897,3 +834,562 @@ class TestPublicCacheableResponses:
         response = client.get("/dynamic")
         assert response.status_code == 200
         assert "pyxle-csrf" in response.cookies
+
+
+# ---------------------------------------------------------------------------
+# Auto (port-namespaced) cookie naming. Cookies ignore ports, so a fixed
+# default name collides between two Pyxle apps on the same host — each app
+# overwrites the other's token and every action in the other app 403s. The
+# default cookie name is therefore namespaced by the bind port from the
+# ASGI scope (``pyxle-csrf-<port>``).
+# ---------------------------------------------------------------------------
+
+
+def _build_auto_named_app(*, secret: str = "test-secret") -> Starlette:
+    """App whose CSRF middleware uses the auto (port-namespaced) cookie name."""
+
+    async def get_handler(request: Request) -> PlainTextResponse:
+        return PlainTextResponse("ok")
+
+    async def post_handler(request: Request) -> JSONResponse:
+        return JSONResponse({"ok": True})
+
+    return Starlette(
+        routes=[
+            Route("/page", get_handler, methods=["GET"]),
+            Route("/action", post_handler, methods=["POST"]),
+        ],
+        middleware=[Middleware(CsrfMiddleware, secret=secret)],
+    )
+
+
+class TestAutoCookieName:
+    def test_cookie_name_derives_from_bind_port(self):
+        client = TestClient(_build_auto_named_app(), base_url="http://127.0.0.1:8103")
+        response = client.get("/page")
+        assert response.status_code == 200
+        assert "pyxle-csrf-8103" in response.cookies
+        assert "pyxle-csrf" not in response.cookies
+
+    def test_round_trip_with_auto_name(self):
+        client = TestClient(_build_auto_named_app(), base_url="http://127.0.0.1:8103")
+        token = client.get("/page").cookies["pyxle-csrf-8103"]
+        response = client.post("/action", headers={"x-csrf-token": token})
+        assert response.status_code == 200
+        assert response.json()["ok"] is True
+
+    def test_two_apps_on_different_ports_use_distinct_cookies(self):
+        """The collision scenario: a browser at 127.0.0.1 holds BOTH apps'
+        cookies (cookies ignore ports). Each app must read only its own —
+        with the old fixed name the second app's Set-Cookie stomped the
+        first's and every action in the first app failed with a mismatch."""
+        client_a = TestClient(_build_auto_named_app(), base_url="http://127.0.0.1:8101")
+        client_b = TestClient(_build_auto_named_app(), base_url="http://127.0.0.1:8102")
+        token_a = client_a.get("/page").cookies["pyxle-csrf-8101"]
+        token_b = client_b.get("/page").cookies["pyxle-csrf-8102"]
+        assert token_a != token_b
+
+        # Simulate the shared browser jar: both cookies present on one host.
+        client_a.cookies.set("pyxle-csrf-8102", token_b)
+        ok = client_a.post("/action", headers={"x-csrf-token": token_a})
+        assert ok.status_code == 200
+        # The other app's token never validates against this app's cookie.
+        crossed = client_a.post("/action", headers={"x-csrf-token": token_b})
+        assert crossed.status_code == 403
+        assert crossed.json()["error"] == "CSRF token mismatch"
+
+    def test_legacy_unnamespaced_cookie_is_ignored(self):
+        """Transition path from the old fixed name: a leftover ``pyxle-csrf``
+        cookie is simply never consulted — the token re-issues under the
+        namespaced name on the next GET."""
+        client = TestClient(_build_auto_named_app(), base_url="http://127.0.0.1:8101")
+        client.cookies.set("pyxle-csrf", "stale-token-from-before-the-upgrade")
+
+        response = client.get("/page")
+        assert "pyxle-csrf-8101" in response.cookies
+
+        posted = client.post(
+            "/action",
+            headers={"x-csrf-token": "stale-token-from-before-the-upgrade"},
+        )
+        assert posted.status_code == 403
+
+    def test_explicit_cookie_name_wins_over_auto(self):
+        client = TestClient(
+            _build_app(cookie_name="pinned-csrf"), base_url="http://127.0.0.1:8103"
+        )
+        response = client.get("/page")
+        assert "pinned-csrf" in response.cookies
+        assert "pyxle-csrf-8103" not in response.cookies
+
+    def test_missing_server_scope_falls_back_to_bare_prefix(self):
+        """A unix-socket bind (or a scope without ``server``) has no port;
+        the bare ``pyxle-csrf`` keeps the cookie working."""
+        import asyncio
+
+        sent: list[dict] = []
+
+        async def inner(scope, receive, send):
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b"ok"})
+
+        async def receive():  # pragma: no cover - never invoked for GET
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(message):
+            sent.append(message)
+
+        mw = CsrfMiddleware(inner, secret="test-secret")
+        scope = {
+            "type": "http",
+            "method": "GET",
+            "path": "/page",
+            "headers": [],
+            "query_string": b"",
+        }
+        asyncio.run(mw(scope, receive, send))
+        start = next(m for m in sent if m["type"] == "http.response.start")
+        cookies = [value for name, value in start["headers"] if name == b"set-cookie"]
+        assert cookies and cookies[0].startswith(b"pyxle-csrf=")
+
+
+# ---------------------------------------------------------------------------
+# Multipart bodies. The middleware stream-parses multipart/form-data only
+# until the ``_csrf_token`` field is obtained; the consumed frames are
+# replayed downstream and the rest of the stream passes through untouched,
+# so file parts are never buffered by the CSRF layer.
+# ---------------------------------------------------------------------------
+
+_MP_BOUNDARY = "pyxle-test-boundary"
+
+
+def _multipart_body(
+    *parts: tuple[str, bytes, str | None], boundary: str = _MP_BOUNDARY
+) -> bytes:
+    """Assemble a raw multipart/form-data body from (name, content, filename)."""
+    out = bytearray()
+    for name, content, filename in parts:
+        out += f"--{boundary}\r\n".encode()
+        disposition = f'Content-Disposition: form-data; name="{name}"'
+        if filename is not None:
+            disposition += f'; filename="{filename}"'
+        out += disposition.encode() + b"\r\n"
+        if filename is not None:
+            out += b"Content-Type: application/octet-stream\r\n"
+        out += b"\r\n" + content + b"\r\n"
+    out += f"--{boundary}--\r\n".encode()
+    return bytes(out)
+
+
+def _multipart_headers(boundary: str = _MP_BOUNDARY) -> dict[str, str]:
+    return {"content-type": f"multipart/form-data; boundary={boundary}"}
+
+
+def _build_multipart_echo_app(captured: dict) -> Starlette:
+    """CSRF-protected app whose POST handler records the raw body it saw."""
+
+    async def get_handler(request: Request) -> PlainTextResponse:
+        return PlainTextResponse("ok")
+
+    async def echo_handler(request: Request) -> JSONResponse:
+        captured["body"] = await request.body()
+        return JSONResponse({"ok": True})
+
+    return Starlette(
+        routes=[
+            Route("/page", get_handler, methods=["GET"]),
+            Route("/echo", echo_handler, methods=["POST"]),
+        ],
+        middleware=[
+            Middleware(CsrfMiddleware, secret="test-secret", cookie_name="pyxle-csrf")
+        ],
+    )
+
+
+class TestMultipartCsrf:
+    """End-to-end multipart coverage: a progressive-enhancement ``<Form>``
+    containing a file input posts multipart/form-data with the token as a
+    hidden field — that must validate, and the inner app must receive the
+    complete original body byte-for-byte."""
+
+    def test_token_first_no_header_succeeds_and_body_is_intact(self):
+        captured: dict = {}
+        client = TestClient(_build_multipart_echo_app(captured))
+        token = client.get("/page").cookies["pyxle-csrf"]
+
+        body = _multipart_body(
+            ("_csrf_token", token.encode(), None),
+            ("upload", b"\x00\x01binary-file-content" * 128, "a.bin"),
+        )
+        response = client.post("/echo", content=body, headers=_multipart_headers())
+        assert response.status_code == 200
+        assert captured["body"] == body
+
+    def test_token_after_small_file_succeeds_and_body_is_intact(self):
+        captured: dict = {}
+        client = TestClient(_build_multipart_echo_app(captured))
+        token = client.get("/page").cookies["pyxle-csrf"]
+
+        body = _multipart_body(
+            ("upload", b"small file first" * 64, "a.txt"),
+            ("_csrf_token", token.encode(), None),
+        )
+        response = client.post("/echo", content=body, headers=_multipart_headers())
+        assert response.status_code == 200
+        assert captured["body"] == body
+
+    def test_mixed_case_boundary_round_trips(self):
+        """curl (and other clients) generate boundaries containing uppercase
+        characters. The boundary parameter is case-SENSITIVE, so the
+        middleware must not lowercase it while matching the media type —
+        that silently breaks every real-world multipart post."""
+        captured: dict = {}
+        client = TestClient(_build_multipart_echo_app(captured))
+        token = client.get("/page").cookies["pyxle-csrf"]
+
+        boundary = "------------------------MiXeDCaseBoundARY42"
+        body = _multipart_body(
+            ("_csrf_token", token.encode(), None),
+            ("upload", b"file data", "a.bin"),
+            boundary=boundary,
+        )
+        response = client.post(
+            "/echo",
+            content=body,
+            headers={"content-type": f"multipart/form-data; boundary={boundary}"},
+        )
+        assert response.status_code == 200
+        assert captured["body"] == body
+
+    def test_wrong_token_returns_mismatch(self):
+        client = TestClient(_build_multipart_echo_app({}))
+        client.get("/page")  # mint a cookie
+        body = _multipart_body(("_csrf_token", b"definitely-wrong", None))
+        response = client.post("/echo", content=body, headers=_multipart_headers())
+        assert response.status_code == 403
+        assert response.json()["error"] == "CSRF token mismatch"
+
+    def test_token_absent_returns_actionable_403(self):
+        client = TestClient(_build_multipart_echo_app({}))
+        client.get("/page")
+        body = _multipart_body(("upload", b"file only", "a.txt"))
+        response = client.post("/echo", content=body, headers=_multipart_headers())
+        assert response.status_code == 403
+        error = response.json()["error"]
+        assert "CSRF token missing" in error
+        assert "_csrf_token" in error
+        assert "x-csrf-token" in error
+        assert "before any file fields" in error
+
+    def test_token_beyond_cap_returns_actionable_403(self, monkeypatch):
+        """A big file part ahead of the token exhausts the scan cap — the
+        request is rejected with guidance rather than buffering the upload."""
+        from pyxle.devserver import csrf as csrf_mod
+
+        monkeypatch.setattr(csrf_mod, "_MAX_MULTIPART_SCAN_BYTES", 512)
+        client = TestClient(_build_multipart_echo_app({}))
+        token = client.get("/page").cookies["pyxle-csrf"]
+
+        body = _multipart_body(
+            ("upload", b"F" * 4096, "big.bin"),
+            ("_csrf_token", token.encode(), None),
+        )
+        response = client.post("/echo", content=body, headers=_multipart_headers())
+        assert response.status_code == 403
+        error = response.json()["error"]
+        assert "CSRF token missing" in error
+        assert "x-csrf-token" in error
+        assert "before any file fields" in error
+
+    def test_header_token_skips_body_scan_entirely(self, monkeypatch):
+        """The fetch/useAction path: a header token means the body is never
+        scanned, so an upload far beyond the cap still succeeds — intact."""
+        from pyxle.devserver import csrf as csrf_mod
+
+        monkeypatch.setattr(csrf_mod, "_MAX_MULTIPART_SCAN_BYTES", 512)
+        captured: dict = {}
+        client = TestClient(_build_multipart_echo_app(captured))
+        token = client.get("/page").cookies["pyxle-csrf"]
+
+        body = _multipart_body(("upload", b"F" * 8192, "big.bin"))
+        response = client.post(
+            "/echo",
+            content=body,
+            headers={**_multipart_headers(), "x-csrf-token": token},
+        )
+        assert response.status_code == 200
+        assert captured["body"] == body
+
+    def test_empty_token_field_returns_missing(self):
+        client = TestClient(_build_multipart_echo_app({}))
+        client.get("/page")
+        body = _multipart_body(("_csrf_token", b"", None))
+        response = client.post("/echo", content=body, headers=_multipart_headers())
+        assert response.status_code == 403
+        assert response.json()["error"] == "CSRF token missing"
+
+    def test_token_without_cookie_returns_cookie_missing(self):
+        """The other half of the double-submit pair: a body token with no
+        cookie to compare against gets its own precise message."""
+        client = TestClient(_build_multipart_echo_app({}))  # no GET → no cookie
+        body = _multipart_body(("_csrf_token", b"some-token", None))
+        response = client.post("/echo", content=body, headers=_multipart_headers())
+        assert response.status_code == 403
+        assert response.json()["error"] == "CSRF cookie missing"
+
+    def test_content_type_without_boundary_rejected(self):
+        client = TestClient(_build_multipart_echo_app({}))
+        client.get("/page")
+        response = client.post(
+            "/echo",
+            content=b"anything",
+            headers={"content-type": "multipart/form-data"},
+        )
+        assert response.status_code == 403
+        assert "CSRF token missing" in response.json()["error"]
+
+    def test_malformed_multipart_body_rejected(self):
+        """Bytes that don't start with the declared boundary abort the scan
+        — the check fails closed with 'token missing'."""
+        client = TestClient(_build_multipart_echo_app({}))
+        client.get("/page")
+        response = client.post(
+            "/echo",
+            content=b"this is not multipart data at all",
+            headers=_multipart_headers(),
+        )
+        assert response.status_code == 403
+        assert "CSRF token missing" in response.json()["error"]
+
+    def test_urlencoded_replay_is_byte_for_byte(self):
+        """Regression for the urlencoded path: the drained body reaches the
+        inner app exactly as sent."""
+        captured: dict = {}
+        client = TestClient(_build_multipart_echo_app(captured))
+        token = client.get("/page").cookies["pyxle-csrf"]
+        body = f"_csrf_token={token}&name=Shivam&note=a%26b%3Dc".encode()
+        response = client.post(
+            "/echo",
+            content=body,
+            headers={"content-type": "application/x-www-form-urlencoded"},
+        )
+        assert response.status_code == 200
+        assert captured["body"] == body
+
+
+# ---------------------------------------------------------------------------
+# The streaming scan primitives — exercised at the raw ASGI level so frame
+# boundaries and consumption behaviour are under precise control.
+# ---------------------------------------------------------------------------
+
+
+class TestMultipartStreamScan:
+    @staticmethod
+    def _frames_receive(frames):
+        """Scripted ``receive`` that also counts how many frames were pulled."""
+        state = {"calls": 0}
+
+        async def receive():
+            frame = frames[state["calls"]]
+            state["calls"] += 1
+            return frame
+
+        return receive, state
+
+    def test_scan_stops_consuming_once_token_part_ends(self):
+        """Frames after the one that completes the token part are left on the
+        stream for downstream — proof that file parts are not buffered by
+        the CSRF layer."""
+        import asyncio
+
+        from pyxle.devserver.csrf import CsrfMiddleware, _generate_token
+
+        token = _generate_token("test-secret")
+        # Frame 1 carries the complete token part AND the next part's opening
+        # boundary + headers (the parser detects part-end at the boundary).
+        full_body = _multipart_body(
+            ("_csrf_token", token.encode(), None),
+            ("upload", b"D" * 512, "d.bin"),
+        )
+        # Split so the token part (and following boundary line) sit in frame 1.
+        split_at = full_body.index(b'name="upload"') + len(b'name="upload"')
+        frame1, rest = full_body[:split_at], full_body[split_at:]
+        mid = len(rest) // 2
+        frames = [
+            {"type": "http.request", "body": frame1, "more_body": True},
+            {"type": "http.request", "body": rest[:mid], "more_body": True},
+            {"type": "http.request", "body": rest[mid:], "more_body": False},
+        ]
+        receive, state = self._frames_receive(frames)
+
+        downstream_body = bytearray()
+        calls_when_downstream_started: list[int] = []
+
+        async def inner(scope, receive_inner, send):
+            calls_when_downstream_started.append(state["calls"])
+            while True:
+                message = await receive_inner()
+                downstream_body.extend(message.get("body", b""))
+                if not message.get("more_body"):
+                    break
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b"ok"})
+
+        sent: list[dict] = []
+
+        async def send(message):
+            sent.append(message)
+
+        mw = CsrfMiddleware(inner, secret="test-secret", cookie_name="pyxle-csrf")
+        scope = {
+            "type": "http",
+            "method": "POST",
+            "path": "/echo",
+            "query_string": b"",
+            "headers": [
+                (b"content-type", f"multipart/form-data; boundary={_MP_BOUNDARY}".encode()),
+                (b"cookie", f"pyxle-csrf={token}".encode()),
+            ],
+            "server": ("127.0.0.1", 8103),
+        }
+        asyncio.run(mw(scope, receive, send))
+
+        start = next(m for m in sent if m["type"] == "http.response.start")
+        assert start["status"] == 200
+        # The scan consumed only frame 1 before handing over to the app…
+        assert calls_when_downstream_started == [1]
+        # …and the app still saw the complete original body, byte-for-byte.
+        assert bytes(downstream_body) == full_body
+
+    def test_scan_finds_token_split_across_frames(self):
+        import asyncio
+
+        from pyxle.devserver.csrf import _scan_multipart_for_token
+
+        body = _multipart_body(("_csrf_token", b"split-token-value", None))
+        third = len(body) // 3
+        frames = [
+            {"type": "http.request", "body": body[:third], "more_body": True},
+            {"type": "http.request", "body": body[third : 2 * third], "more_body": True},
+            {"type": "http.request", "body": body[2 * third :], "more_body": False},
+        ]
+        receive, _ = self._frames_receive(frames)
+        scan = asyncio.run(
+            _scan_multipart_for_token(
+                receive,
+                content_type=f"multipart/form-data; boundary={_MP_BOUNDARY}",
+                field_name="_csrf_token",
+            )
+        )
+        assert scan.token == "split-token-value"
+        assert scan.consumed == body
+        assert scan.stream_exhausted is True
+        assert scan.over_cap is False
+
+    def test_scan_missing_boundary_consumes_nothing(self):
+        import asyncio
+
+        from pyxle.devserver.csrf import _scan_multipart_for_token
+
+        async def receive():  # pragma: no cover - never invoked
+            raise AssertionError("scan must not read the stream without a boundary")
+
+        scan = asyncio.run(
+            _scan_multipart_for_token(
+                receive,
+                content_type="multipart/form-data",
+                field_name="_csrf_token",
+            )
+        )
+        assert scan.token is None
+        assert scan.consumed == b""
+        assert scan.over_cap is False
+
+    def test_scan_reports_over_cap(self, monkeypatch):
+        import asyncio
+
+        from pyxle.devserver import csrf as csrf_mod
+
+        monkeypatch.setattr(csrf_mod, "_MAX_MULTIPART_SCAN_BYTES", 64)
+        body = _multipart_body(
+            ("upload", b"Z" * 512, "z.bin"),
+            ("_csrf_token", b"tok", None),
+        )
+        frames = [
+            {"type": "http.request", "body": body[:128], "more_body": True},
+            {"type": "http.request", "body": body[128:], "more_body": False},
+        ]
+        receive, state = self._frames_receive(frames)
+        scan = asyncio.run(
+            csrf_mod._scan_multipart_for_token(
+                receive,
+                content_type=f"multipart/form-data; boundary={_MP_BOUNDARY}",
+                field_name="_csrf_token",
+            )
+        )
+        assert scan.token is None
+        assert scan.over_cap is True
+        # Only the first frame was consumed — the scan stops at the cap.
+        assert state["calls"] == 1
+        assert scan.consumed == body[:128]
+
+    def test_scan_handles_disconnect_mid_body(self):
+        import asyncio
+
+        from pyxle.devserver.csrf import _scan_multipart_for_token
+
+        body = _multipart_body(("_csrf_token", b"tok", None))
+        frames = [
+            {"type": "http.request", "body": body[:10], "more_body": True},
+            {"type": "http.disconnect"},
+        ]
+        receive, _ = self._frames_receive(frames)
+        scan = asyncio.run(
+            _scan_multipart_for_token(
+                receive,
+                content_type=f"multipart/form-data; boundary={_MP_BOUNDARY}",
+                field_name="_csrf_token",
+            )
+        )
+        assert scan.token is None
+        assert scan.stream_exhausted is True
+        assert scan.consumed == body[:10]
+
+    def test_scan_skips_empty_body_frames(self):
+        import asyncio
+
+        from pyxle.devserver.csrf import _scan_multipart_for_token
+
+        body = _multipart_body(("_csrf_token", b"tok", None))
+        frames = [
+            {"type": "http.request", "body": b"", "more_body": True},
+            {"type": "http.request", "body": body, "more_body": False},
+        ]
+        receive, _ = self._frames_receive(frames)
+        scan = asyncio.run(
+            _scan_multipart_for_token(
+                receive,
+                content_type=f"multipart/form-data; boundary={_MP_BOUNDARY}",
+                field_name="_csrf_token",
+            )
+        )
+        assert scan.token == "tok"
+        assert scan.consumed == body
+
+    def test_resume_receive_replays_prefix_then_delegates(self):
+        import asyncio
+
+        from pyxle.devserver.csrf import _resume_receive
+
+        frames = [{"type": "http.request", "body": b" world", "more_body": False}]
+        receive, _ = self._frames_receive(frames)
+        resumed = _resume_receive(b"hello", receive)
+
+        async def collect():
+            first = await resumed()
+            second = await resumed()
+            return first, second
+
+        first, second = asyncio.run(collect())
+        assert first == {"type": "http.request", "body": b"hello", "more_body": True}
+        assert second == {"type": "http.request", "body": b" world", "more_body": False}

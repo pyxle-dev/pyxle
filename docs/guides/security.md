@@ -8,14 +8,27 @@ CSRF (Cross-Site Request Forgery) protection is **enabled by default** using a d
 
 ### How it works
 
-1. Pyxle sets a `pyxle-csrf` cookie on every response
+1. Pyxle sets a CSRF cookie on every response. The default name is **namespaced by the app's bind port** — `pyxle-csrf-8000` for an app serving on port 8000
 2. State-changing requests (`POST`, `PUT`, `PATCH`, `DELETE`) must echo the cookie value back, either in the `x-csrf-token` header or — for form-encoded submissions, such as a `<Form>` post before hydration — in a hidden `_csrf_token` form field
 3. The framework validates that the submitted token matches the cookie using constant-time comparison
 4. If they do not match, a `403 Forbidden` response is returned
 
 The `<Form>` component and `useAction` hook handle this automatically.
 
-Pyxle buffers at most 1 MB of a form-encoded body to find `_csrf_token`. A larger `application/x-www-form-urlencoded` or `multipart/form-data` body that doesn't carry the header token is rejected with `413` — for large uploads, send the token via the `x-csrf-token` header instead.
+### Why the cookie name carries the port
+
+Browsers scope cookies to a **host, not a host+port**. With a fixed cookie name, two Pyxle apps on the same host — say two dev servers on `127.0.0.1:8000` and `127.0.0.1:8001` — would keep overwriting each other's token, and every action in the other app would fail with `403 CSRF token mismatch`. Namespacing the default name with the bind port (read from the ASGI connection scope) gives each app its own cookie. The bind port is stable per app in development *and* behind a production reverse proxy, where the public port (443) differs from the bind port but never varies per request.
+
+Set `csrf.cookieName` to pin an explicit name instead — do this if you serve the same app from multiple ports and want one shared token, or if your production setup pre-renders pages with `pyxle build` and then serves them on a *different* port than `pyxle.config.json` declares (the pre-baked pages embed the cookie name). The same applies if you run the ASGI app over a **unix socket** (e.g. raw `uvicorn --uds`): with no bind port to namespace by, pin `cookieName` explicitly so the middleware and rendered pages always agree.
+
+Upgrading from an older Pyxle: a leftover `pyxle-csrf` cookie is simply ignored — the token re-issues under the namespaced name on the next page load. No action needed.
+
+### Form bodies and uploads
+
+Pyxle never buffers an unbounded request body to find `_csrf_token`:
+
+- `application/x-www-form-urlencoded` bodies are buffered up to 1 MB; a larger body without the header token is rejected with `413`.
+- `multipart/form-data` bodies are **stream-parsed only until the `_csrf_token` field is found** — file parts after the token are passed through to your handler untouched, never buffered by the CSRF layer. `<Form>` renders the hidden token field first, so an upload of any size works out of the box. The scan is capped at 1 MiB of pre-token data; if the field hasn't appeared by then (or isn't present at all), the request is rejected with `403` and a message telling you to send the token in the `x-csrf-token` header or move `_csrf_token` before the file fields.
 
 ### Configuration
 
@@ -23,7 +36,7 @@ Pyxle buffers at most 1 MB of a form-encoded body to find `_csrf_token`. A large
 {
   "csrf": {
     "enabled": true,
-    "cookieName": "pyxle-csrf",
+    "cookieName": "my-app-csrf",
     "headerName": "x-csrf-token",
     "cookieSecure": false,
     "cookieSameSite": "lax",
@@ -35,7 +48,7 @@ Pyxle buffers at most 1 MB of a form-encoded body to find `_csrf_token`. A large
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `enabled` | `boolean` | `true` | Enable/disable CSRF |
-| `cookieName` | `string` | `"pyxle-csrf"` | Cookie name |
+| `cookieName` | `string` | auto: `"pyxle-csrf-<port>"` | Cookie name; unset → namespaced by the bind port (see above) |
 | `headerName` | `string` | `"x-csrf-token"` | Header name |
 | `cookieSecure` | `boolean` | `false` | Set `Secure` flag (enable in production with HTTPS) |
 | `cookieSameSite` | `string` | `"lax"` | `SameSite` attribute (`"strict"`, `"lax"`, or `"none"`) |
@@ -61,12 +74,18 @@ Or with the object form:
 
 ### Token validation for custom fetch calls
 
-If you make `POST` requests outside of `<Form>` or `useAction`, read the CSRF token from the cookie and include it as a header:
+If you make `POST` requests outside of `<Form>` or `useAction`, read the CSRF token from the cookie and include it as a header. Don't hardcode the cookie name — the default is port-namespaced, so resolve it from the `window.__PYXLE_CSRF_COOKIE__` global Pyxle injects into every page:
 
 ```javascript
 function getCsrfToken() {
-  const match = document.cookie.match(/pyxle-csrf=([^;]+)/);
-  return match ? match[1] : '';
+  const cookieName = window.__PYXLE_CSRF_COOKIE__ ?? 'pyxle-csrf';
+  for (const part of document.cookie.split(';')) {
+    const eq = part.indexOf('=');
+    if (eq !== -1 && part.slice(0, eq).trim() === cookieName) {
+      return decodeURIComponent(part.slice(eq + 1));
+    }
+  }
+  return '';
 }
 
 await fetch('/api/data', {
@@ -79,7 +98,7 @@ await fetch('/api/data', {
 });
 ```
 
-If you've customised `csrf.cookieName` or `csrf.headerName`, use your configured names instead — Pyxle also injects non-default names into every page as `window.__PYXLE_CSRF_COOKIE__` and `window.__PYXLE_CSRF_HEADER__`, so custom code can read those globals (falling back to `pyxle-csrf` / `x-csrf-token`) rather than hardcoding.
+A customised `csrf.headerName` is exposed the same way, as `window.__PYXLE_CSRF_HEADER__` (falling back to `x-csrf-token`). The globals always carry the *effective* names — including the auto port-namespaced cookie name, which client code cannot derive itself behind a reverse proxy.
 
 ## Signed cookies and tokens
 

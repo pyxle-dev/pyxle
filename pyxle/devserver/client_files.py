@@ -2960,8 +2960,12 @@ def _render_use_action_component() -> str:
 
             // Cookie / header names honour ``csrf.cookieName`` and
             // ``csrf.headerName`` from pyxle.config.json. The document
-            // shell injects non-default names as window globals; absent
-            // globals mean the framework defaults are in effect.
+            // shell injects the effective names as window globals —
+            // including the auto (port-namespaced) ``pyxle-csrf-<port>``
+            // default, which the client cannot derive itself (the bind
+            // port is invisible behind a reverse proxy). The bare
+            // fallbacks below only apply when no global was injected
+            // (e.g. a pinned default name).
             function csrfCookieName() {
               if (typeof globalThis !== 'undefined' && typeof globalThis.__PYXLE_CSRF_COOKIE__ === 'string' && globalThis.__PYXLE_CSRF_COOKIE__) {
                 return globalThis.__PYXLE_CSRF_COOKIE__;
@@ -3202,8 +3206,12 @@ def _render_form_component() -> str:
 
             // Cookie / header names honour ``csrf.cookieName`` and
             // ``csrf.headerName`` from pyxle.config.json. The document
-            // shell injects non-default names as window globals; absent
-            // globals mean the framework defaults are in effect.
+            // shell injects the effective names as window globals —
+            // including the auto (port-namespaced) ``pyxle-csrf-<port>``
+            // default, which the client cannot derive itself (the bind
+            // port is invisible behind a reverse proxy). The bare
+            // fallbacks below only apply when no global was injected
+            // (e.g. a pinned default name).
             function csrfCookieName() {
               if (typeof globalThis !== 'undefined' && typeof globalThis.__PYXLE_CSRF_COOKIE__ === 'string' && globalThis.__PYXLE_CSRF_COOKIE__) {
                 return globalThis.__PYXLE_CSRF_COOKIE__;

@@ -29,12 +29,38 @@ class CorsConfig:
         return bool(self.origins)
 
 
+# Prefix for the default (port-namespaced) CSRF cookie name. Cookies ignore
+# ports, so a fixed name would collide between two Pyxle apps on the same
+# host (e.g. two dev servers on 127.0.0.1) — each app would overwrite the
+# other's token and every action in the other app would 403.
+CSRF_COOKIE_NAME_PREFIX = "pyxle-csrf"
+
+
+def default_csrf_cookie_name(port: int | None) -> str:
+    """Return the default CSRF cookie name for an app bound to ``port``.
+
+    The bind port is a stable per-app discriminator: unique per app on a
+    development host, and constant behind a production reverse proxy. When
+    the port is unknown (e.g. a unix-socket bind), the bare prefix is used.
+    """
+    if port is None:
+        return CSRF_COOKIE_NAME_PREFIX
+    return f"{CSRF_COOKIE_NAME_PREFIX}-{port}"
+
+
 @dataclass(frozen=True, slots=True)
 class CsrfConfig:
-    """CSRF protection configuration."""
+    """CSRF protection configuration.
+
+    ``cookie_name`` of ``None`` (the default) means *auto*: the cookie is
+    named ``pyxle-csrf-<port>`` after the app's bind port (see
+    :func:`default_csrf_cookie_name`), so multiple Pyxle apps on one host
+    never stomp each other's token. Set ``csrf.cookieName`` in
+    ``pyxle.config.json`` to pin an explicit name instead.
+    """
 
     enabled: bool = True
-    cookie_name: str = "pyxle-csrf"
+    cookie_name: str | None = None
     header_name: str = "x-csrf-token"
     cookie_secure: bool = False
     cookie_samesite: str = "lax"
@@ -781,8 +807,8 @@ def _parse_csrf_block(value: Any, *, source: Path) -> CsrfConfig:
     if not isinstance(enabled, bool):
         raise ConfigError(f"Invalid value for 'csrf.enabled' in '{source}': expected boolean.")
 
-    cookie_name = value.get("cookieName", "pyxle-csrf")
-    if not isinstance(cookie_name, str) or not cookie_name.strip():
+    cookie_name = value.get("cookieName")
+    if cookie_name is not None and (not isinstance(cookie_name, str) or not cookie_name.strip()):
         raise ConfigError(f"Invalid value for 'csrf.cookieName' in '{source}': expected non-empty string.")
 
     header_name = value.get("headerName", "x-csrf-token")
@@ -1095,6 +1121,8 @@ __all__ = [
     "ConfigError",
     "CorsConfig",
     "CsrfConfig",
+    "CSRF_COOKIE_NAME_PREFIX",
+    "default_csrf_cookie_name",
     "load_config",
     "apply_env_overrides",
     "DEFAULT_CONFIG_FILENAME",
