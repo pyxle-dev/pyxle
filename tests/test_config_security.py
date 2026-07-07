@@ -51,11 +51,36 @@ class TestCsrfConfigDefaults:
     def test_default_enabled(self):
         assert CsrfConfig().enabled is True
 
-    def test_default_cookie_name(self):
-        assert CsrfConfig().cookie_name == "pyxle-csrf"
+    def test_default_cookie_name_is_auto(self):
+        """``None`` means *auto*: the middleware derives ``pyxle-csrf-<port>``
+        from the request's bind port so two apps on one host never stomp
+        each other's token."""
+        assert CsrfConfig().cookie_name is None
 
     def test_default_samesite(self):
         assert CsrfConfig().cookie_samesite == "lax"
+
+
+class TestDefaultCsrfCookieName:
+    """``default_csrf_cookie_name`` — the auto (port-namespaced) name shared
+    by the middleware and the document-shell bootstrap script."""
+
+    def test_port_is_appended(self):
+        from pyxle.config import default_csrf_cookie_name
+
+        assert default_csrf_cookie_name(8103) == "pyxle-csrf-8103"
+
+    def test_unknown_port_uses_bare_prefix(self):
+        """A unix-socket bind has no port; the bare prefix keeps the cookie
+        working (it matches the client's baked-in fallback)."""
+        from pyxle.config import default_csrf_cookie_name
+
+        assert default_csrf_cookie_name(None) == "pyxle-csrf"
+
+    def test_prefix_constant_matches(self):
+        from pyxle.config import CSRF_COOKIE_NAME_PREFIX, default_csrf_cookie_name
+
+        assert default_csrf_cookie_name(80).startswith(CSRF_COOKIE_NAME_PREFIX + "-")
 
 
 # ---------------------------------------------------------------------------
@@ -165,6 +190,17 @@ class TestCsrfConfigParsing:
     def test_custom_cookie_name(self, tmp_path: Path):
         config = self._load(tmp_path, {"cookieName": "my-csrf"})
         assert config.csrf.cookie_name == "my-csrf"
+
+    def test_cookie_name_absent_stays_auto(self, tmp_path: Path):
+        """No ``cookieName`` key → ``None`` (auto port-namespaced name)."""
+        config = self._load(tmp_path, {"enabled": True})
+        assert config.csrf.cookie_name is None
+
+    def test_non_string_cookie_name_raises(self, tmp_path: Path):
+        config_file = tmp_path / "pyxle.config.json"
+        config_file.write_text(json.dumps({"csrf": {"cookieName": 8103}}))
+        with pytest.raises(ConfigError, match="cookieName"):
+            load_config(tmp_path, config_path=config_file)
 
     def test_custom_header_name(self, tmp_path: Path):
         config = self._load(tmp_path, {"headerName": "x-my-token"})

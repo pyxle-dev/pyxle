@@ -249,14 +249,46 @@ def test_render_document_embeds_only_non_default_csrf_names(
     assert "__PYXLE_CSRF_HEADER__" not in html
 
 
-def test_render_document_omits_csrf_names_for_defaults(
+def test_render_document_embeds_auto_port_namespaced_cookie_name(
     page_route: PageRoute, tmp_path: Path
 ) -> None:
-    """Default names (or no CSRF config at all) embed nothing — the client
-    falls back to ``pyxle-csrf`` / ``x-csrf-token`` on its own."""
+    """The auto (port-namespaced) cookie name must reach the client.
+
+    With ``csrf.cookieName`` unset, the middleware names the cookie
+    ``pyxle-csrf-<bind port>`` — a name the client cannot derive itself
+    (behind a reverse proxy the bind port is invisible), so the shell must
+    inject it. The default header name still needs no global."""
     from pyxle.config import CsrfConfig
 
-    for csrf in (None, CsrfConfig(), CsrfConfig(header_name="X-CSRF-Token")):
+    settings = DevServerSettings.from_project_root(
+        tmp_path, starlette_port=8103, csrf=CsrfConfig()
+    )
+    html = render_document(
+        settings=settings,
+        page=page_route,
+        body_html="<p>Hi</p>",
+        props={},
+        script_nonce="n",
+        head_elements=page_route.head_elements,
+    )
+
+    assert 'window.__PYXLE_CSRF_COOKIE__ = "pyxle-csrf-8103";' in html
+    assert "__PYXLE_CSRF_HEADER__" not in html
+
+
+def test_render_document_omits_csrf_names_for_client_fallbacks(
+    page_route: PageRoute, tmp_path: Path
+) -> None:
+    """No CSRF config, or names matching the client's baked-in fallbacks,
+    embed nothing — the client resolves ``pyxle-csrf`` / ``x-csrf-token``
+    on its own."""
+    from pyxle.config import CsrfConfig
+
+    for csrf in (
+        None,
+        CsrfConfig(cookie_name="pyxle-csrf"),
+        CsrfConfig(cookie_name="pyxle-csrf", header_name="X-CSRF-Token"),
+    ):
         settings = DevServerSettings.from_project_root(tmp_path, csrf=csrf)
         html = render_document(
             settings=settings,

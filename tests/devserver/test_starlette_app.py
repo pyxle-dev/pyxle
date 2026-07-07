@@ -2097,10 +2097,12 @@ def test_create_starlette_app_installs_csrf_middleware(
     client = TestClient(app, raise_server_exceptions=False)
 
     # A GET is a safe method: the CSRF cookie is seeded on the response.
+    # The default cookie name is port-namespaced (``pyxle-csrf-<bind port>``)
+    # so two Pyxle apps on one host never stomp each other's token.
     got = client.get("/api/pulse")
     assert got.status_code == 200
     assert any(
-        cookie.startswith("pyxle-csrf=") for cookie in got.headers.get_list("set-cookie")
+        cookie.startswith("pyxle-csrf-") for cookie in got.headers.get_list("set-cookie")
     )
 
     # A POST without the matching header/token is rejected by the middleware.
@@ -2143,7 +2145,7 @@ def test_create_starlette_app_csrf_secure_cookie_in_production(
 
     got = client.get("/api/pulse")
     csrf_cookie = next(
-        c for c in got.headers.get_list("set-cookie") if c.startswith("pyxle-csrf=")
+        c for c in got.headers.get_list("set-cookie") if c.startswith("pyxle-csrf-")
     )
     assert "Secure" in csrf_cookie
 
