@@ -50,6 +50,7 @@ The `pyxle` package includes:
 | `pyxle.config` | Configuration loading and validation |
 | Starlette | ASGI web server (installed as a dependency) |
 | Uvicorn | ASGI server runner (installed as a dependency) |
+| `pyxle-langkit` | Language toolkit powering `pyxle check`'s JSX validation (installed as a dependency) |
 
 Node.js dependencies (React, Vite, Tailwind) are installed per-project via `npm install` -- they are **not** global.
 

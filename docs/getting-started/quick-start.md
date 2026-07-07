@@ -88,7 +88,12 @@ This prints the route table derived from your `pages/` directory:
 pyxle check
 ```
 
-This validates `.pyxl` syntax, checks your config file, and reports any issues.
+This validates your `.pyxl` files — Python syntax, JSX, and semantic issues like undefined names — plus your config file, and reports any problems it finds. Everything Python-side ships with `pip install pyxle-framework`, and the JSX pass runs on the Node.js install you already have from step 1 — so on a fresh project you should see:
+
+```
+ℹ️  Checked 2 .pyxl file(s) in my-app/
+✅ All checks passed
+```
 
 ## Next steps
 

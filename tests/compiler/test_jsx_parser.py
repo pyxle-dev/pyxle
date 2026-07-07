@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 from pyxle.compiler.jsx_parser import (
     JSXParseResult,
+    _langkit_js_base,
     parse_jsx_components,
 )
 
@@ -120,6 +121,81 @@ def test_script_not_found_returns_error_diagnostic():
     # the script available in the environment is enough to exercise the
     # success path. The script-not-found path is well-tested by manual
     # smoke tests when pyxle-langkit isn't installed.
+
+
+def test_langkit_js_base_resolves_installed_package(tmp_path):
+    """``_langkit_js_base`` locates the ``js/`` directory of an installed
+    ``pyxle_langkit`` distribution via ``find_spec`` (no import — importing
+    would be a runtime cycle, since langkit imports ``pyxle.compiler``)."""
+
+    class _FakeSpec:
+        submodule_search_locations = [str(tmp_path / "pyxle_langkit")]
+
+    with patch("pyxle.compiler.jsx_parser.importlib.util.find_spec") as mock_spec:
+        mock_spec.return_value = _FakeSpec()
+        base = _langkit_js_base()
+    mock_spec.assert_called_once_with("pyxle_langkit")
+    assert base == tmp_path / "pyxle_langkit" / "js"
+
+
+def test_langkit_js_base_returns_none_when_not_installed():
+    """Without the package installed, resolution degrades to ``None`` so the
+    sibling-path heuristics (and ultimately the structured error) apply."""
+    with patch("pyxle.compiler.jsx_parser.importlib.util.find_spec") as mock_spec:
+        mock_spec.return_value = None
+        assert _langkit_js_base() is None
+
+
+def test_langkit_js_base_returns_none_for_broken_install():
+    """A broken/half-uninstalled distribution (``find_spec`` raising) must
+    degrade to ``None``, never crash ``pyxle check``."""
+    with patch("pyxle.compiler.jsx_parser.importlib.util.find_spec") as mock_spec:
+        mock_spec.side_effect = ImportError("broken metadata")
+        assert _langkit_js_base() is None
+
+
+def test_langkit_js_base_returns_none_for_namespace_less_spec():
+    """A spec without ``submodule_search_locations`` (not a package) yields
+    ``None`` rather than a bogus path."""
+
+    class _FakeSpec:
+        submodule_search_locations = None
+
+    with patch("pyxle.compiler.jsx_parser.importlib.util.find_spec") as mock_spec:
+        mock_spec.return_value = _FakeSpec()
+        assert _langkit_js_base() is None
+
+
+def test_installed_langkit_extractor_is_preferred(tmp_path):
+    """When the installed distribution ships the bundled extractor, it is the
+    script that gets executed — covering the editable-pyxle + site-packages
+    langkit layout where the sibling-path heuristics all miss."""
+    js_dir = tmp_path / "pyxle_langkit" / "js"
+    js_dir.mkdir(parents=True)
+    bundle = js_dir / "jsx_component_extractor.bundle.mjs"
+    bundle.write_text("// fake bundle", encoding="utf-8")
+
+    class _FakeSpec:
+        submodule_search_locations = [str(tmp_path / "pyxle_langkit")]
+
+    class _FakeProc:
+        returncode = 0
+        stdout = json.dumps({"ok": True, "components": []})
+        stderr = ""
+
+    with (
+        patch("pyxle.compiler.jsx_parser.importlib.util.find_spec") as mock_spec,
+        patch("pyxle.compiler.jsx_parser.subprocess.run") as mock_run,
+    ):
+        mock_spec.return_value = _FakeSpec()
+        mock_run.return_value = _FakeProc()
+        result = parse_jsx_components(
+            "import React from 'react';\nexport default function P() { return <div />; }",
+            target_components={"Script"},
+        )
+    assert result.error is None
+    command = mock_run.call_args.args[0]
+    assert command[1] == str(bundle)
 
 
 def test_jsx_parse_result_dataclass_is_frozen():

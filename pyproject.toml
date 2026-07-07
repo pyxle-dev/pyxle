@@ -44,7 +44,18 @@ dependencies = [
   # unused imports, redefinitions) beyond the parser's syntax check. Tiny and
   # pure-Python with zero transitive dependencies; imported lazily so it only
   # loads for ``pyxle check``, never on the compile/serve hot path.
-  "pyflakes>=3.1,<4.0"
+  "pyflakes>=3.1,<4.0",
+  # pyxle-langkit ships the self-contained JSX component extractor that powers
+  # the JSX layer of ``pyxle check``. It is a default dependency so ``check``
+  # works out of the box on a fresh install — previously it exited 1 on a
+  # brand-new scaffold unless the undocumented ``[langkit]`` extra was
+  # installed (the top pre-launch QA finding). Honest note: this is a
+  # deliberate dependency cycle — pyxle-langkit declares
+  # ``pyxle-framework>=0.1.0``. pip and uv resolve published cycles fine, and
+  # the cycle was chosen over vendoring the extractor into this package, which
+  # would inevitably drift from the langkit source of truth. The module
+  # boundary holds: langkit only imports ``pyxle.compiler``.
+  "pyxle-langkit>=0.3.4,<0.4",
 ]
 
 [project.urls]
@@ -55,8 +66,11 @@ Documentation = "https://pyxle.dev/docs/"
 PyPI = "https://pypi.org/project/pyxle-framework/"
 
 [project.optional-dependencies]
+# Redundant since 0.7.0 — pyxle-langkit is now a default dependency (see
+# [project] dependencies). Kept so existing installs and docs referencing
+# ``pyxle-framework[langkit]`` keep working; the floor matches the default dep.
 langkit = [
-  "pyxle-langkit>=0.2.0",
+  "pyxle-langkit>=0.3.4,<0.4",
 ]
 # Shared Redis backends — the server-side page cache
 # (PYXLE_PAGE_CACHE_BACKEND=redis) and the cross-worker realtime broker

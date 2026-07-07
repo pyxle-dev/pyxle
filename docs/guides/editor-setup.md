@@ -26,17 +26,10 @@ The extension is also available on the
 ### 2. Install the language server
 
 The VS Code extension is a thin client — the actual intelligence comes from
-the `pyxle-langserver` process. Install it alongside your project:
-
-```bash
-pip install pyxle-langkit
-```
-
-Or install it as an optional extra with the framework:
-
-```bash
-pip install pyxle-framework[langkit]
-```
+the `pyxle-langserver` process. As of 0.7.0 it ships with the framework itself —
+if you've run `pip install pyxle-framework`, `pyxle-langserver` is already in
+your environment. (On older framework versions, `pip install pyxle-langkit`
+installs it separately.)
 
 That's it. Open any `.pyxl` file and you'll see the **✓ Pyxle** indicator
 in the status bar when the language server connects.
@@ -181,7 +174,7 @@ pyxle-langkit format pages/index.pyxl --check
 Add to your CI pipeline to catch issues before merge:
 
 ```bash
-pip install pyxle-langkit
+pip install pyxle-framework  # pyxle-langkit ships with it
 pyxle-langkit lint pages/*.pyxl
 ```
 
@@ -246,7 +239,7 @@ for a future release.
 ### "pyxle-langserver: command not found"
 
 The language server isn't on your PATH. Either:
-- Install globally: `pip install pyxle-langkit`
+- Install it (ships with the framework): `pip install pyxle-framework` — or standalone: `pip install pyxle-langkit`
 - Or set the full path in VS Code settings:
   `"pyxle.langserver.command": "/path/to/venv/bin/pyxle-langserver"`
 
