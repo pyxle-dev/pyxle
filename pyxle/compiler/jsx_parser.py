@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import subprocess
 import tempfile
@@ -60,16 +61,41 @@ def parse_jsx_components(jsx_code: str, *, target_components: set[str] | None = 
         return _run_babel_parser(str(temp_path), target_components)
 
 
+def _langkit_js_base() -> Path | None:
+    """Locate the ``js/`` directory of the installed ``pyxle_langkit`` package.
+
+    Uses ``importlib.util.find_spec`` so the package is *located without being
+    imported* — ``pyxle_langkit`` imports ``pyxle.compiler``, so an actual
+    import from here would be a runtime cycle. Returns ``None`` when the
+    package isn't installed (the sibling-path heuristics below still apply).
+    """
+    try:
+        spec = importlib.util.find_spec("pyxle_langkit")
+    except (ImportError, ValueError):
+        # A broken or half-uninstalled distribution must degrade to the
+        # sibling-path heuristics, never crash ``pyxle check``.
+        return None
+    if spec is None or not spec.submodule_search_locations:
+        return None
+    return Path(next(iter(spec.submodule_search_locations))) / "js"
+
+
 def _run_babel_parser(source_path: str, target_components: set[str] | None) -> JSXParseResult:
     """Run the Node.js Babel parser script."""
     # Resolve the extractor script. Prefer the self-contained bundle
     # (``*.bundle.mjs`` — Babel inlined, so it works with zero npm setup on a
     # clean ``pip install``); fall back to the source ``.mjs`` (which needs
     # @babel/* in node_modules — the dev/CI layout). Each location, in order:
-    #   1. nested in the installed pyxle package
-    #   2. installed pyxle_langkit sibling (the real ``pip install`` location)
-    #   3. a sibling pyxle-langkit checkout (workspace dev)
+    #   1. the installed pyxle_langkit distribution (a default dependency
+    #      since 0.7.0), resolved via importlib — works for every install
+    #      layout, including an editable pyxle with langkit in site-packages
+    #   2. nested in the installed pyxle package
+    #   3. installed pyxle_langkit sibling (the pre-importlib heuristic for
+    #      a flat site-packages layout)
+    #   4. a sibling pyxle-langkit checkout (workspace dev)
+    _installed_base = _langkit_js_base()
     _js_bases = (
+        *((_installed_base,) if _installed_base is not None else ()),
         Path(__file__).parent.parent / "pyxle_langkit" / "js",
         Path(__file__).parent.parent.parent / "pyxle_langkit" / "js",
         Path(__file__).resolve().parent.parent.parent.parent / "pyxle-langkit" / "pyxle_langkit" / "js",
