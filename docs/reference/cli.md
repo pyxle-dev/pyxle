@@ -170,6 +170,16 @@ Validate `.pyxl` files, configuration, and dependencies without starting the ser
 - **Python semantics** (via pyflakes): undefined names — e.g. a symbol you `raise` but never imported — unused imports, redefinitions. Compiler-injected runtime names (`server`, `action`, `LoaderError`, `ActionError`, …) are recognized, so the idiomatic patterns never read as undefined.
 - **JSX syntax** (via Babel): unclosed tags/expressions, mismatched braces, TypeScript in a client block, and **duplicate `export default`** (which Babel accepts but the build rejects).
 
+As of 0.7.0 the JSX level works out of the box — `pyxle-langkit`, which provides the Babel-based checker, ships with the framework. On earlier versions it required the `[langkit]` extra (`pip install 'pyxle-framework[langkit]'`); without it, the JSX check reported itself unavailable.
+
+> **What a green check proves — and what it doesn't.** `pyxle check` is a
+> static gate: it validates `.pyxl` syntax, Python semantics, and JSX syntax.
+> It does **not** render your pages, so a mistake that only exists at runtime —
+> a component reading `data.posts` when the loader returns `{"items": ...}`, a
+> loader whose query fails against the real database — surfaces when the page
+> renders, not here. Treat a clean check as "this compiles"; loading the page
+> under `pyxle dev` (or a test that requests it) remains the runtime proof.
+
 ```bash
 pyxle check [directory] [options]
 ```

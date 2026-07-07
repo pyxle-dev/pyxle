@@ -49,7 +49,7 @@ async def load(request):
 
 ## Plugin settings
 
-All settings are optional — with none, you get SQLite at `./data/app.db`.
+All settings are optional — with none, you get SQLite at `./data/app.db`. There is no init step: on first startup the plugin creates the `data/` directory and the database file itself, then applies any pending migrations. (Plugins built on pyxle-db inherit this — [pyxle-auth](pyxle-auth.md#where-accounts-live)'s user records land in this same file until you point `url` at a real server.)
 
 | Key | Default | What it does |
 |---|---|---|
@@ -156,7 +156,10 @@ async def load(request):
 
 @action
 async def create_post(request):
-    await request.state.db.execute("INSERT INTO posts (title) VALUES (?)", (title,))
+    body = await request.json()
+    await request.state.db.execute(
+        "INSERT INTO posts (title) VALUES (?)", (body["title"],)
+    )
     return {"ok": True}   # committed automatically on success
 ```
 

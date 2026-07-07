@@ -2,7 +2,7 @@
 
 Pyxle is a Python-first full-stack web framework that brings the Next.js developer experience to the Python ecosystem. Write server logic in Python, UI in React, and ship them together in `.pyxl` files.
 
-**Current version:** 0.5.0 (beta)
+**Status:** beta (`0.x`) — see the [changelog](changelog.md) for the current release.
 
 ## What's new in 0.5.0
 
