@@ -213,9 +213,12 @@ pyxle install  # (re)install Python + Node deps
 - **DON'T** call your own actions with `fetch` or write a route for them — use `useAction`/`<Form>`.
 - **DON'T** put emoji or other non-BMP characters in **server-rendered** JSX text — SSR can fail
   to encode them. Use them only in client-only paths, or stick to plain text.
-- **DON'T** import `server`/`action` to use the decorators (they're injected). In a file with an
-  `@action`, `ActionError`/`ValidationActionError` are injected too — don't import them. **DO**
-  import `LoaderError` (`from pyxle.runtime import LoaderError`) before raising it — it is *not* injected.
+- **DON'T** import `server`/`action` to use the decorators, or `LoaderError`/`ActionError`/
+  `ValidationActionError`/`invalidate_routes` to raise/call them — the compiler auto-injects each
+  alongside the decorator that uses it (a `@server` loader injects `LoaderError`; an `@action`
+  injects `ActionError`/`ValidationActionError`/`invalidate_routes`). An explicit import (or your
+  own definition) of one of these names is harmless — it takes precedence over the injected one —
+  just unnecessary.
 - **DON'T** expose secrets: env vars reach the browser only with a `PYXLE_PUBLIC_` prefix, and
   loader/action return values are sent to the client.
 - **DON'T** add a `# --- JSX ---` / `# --- client ---` marker — the split is automatic.

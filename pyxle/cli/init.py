@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import secrets
 from pathlib import Path
 from typing import Mapping
@@ -16,6 +17,26 @@ from .scaffold import FilesystemWriter, InvalidProjectName, validate_project_nam
 from .templates import ScaffoldingTemplate, TemplateRegistry
 
 SUPPORTED_TEMPLATES = {"default"}
+
+_MAJOR_MINOR_RE = re.compile(r"^(\d+)\.(\d+)")
+
+
+def framework_requirement(version: str) -> str:
+    """Return the ``pyxle-framework`` requirement line for a scaffolded project.
+
+    The specifier is derived from the *running* framework version so a scaffold
+    never pins an older release than the CLI that generated it: running
+    ``0.7.0`` emits ``pyxle-framework>=0.7.0,<0.8`` (current version up to, but
+    excluding, the next minor). When the version metadata is unavailable —
+    e.g. an uninstalled source checkout reports ``"unknown"`` — the requirement
+    is left unpinned rather than emitting an unsatisfiable specifier.
+    """
+
+    match = _MAJOR_MINOR_RE.match(version)
+    if match is None:
+        return "pyxle-framework"
+    major, minor = int(match.group(1)), int(match.group(2))
+    return f"pyxle-framework>={version},<{major}.{minor + 1}"
 
 
 def build_template_registry() -> TemplateRegistry:
@@ -103,6 +124,7 @@ def run_init(
         "package_name": project_slug,
         "project_name": project_name,
         "pyxle_version": __version__,
+        "pyxle_framework_requirement": framework_requirement(__version__),
     }
     render_templates(writer, build_template_registry(), context, overwrite=force)
     writer.write("public/favicon.ico", default_favicon_bytes(), binary=True, overwrite=force)

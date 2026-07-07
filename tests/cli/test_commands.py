@@ -147,17 +147,90 @@ def test_install_dependencies_executes_commands(monkeypatch, tmp_path) -> None:
     assert calls[1][1] == tmp_path
 
 
-def test_scaffold_requirements_declares_pyxle_framework() -> None:
-    """The scaffolded requirements.txt must list pyxle-framework itself, so a
-    fresh clone + `pip install -r requirements.txt` pulls the runtime."""
-    from importlib import resources
+def test_scaffold_requirements_pins_running_framework_version(tmp_path, monkeypatch) -> None:
+    """`pyxle init` must render the pyxle-framework requirement from the RUNNING
+    framework version — `>=<current>,<<next-minor>` — so `pyxle install` can never
+    silently downgrade the framework a scaffold was generated with.
 
-    content = (
-        resources.files("pyxle.templates.scaffold")
-        .joinpath("requirements.txt")
-        .read_text(encoding="utf-8")
+    The expectation is derived from the live ``pyxle.__version__`` so this test
+    can never go stale on a version bump.
+    """
+    import re
+
+    from pyxle.cli.init import run_init
+
+    monkeypatch.chdir(tmp_path)
+    run_init("demo", force=False, template="default", logger=cli.ConsoleLogger(), log_steps=False)
+
+    content = (tmp_path / "demo" / "requirements.txt").read_text(encoding="utf-8")
+    line = next(
+        ln for ln in content.splitlines() if ln.startswith("pyxle-framework")
     )
-    assert "pyxle-framework" in content
+
+    match = re.match(r"^(\d+)\.(\d+)", __version__)
+    assert match is not None, (
+        "pyxle-framework distribution metadata is unavailable in this environment"
+    )
+    major, minor = int(match.group(1)), int(match.group(2))
+    assert line == f"pyxle-framework>={__version__},<{major}.{minor + 1}"
+    # No leftover template placeholder anywhere in the rendered file.
+    assert "$" not in content
+
+
+@pytest.mark.parametrize(
+    ("version", "expected"),
+    [
+        ("0.7.0", "pyxle-framework>=0.7.0,<0.8"),
+        ("0.6.1", "pyxle-framework>=0.6.1,<0.7"),
+        ("1.9.3", "pyxle-framework>=1.9.3,<1.10"),
+        ("0.7.0rc1", "pyxle-framework>=0.7.0rc1,<0.8"),
+        ("2.0.0.dev4", "pyxle-framework>=2.0.0.dev4,<2.1"),
+    ],
+)
+def test_framework_requirement_spans_current_to_next_minor(version, expected) -> None:
+    from pyxle.cli.init import framework_requirement
+
+    assert framework_requirement(version) == expected
+
+
+def test_framework_requirement_unparseable_version_left_unpinned() -> None:
+    """An uninstalled source checkout reports version "unknown" — the scaffold
+    must emit a satisfiable (unpinned) requirement, not a broken specifier."""
+    from pyxle.cli.init import framework_requirement
+
+    assert framework_requirement("unknown") == "pyxle-framework"
+
+
+def test_scaffold_package_json_pins_audit_clean_vite(tmp_path, monkeypatch) -> None:
+    """The scaffold must pin vite >= 6 — the vite 5 range resolves a transitive
+    esbuild <= 0.24.2 that `npm audit` flags (GHSA-67mh-4wv8-2f99) on every
+    fresh project, and plugin-react >= 4.4 to match."""
+    from pyxle.cli.init import run_init
+
+    monkeypatch.chdir(tmp_path)
+    run_init("demo", force=False, template="default", logger=cli.ConsoleLogger(), log_steps=False)
+
+    manifest = read_json(tmp_path / "demo" / "package.json")
+    dev_deps = manifest["devDependencies"]
+    vite_major = int(dev_deps["vite"].lstrip("^~").split(".", 1)[0])
+    assert vite_major >= 6
+    plugin_spec = dev_deps["@vitejs/plugin-react"].lstrip("^~")
+    plugin_major, plugin_minor = (int(part) for part in plugin_spec.split(".")[:2])
+    assert (plugin_major, plugin_minor) >= (4, 4)
+
+
+def test_scaffold_agents_md_documents_auto_injected_runtime_names(tmp_path, monkeypatch) -> None:
+    """AGENTS.md must not claim `LoaderError` needs an import — the compiler
+    auto-injects it (alongside ActionError/ValidationActionError/invalidate_routes),
+    and the rest of the file says so."""
+    from pyxle.cli.init import run_init
+
+    monkeypatch.chdir(tmp_path)
+    run_init("demo", force=False, template="default", logger=cli.ConsoleLogger(), log_steps=False)
+
+    agents = (tmp_path / "demo" / "AGENTS.md").read_text(encoding="utf-8")
+    assert "*not* injected" not in agents
+    assert "import `LoaderError` (`from pyxle.runtime import LoaderError`) before" not in agents
 
 
 def test_in_virtualenv_detects_environments(monkeypatch) -> None:
@@ -1859,6 +1932,129 @@ def test_typecheck_command_fails_when_tsc_not_found(monkeypatch) -> None:
         assert "tsc" in result.stdout.lower() or "TypeScript" in result.stdout
 
 
+def test_typecheck_missing_typescript_errors_without_invoking_tsc(monkeypatch) -> None:
+    """Without typescript (no node_modules/typescript, not in package.json),
+    typecheck must emit ONE actionable error and never spawn a compiler —
+    previously the `npx --yes tsc` fallback relayed npm's placeholder banner."""
+    with runner.isolated_filesystem():
+        project = Path("demo")
+        (project / "pages").mkdir(parents=True)
+        (project / "public").mkdir()
+        (project / "pages" / "index.pyxl").write_text(
+            "import React from 'react';\n"
+            "export default function Page() { return <div />; }\n",
+            encoding="utf-8",
+        )
+        (project / "package.json").write_text(
+            json.dumps({"name": "demo", "devDependencies": {"vite": "^6.3.5"}}),
+            encoding="utf-8",
+        )
+
+        # No local node_modules and nothing on PATH → tsc genuinely absent.
+        monkeypatch.setattr("shutil.which", lambda cmd: None)
+
+        def forbid_run(*args, **kwargs):
+            raise AssertionError("typecheck must not spawn a compiler when typescript is missing")
+
+        monkeypatch.setattr("pyxle.cli.subprocess.run", forbid_run)
+
+        result = runner.invoke(app, ["typecheck", "demo"], catch_exceptions=False)
+        assert result.exit_code == 1
+        assert "TypeScript is required for 'pyxle typecheck'" in result.stdout
+        assert "npm install --save-dev typescript" in result.stdout
+        assert "0 error(s)" not in result.stdout
+
+
+def test_typecheck_typescript_declared_but_not_installed(monkeypatch) -> None:
+    """typescript listed in package.json but node_modules missing → point at
+    `npm install`, not at adding the dependency again."""
+    with runner.isolated_filesystem():
+        project = Path("demo")
+        (project / "pages").mkdir(parents=True)
+        (project / "public").mkdir()
+        (project / "pages" / "index.pyxl").write_text(
+            "import React from 'react';\n"
+            "export default function Page() { return <div />; }\n",
+            encoding="utf-8",
+        )
+        (project / "package.json").write_text(
+            json.dumps({"name": "demo", "devDependencies": {"typescript": "^5.5.0"}}),
+            encoding="utf-8",
+        )
+
+        monkeypatch.setattr("shutil.which", lambda cmd: None)
+
+        result = runner.invoke(app, ["typecheck", "demo"], catch_exceptions=False)
+        assert result.exit_code == 1
+        assert "declared in package.json but not installed" in result.stdout
+        assert "npm install" in result.stdout
+        assert "--save-dev" not in result.stdout
+
+
+def test_typecheck_failed_run_never_reports_zero_errors(monkeypatch) -> None:
+    """A non-zero tsc exit with no `error TS` diagnostics (crash, wrong binary)
+    must not produce the self-contradictory 'failed with 0 error(s)' summary."""
+    with runner.isolated_filesystem():
+        project = Path("demo")
+        (project / "pages").mkdir(parents=True)
+        (project / "public").mkdir()
+        (project / "pages" / "index.pyxl").write_text(
+            "import React from 'react';\n"
+            "export default function Page() { return <div />; }\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setattr("pyxle.cli._find_tsc", lambda root: ["tsc"])
+
+        fake_result = subprocess.CompletedProcess(
+            args=["tsc", "--noEmit"],
+            returncode=1,
+            stdout="This is not the tsc command you are looking for\n",
+            stderr="",
+        )
+        monkeypatch.setattr("pyxle.cli.subprocess.run", lambda *a, **kw: fake_result)
+
+        result = runner.invoke(app, ["typecheck", "demo"], catch_exceptions=False)
+        assert result.exit_code == 1
+        assert "0 error(s)" not in result.stdout
+        assert "exited with code 1" in result.stdout
+
+
+def test_find_tsc_has_no_npx_fallback(tmp_path: Path, monkeypatch) -> None:
+    """`npx --yes tsc` resolves npm's placeholder `tsc` package, never the real
+    compiler — _find_tsc must not fall back to it."""
+    from pyxle.cli import _find_tsc
+
+    monkeypatch.setattr(
+        "shutil.which", lambda cmd: "/usr/bin/npx" if cmd == "npx" else None
+    )
+
+    assert _find_tsc(tmp_path) is None
+
+
+def test_typescript_declared_reads_package_json(tmp_path: Path) -> None:
+    from pyxle.cli import _typescript_declared
+
+    # No package.json at all.
+    assert _typescript_declared(tmp_path) is False
+
+    package_json = tmp_path / "package.json"
+    package_json.write_text(json.dumps({"devDependencies": {"vite": "^6.3.5"}}))
+    assert _typescript_declared(tmp_path) is False
+
+    package_json.write_text(json.dumps({"devDependencies": {"typescript": "^5.5.0"}}))
+    assert _typescript_declared(tmp_path) is True
+
+    package_json.write_text(json.dumps({"dependencies": {"typescript": "^5.5.0"}}))
+    assert _typescript_declared(tmp_path) is True
+
+    package_json.write_text("{not json")
+    assert _typescript_declared(tmp_path) is False
+
+    package_json.write_text(json.dumps(["not", "a", "dict"]))
+    assert _typescript_declared(tmp_path) is False
+
+
 def test_typecheck_command_succeeds_on_clean_output(monkeypatch) -> None:
     with runner.isolated_filesystem():
         project = Path("demo")
@@ -2051,16 +2247,6 @@ def test_emit_tsc_diagnostic_falls_back_for_unparseable_line() -> None:
 
     assert len(captured) == 1
     assert "Some random output line" in captured[0]
-
-
-def test_find_tsc_falls_back_to_npx(tmp_path: Path, monkeypatch) -> None:
-    from pyxle.cli import _find_tsc
-
-    monkeypatch.setattr("shutil.which", lambda cmd: "/usr/local/bin/npx" if cmd == "npx" else None)
-
-    result = _find_tsc(tmp_path)
-    assert result is not None
-    assert "npx" in result[0]
 
 
 # ---------------------------------------------------------------------------
@@ -2582,8 +2768,10 @@ def test_typecheck_command_lazy_imports_devserver_settings(monkeypatch) -> None:
         )
 
         monkeypatch.setattr("pyxle.cli.DevServerSettings", None)
-        # Stop before tsc: a missing tsconfig short-circuits after the
-        # lazy import + build, which is enough to exercise lines 868-870.
+        # Get past the up-front tsc resolution, then stop at the missing
+        # tsconfig after the lazy import + build — enough to exercise the
+        # lazy-import branch.
+        monkeypatch.setattr("pyxle.cli._find_tsc", lambda root: ["tsc"])
         monkeypatch.setattr("pyxle.devserver.builder.build_once", lambda s: None)
 
         result = runner.invoke(app, ["typecheck", "demo"], catch_exceptions=False)
@@ -2622,6 +2810,7 @@ def test_typecheck_command_build_failure_exits(monkeypatch) -> None:
         def boom(_settings):
             raise RuntimeError("build blew up")
 
+        monkeypatch.setattr("pyxle.cli._find_tsc", lambda root: ["tsc"])
         monkeypatch.setattr("pyxle.devserver.builder.build_once", boom)
 
         result = runner.invoke(app, ["typecheck", "demo"], catch_exceptions=False)
@@ -2638,13 +2827,10 @@ def test_typecheck_command_errors_when_tsconfig_missing(monkeypatch) -> None:
         (project / "pages").mkdir(parents=True)
         (project / "public").mkdir(parents=True)
 
-        # build_once is stubbed so no real tsconfig.json is produced.
+        # tsc resolves up front; build_once is stubbed so no real
+        # tsconfig.json is produced and the missing-tsconfig branch fires.
+        monkeypatch.setattr("pyxle.cli._find_tsc", lambda root: ["tsc"])
         monkeypatch.setattr("pyxle.devserver.builder.build_once", lambda s: None)
-        # _find_tsc should never be consulted; the missing tsconfig wins first.
-        monkeypatch.setattr(
-            "pyxle.cli._find_tsc",
-            lambda root: (_ for _ in ()).throw(AssertionError("tsc lookup too early")),
-        )
 
         result = runner.invoke(app, ["typecheck", "demo"], catch_exceptions=False)
 

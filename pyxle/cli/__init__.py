@@ -1014,6 +1014,22 @@ def typecheck(
         logger.error(f"Failed to create settings: {exc}")
         raise typer.Exit(code=1) from exc
 
+    # Resolve the TypeScript compiler up front — if it isn't installed there
+    # is nothing to run, so fail fast with one actionable error instead of
+    # building the project first and failing afterwards.
+    tsc_command = _find_tsc(project_root)
+    if tsc_command is None:
+        if _typescript_declared(project_root):
+            logger.error(
+                "TypeScript is declared in package.json but not installed — run: npm install"
+            )
+        else:
+            logger.error(
+                "TypeScript is required for 'pyxle typecheck' — "
+                "run: npm install --save-dev typescript"
+            )
+        raise typer.Exit(code=1)
+
     from pyxle.devserver.builder import build_once  # noqa: PLC0415
 
     logger.info("Building project before type-checking")
@@ -1027,14 +1043,6 @@ def typecheck(
     tsconfig_path = client_dir / "tsconfig.json"
     if not tsconfig_path.is_file():
         logger.error(f"tsconfig.json not found at '{tsconfig_path}'")
-        raise typer.Exit(code=1)
-
-    tsc_command = _find_tsc(project_root)
-    if tsc_command is None:
-        logger.error(
-            "TypeScript compiler (tsc) not found. "
-            "Install it with 'npm install --save-dev typescript' or 'npm install -g typescript'."
-        )
         raise typer.Exit(code=1)
 
     full_command = [*tsc_command, "--noEmit", "--project", str(tsconfig_path)]
@@ -1067,7 +1075,12 @@ def typecheck(
         logger.success("Type check passed — no errors found")
     else:
         error_count = sum(1 for line in (result.stdout or "").splitlines() if ": error TS" in line)
-        logger.error(f"Type check failed with {error_count} error(s)")
+        if error_count > 0:
+            logger.error(f"Type check failed with {error_count} error(s)")
+        else:
+            # tsc failed without reporting diagnostics (crash, bad invocation,
+            # unexpected binary) — never claim "0 error(s)" for a failed run.
+            logger.error(f"Type check failed — tsc exited with code {result.returncode}")
         raise typer.Exit(code=1)
 
 
@@ -1090,7 +1103,13 @@ def _emit_tsc_diagnostic(logger: ConsoleLogger, line: str) -> None:
 
 
 def _find_tsc(project_root: Path) -> list[str] | None:
-    """Locate the TypeScript compiler binary."""
+    """Locate the TypeScript compiler binary.
+
+    Only a real ``tsc`` is returned: the project-local ``node_modules/.bin``
+    entry or a global install on ``PATH``. There is deliberately no
+    ``npx tsc`` fallback — when TypeScript isn't installed, npm's ``tsc``
+    package is a placeholder that prints a banner instead of type-checking.
+    """
 
     import shutil  # noqa: PLC0415
 
@@ -1108,12 +1127,25 @@ def _find_tsc(project_root: Path) -> list[str] | None:
     if global_tsc is not None:
         return [global_tsc]
 
-    # npx fallback
-    npx = shutil.which("npx")
-    if npx is not None:
-        return [npx, "--yes", "tsc"]
-
     return None
+
+
+def _typescript_declared(project_root: Path) -> bool:
+    """Whether the project's ``package.json`` declares a ``typescript`` dependency."""
+
+    package_json = project_root / "package.json"
+    if not package_json.is_file():
+        return False
+    try:
+        manifest = json.loads(package_json.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(manifest, dict):
+        return False
+    return any(
+        isinstance(manifest.get(section), dict) and "typescript" in manifest[section]
+        for section in ("devDependencies", "dependencies")
+    )
 
 
 @app.command(help="Display the project's file-based route table.")
