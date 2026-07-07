@@ -78,6 +78,23 @@ async def endpoint(request: Request) -> JSONResponse:
 
 `sign_up` has the same shape and also returns `(user, cookie)`. `sign_out(cookie_value=...)` returns a cookie that clears the browser's copy — set it the same way.
 
+## Where accounts live
+
+pyxle-auth stores its records — users, sessions, rate-limit buckets, tokens, roles — in whatever database [pyxle-db](pyxle-db.md) opens. With no pyxle-db settings, that's a SQLite file **auto-created at `data/app.db` on first run**: the plugin creates the directory and the file, and pyxle-auth's bundled migrations build its tables at startup. There is no manual migration or `create-db` step — the Quickstart config above boots against an empty project and just works.
+
+For production, point pyxle-db at your real database and pyxle-auth follows — its migrations apply there at startup exactly as they do to SQLite:
+
+```json
+{
+  "plugins": [
+    { "name": "pyxle-db", "settings": { "url": "env:DATABASE_URL" } },
+    "pyxle-auth"
+  ]
+}
+```
+
+The `env:` indirection keeps credentials out of the committed config — see [pyxle-db → Plugin settings](pyxle-db.md#plugin-settings). Remember the SQLite file is your user table: back it up like one, and never commit or deploy a local `data/app.db` over a production database. (To back pyxle-auth with something other than pyxle-db entirely, see [Bring your own database](#bring-your-own-database).)
+
 ## Identity model: email or username
 
 By default accounts are identified by **email** — exactly as the examples above. To build a username-based app (any available handle, no email or phone required), set `identifier` to `"username"`:
@@ -175,6 +192,28 @@ function Account() {
 ```
 
 The signed-in user is **seeded into the server render** (`window.__PYXLE_AUTH__`), so `useAuth` shows the right state on the first frame — no flash of "logged out", no extra round-trip.
+
+### CSRF
+
+`POST /auth/login`, `/auth/signup`, and `/auth/logout` are state-changing endpoints, so the framework's CSRF protection guards them like any other POST — a request that doesn't carry the token is rejected with `403` ("CSRF token missing"). `useAuth()` handles this for you; you only deal with it when calling the endpoints directly (curl, an HTTP client, an integration test).
+
+The dance is the standard double-submit pattern: any ordinary `GET` response issues the Pyxle CSRF cookie (responses marked publicly cacheable skip it), and the POST must echo that cookie's value back in the `X-CSRF-Token` header (alongside the cookie itself):
+
+```bash
+# 1. Any GET issues the CSRF cookie — capture it in a cookie jar
+curl -s -c jar.txt http://localhost:8000/auth/me > /dev/null
+
+# 2. The token is the value of the Pyxle CSRF cookie
+TOKEN=$(awk '$6 ~ /csrf/ { print $7 }' jar.txt)
+
+# 3. POST with the cookie jar, echoing the token in the header
+curl -s -b jar.txt -H "X-CSRF-Token: $TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{"email": "ada@example.com", "password": "correct horse battery"}' \
+     http://localhost:8000/auth/login
+```
+
+The cookie and header names (and how to customise or exempt paths from the check) are documented in [Security → CSRF protection](../guides/security.md#csrf-protection). For token-authenticated API clients that can't run this dance, see the exempt-paths note under [JWT](#jwt-for-api--mobile-clients).
 
 ## Guards
 

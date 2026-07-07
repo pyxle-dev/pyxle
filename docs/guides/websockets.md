@@ -10,6 +10,12 @@ over HTTP and a live connection over WS.
 
 from pyxle.realtime import channel
 
+
+@server
+async def load(request):
+    return {"room": request.path_params["room"]}
+
+
 async def websocket(ws):
     await ws.accept()
     room = ws.path_params["room"]
@@ -23,8 +29,8 @@ async def websocket(ws):
 import React from 'react';
 import { useWebSocket } from 'pyxle/client';
 
-export default function Chat() {
-  const { status, send, lastMessage } = useWebSocket(window.location.pathname);
+export default function Chat({ data }) {
+  const { status, send, lastMessage } = useWebSocket(`/chat/${data.room}`);
   // …render the chat UI…
 }
 ```
@@ -32,6 +38,14 @@ export default function Chat() {
 Open `/chat/lobby` and you get the page; the client hook upgrades the **same
 path** to a WebSocket. Two browsers in `/chat/lobby` exchange messages in real
 time; `/chat/general` is a separate room.
+
+> **Derive the path from props, not `window`.** The component renders on the
+> server first, and the hook's *arguments* are evaluated during that render —
+> only the connection waits for the browser. Reaching for a browser global at
+> render scope (`useWebSocket(window.location.pathname)`) therefore crashes SSR
+> with `window is not defined`. Build the path from route data instead, as
+> above: the loader returns the dynamic segment and the component templates it
+> into the same path the page was served from.
 
 ## The `websocket` handler
 
@@ -212,8 +226,10 @@ async def websocket(ws):
 ## The `useWebSocket()` client hook
 
 `useWebSocket(path, options?)` connects from the browser with auto-reconnect,
-JSON parsing, and connection state. It **never connects during SSR** and
-reconnects with exponential backoff (capped, with jitter).
+JSON parsing, and connection state. It **never connects during SSR** — though
+its arguments are still evaluated there, so derive `path` from props or loader
+data, never from `window` — and reconnects with exponential backoff (capped,
+with jitter).
 
 ```jsx
 import { useWebSocket } from 'pyxle/client';
