@@ -1225,3 +1225,109 @@ def test_action_router_without_hooks_still_dispatches(tmp_path: Path) -> None:
     response = client.post("/api/__actions/nohooks_dispatch/go", json={})
     assert response.status_code == 200
     assert response.json() == {"ok": True, "value": 1}
+
+
+# ---------------------------------------------------------------------------
+# Missing request.state attribute guidance
+# ---------------------------------------------------------------------------
+
+
+def _state_action_app(module_path: Path, *, debug: bool) -> TestClient:
+    route = ActionRoute(
+        path="/api/__actions/state/save",
+        page_path="/state",
+        action_name="save",
+        server_module_path=module_path,
+        module_key=f"pyxle.server.pages.state_{'dev' if debug else 'prod'}",
+    )
+    router = build_action_router([route], debug=debug)
+
+    from starlette.applications import Starlette
+
+    app = Starlette()
+    app.router.routes.extend(router.routes)
+    return TestClient(app, raise_server_exceptions=False)
+
+
+def test_action_dispatch_missing_state_guidance_in_debug(tmp_path: Path) -> None:
+    """request.state.db without the plugin → actionable guidance, not a bare
+    "'State' object has no attribute 'db'"."""
+    module_path = _write_module(
+        tmp_path / "server" / "pages" / "state_dev.py",
+        """
+        from pyxle.runtime import action
+
+        @action
+        async def save(request):
+            request.state.db.execute("SELECT 1")
+            return {}
+        """,
+    )
+
+    client = _state_action_app(module_path, debug=True)
+    response = client.post("/api/__actions/state/save", json={})
+
+    assert response.status_code == 500
+    data = response.json()
+    assert data["ok"] is False
+    assert "request.state.db is not set" in data["error"]
+    assert "pyxle-db" in data["error"]
+
+
+def test_action_dispatch_missing_state_generic_in_production(tmp_path: Path) -> None:
+    """Production responses never leak the guidance (or any internals)."""
+    module_path = _write_module(
+        tmp_path / "server" / "pages" / "state_prod.py",
+        """
+        from pyxle.runtime import action
+
+        @action
+        async def save(request):
+            request.state.db.execute("SELECT 1")
+            return {}
+        """,
+    )
+
+    client = _state_action_app(module_path, debug=False)
+    response = client.post("/api/__actions/state/save", json={})
+
+    assert response.status_code == 500
+    data = response.json()
+    assert data["ok"] is False
+    assert data["error"] == "Internal server error"
+
+
+def test_action_dispatch_other_attribute_error_flows_through(tmp_path: Path) -> None:
+    """A non-State AttributeError keeps the existing generic error path."""
+    module_path = _write_module(
+        tmp_path / "server" / "pages" / "attr_boom.py",
+        """
+        from pyxle.runtime import action
+
+        @action
+        async def save(request):
+            raise AttributeError("boom")
+        """,
+    )
+
+    route = ActionRoute(
+        path="/api/__actions/attr-boom/save",
+        page_path="/attr-boom",
+        action_name="save",
+        server_module_path=module_path,
+        module_key="pyxle.server.pages.attr_boom",
+    )
+    router = build_action_router([route], debug=True)
+
+    from starlette.applications import Starlette
+
+    app = Starlette()
+    app.router.routes.extend(router.routes)
+    client = TestClient(app, raise_server_exceptions=False)
+
+    response = client.post("/api/__actions/attr-boom/save", json={})
+
+    assert response.status_code == 500
+    data = response.json()
+    assert data["ok"] is False
+    assert data["error"] == "boom"

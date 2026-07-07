@@ -131,3 +131,48 @@ def test_ensure_fresh_build_cache_handles_corrupt_metadata(tmp_path: Path) -> No
             payload = json.load(file)
 
         assert payload == {"schema_version": "9", "sources": {}}
+
+
+def test_save_build_metadata_skips_identical_content(tmp_path: Path) -> None:
+    """Rewriting unchanged metadata must not touch the file (mtime stays)."""
+    import time
+
+    settings = make_settings(tmp_path)
+    initialize_build_directories(settings)
+    metadata = BuildMetadata(
+        schema_version=BUILD_CACHE_SCHEMA_VERSION,
+        sources={},
+    )
+
+    save_build_metadata(settings.build_root, metadata)
+    meta_path = settings.build_root / "meta.json"
+    before = meta_path.stat().st_mtime_ns
+    time.sleep(0.02)
+
+    save_build_metadata(settings.build_root, metadata)
+
+    assert meta_path.stat().st_mtime_ns == before
+    assert not (settings.build_root / "meta.json.tmp").exists()
+
+
+def test_save_build_metadata_replaces_changed_content_atomically(tmp_path: Path) -> None:
+    """Changed metadata is rewritten (via temp + rename) with no temp leftover."""
+    from pyxle.devserver.build import CachedSourceRecord
+
+    settings = make_settings(tmp_path)
+    initialize_build_directories(settings)
+    save_build_metadata(
+        settings.build_root,
+        BuildMetadata(schema_version=BUILD_CACHE_SCHEMA_VERSION, sources={}),
+    )
+
+    updated = BuildMetadata(
+        schema_version=BUILD_CACHE_SCHEMA_VERSION,
+        sources={"index.pyxl": CachedSourceRecord(kind="page", content_hash="abc")},
+    )
+    save_build_metadata(settings.build_root, updated)
+
+    meta_path = settings.build_root / "meta.json"
+    payload = json.loads(meta_path.read_text(encoding="utf-8"))
+    assert payload["sources"] == {"index.pyxl": {"kind": "page", "hash": "abc"}}
+    assert not (settings.build_root / "meta.json.tmp").exists()

@@ -6,6 +6,7 @@ import importlib
 import importlib.util
 import inspect
 import logging
+import re
 import secrets
 import sys
 import time
@@ -35,6 +36,64 @@ from .template import (
 
 class LoaderExecutionError(RuntimeError):
     """Raised when a page loader returns an unexpected value."""
+
+
+#: The exact ``AttributeError`` message Starlette's ``State`` raises when
+#: server code reads an attribute nothing populated (``request.state.db``
+#: without the pyxle-db plugin, ``request.state.user`` without an auth
+#: middleware, ...). Anchored so only genuine ``State`` misses match.
+_STATE_ATTRIBUTE_MESSAGE_RE = re.compile(
+    r"^'State' object has no attribute '(?P<name>[^']+)'$"
+)
+
+
+def missing_state_attribute(error: BaseException) -> str | None:
+    """Return the missing ``request.state`` attribute name for ``error``.
+
+    Matches exactly the ``AttributeError`` Starlette's ``State`` raises when a
+    loader or action reads a ``request.state`` attribute that no plugin or
+    middleware provided. Any other exception — including other
+    ``AttributeError``\\ s — returns ``None`` so it flows through the normal
+    error path untouched.
+    """
+    if not isinstance(error, AttributeError):
+        return None
+    match = _STATE_ATTRIBUTE_MESSAGE_RE.match(str(error))
+    return match.group("name") if match else None
+
+
+def _missing_state_message(attribute: str) -> str:
+    if attribute == "db":
+        return (
+            "request.state.db is not set — it is provided by the pyxle-db "
+            'plugin. Add it to pyxle.config.json ("plugins": ["pyxle-db"]) '
+            "and restart the dev server."
+        )
+    return (
+        f"request.state.{attribute} is not set — state attributes are "
+        "provided by plugins or middleware (for example, request.state.db "
+        'requires the pyxle-db plugin: "plugins": ["pyxle-db"] in '
+        "pyxle.config.json). Check your plugin/middleware configuration."
+    )
+
+
+class MissingRequestStateError(LoaderExecutionError):
+    """Raised when server code reads an unset ``request.state`` attribute.
+
+    Wraps the bare ``AttributeError: 'State' object has no attribute '<name>'``
+    Starlette raises in that case with actionable guidance (state attributes
+    are provided by plugins or middleware; ``request.state.db`` needs the
+    pyxle-db plugin). Subclasses :class:`LoaderExecutionError` so every loader
+    pipeline (buffered, streaming, navigation) reports it as a loader-stage
+    failure: guidance in the dev overlay and server log, the generic sanitized
+    response in production. The original ``AttributeError`` stays reachable
+    through ``__cause__``. Also used by the ``@action`` dispatcher for the
+    same diagnosis on action requests.
+    """
+
+    def __init__(self, attribute: str) -> None:
+        super().__init__(_missing_state_message(attribute))
+        self.attribute = attribute
 
 
 class HeadEvaluationError(RuntimeError):
@@ -737,13 +796,31 @@ async def _execute_loader(
 
     _loader_start = time.perf_counter()
     with span("loader"):
-        result = loader(request)
-        if hasattr(result, "__await__"):
-            result = await result  # type: ignore[assignment]
+        result = await _invoke_loader_callable(loader, request)
     _record_render_metric(request, "loader", (time.perf_counter() - _loader_start) * 1000.0)
 
     payload, status_code, revalidate = _normalize_loader_result(result, page)
     return payload, status_code, revalidate, module
+
+
+async def _invoke_loader_callable(loader: Callable[..., Any], request: Request) -> Any:
+    """Call a ``@server`` loader (sync or async) and return its result.
+
+    A read of an unset ``request.state`` attribute is translated into
+    :class:`MissingRequestStateError` (guidance instead of a bare
+    ``AttributeError``), chaining the original exception; every other
+    exception propagates untouched.
+    """
+    try:
+        result = loader(request)
+        if hasattr(result, "__await__"):
+            result = await result
+    except AttributeError as exc:
+        attribute = missing_state_attribute(exc)
+        if attribute is None:
+            raise
+        raise MissingRequestStateError(attribute) from exc
+    return result
 
 
 async def _execute_layout_loaders(
@@ -770,9 +847,7 @@ async def _execute_layout_loaders(
         if loader_fn is None:
             continue
 
-        result = loader_fn(request)
-        if hasattr(result, "__await__"):
-            result = await result
+        result = await _invoke_loader_callable(loader_fn, request)
 
         # Layout loaders return a plain dict (no status code).
         if isinstance(result, tuple) and result:
@@ -1294,6 +1369,8 @@ def _normalize_head_entries(page: PageRoute, value: Any) -> tuple[str, ...]:
 
 __all__ = [
     "LoaderExecutionError",
+    "MissingRequestStateError",
+    "missing_state_attribute",
     "build_page_response",
     "build_page_navigation_response",
     "build_not_found_response",

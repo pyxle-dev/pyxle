@@ -17,9 +17,51 @@ from .settings import DevServerSettings
 
 _ViteProbe = Callable[[str, int], Awaitable[bool]]
 
+#: Maximum consecutive relaunch attempts after an unexpected Vite exit.
+#: Three attempts (with the exponential backoff below) are enough to ride out
+#: transient causes — e.g. a rebuild burst rewriting generated files while
+#: Vite is mid config-restart — while a persistently broken setup (bad
+#: ``vite.config.js``, missing dependency) still fails fast and loudly instead
+#: of crash-looping forever.
+DEFAULT_RESTART_ATTEMPTS = 3
+
+#: Base delay in seconds before relaunching Vite after an unexpected exit.
+#: Doubles on every consecutive failure (0.5s → 1s → 2s) so the condition that
+#: killed Vite (an in-flight rebuild, a port not yet released) has time to
+#: clear, while the first relaunch is quick enough that HMR is back before the
+#: developer notices.
+DEFAULT_RESTART_DELAY = 0.5
+
+
+class ViteSupervisionError(RuntimeError):
+    """Raised when Vite exits unexpectedly and cannot be relaunched.
+
+    Produced after the supervisor exhausts its relaunch budget
+    (:data:`DEFAULT_RESTART_ATTEMPTS` by default). The dev server is still
+    running at that point but can no longer serve client assets, so the error
+    is surfaced prominently instead of leaving a silently dead asset server.
+    """
+
+    def __init__(self, attempts: int) -> None:
+        super().__init__(
+            "Vite dev server exited unexpectedly and could not be relaunched "
+            f"after {attempts} attempt(s). Client assets can no longer be "
+            "served — restart `pyxle dev`. Check the [vite] log output above "
+            "for the underlying failure."
+        )
+        self.attempts = attempts
+
 
 class ViteProcess:
-    """Launch and supervise the Vite dev server."""
+    """Launch and supervise the Vite dev server.
+
+    Supervision: any exit the supervisor did not initiate via :meth:`stop` —
+    including a "clean" exit code 0, which Vite produces when e.g. its config
+    file disappears mid config-reload — is treated as unexpected and answered
+    with a bounded, exponentially backed-off relaunch. Exhausting the relaunch
+    budget records a :class:`ViteSupervisionError` (see :attr:`fatal_error`)
+    and logs it as a fatal error.
+    """
 
     def __init__(
         self,
@@ -32,7 +74,8 @@ class ViteProcess:
         readiness_timeout: float = 10.0,
         readiness_interval: float = 0.1,
         probe: _ViteProbe | None = None,
-        restart_delay: float = 0.5,
+        restart_delay: float = DEFAULT_RESTART_DELAY,
+        max_restart_attempts: int = DEFAULT_RESTART_ATTEMPTS,
     ) -> None:
         self._settings = settings
         self._logger = logger or ConsoleLogger()
@@ -48,6 +91,9 @@ class ViteProcess:
         self._stopping: bool = False
         self._restart_task: asyncio.Task[None] | None = None
         self._restart_delay = restart_delay
+        self._max_restart_attempts = max_restart_attempts
+        self._restart_attempts = 0
+        self._fatal_error: ViteSupervisionError | None = None
         self._command_override: list[str] | None = None
         self._npm_install_attempted = False
 
@@ -55,6 +101,11 @@ class ViteProcess:
     def running(self) -> bool:
         process = self._process
         return process is not None and process.returncode is None
+
+    @property
+    def fatal_error(self) -> ViteSupervisionError | None:
+        """The supervision failure that ended relaunch attempts, if any."""
+        return self._fatal_error
 
     async def start(self) -> None:
         if self.running:
@@ -68,6 +119,13 @@ class ViteProcess:
             with suppress(asyncio.CancelledError):
                 await restart_task
             self._restart_task = None
+        if current_task is not restart_task or restart_task is None:
+            # A manual (re)start expresses fresh intent: clear any previous
+            # supervision failure so the relaunch budget starts over. The
+            # supervisor's own relaunch loop must NOT reset the counter here,
+            # or the retry budget could never be exhausted.
+            self._fatal_error = None
+            self._restart_attempts = 0
 
         command = self._build_launch_command()
         self._logger.info("Launching Vite dev server: " + " ".join(command))
@@ -319,16 +377,25 @@ class ViteProcess:
                     await task
 
         returncode = await process.wait()
-        crashed = returncode not in (0, None) and not self._stopping
 
         if returncode not in (0, None):
             self._logger.error(f"[vite] process exited with code {returncode}")
         else:
             self._logger.info("[vite] process exited")
 
-        if crashed:
-            self._logger.warning("Vite process exited unexpectedly; attempting restart")
-            self._process = None
+        if self._stopping:
+            return
+
+        # Any exit the supervisor did not initiate is unexpected — including a
+        # "clean" exit code 0 (Vite exits 0 when, e.g., its config file
+        # vanishes during a config-reload). Without a relaunch the dev server
+        # would keep running with no asset server behind it, which looks like
+        # a dead page in the browser.
+        self._logger.warning("Vite process exited unexpectedly; attempting restart")
+        self._process = None
+        if self._fatal_error is None and (
+            self._restart_task is None or self._restart_task.done()
+        ):
             self._restart_task = asyncio.create_task(self._restart_after_exit())
 
     async def _pipe_stream(self, stream: asyncio.StreamReader, *, is_error: bool) -> None:
@@ -345,18 +412,73 @@ class ViteProcess:
                 self._logger.info(f"[vite] {message}")
 
     async def _restart_after_exit(self) -> None:
+        """Relaunch Vite after an unexpected exit, with backoff and a budget.
+
+        Each consecutive failure doubles the delay; a relaunch that reaches
+        readiness resets the budget (the supervisor is healthy again).
+        Exhausting :attr:`_max_restart_attempts` records a
+        :class:`ViteSupervisionError` and logs it as fatal.
+        """
         try:
-            await asyncio.sleep(self._restart_delay)
-            if self._stopping:
+            while not self._stopping:
+                self._restart_attempts += 1
+                if self._restart_attempts > self._max_restart_attempts:
+                    self._fatal_error = ViteSupervisionError(self._max_restart_attempts)
+                    self._logger.error(str(self._fatal_error))
+                    # Never leave a hung child running unsupervised past the
+                    # budget — it would hold the port and confuse the next
+                    # manual start().
+                    await self._terminate_unready_child()
+                    return
+                delay = self._restart_delay * (2 ** (self._restart_attempts - 1))
+                self._logger.warning(
+                    f"Relaunching Vite dev server in {delay:.1f}s "
+                    f"(attempt {self._restart_attempts}/{self._max_restart_attempts})"
+                )
+                await asyncio.sleep(delay)
+                if self._stopping:
+                    return
+                try:
+                    await self.start()
+                    await self.wait_until_ready()
+                except Exception as exc:
+                    self._logger.warning(f"Vite relaunch attempt failed: {exc}")
+                    # A child that launched but never became ready (hung Vite)
+                    # must not survive the attempt: ``start()`` would no-op on
+                    # it next iteration and the budget would burn re-probing
+                    # the same dead-end process.
+                    await self._terminate_unready_child()
+                    continue
+                # The relaunched process accepts connections again; treat the
+                # supervisor as healthy and forget the failure streak.
+                self._restart_attempts = 0
                 return
-            await self.start()
-            await self.wait_until_ready()
-        except asyncio.CancelledError:  # pragma: no cover - cancellation path
-            raise
-        except Exception as exc:  # pragma: no cover - defensive
-            self._logger.error(f"Failed to restart Vite dev server: {exc}")
         finally:
-            self._restart_task = None
+            if self._restart_task is asyncio.current_task():
+                self._restart_task = None
+
+    async def _terminate_unready_child(self) -> None:
+        """Terminate a live child without entering shutdown state.
+
+        Used only by the supervisor when a relaunch left Vite running but not
+        accepting connections. ``_stopping`` stays False (this is not a
+        shutdown) — the monitor task skips rescheduling because the restart
+        task is still the current task.
+        """
+        process = self._process
+        if process is None or process.returncode is not None:
+            return
+        self._logger.warning(
+            "Vite is running but not accepting connections; terminating the hung process"
+        )
+        process.terminate()
+        try:
+            await asyncio.wait_for(process.wait(), timeout=self._stop_timeout)
+        except asyncio.TimeoutError:
+            self._logger.warning("Hung Vite process did not exit after SIGTERM; killing")
+            process.kill()
+            await process.wait()
+        self._process = None
 
     @staticmethod
     async def _default_probe(host: str, port: int) -> bool:
@@ -371,4 +493,9 @@ class ViteProcess:
             return True
 
 
-__all__ = ["ViteProcess"]
+__all__ = [
+    "DEFAULT_RESTART_ATTEMPTS",
+    "DEFAULT_RESTART_DELAY",
+    "ViteProcess",
+    "ViteSupervisionError",
+]

@@ -8,7 +8,7 @@ import pytest
 
 from pyxle.cli.logger import ConsoleLogger
 from pyxle.devserver.settings import DevServerSettings
-from pyxle.devserver.vite import ViteProcess
+from pyxle.devserver.vite import ViteProcess, ViteSupervisionError
 
 pytestmark = pytest.mark.anyio("asyncio")
 
@@ -669,3 +669,257 @@ async def test_vite_process_default_probe(monkeypatch) -> None:
 
 	assert results == [False, True]
 
+
+async def test_vite_process_relaunches_after_unexpected_clean_exit(settings: DevServerSettings) -> None:
+	"""An exit the supervisor didn't initiate — even code 0 — is relaunched."""
+
+	class Factory:
+		def __init__(self) -> None:
+			self.calls = 0
+
+		async def __call__(self, *cmd: str, **_: Any) -> FakeProcess:
+			if self.calls == 0:
+				process = FakeProcess(stdout_lines=None, stderr_lines=None, exit_code=0)
+			else:
+				process = FakeProcess(
+					stdout_lines=None,
+					stderr_lines=None,
+					exit_code=0,
+					auto_exit=False,
+				)
+			process.start()
+			self.calls += 1
+			return process
+
+	factory = Factory()
+	capture: list[str] = []
+	logger = ConsoleLogger(secho=lambda msg, **_: capture.append(msg))
+
+	async def probe(host: str, port: int) -> bool:
+		return True
+
+	vite = ViteProcess(
+		settings,
+		logger=logger,
+		process_factory=factory,
+		restart_delay=0,
+		readiness_interval=0.01,
+		probe=probe,
+		stop_timeout=0.1,
+	)
+
+	await vite.start()
+
+	async def wait_for_relaunch() -> None:
+		while not (factory.calls >= 2 and vite.running and vite._restart_task is None):
+			await asyncio.sleep(0.01)
+
+	await asyncio.wait_for(wait_for_relaunch(), timeout=1)
+
+	assert factory.calls == 2
+	assert vite.running is True
+	assert vite.fatal_error is None
+	assert vite._restart_attempts == 0  # a ready relaunch resets the budget
+	assert any("exited unexpectedly" in msg for msg in capture)
+
+	await vite.stop()
+
+
+async def test_vite_process_shutdown_exit_does_not_relaunch(settings: DevServerSettings) -> None:
+	"""A stop()-initiated exit must never schedule a relaunch."""
+
+	class Factory:
+		def __init__(self) -> None:
+			self.calls = 0
+
+		async def __call__(self, *cmd: str, **_: Any) -> FakeProcess:
+			process = FakeProcess(
+				stdout_lines=None,
+				stderr_lines=None,
+				exit_code=0,
+				auto_exit=False,
+			)
+			process.start()
+			self.calls += 1
+			return process
+
+	factory = Factory()
+	capture: list[str] = []
+	logger = ConsoleLogger(secho=lambda msg, **_: capture.append(msg))
+
+	vite = ViteProcess(settings, logger=logger, process_factory=factory, stop_timeout=0.1)
+
+	await vite.start()
+	await asyncio.sleep(0)
+	await vite.stop()
+	await asyncio.sleep(0.05)
+
+	assert factory.calls == 1
+	assert vite._restart_task is None
+	assert vite.fatal_error is None
+	assert not any("attempting restart" in msg for msg in capture)
+
+
+async def test_vite_process_restart_exhaustion_surfaces_structured_error(
+	settings: DevServerSettings,
+) -> None:
+	"""Relaunch attempts are bounded; exhaustion records a ViteSupervisionError."""
+
+	class CrashingFactory:
+		def __init__(self) -> None:
+			self.calls = 0
+
+		async def __call__(self, *cmd: str, **_: Any) -> FakeProcess:
+			process = FakeProcess(stdout_lines=None, stderr_lines=None, exit_code=1)
+			process.start()
+			self.calls += 1
+			return process
+
+	factory = CrashingFactory()
+	capture: list[str] = []
+	logger = ConsoleLogger(secho=lambda msg, **_: capture.append(msg))
+
+	async def probe(host: str, port: int) -> bool:
+		return False
+
+	vite = ViteProcess(
+		settings,
+		logger=logger,
+		process_factory=factory,
+		restart_delay=0,
+		readiness_interval=0.01,
+		readiness_timeout=0.2,
+		probe=probe,
+		max_restart_attempts=2,
+		stop_timeout=0.1,
+	)
+
+	await vite.start()
+
+	async def wait_for_fatal() -> None:
+		while vite.fatal_error is None:
+			await asyncio.sleep(0.01)
+
+	await asyncio.wait_for(wait_for_fatal(), timeout=5)
+
+	error = vite.fatal_error
+	assert isinstance(error, ViteSupervisionError)
+	assert error.attempts == 2
+	assert "could not be relaunched" in str(error)
+	assert "pyxle dev" in str(error)
+	assert factory.calls == 3  # the initial launch + 2 relaunch attempts
+	assert vite.running is False
+	assert any("could not be relaunched" in msg for msg in capture)
+	assert any("relaunch attempt failed" in msg.lower() for msg in capture)
+
+	await vite.stop()
+
+
+async def test_vite_process_manual_start_clears_fatal_error(settings: DevServerSettings) -> None:
+	"""After exhaustion, an explicit start() resets the supervision budget."""
+
+	class Factory:
+		def __init__(self) -> None:
+			self.calls = 0
+
+		async def __call__(self, *cmd: str, **_: Any) -> FakeProcess:
+			process = FakeProcess(
+				stdout_lines=None,
+				stderr_lines=None,
+				exit_code=0,
+				auto_exit=False,
+			)
+			process.start()
+			self.calls += 1
+			return process
+
+	factory = Factory()
+	vite = ViteProcess(settings, process_factory=factory, stop_timeout=0.1)
+	vite._fatal_error = ViteSupervisionError(3)
+	vite._restart_attempts = 4
+
+	await vite.start()
+
+	assert vite.fatal_error is None
+	assert vite._restart_attempts == 0
+	assert vite.running is True
+
+	await vite.stop()
+
+
+async def test_vite_process_restart_loop_no_ops_when_already_stopping(
+	settings: DevServerSettings,
+) -> None:
+	"""A relaunch racing stop() exits immediately without spawning anything."""
+	stub = ProcessStub()
+	vite = ViteProcess(settings, process_factory=stub)
+	vite._stopping = True
+
+	await vite._restart_after_exit()
+
+	assert stub.created_commands == []
+	assert vite._restart_task is None
+	assert vite.fatal_error is None
+
+
+async def test_vite_supervisor_terminates_hung_child_and_stops_leak(
+	settings: DevServerSettings,
+) -> None:
+	"""A relaunched Vite that stays alive but never listens is terminated on
+	each failed attempt (so every attempt launches a FRESH process) and again
+	on budget exhaustion — no orphan survives the supervisor."""
+
+	class HungFactory:
+		def __init__(self) -> None:
+			self.calls = 0
+			self.processes: list[FakeProcess] = []
+
+		async def __call__(self, *cmd: str, **_: Any) -> FakeProcess:
+			# First process crashes to trigger the supervisor; every relaunch
+			# hangs: alive, but the probe below never reports ready.
+			auto_exit = self.calls == 0
+			process = FakeProcess(
+				stdout_lines=None,
+				stderr_lines=None,
+				exit_code=1 if auto_exit else 0,
+				auto_exit=auto_exit,
+			)
+			process.start()
+			self.calls += 1
+			self.processes.append(process)
+			return process
+
+	factory = HungFactory()
+	capture: list[str] = []
+	logger = ConsoleLogger(secho=lambda msg, **_: capture.append(msg))
+
+	async def never_ready(host: str, port: int) -> bool:
+		return False
+
+	vite = ViteProcess(
+		settings,
+		logger=logger,
+		process_factory=factory,
+		restart_delay=0,
+		readiness_timeout=0.05,
+		readiness_interval=0.01,
+		probe=never_ready,
+		stop_timeout=0.1,
+	)
+
+	await vite.start()
+
+	async def wait_for_exhaustion() -> None:
+		while vite.fatal_error is None:
+			await asyncio.sleep(0.01)
+
+	await asyncio.wait_for(wait_for_exhaustion(), timeout=5)
+
+	# One fresh process per attempt: the hung child never survives into the
+	# next iteration, and none survives exhaustion.
+	assert factory.calls == 1 + vite._max_restart_attempts
+	assert all(process.returncode is not None for process in factory.processes)
+	assert vite.running is False
+	assert any("terminating the hung process" in msg for msg in capture)
+
+	await vite.stop()

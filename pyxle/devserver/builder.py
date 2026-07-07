@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import shutil
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict
@@ -47,9 +48,33 @@ class BuildSummary:
         )
 
 
-def build_once(settings: DevServerSettings, *, force_rebuild: bool = False) -> BuildSummary:
-    """Run a single build pass for the project located at ``settings``."""
+#: Serializes build passes within the process. The watcher debounces
+#: filesystem events, but a debounce timer that fires while a previous build
+#: is still running starts a second pass on another thread
+#: (``threading.Timer.cancel()`` cannot stop a timer that has already fired).
+#: Two interleaved passes read and rewrite the same ``meta.json`` and
+#: generated artifacts; a torn read used to make
+#: :func:`ensure_fresh_build_cache` mistake a mid-write ``meta.json`` for a
+#: schema mismatch and wipe the whole build cache — deleting and recreating
+#: ``vite.config.js``, which Vite answers with a full (and racy) dev-server
+#: restart. Running one pass at a time keeps every pass' view of the cache
+#: consistent.
+_BUILD_PASS_LOCK = threading.Lock()
 
+
+def build_once(settings: DevServerSettings, *, force_rebuild: bool = False) -> BuildSummary:
+    """Run a single build pass for the project located at ``settings``.
+
+    Passes are serialized process-wide (see :data:`_BUILD_PASS_LOCK`): a call
+    that arrives while another pass is running blocks until that pass
+    finishes, then rebuilds against the fresh metadata it left behind.
+    """
+
+    with _BUILD_PASS_LOCK:
+        return _build_once_locked(settings, force_rebuild=force_rebuild)
+
+
+def _build_once_locked(settings: DevServerSettings, *, force_rebuild: bool) -> BuildSummary:
     paths, previous_metadata = ensure_fresh_build_cache(settings)
     sources = scan_source_tree(settings)
     summary = BuildSummary()

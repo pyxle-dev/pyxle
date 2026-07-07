@@ -2701,3 +2701,136 @@ async def test_nav_payload_carries_error_asset_when_boundary_present(
     )
     body = json.loads((await _read_response_body(response)).decode())
     assert body["page"]["errorAssetPath"] == "/pages/error.jsx"
+
+
+# ---------------------------------------------------------------------------
+# Missing request.state attribute guidance
+# ---------------------------------------------------------------------------
+
+
+def test_missing_state_attribute_matches_starlette_state_error() -> None:
+    """Only Starlette's exact State AttributeError pattern is recognized."""
+    from starlette.datastructures import State
+
+    try:
+        State().db
+    except AttributeError as exc:
+        state_error = exc
+
+    assert ssr_view.missing_state_attribute(state_error) == "db"
+    assert ssr_view.missing_state_attribute(AttributeError("boom")) is None
+    assert (
+        ssr_view.missing_state_attribute(
+            ValueError("'State' object has no attribute 'db'")
+        )
+        is None
+    )
+
+
+def test_missing_request_state_error_messages() -> None:
+    """'db' gets the pyxle-db pointer; other names get the generic guidance."""
+    db_error = ssr_view.MissingRequestStateError("db")
+    assert db_error.attribute == "db"
+    assert "request.state.db is not set" in str(db_error)
+    assert "pyxle-db" in str(db_error)
+    assert '"plugins": ["pyxle-db"]' in str(db_error)
+
+    generic = ssr_view.MissingRequestStateError("session")
+    assert generic.attribute == "session"
+    assert "request.state.session is not set" in str(generic)
+    assert "plugins or middleware" in str(generic)
+    assert "pyxle-db" in str(generic)  # the example still shows the pattern
+
+
+def _state_page(tmp_path: Path, loader_body: str) -> PageRoute:
+    server_module = tmp_path / "server" / "state_page.py"
+    server_module.parent.mkdir(parents=True, exist_ok=True)
+    server_module.write_text(
+        f"async def load_home(request):\n    {loader_body}\n",
+        encoding="utf-8",
+    )
+    page = _page_route(tmp_path, loader_name="load_home")
+    return replace(page, server_module_path=server_module, module_key="pyxle.server.pages.state_page")
+
+
+@pytest.mark.anyio
+async def test_execute_loader_wraps_missing_state_with_guidance(tmp_path: Path) -> None:
+    """request.state.db without a provider → MissingRequestStateError, chained."""
+    page = _state_page(tmp_path, "return {'rows': request.state.db}")
+    request = Request({"type": "http", "method": "GET", "path": "/", "headers": []})
+
+    with pytest.raises(ssr_view.MissingRequestStateError) as excinfo:
+        await ssr_view._execute_loader(page, request, module=None, debug=True)
+
+    assert excinfo.value.attribute == "db"
+    assert isinstance(excinfo.value.__cause__, AttributeError)
+    assert "'State' object has no attribute 'db'" in str(excinfo.value.__cause__)
+
+
+@pytest.mark.anyio
+async def test_execute_loader_other_attribute_error_flows_through(tmp_path: Path) -> None:
+    """Any other AttributeError is re-raised untouched (no wrapping)."""
+    page = _state_page(tmp_path, "raise AttributeError('boom')")
+    request = Request({"type": "http", "method": "GET", "path": "/", "headers": []})
+
+    with pytest.raises(AttributeError) as excinfo:
+        await ssr_view._execute_loader(page, request, module=None, debug=True)
+
+    assert not isinstance(excinfo.value, ssr_view.MissingRequestStateError)
+    assert str(excinfo.value) == "boom"
+
+
+@pytest.mark.anyio
+async def test_build_page_response_missing_state_shows_guidance_in_dev(
+    settings: DevServerSettings, tmp_path: Path
+) -> None:
+    page = _state_page(tmp_path, "return {'rows': request.state.db}")
+    renderer = StubRenderer()
+    overlay = StubOverlay()
+    request = Request(
+        {"type": "http", "http_version": "1.1", "method": "GET", "path": "/", "root_path": "", "headers": []}
+    )
+
+    response = await build_page_response(
+        request=request,
+        settings=settings,
+        page=page,
+        renderer=renderer,
+        overlay=overlay,
+    )
+
+    body = (await _read_response_body(response)).decode()
+    assert response.status_code == 500
+    assert "MissingRequestStateError" in body
+    assert "pyxle-db" in body
+
+    # The overlay breadcrumb carries the same guidance for the dev overlay.
+    assert overlay.events and overlay.events[0][0] == "error"
+    breadcrumbs = overlay.events[0][2]
+    assert breadcrumbs[0]["status"] == "failed"
+    assert "request.state.db is not set" in breadcrumbs[0]["detail"]
+
+
+@pytest.mark.anyio
+async def test_build_page_response_missing_state_stays_generic_in_production(
+    settings: DevServerSettings, tmp_path: Path
+) -> None:
+    prod_settings = replace(settings, debug=False)
+    page = _state_page(tmp_path, "return {'rows': request.state.db}")
+    renderer = StubRenderer()
+    request = Request(
+        {"type": "http", "http_version": "1.1", "method": "GET", "path": "/", "root_path": "", "headers": []}
+    )
+
+    response = await build_page_response(
+        request=request,
+        settings=prod_settings,
+        page=page,
+        renderer=renderer,
+    )
+
+    body = (await _read_response_body(response)).decode()
+    assert response.status_code == 500
+    assert "pyxle-db" not in body
+    assert "request.state" not in body
+    assert "MissingRequestStateError" not in body
