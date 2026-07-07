@@ -9,7 +9,7 @@ Every page of a Pyxle app can serve a clean **Markdown** rendition of itself —
 That single line gives you:
 
 - **Per-page Markdown** at each URL with `.md` appended — `/docs/routing` → `/docs/routing.md`.
-- **Content negotiation** — the *same* URL returns Markdown to any request that sends `Accept: text/markdown`. Browsers never send it, so humans are unaffected.
+- **Content negotiation** — the *same* URL returns Markdown to any request whose `Accept` header asks for `text/markdown`, negotiated with proper [RFC 9110](https://www.rfc-editor.org/rfc/rfc9110#section-12.5.1) q-values. Browsers never send it, so humans are unaffected.
 - **An `/llms.txt` index** — the [llms.txt](https://llmstxt.org/) convention: a Markdown map of your site.
 - **Discovery headers** on every response — `Link: </llms.txt>; rel="llms-txt"` and `X-Llms-Txt: /llms.txt` — so an agent finds the index without parsing HTML.
 
@@ -130,6 +130,8 @@ Returning `None` **declines** and defers to the next ancestor (and ultimately to
 
 If nothing above resolves and you've set `"autoConvert": true`, Pyxle renders the page and converts its HTML to Markdown with a small, **dependency-free** converter. It's **off by default** and deliberately best-effort: headings, paragraphs, lists, links, emphasis, and code survive; layout chrome, tables, and rich components may not. Treat it as "something is better than a redirect" — prefer an authored `.md` or a handler for anything you care about.
 
+Converted pages keep agents **on the Markdown channel**: internal links to other pages are rewritten to their `.md` renditions — `[About](/about)` becomes `[About](/about.md)`, with query strings and fragments preserved (`/about?x=1#y` → `/about.md?x=1#y`). External URLs, `mailto:`/`tel:` links, `/api/` routes, asset paths with a file extension, and links already ending in `.md` are left untouched. See [`html_to_markdown`](#ctxrender_html--post-processing-the-rendered-page) for the same behavior in your own handlers.
+
 ### The redirect fallback
 
 With the feature on but no Markdown source and `autoConvert` off, `/<page>.md` returns a **`307` redirect** to `/<page>`. An agent that guesses a `.md` URL lands on the real page instead of a 404.
@@ -177,8 +179,10 @@ from pyxle.devserver.llms import html_to_markdown   # the built-in converter
 
 async def to_markdown(ctx):
     html = await ctx.render_html()
-    return html_to_markdown(html)          # roughly what autoConvert does, but on your terms
+    return html_to_markdown(html)          # what autoConvert does, but on your terms
 ```
+
+`html_to_markdown` rewrites internal page links to their `.md` renditions by default (exactly like [autoConvert](#autoconvert-the-lossy-fallback)); pass `rewrite_links=False` to keep every `href` verbatim.
 
 It's lazy and potentially expensive (a full SSR pass), so only call it when you need it. When you want the page's *data* rather than its rendered HTML, reach for `ctx.run_loader()` instead — it's much cheaper.
 
@@ -220,7 +224,7 @@ def wrap_markdown(ctx, markdown):
     return f"{header}\n{markdown}"
 ```
 
-Because it runs on Markdown from *every* source (co-located files, `to_markdown` handlers, `autoConvert`), the framing is defined **once** and applied everywhere. Return `None` to leave the Markdown untouched. And because it's applied at serve time — not baked into your source — your `/llms-full.txt` corpus and the raw `.md` files stay clean.
+Because it runs on Markdown from *every* source (co-located files, `to_markdown` handlers, `autoConvert`), the framing is defined **once** and applied everywhere — and it always receives the *final* resolved Markdown, so `autoConvert` output arrives with its internal links already rewritten to `.md`. Return `None` to leave the Markdown untouched. And because it's applied at serve time — not baked into your source — your `/llms-full.txt` corpus and the raw `.md` files stay clean.
 
 ---
 
@@ -230,7 +234,12 @@ Because it runs on Markdown from *every* source (co-located files, `to_markdown`
 
 1. a **static `public/llms.txt`** (served by the static-asset layer before anything else) — full manual control;
 2. a **`llms_txt`** function in the root `pages/llms.py` — generate it dynamically;
-3. a **generated** default: an `H1` plus a `## Pages` list linking every concrete (non-parameterised) page's `.md`.
+3. a **generated** default: an `H1` plus a `## Pages` list of every concrete (non-parameterised) page.
+
+The generated default is precise about what it advertises:
+
+- **Links are absolute**, derived from the request's scheme and host (`https://example.com/about.md`) — so the index still points home when it's saved to disk or pasted into a chat. Behind a reverse proxy, run uvicorn with proxy-header support (`pyxle serve` does) so the advertised origin is the public one.
+- **A page is linked at its `.md` URL only when that URL actually serves Markdown.** Each page is checked against the same [resolution ladder](#how-a-pages-markdown-is-resolved) `.md` requests use: a co-located `.md` file, a page-local `to_markdown`, or an ancestor `llms.py` handler qualifies it — and with `autoConvert` on, every page qualifies. A page with no source is listed at its **canonical HTML URL** instead, so the index never advertises a `.md` link that would just redirect.
 
 For a site with dynamic content — docs, a blog, a catalog — the generated default can't enumerate your dynamic routes, so provide a `llms_txt` hook:
 
@@ -261,8 +270,29 @@ Each entry in `ctx.pages` is an **`LlmsPageInfo`** — `path` (e.g. `/about`), `
 
 Beyond the `.md` URLs, two things make the feature work for agents that don't append `.md`:
 
-- **`Accept: text/markdown` negotiation.** A request to the *canonical* URL (`/docs/routing`) that includes `text/markdown` in its `Accept` header gets the Markdown, resolved through the exact same ladder. Browsers never send that header, so this is invisible to human visitors. The response carries `Vary: Accept` so shared caches key on it correctly.
+- **`Accept: text/markdown` negotiation.** A request to the *canonical* URL (`/docs/routing`) whose `Accept` header prefers `text/markdown` gets the Markdown, resolved through the exact same ladder. Browsers never ask for it, so this is invisible to human visitors. The response carries `Vary: Accept` so shared caches key on it correctly.
 - **Discovery headers.** Every response advertises the index: `Link: </llms.txt>; rel="llms-txt"` and `X-Llms-Txt: /llms.txt`. An agent can find your `llms.txt` from any page without parsing the body.
+
+### Negotiation rules
+
+The `Accept` header is negotiated per [RFC 9110 §12.5.1](https://www.rfc-editor.org/rfc/rfc9110#section-12.5.1). Markdown is served when **both** hold:
+
+1. `text/markdown` appears as an **exact media type** with `q > 0`. Matching is by type/subtype token, case-insensitive — never by substring — and wildcards (`*/*`, `text/*`) never select Markdown, so ordinary browser headers keep getting HTML.
+2. Its q-weight is **at least** the effective weight of `text/html` (which *does* pick up wildcard ranges). Ties go to Markdown — the client asked for it explicitly.
+
+In practice:
+
+| `Accept` header | Serves | Why |
+|---|---|---|
+| `text/markdown` | Markdown | explicit, q defaults to 1.0 |
+| `text/markdown, text/html` | Markdown | equal weight — explicit ask wins the tie |
+| `text/html;q=0.9, text/markdown;q=0.8` | HTML | HTML weighted higher |
+| `text/html, text/markdown;q=0` | HTML | `q=0` means *not acceptable* |
+| `text/markdown;q=0.5, */*;q=0.9` | HTML | HTML is 0.9 via the wildcard |
+| `text/html,application/xhtml+xml,…,*/*;q=0.8` (a browser) | HTML | no explicit `text/markdown` |
+| `text/markdownish` or malformed garbage | HTML | no substring matching; parsing never raises |
+
+q-values default to `1.0` and are clamped to `0..1`; malformed media-ranges are ignored and an unusable header falls back to HTML.
 
 ---
 
@@ -299,7 +329,7 @@ Ship a normal XML sitemap alongside it. (OpenAI and Anthropic expose separate to
 
 **Serve docs from generated JSON** (as pyxle.dev does): one directory handler maps a slug to a pre-built Markdown field. See [directory handler](#3-a-directory-llmspy-handler-covers-a-route-subtree) above.
 
-**Rewrite links for portability.** Markdown that travels (pasted into a chat, saved to disk) should carry absolute links. Rewrite relative links to absolute `.md` URLs when you generate or store the Markdown, so `[Routing](../routing.md)` becomes `[Routing](https://example.com/docs/routing.md)`.
+**Rewrite links for portability.** Internal links already point at `.md` renditions — [autoConvert](#autoconvert-the-lossy-fallback) and `html_to_markdown` rewrite them for you. But Markdown that travels (pasted into a chat, saved to disk) should also carry **absolute** links. Make them absolute when you generate or store the Markdown, so `[Routing](/docs/routing.md)` becomes `[Routing](https://example.com/docs/routing.md)` — the generated `/llms.txt` already does this.
 
 **Add an agent search endpoint.** Agents can search by fetching `/llms-full.txt` and scanning it, but a dedicated endpoint is nicer. A plain `pages/api/*.py` route that ranks your content and returns Markdown links works well — then point to it from `wrap_markdown`:
 
@@ -329,7 +359,7 @@ async def endpoint(request):
 
 **Is this the same as Mintlify's `.md`/llms.txt?** Same idea, but built into the framework and applied to your *whole app*, not just a hosted docs site — and you control exactly where each page's Markdown comes from.
 
-**Who reads all this?** Right now, the clearest win is direct: point any AI assistant — Claude, Cursor, ChatGPT — at a `.md` URL or your `llms.txt` and it gets clean, token-efficient context instead of scraped HTML. Beyond that, `.md` and [llms.txt](https://llmstxt.org/) are the conventions the AI ecosystem is standardizing on — so your app already speaks the format machine readers are moving toward, served to spec (per-page Markdown, `Accept` negotiation, discovery headers) with nothing more to do as adoption grows.
+**Who reads all this?** Right now, the clearest win is direct: point any AI assistant — Claude, Cursor, ChatGPT — at a `.md` URL or your `llms.txt` and it gets clean, token-efficient context instead of scraped HTML. Beyond that, `.md` and [llms.txt](https://llmstxt.org/) are the conventions the AI ecosystem is standardizing on — so your app already speaks the format machine readers are moving toward, served to spec (per-page Markdown, RFC 9110 `Accept` negotiation, discovery headers) with nothing more to do as adoption grows.
 
 ---
 

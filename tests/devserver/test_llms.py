@@ -63,6 +63,53 @@ def test_wants_markdown():
     assert llms.wants_markdown(req_none) is False
 
 
+@pytest.mark.parametrize(
+    "accept,expected",
+    [
+        # -- explicit opt-in ------------------------------------------------
+        ("text/markdown", True),
+        ("text/markdown, text/html", True),  # equal q -> markdown wins ties
+        ("text/html, text/markdown", True),
+        ("TEXT/MARKDOWN", True),  # type/subtype match is case-insensitive
+        ("text/markdown;q=0.5", True),  # html absent -> not acceptable
+        ("text/markdown;q=0.9, text/html;q=0.8", True),
+        ("text/markdown, */*;q=0.1", True),  # html only via low-q wildcard
+        ("text/html;q=0, text/markdown;q=0.001", True),  # html excluded
+        ("text/markdown;level=1;q=0.3, text/html;q=0.2", True),  # extra params
+        ('text/markdown;note="a,b"', True),  # quoted comma inside a param
+        ("text/markdown;q=2", True),  # q clamped to 1.0
+        ("text/markdown;q=abc", True),  # malformed q -> default 1.0
+        ("text/markdown;q=nan", True),  # non-finite q -> default 1.0
+        ("text/markdown;q=0.5;q=0", True),  # first q ends media params (accept-ext)
+        # -- browsers / no explicit markdown --------------------------------
+        ("", False),
+        ("text/html", False),
+        ("application/json", False),
+        ("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", False),
+        ("*/*", False),  # wildcards never select markdown
+        ("text/*", False),
+        # -- substring must NOT match (the original bug) ---------------------
+        ("text/markdownish", False),
+        ("application/text/markdown", False),
+        # -- q-value semantics (RFC 9110 §12.5.1) ----------------------------
+        ("text/html, text/markdown;q=0", False),  # q=0 means NOT acceptable
+        ("text/html;q=0.9, text/markdown;q=0.8", False),  # HTML preferred
+        ("text/markdown;q=0.5, */*;q=0.9", False),  # html effective 0.9 via wildcard
+        ("text/markdown;q=-1", False),  # clamped to 0 -> excluded
+        ('text/markdown;note="a,b";q=0', False),  # q=0 after quoted comma
+        # -- malformed headers never raise, fall back to HTML ----------------
+        ("garbage", False),
+        ("text/", False),
+        ("/markdown", False),
+        ("text/a/b", False),
+        (";;;,,,", False),
+        (",", False),
+    ],
+)
+def test_markdown_is_acceptable(accept, expected):
+    assert llms.markdown_is_acceptable(accept) is expected
+
+
 def test_is_enabled():
     assert llms.is_enabled(None) is False
     assert llms.is_enabled(SimpleNamespace(enabled=False)) is False
@@ -90,7 +137,7 @@ def test_html_to_markdown_structure():
     assert "# Title" in md
     assert "**world**" in md
     assert "*friends*" in md
-    assert "[here](/x)" in md
+    assert "[here](/x.md)" in md  # internal links are rewritten by default
     assert "- one" in md and "- two" in md
     assert "1. first" in md and "2. second" in md
     assert "x = 1\ny = 2" in md  # code preserved verbatim
@@ -111,6 +158,69 @@ def test_html_to_markdown_link_without_href():
     md = llms.html_to_markdown("<a>bare</a>")
     assert "bare" in md
     assert "](" not in md
+
+
+# ---------------------------------------------------------------------------
+# Internal-link rewriting (autoConvert / html_to_markdown default)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "href,expected",
+    [
+        # rewritten: extensionless page paths get .md, query/fragment preserved
+        ("/about", "/about.md"),
+        ("/about?x=1", "/about.md?x=1"),
+        ("/about#y", "/about.md#y"),
+        ("/about?x=1#y", "/about.md?x=1#y"),
+        ("/", "/index.md"),
+        ("/docs/", "/docs.md"),  # trailing slash -> canonical page path
+        ("/docs/v1.2/intro", "/docs/v1.2/intro.md"),  # dot in a non-final segment
+        ("docs/intro", "docs/intro.md"),  # relative links too
+        ("../routing", "../routing.md"),
+        ("/apinot", "/apinot.md"),  # /api prefix must match on segment boundary
+        # untouched: external / protocol links
+        ("https://example.com/about", "https://example.com/about"),
+        ("http://example.com/", "http://example.com/"),
+        ("//cdn.example.com/lib.js", "//cdn.example.com/lib.js"),
+        ("mailto:hi@example.com", "mailto:hi@example.com"),
+        ("tel:+15550100", "tel:+15550100"),
+        # untouched: API routes
+        ("/api", "/api"),
+        ("/api/search?q=x", "/api/search?q=x"),
+        # untouched: assets and existing .md links
+        ("/logo.png", "/logo.png"),
+        ("/styles/site.css", "/styles/site.css"),
+        ("/about.md", "/about.md"),
+        # untouched: same-page and empty links
+        ("#section", "#section"),
+        ("?q=1", "?q=1"),
+        ("", ""),
+        # untouched: unparseable URL never raises
+        ("https://[bad", "https://[bad"),
+    ],
+)
+def test_rewrite_internal_href(href, expected):
+    assert llms._rewrite_internal_href(href) == expected
+
+
+def test_html_to_markdown_rewrites_links_by_default():
+    html = (
+        '<p><a href="/about?x=1#y">About</a> '
+        '<a href="https://ext.example/z">Ext</a> '
+        '<a href="/api/search">API</a> '
+        '<a href="/logo.png">Logo</a></p>'
+    )
+    md = llms.html_to_markdown(html)
+    assert "[About](/about.md?x=1#y)" in md
+    assert "[Ext](https://ext.example/z)" in md
+    assert "[API](/api/search)" in md
+    assert "[Logo](/logo.png)" in md
+
+
+def test_html_to_markdown_rewrite_links_opt_out():
+    md = llms.html_to_markdown('<a href="/about">About</a>', rewrite_links=False)
+    assert "[About](/about)" in md
 
 
 # ---------------------------------------------------------------------------
@@ -204,7 +314,7 @@ async def test_auto_convert_fallback(app_tree, monkeypatch):
     import pyxle.ssr.view as view
 
     async def fake_render(*, request, settings, page, renderer, suppress_per_user=False):
-        return "<h1>Converted</h1>", 200
+        return '<h1>Converted</h1><a href="/about">About</a>', 200
 
     monkeypatch.setattr(view, "render_page_body_html", fake_render)
     (app_tree.pages / "z.pyxl").write_text("x")
@@ -212,6 +322,8 @@ async def test_auto_convert_fallback(app_tree, monkeypatch):
     cfg = SimpleNamespace(enabled=True, auto_convert=True)
     md = await _resolve(app_tree, page, "/z.md", config=cfg)
     assert "# Converted" in md
+    # autoConvert output keeps agents on the markdown channel
+    assert "[About](/about.md)" in md
 
 
 async def test_no_source_returns_none(app_tree):
@@ -234,19 +346,74 @@ async def test_handler_must_return_str_or_none(app_tree):
 # ---------------------------------------------------------------------------
 
 
-def _routes(*paths):
-    return SimpleNamespace(pages=[SimpleNamespace(path=p) for p in paths])
+def _routes_in(app_tree, *specs):
+    """Route table of full page descriptors; each spec is ``(rel_source, path)``."""
+    return SimpleNamespace(pages=[_page_in(app_tree, rel, path) for rel, path in specs])
 
 
-def test_build_llms_txt(tmp_path):
-    settings = SimpleNamespace(project_root=tmp_path / "acme-docs", pages_dir=tmp_path)
-    routes = _routes("/", "/about", "/docs/{slug:path}", "/benchmarks")
-    txt = llms.build_llms_txt(routes=routes, settings=settings)
-    assert txt.startswith("# Acme Docs")
-    assert "- [Home](/index.md)" in txt
-    assert "- [About](/about.md)" in txt
-    assert "- [Benchmarks](/benchmarks.md)" in txt
+def test_build_llms_txt_links_md_only_when_it_resolves(app_tree):
+    # about has a co-located .md -> .md link; bare has no source -> HTML link
+    (app_tree.pages / "about.pyxl").write_text("x")
+    (app_tree.pages / "about.md").write_text("# About\n")
+    (app_tree.pages / "bare.pyxl").write_text("x")
+    routes = _routes_in(
+        app_tree,
+        ("index.pyxl", "/"),
+        ("about.pyxl", "/about"),
+        ("bare.pyxl", "/bare"),
+        ("docs/[[...slug]].pyxl", "/docs/{slug:path}"),
+    )
+    txt = llms.build_llms_txt(
+        routes=routes,
+        settings=app_tree.settings,
+        config=app_tree.settings.llms,
+        base_url="https://example.com",
+    )
+    assert txt.startswith("# ")
+    assert "## Pages" in txt
+    assert "- [About](https://example.com/about.md)" in txt
+    assert "- [Bare](https://example.com/bare)" in txt  # never a dead-end .md link
+    assert "- [Home](https://example.com/)" in txt  # no source -> HTML URL
     assert "slug" not in txt  # dynamic route omitted
+
+
+def test_build_llms_txt_handlers_count_as_markdown(app_tree):
+    # a page-local to_markdown and a directory llms.py both make .md real
+    (app_tree.pages / "p.pyxl").write_text("x")
+    (app_tree.pages / "p.py").write_text("def to_markdown(ctx):\n    return '# P'\n")
+    (app_tree.pages / "docs" / "intro.pyxl").write_text("x")
+    (app_tree.pages / "docs" / "llms.py").write_text(
+        "def to_markdown(ctx):\n    return '# D'\n"
+    )
+    routes = _routes_in(app_tree, ("p.pyxl", "/p"), ("docs/intro.pyxl", "/docs/intro"))
+    txt = llms.build_llms_txt(
+        routes=routes,
+        settings=app_tree.settings,
+        config=app_tree.settings.llms,
+        base_url="https://example.com",
+    )
+    assert "- [P](https://example.com/p.md)" in txt
+    assert "- [Intro](https://example.com/docs/intro.md)" in txt
+
+
+def test_build_llms_txt_auto_convert_links_every_page(app_tree):
+    (app_tree.pages / "bare.pyxl").write_text("x")
+    routes = _routes_in(app_tree, ("bare.pyxl", "/bare"))
+    cfg = SimpleNamespace(enabled=True, auto_convert=True)
+    txt = llms.build_llms_txt(
+        routes=routes, settings=app_tree.settings, config=cfg, base_url="https://example.com"
+    )
+    assert "- [Bare](https://example.com/bare.md)" in txt
+
+
+def test_build_llms_txt_empty_base_url_is_relative(app_tree):
+    (app_tree.pages / "about.pyxl").write_text("x")
+    (app_tree.pages / "about.md").write_text("# About\n")
+    routes = _routes_in(app_tree, ("about.pyxl", "/about"))
+    txt = llms.build_llms_txt(
+        routes=routes, settings=app_tree.settings, config=app_tree.settings.llms
+    )
+    assert "- [About](/about.md)" in txt
 
 
 # ---------------------------------------------------------------------------
@@ -301,16 +468,21 @@ def test_markdown_route_dynamic_slug(app_tree):
 
 
 def test_llms_txt_route_default_and_hook(app_tree):
-    routes = _routes("/", "/about")
-    # default generated index
+    (app_tree.pages / "about.pyxl").write_text("x")
+    (app_tree.pages / "about.md").write_text("# About\n")
+    (app_tree.pages / "bare.pyxl").write_text("x")
+    routes = _routes_in(app_tree, ("about.pyxl", "/about"), ("bare.pyxl", "/bare"))
+    # default generated index: absolute URLs from the request's scheme + host,
+    # .md only for pages whose markdown actually resolves
     default_route = llms.make_llms_txt_route(routes, settings=app_tree.settings)
     client = TestClient(Starlette(routes=[default_route]))
     resp = client.get("/llms.txt")
     assert resp.status_code == 200
     assert "## Pages" in resp.text
-    assert "- [About](/about.md)" in resp.text
+    assert "- [About](http://testserver/about.md)" in resp.text
+    assert "- [Bare](http://testserver/bare)" in resp.text
 
-    # hook override in root pages/llms.py
+    # hook override in root pages/llms.py; render_default() keeps the same links
     (app_tree.pages / "llms.py").write_text(
         "def llms_txt(ctx):\n    return '# Custom\\n' + ctx.render_default()\n"
     )
@@ -319,6 +491,7 @@ def test_llms_txt_route_default_and_hook(app_tree):
     resp2 = client2.get("/llms.txt")
     assert resp2.text.startswith("# Custom\n")
     assert "## Pages" in resp2.text
+    assert "- [About](http://testserver/about.md)" in resp2.text
 
 
 def test_discovery_middleware_adds_headers():
@@ -454,15 +627,21 @@ async def test_local_handler_import_failure_falls_through(app_tree):
 
 
 def test_llms_txt_hook_returning_none_falls_back(app_tree):
+    (app_tree.pages / "about.pyxl").write_text("x")
     (app_tree.pages / "llms.py").write_text("def llms_txt(ctx):\n    return None\n")
-    route = llms.make_llms_txt_route(_routes("/", "/about"), settings=app_tree.settings)
+    route = llms.make_llms_txt_route(
+        _routes_in(app_tree, ("about.pyxl", "/about")), settings=app_tree.settings
+    )
     resp = TestClient(Starlette(routes=[route])).get("/llms.txt")
     assert resp.status_code == 200 and "## Pages" in resp.text
 
 
 def test_llms_txt_hook_error_falls_back(app_tree):
+    (app_tree.pages / "about.pyxl").write_text("x")
     (app_tree.pages / "llms.py").write_text("def llms_txt(ctx):\n    raise RuntimeError('x')\n")
-    route = llms.make_llms_txt_route(_routes("/", "/about"), settings=app_tree.settings)
+    route = llms.make_llms_txt_route(
+        _routes_in(app_tree, ("about.pyxl", "/about")), settings=app_tree.settings
+    )
     resp = TestClient(Starlette(routes=[route])).get("/llms.txt")
     assert resp.status_code == 200 and "## Pages" in resp.text
 
@@ -488,6 +667,38 @@ def test_html_to_markdown_blockquote_and_nested_list():
 # ---------------------------------------------------------------------------
 # wrap_markdown hook (root pages/llms.py frames every .md response)
 # ---------------------------------------------------------------------------
+
+
+def test_markdown_route_auto_convert_rewrites_links_and_wrap_sees_them(
+    app_tree, monkeypatch
+):
+    import pyxle.ssr.view as view
+
+    async def fake_render(*, request, settings, page, renderer, suppress_per_user=False):
+        html = (
+            '<p>See <a href="/about?x=1#y">about</a>, '
+            '<a href="https://ext.example/z">ext</a> and '
+            '<a href="/api/go">api</a>.</p>'
+        )
+        return html, 200
+
+    monkeypatch.setattr(view, "render_page_body_html", fake_render)
+    (app_tree.pages / "z.pyxl").write_text("x")
+    (app_tree.pages / "llms.py").write_text(
+        "def wrap_markdown(ctx, md):\n    return 'HDR\\n' + md\n"
+    )
+    routes = SimpleNamespace(pages=[_page_in(app_tree, "z.pyxl", "/z")])
+    cfg = SimpleNamespace(enabled=True, auto_convert=True)
+    md_routes = llms.build_markdown_routes(
+        routes, settings=app_tree.settings, renderer=None, config=cfg
+    )
+    resp = TestClient(Starlette(routes=md_routes)).get("/z.md")
+    assert resp.status_code == 200
+    # wrap_markdown received the already-rewritten markdown
+    assert resp.text.startswith("HDR\n")
+    assert "[about](/about.md?x=1#y)" in resp.text
+    assert "[ext](https://ext.example/z)" in resp.text
+    assert "[api](/api/go)" in resp.text
 
 
 async def test_wrap_markdown_hook_frames_output(app_tree):
@@ -556,3 +767,28 @@ async def test_run_loader_no_loader_returns_empty(app_tree):
     )
     page = _page_in(app_tree, "q.pyxl", "/q", has_loader=False, loader_name=None)
     assert await _resolve(app_tree, page, "/q.md") == "EMPTY"
+
+
+def test_llms_txt_sync_hook_runs_off_event_loop(app_tree):
+    """A sync ``llms_txt`` hook runs in a worker thread (no running event
+    loop), so a hook that calls ``ctx.render_default()`` — filesystem checks
+    plus module imports — can never block the loop."""
+    (app_tree.pages / "about.pyxl").write_text("x")
+    (app_tree.pages / "about.md").write_text("# About\n")
+    routes = _routes_in(app_tree, ("about.pyxl", "/about"))
+    (app_tree.pages / "llms.py").write_text(
+        "import asyncio\n"
+        "def llms_txt(ctx):\n"
+        "    try:\n"
+        "        asyncio.get_running_loop()\n"
+        "        marker = 'ON_LOOP'\n"
+        "    except RuntimeError:\n"
+        "        marker = 'OFF_LOOP'\n"
+        "    return f'# {marker}\\n' + ctx.render_default()\n"
+    )
+    route = llms.make_llms_txt_route(routes, settings=app_tree.settings)
+    client = TestClient(Starlette(routes=[route]))
+    resp = client.get("/llms.txt")
+    assert resp.status_code == 200
+    assert resp.text.startswith("# OFF_LOOP\n")
+    assert "- [About](http://testserver/about.md)" in resp.text

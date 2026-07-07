@@ -2,8 +2,9 @@
 
 Enabled with the ``llms`` block in ``pyxle.config.json`` (see
 :class:`pyxle.config.LlmsConfig`). When on, the framework serves a markdown
-rendition of each page at its URL with ``.md`` appended — and to requests that
-send ``Accept: text/markdown`` — advertises the index via ``Link`` /
+rendition of each page at its URL with ``.md`` appended — and to requests whose
+``Accept`` header prefers ``text/markdown``, negotiated with RFC 9110 q-values
+(see :func:`markdown_is_acceptable`) — advertises the index via ``Link`` /
 ``X-Llms-Txt`` discovery headers, and serves a generated ``/llms.txt``
 (overridable by a static ``public/llms.txt``, which the static-asset middleware
 serves first).
@@ -33,10 +34,12 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import math
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
+from urllib.parse import urlsplit, urlunsplit
 
 from starlette.datastructures import MutableHeaders
 from starlette.requests import Request
@@ -341,18 +344,49 @@ _BLOCK_TAGS = frozenset(
 )
 
 
+def _rewrite_internal_href(href: str) -> str:
+    """Rewrite an internal page href to its ``.md`` URL; leave everything else.
+
+    Rewrites relative and root-relative links to extensionless page paths —
+    ``/about?x=1#y`` → ``/about.md?x=1#y``, ``/`` → ``/index.md`` — keeping
+    query strings and fragments intact. Left untouched: URLs with a scheme or
+    host (``https://…``, ``mailto:``, ``tel:``, protocol-relative ``//host``),
+    ``/api/`` routes, fragment- or query-only links, and paths whose last
+    segment has a file extension (assets, and links already ending in ``.md``).
+    """
+    try:
+        parts = urlsplit(href)
+    except ValueError:
+        return href
+    if parts.scheme or parts.netloc:
+        return href
+    path = parts.path
+    if not path:
+        return href
+    if path == "/api" or path.startswith("/api/"):
+        return href
+    last_segment = path.rstrip("/").rsplit("/", 1)[-1]
+    if "." in last_segment:
+        return href
+    md_path = "/index.md" if path == "/" else path.rstrip("/") + ".md"
+    return urlunsplit(("", "", md_path, parts.query, parts.fragment))
+
+
 class _MarkdownExtractor(HTMLParser):
     """Convert a fragment of rendered HTML into approximate markdown.
 
     Deliberately small and dependency-free: it covers the common structural
     tags (headings, paragraphs, lists, links, emphasis, code, blockquotes,
-    rules) and drops everything it doesn't understand to plain text. This backs
-    the opt-in ``auto_convert`` fallback only — author-provided markdown or a
-    handler always produces cleaner output.
+    rules) and drops everything it doesn't understand to plain text. With
+    ``rewrite_links`` internal page hrefs are rewritten to their ``.md``
+    renditions (see :func:`_rewrite_internal_href`). This backs the opt-in
+    ``auto_convert`` fallback only — author-provided markdown or a handler
+    always produces cleaner output.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, rewrite_links: bool = False) -> None:
         super().__init__(convert_charrefs=True)
+        self._rewrite_links = rewrite_links
         self._out: list[str] = []
         self._skip_depth = 0
         self._pre_depth = 0
@@ -396,9 +430,11 @@ class _MarkdownExtractor(HTMLParser):
             self._newline(2)
             self._emit("```\n")
         elif tag == "a":
-            href = _attr(attrs, "href")
+            href = _attr(attrs, "href") or ""
+            if href and self._rewrite_links:
+                href = _rewrite_internal_href(href)
             self._emit("[")
-            self._pending_prefix = href or ""
+            self._pending_prefix = href
         elif tag in ("ul", "ol"):
             self._list_stack.append({"ordered": tag == "ol", "n": 0})
         elif tag == "li":
@@ -491,9 +527,23 @@ def _attr(attrs: list[tuple[str, str | None]], name: str) -> str | None:
     return None
 
 
-def html_to_markdown(html: str) -> str:
-    """Convert rendered HTML to approximate markdown (best-effort, lossy)."""
-    parser = _MarkdownExtractor()
+def html_to_markdown(html: str, *, rewrite_links: bool = True) -> str:
+    """Convert rendered HTML to approximate markdown (best-effort, lossy).
+
+    By default internal page links are rewritten to their ``.md`` renditions
+    (``/about`` → ``/about.md``, preserving query strings and fragments) so an
+    agent following links stays on the markdown channel; pass
+    ``rewrite_links=False`` to keep hrefs verbatim. External URLs,
+    ``mailto:``/``tel:``, ``/api/`` routes, asset paths with file extensions,
+    and links already ending in ``.md`` are never touched.
+
+    Relative (non root-relative) hrefs are rewritten in place, so on a
+    directory-index page — whose markdown rendition serves from ``/deep.md``
+    rather than ``/deep/`` — a link like ``child`` resolves against the
+    shifted base. Prefer root-relative hrefs (``/deep/child``) in pages meant
+    for markdown consumption.
+    """
+    parser = _MarkdownExtractor(rewrite_links=rewrite_links)
     parser.feed(html)
     parser.close()
     return parser.result()
@@ -563,7 +613,13 @@ class LlmsTxtContext:
     _render_default: Callable[[], str]
 
     def render_default(self) -> str:
-        """Return the framework's generated ``/llms.txt``."""
+        """Return the framework's generated ``/llms.txt``.
+
+        Performs filesystem checks and module imports. Sync ``llms_txt`` hooks
+        are invoked in a worker thread, so calling this from one is always
+        safe; an *async* hook runs on the event loop and should wrap it —
+        ``await asyncio.to_thread(ctx.render_default)``.
+        """
         return self._render_default()
 
 
@@ -574,17 +630,59 @@ def _page_infos(routes: RouteTable) -> tuple[LlmsPageInfo, ...]:
     )
 
 
-def build_llms_txt(*, routes: RouteTable, settings: Any) -> str:
+def _page_serves_markdown(page: PageRoute, *, settings: Any, config: Any, debug: bool) -> bool:
+    """Statically walk the resolution ladder: does ``page`` have a markdown source?
+
+    Mirrors :func:`_resolve_source_markdown` without invoking handlers: a
+    co-located ``.md`` file, a page-local ``to_markdown``, an ancestor
+    ``llms.py`` ``to_markdown``, or ``auto_convert`` means the page's ``.md``
+    URL serves markdown; otherwise it just redirects to the HTML page. A
+    handler that exists but declines at request time counts as markdown — its
+    answer can't be known without running it.
+    """
+    if getattr(config, "auto_convert", False):
+        return True
+    if colocated_markdown_path(page).is_file():
+        return True
+    if _load_local_handler(page, debug=debug) is not None:
+        return True
+    return next(_iter_directory_handlers(page, settings, debug=debug), None) is not None
+
+
+def build_llms_txt(
+    *,
+    routes: RouteTable,
+    settings: Any,
+    config: Any = None,
+    base_url: str = "",
+) -> str:
     """Generate a spec-shaped ``/llms.txt`` index from the route table.
 
-    Produces an H1 title (the project directory name) and a ``## Pages`` list
-    linking each concrete page's ``.md`` rendition. Dynamic (parameterised)
-    routes are omitted since they have no single URL to list — apps with dynamic
-    content should provide a ``llms_txt`` hook or a static ``public/llms.txt``.
+    Produces an H1 title (the project directory name) and a ``## Pages`` list.
+    Each concrete page is checked against the same resolution ladder ``.md``
+    requests use: pages with a markdown source (every page when
+    ``config.auto_convert`` is on) are linked at their ``.md`` URL, while pages
+    whose ``.md`` URL would just redirect are listed at their canonical HTML
+    URL instead — the index never advertises markdown that isn't there.
+
+    ``base_url`` (e.g. ``"https://example.com"``, no trailing slash) makes the
+    links absolute; when empty, links are root-relative. Dynamic
+    (parameterised) routes are omitted since they have no single URL to list —
+    apps with dynamic content should provide a ``llms_txt`` hook or a static
+    ``public/llms.txt``.
+
+    Performs filesystem checks and module imports, so call it off the event
+    loop — the built-in route runs it via ``asyncio.to_thread``.
     """
+    debug = bool(getattr(settings, "debug", False))
+    base = base_url.rstrip("/")
     lines = [f"# {_default_title(settings)}", "", "## Pages", ""]
-    for info in _page_infos(routes):
-        lines.append(f"- [{info.title}]({info.md_url})")
+    for page in _listable_pages(routes):
+        if _page_serves_markdown(page, settings=settings, config=config, debug=debug):
+            url = base + _md_url_for(page.path)
+        else:
+            url = base + page.path
+        lines.append(f"- [{_label_for(page)}]({url})")
     lines.append("")
     return "\n".join(lines)
 
@@ -594,13 +692,137 @@ def build_llms_txt(*, routes: RouteTable, settings: Any) -> str:
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True, slots=True)
+class _MediaRange:
+    """One parsed ``Accept`` media-range: lowercased type/subtype plus q-weight."""
+
+    type: str
+    subtype: str
+    q: float
+
+
+def _split_accept_items(header: str) -> list[str]:
+    """Split an ``Accept`` header on commas, honouring quoted-string parameters."""
+    items: list[str] = []
+    current: list[str] = []
+    in_quotes = False
+    escaped = False
+    for char in header:
+        if escaped:
+            current.append(char)
+            escaped = False
+        elif char == "\\" and in_quotes:
+            current.append(char)
+            escaped = True
+        elif char == '"':
+            in_quotes = not in_quotes
+            current.append(char)
+        elif char == "," and not in_quotes:
+            items.append("".join(current))
+            current = []
+        else:
+            current.append(char)
+    items.append("".join(current))
+    return items
+
+
+def _parse_q(raw: str) -> float:
+    """Parse a ``q`` parameter value: default 1.0 on malformed input, clamped 0..1."""
+    try:
+        q = float(raw)
+    except ValueError:
+        return 1.0
+    if math.isnan(q):
+        return 1.0
+    return min(max(q, 0.0), 1.0)
+
+
+def _parse_accept(header: str) -> tuple[_MediaRange, ...]:
+    """Parse an ``Accept`` header into media-ranges; malformed ranges are dropped."""
+    ranges: list[_MediaRange] = []
+    for item in _split_accept_items(header):
+        media, _, params = item.partition(";")
+        type_, sep, subtype = media.strip().lower().partition("/")
+        type_ = type_.strip()
+        subtype = subtype.strip()
+        if not sep or not type_ or not subtype or "/" in subtype:
+            continue
+        q = 1.0
+        for param in params.split(";"):
+            key, eq, value = param.partition("=")
+            if key.strip().lower() == "q" and eq:
+                q = _parse_q(value.strip().strip('"'))
+                break  # parameters after q are accept-ext (RFC 9110 §12.4.2)
+        ranges.append(_MediaRange(type_, subtype, q))
+    return tuple(ranges)
+
+
+def _acceptance_q(
+    ranges: tuple[_MediaRange, ...], type_: str, subtype: str, *, exact_only: bool = False
+) -> float:
+    """Effective q-weight of ``type_/subtype`` under ``ranges``.
+
+    The most specific matching range wins (exact ``type/subtype`` over
+    ``type/*`` over ``*/*``, per RFC 9110 §12.5.1); among equally specific
+    ranges the last declaration wins. Returns ``0.0`` when nothing matches —
+    the media type is not acceptable. With ``exact_only`` wildcard ranges are
+    ignored, so only an explicit ``type/subtype`` entry can make it acceptable.
+    """
+    exact: Optional[float] = None
+    subtype_wildcard: Optional[float] = None
+    full_wildcard: Optional[float] = None
+    for media_range in ranges:
+        if media_range.type == type_ and media_range.subtype == subtype:
+            exact = media_range.q
+        elif media_range.type == type_ and media_range.subtype == "*":
+            subtype_wildcard = media_range.q
+        elif media_range.type == "*" and media_range.subtype == "*":
+            full_wildcard = media_range.q
+    if exact is not None:
+        return exact
+    if exact_only:
+        return 0.0
+    if subtype_wildcard is not None:
+        return subtype_wildcard
+    if full_wildcard is not None:
+        return full_wildcard
+    return 0.0
+
+
+def markdown_is_acceptable(accept: str) -> bool:
+    """Decide whether ``text/markdown`` should be served for an ``Accept`` header.
+
+    Implements RFC 9110 §12.5.1 negotiation for the one choice the feature
+    makes — markdown vs HTML:
+
+    - Media-ranges match by exact ``type/subtype`` token, never by substring;
+      wildcards (``*/*``, ``text/*``) never select markdown, so browser Accept
+      headers keep getting HTML.
+    - ``q`` weights are honoured: default ``1.0``, clamped to ``0..1``, and
+      ``q=0`` means *not acceptable*.
+    - Markdown is served iff ``text/markdown`` is explicitly acceptable
+      (``q > 0``) **and** weighted at least as high as the effective weight of
+      ``text/html`` (which does benefit from wildcard ranges).
+    - Never raises: malformed ranges are ignored and an unusable header falls
+      back to HTML.
+    """
+    if not accept:
+        return False
+    ranges = _parse_accept(accept)
+    markdown_q = _acceptance_q(ranges, "text", "markdown", exact_only=True)
+    if markdown_q <= 0.0:
+        return False
+    return markdown_q >= _acceptance_q(ranges, "text", "html")
+
+
 def wants_markdown(request: Request) -> bool:
-    """Return ``True`` when a request explicitly accepts ``text/markdown``.
+    """Return ``True`` when a request's ``Accept`` header prefers ``text/markdown``.
 
     Browsers never send ``text/markdown`` in ``Accept``, so this only fires for
-    agents that opt in — the canonical HTML URL is unchanged for humans.
+    agents that opt in — the canonical HTML URL is unchanged for humans. The
+    negotiation rules live in :func:`markdown_is_acceptable`.
     """
-    return "text/markdown" in request.headers.get("accept", "")
+    return markdown_is_acceptable(request.headers.get("accept", ""))
 
 
 class LlmsDiscoveryMiddleware:
@@ -714,20 +936,37 @@ def make_llms_txt_route(routes: RouteTable, *, settings: Any) -> Route:
 
     Resolution order: a static ``public/llms.txt`` (served by the static-asset
     middleware before this route ever runs) → a ``llms_txt`` hook in the root
-    ``pages/llms.py`` → a generated index of the app's pages.
+    ``pages/llms.py`` → a generated index of the app's pages. Generated links
+    are absolute, derived from the request's scheme and host (uvicorn's
+    proxy-header support keeps these correct behind a reverse proxy).
     """
+    config = getattr(settings, "llms", None)
 
     async def handler(request: Request) -> Response:
         debug = bool(getattr(settings, "debug", False))
+        base_url = f"{request.url.scheme}://{request.url.netloc}"
+
+        def render_default() -> str:
+            return build_llms_txt(
+                routes=routes, settings=settings, config=config, base_url=base_url
+            )
+
         hook = _load_llms_txt_hook(settings, debug=debug)
         if hook is not None:
             ctx = LlmsTxtContext(
                 request=request,
                 pages=_page_infos(routes),
-                _render_default=lambda: build_llms_txt(routes=routes, settings=settings),
+                _render_default=render_default,
             )
             try:
-                result = hook(ctx)
+                # Sync hooks run in a worker thread so a hook that calls
+                # ``ctx.render_default()`` (filesystem checks + module imports)
+                # never blocks the event loop. Async hooks own their loop
+                # discipline — see ``LlmsTxtContext.render_default``.
+                if inspect.iscoroutinefunction(hook):
+                    result = await hook(ctx)
+                else:
+                    result = await asyncio.to_thread(hook, ctx)
                 if inspect.isawaitable(result):
                     result = await result
             except Exception:
@@ -736,8 +975,7 @@ def make_llms_txt_route(routes: RouteTable, *, settings: Any) -> Route:
             if isinstance(result, str):
                 return PlainTextResponse(result, media_type=MARKDOWN_MEDIA_TYPE)
         return PlainTextResponse(
-            build_llms_txt(routes=routes, settings=settings),
-            media_type=MARKDOWN_MEDIA_TYPE,
+            await asyncio.to_thread(render_default), media_type=MARKDOWN_MEDIA_TYPE
         )
 
     handler.__name__ = "llms_txt"
@@ -758,6 +996,7 @@ __all__ = [
     "is_enabled",
     "make_llms_txt_route",
     "make_markdown_route_handler",
+    "markdown_is_acceptable",
     "markdown_route_path",
     "resolve_page_markdown",
     "strip_md_suffix",
