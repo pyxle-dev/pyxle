@@ -6,16 +6,26 @@ from importlib import import_module
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:  # pragma: no cover - import-time helpers
-    from .renderer import ComponentRenderer, ComponentRenderError, pool_render_factory
+    from .renderer import (
+        BROWSER_ONLY_GLOBALS,
+        BrowserGlobalRenderError,
+        ComponentRenderer,
+        ComponentRenderError,
+        detect_browser_only_global,
+        pool_render_factory,
+    )
     from .template import render_document, render_error_document
     from .view import build_page_response
     from .worker_pool import SsrWorkerPool, WorkerPoolError
 
 __all__ = [
+    "BROWSER_ONLY_GLOBALS",
+    "BrowserGlobalRenderError",
     "ComponentRenderError",
     "ComponentRenderer",
     "InlineStyleFragment",
     "RenderResult",
+    "detect_browser_only_global",
     "pool_render_factory",
     "SsrWorkerPool",
     "WorkerPoolError",
@@ -29,10 +39,13 @@ __all__ = [
 
 def __getattr__(name: str) -> Any:  # pragma: no cover - module-level indirection
     if name in {
+        "BROWSER_ONLY_GLOBALS",
+        "BrowserGlobalRenderError",
         "ComponentRenderer",
         "ComponentRenderError",
         "InlineStyleFragment",
         "RenderResult",
+        "detect_browser_only_global",
         "pool_render_factory",
     }:
         module = import_module(".renderer", __name__)

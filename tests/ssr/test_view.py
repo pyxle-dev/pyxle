@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -12,7 +13,12 @@ from starlette.requests import Request
 from pyxle.devserver.routes import PageRoute
 from pyxle.devserver.settings import DevServerSettings
 from pyxle.ssr import view as ssr_view
-from pyxle.ssr.renderer import ComponentRenderError, InlineStyleFragment, RenderResult
+from pyxle.ssr.renderer import (
+    BrowserGlobalRenderError,
+    ComponentRenderError,
+    InlineStyleFragment,
+    RenderResult,
+)
 from pyxle.ssr.view import (
     HeadEvaluationError,
     build_page_navigation_response,
@@ -2834,3 +2840,226 @@ async def test_build_page_response_missing_state_stays_generic_in_production(
     assert "pyxle-db" not in body
     assert "request.state" not in body
     assert "MissingRequestStateError" not in body
+
+
+# ---------------------------------------------------------------------------
+# Browser-global render errors — enrichment, prod hygiene, regression
+# ---------------------------------------------------------------------------
+
+
+def _failing_renderer(message: str) -> StubRenderer:
+    """A renderer whose render always fails with *message*."""
+
+    class _Failing(StubRenderer):
+        async def render(
+            self,
+            component_path: Path,
+            props: dict[str, object],
+            *,
+            request_pathname: str | None = None,
+            csrf_token: str | None = None,
+        ) -> RenderResult:  # type: ignore[override]
+            raise ComponentRenderError(message)
+
+    return _Failing()
+
+
+def _plain_request() -> Request:
+    return Request(
+        {"type": "http", "http_version": "1.1", "method": "GET", "path": "/", "root_path": "", "headers": []}
+    )
+
+
+def test_enrich_render_error_upgrades_browser_global(tmp_path: Path) -> None:
+    """A browser-global ReferenceError becomes a BrowserGlobalRenderError."""
+    page = _page_route(tmp_path, loader_name=None)
+    original = ComponentRenderError("document is not defined")
+
+    enriched = ssr_view._enrich_render_error(original, page)
+
+    assert isinstance(enriched, BrowserGlobalRenderError)
+    assert enriched.global_name == "document"
+    assert enriched.source_file == "pages/index.pyxl"
+    assert enriched.original_message == "document is not defined"
+    assert enriched.__cause__ is original
+    # Already-enriched errors pass through untouched (no double wrapping).
+    assert ssr_view._enrich_render_error(enriched, page) is enriched
+
+
+def test_enrich_render_error_leaves_unrelated_errors_untouched(tmp_path: Path) -> None:
+    """Non-browser-global render errors flow through as the same object."""
+    page = _page_route(tmp_path, loader_name=None)
+    for message in ("render boom", "someHelper is not defined"):
+        original = ComponentRenderError(message)
+        assert ssr_view._enrich_render_error(original, page) is original
+
+
+@pytest.mark.anyio
+async def test_build_page_response_enriches_browser_global_error_in_dev(
+    settings: DevServerSettings, tmp_path: Path
+) -> None:
+    """Dev error page + overlay explain the browser-global failure and the fix."""
+    page = _page_route(tmp_path, loader_name=None)
+    renderer = _failing_renderer("window is not defined")
+    overlay = StubOverlay()
+
+    response = await build_page_response(
+        request=_plain_request(),
+        settings=settings,
+        page=page,
+        renderer=renderer,
+        overlay=overlay,
+    )
+
+    body = (await _read_response_body(response)).decode()
+    assert response.status_code == 500
+    assert "window is not defined" in body
+    assert "pages/index.pyxl" in body
+    assert "browser global" in body
+    assert "useEffect" in body
+    assert "BrowserGlobalRenderError" in body
+    # The overlay's renderer breadcrumb carries the enriched detail too.
+    error_events = [event for event in overlay.events if event[0] == "error"]
+    assert error_events
+    renderer_breadcrumb = error_events[0][2][1]
+    assert renderer_breadcrumb["status"] == "failed"
+    assert "pages/index.pyxl" in renderer_breadcrumb["detail"]
+    assert "useEffect" in renderer_breadcrumb["detail"]
+
+
+@pytest.mark.anyio
+async def test_build_page_response_browser_global_error_is_generic_in_production(
+    settings: DevServerSettings,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Production body stays generic; the enriched message goes to the log only."""
+    prod_settings = replace(settings, debug=False)
+    page = _page_route(tmp_path, loader_name=None)
+    renderer = _failing_renderer("window is not defined")
+
+    with caplog.at_level(logging.ERROR, logger="pyxle.ssr.view"):
+        response = await build_page_response(
+            request=_plain_request(),
+            settings=prod_settings,
+            page=page,
+            renderer=renderer,
+        )
+
+    body = (await _read_response_body(response)).decode()
+    assert response.status_code == 500
+    assert "Server Error" in body
+    # No internals in the HTTP body (security rule 18): no global name, no
+    # source file, no remedy text, no exception type.
+    assert "window" not in body
+    assert "index.pyxl" not in body
+    assert "pages/" not in body
+    assert "useEffect" not in body
+    assert "BrowserGlobalRenderError" not in body
+    # The enriched explanation is preserved server-side for the operator.
+    assert "pages/index.pyxl" in caplog.text
+    assert "browser global" in caplog.text
+    assert "useEffect" in caplog.text
+
+
+@pytest.mark.anyio
+async def test_build_page_response_unrelated_reference_error_not_rewritten(
+    settings: DevServerSettings, tmp_path: Path
+) -> None:
+    """A ReferenceError on a non-browser name renders exactly as before."""
+    page = _page_route(tmp_path, loader_name=None)
+    renderer = _failing_renderer("someHelper is not defined")
+    overlay = StubOverlay()
+
+    response = await build_page_response(
+        request=_plain_request(),
+        settings=settings,
+        page=page,
+        renderer=renderer,
+        overlay=overlay,
+    )
+
+    body = (await _read_response_body(response)).decode()
+    assert response.status_code == 500
+    assert "someHelper is not defined" in body
+    assert "ComponentRenderError" in body
+    assert "browser global" not in body
+    assert "useEffect" not in body
+    assert "BrowserGlobalRenderError" not in body
+
+
+@pytest.mark.anyio
+async def test_build_page_navigation_response_enriches_browser_global_error(
+    settings: DevServerSettings, tmp_path: Path
+) -> None:
+    """The dev nav-error JSON carries the enriched message and error type."""
+    page = _page_route(tmp_path, loader_name=None)
+    renderer = _failing_renderer("document is not defined")
+
+    response = await build_page_navigation_response(
+        request=_plain_request(),
+        settings=settings,
+        page=page,
+        renderer=renderer,
+        overlay=StubOverlay(),
+    )
+
+    payload = json.loads(await _read_response_body(response))
+    assert response.status_code == 500
+    assert payload["ok"] is False
+    assert payload["stage"] == "renderer"
+    assert payload["errorType"] == "BrowserGlobalRenderError"
+    assert "pages/index.pyxl" in payload["error"]
+    assert "useEffect" in payload["error"]
+
+
+@pytest.mark.anyio
+async def test_build_page_navigation_response_browser_global_error_generic_in_production(
+    settings: DevServerSettings, tmp_path: Path
+) -> None:
+    """The production nav-error JSON leaks neither the global nor the file."""
+    prod_settings = replace(settings, debug=False)
+    page = _page_route(tmp_path, loader_name=None)
+    renderer = _failing_renderer("localStorage is not defined")
+
+    response = await build_page_navigation_response(
+        request=_plain_request(),
+        settings=prod_settings,
+        page=page,
+        renderer=renderer,
+        overlay=StubOverlay(),
+    )
+
+    raw = (await _read_response_body(response)).decode()
+    payload = json.loads(raw)
+    assert response.status_code == 500
+    assert payload["errorType"] == "ServerError"
+    assert payload["error"] == "The server encountered an error while processing this request."
+    assert "localStorage" not in raw
+    assert "pyxl" not in raw
+    assert "useEffect" not in raw
+
+
+@pytest.mark.anyio
+async def test_build_streaming_page_response_enriches_browser_global_shell_error(
+    settings: DevServerSettings, tmp_path: Path
+) -> None:
+    """A browser-global shell error on the streaming path gets the same enrichment."""
+    page = replace(_page_route(tmp_path, loader_name=None), uses_suspense=True)
+    renderer = StubRenderer()
+    overlay = StubOverlay()
+
+    response = await build_streaming_page_response(
+        request=_plain_request(),
+        settings=settings,
+        page=page,
+        renderer=renderer,
+        stream_render=_stream_of({"type": "error", "error": "matchMedia is not defined"}),
+        overlay=overlay,
+    )
+
+    body = (await _read_response_body(response)).decode()
+    assert response.status_code == 500
+    assert "matchMedia is not defined" in body
+    assert "pages/index.pyxl" in body
+    assert "useEffect" in body

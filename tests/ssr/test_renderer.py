@@ -10,12 +10,15 @@ import pytest
 
 import pyxle.ssr.renderer as renderer_module
 from pyxle.ssr.renderer import (
+    BROWSER_ONLY_GLOBALS,
+    BrowserGlobalRenderError,
     ComponentRenderer,
     ComponentRenderError,
     RenderResult,
     _derive_project_paths,
     _format_node_error,
     _parse_runtime_output,
+    detect_browser_only_global,
 )
 from tests.ssr.utils import ensure_test_node_modules
 
@@ -535,3 +538,65 @@ def test_node_runtime_rejects_non_string_html(tmp_path: Path, monkeypatch: pytes
 
     with pytest.raises(ComponentRenderError):
         runtime.render({})
+
+
+# ---------------------------------------------------------------------------
+# Browser-global ReferenceError detection
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("name", BROWSER_ONLY_GLOBALS)
+def test_detect_browser_only_global_matches_each_global(name: str) -> None:
+    """Every browser-only global's bare ReferenceError message is detected."""
+    assert detect_browser_only_global(f"{name} is not defined") == name
+
+
+def test_detect_browser_only_global_accepts_reference_error_prefix() -> None:
+    """The full Node message shape with the ReferenceError prefix is detected."""
+    assert detect_browser_only_global("ReferenceError: window is not defined") == "window"
+
+
+def test_detect_browser_only_global_matches_inside_larger_message() -> None:
+    """A ReferenceError embedded in surrounding runtime text is still found."""
+    message = "Render failed: localStorage is not defined\n    at Page (pages/index.jsx:3)"
+    assert detect_browser_only_global(message) == "localStorage"
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "myHelper is not defined",
+        "ReferenceError: fetchData is not defined",
+        "SSR runtime failed to execute",
+        "window.matchMedia is not a function",
+        "thewindow is not defined",
+        "",
+    ],
+)
+def test_detect_browser_only_global_ignores_unrelated_errors(message: str) -> None:
+    """Unrelated errors — including ReferenceErrors on other names — return None."""
+    assert detect_browser_only_global(message) is None
+
+
+def test_browser_global_render_error_message_and_attributes() -> None:
+    """The enriched error names the source file, the global, and the remedy."""
+    error = BrowserGlobalRenderError(
+        global_name="window",
+        source_file="pages/dashboard.pyxl",
+        original_message="window is not defined",
+    )
+
+    assert isinstance(error, ComponentRenderError)
+    assert error.global_name == "window"
+    assert error.source_file == "pages/dashboard.pyxl"
+    assert error.original_message == "window is not defined"
+
+    message = str(error)
+    assert message.startswith("window is not defined")
+    assert "pages/dashboard.pyxl" in message
+    assert "browser global" in message
+    assert "server-side rendering" in message
+    assert "useEffect" in message
+    assert "event handler" in message
+    assert "<ClientOnly>" in message
+    assert "docs/guides/client-components.md" in message

@@ -23,7 +23,13 @@ from pyxle.devserver.overlay import OverlayManager
 from pyxle.devserver.routes import PageRoute
 from pyxle.devserver.settings import DevServerSettings
 
-from .renderer import ComponentRenderer, ComponentRenderError, InlineStyleFragment
+from .renderer import (
+    BrowserGlobalRenderError,
+    ComponentRenderer,
+    ComponentRenderError,
+    InlineStyleFragment,
+    detect_browser_only_global,
+)
 from .template import (
     _AUTH_SEED_ABSENT,
     ManifestLookupError,
@@ -158,6 +164,39 @@ def _log_render_failure(
         error,
         exc_info=error,
     )
+
+
+def _enrich_render_error(exc: ComponentRenderError, page: PageRoute) -> ComponentRenderError:
+    """Upgrade a browser-global ``ReferenceError`` into an actionable error.
+
+    A component that evaluates a browser global (``window``, ``document``, …)
+    at render scope fails SSR with a bare ``"window is not defined"`` whose
+    traceback is entirely framework frames — it names no user file and hints
+    at no fix. When the render error matches that shape, return a
+    :class:`~pyxle.ssr.renderer.BrowserGlobalRenderError` that explains the
+    server/browser split, names the page's ``.pyxl`` source file, and points
+    at the remedy. Any other render error is returned unchanged so unrelated
+    failures flow through exactly as before.
+
+    The enriched message is shown in development (error overlay, dev error
+    page) and written to the server log; production responses are already
+    sanitized to a generic document, so no file path or internals reach the
+    HTTP body (CLAUDE.md rule 18).
+    """
+    if isinstance(exc, BrowserGlobalRenderError):
+        return exc
+    global_name = detect_browser_only_global(str(exc))
+    if global_name is None:
+        return exc
+    enriched = BrowserGlobalRenderError(
+        global_name=global_name,
+        source_file=f"pages/{page.source_relative_path.as_posix()}",
+        original_message=str(exc),
+    )
+    # Preserve the original exception as the cause so log tracebacks keep the
+    # raw Node runtime failure alongside the enriched explanation.
+    enriched.__cause__ = exc
+    return enriched
 
 
 def _error_response(
@@ -385,6 +424,7 @@ async def _handle_render_exception(
     elif isinstance(exc, HeadEvaluationError):
         stage, status_code = "server", 500
     elif isinstance(exc, ComponentRenderError):
+        exc = _enrich_render_error(exc, page)
         stage, status_code = "renderer", 500
     else:  # pragma: no cover - defensive guardrail for unexpected faults
         if overlay is not None:
@@ -693,7 +733,7 @@ async def build_page_navigation_response(
             overlay=overlay,
             loader_breadcrumb=loader_breadcrumb,
             stage="renderer",
-            error=exc,
+            error=_enrich_render_error(exc, page),
         )
     except Exception as exc:  # pragma: no cover - defensive guardrail
         return await _navigation_error_response(

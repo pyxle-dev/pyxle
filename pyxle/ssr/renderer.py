@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -14,6 +15,82 @@ from typing import Any, Awaitable, Callable, Dict, Tuple, TypeVar
 
 class ComponentRenderError(RuntimeError):
     """Raised when a component cannot be rendered server-side."""
+
+
+#: Browser-only globals that do not exist in the Node SSR environment. A
+#: ``ReferenceError`` on one of these names during a server render means the
+#: component evaluated a browser API at render scope — the exact mistake
+#: :class:`BrowserGlobalRenderError` explains and points at the fix for.
+BROWSER_ONLY_GLOBALS: tuple[str, ...] = (
+    "window",
+    "document",
+    "navigator",
+    "localStorage",
+    "sessionStorage",
+    "location",
+    "matchMedia",
+    "requestAnimationFrame",
+)
+
+#: Matches Node's ``ReferenceError`` message shape — ``"<name> is not
+#: defined"``, optionally prefixed with ``"ReferenceError:"`` — and captures
+#: the offending identifier.
+_REFERENCE_ERROR_RE = re.compile(
+    r"(?:\bReferenceError:\s*)?\b([A-Za-z_$][A-Za-z0-9_$]*) is not defined\b"
+)
+
+
+def detect_browser_only_global(message: str) -> str | None:
+    """Return the browser-only global named in a Node ``ReferenceError`` message.
+
+    Component render bodies also run in Node during SSR, where browser APIs do
+    not exist — evaluating e.g. ``window.location.pathname`` at render scope
+    fails with ``ReferenceError: window is not defined``. This helper
+    recognizes that message shape and returns the offending name when it is
+    one of :data:`BROWSER_ONLY_GLOBALS`. Any other message — including a
+    ``ReferenceError`` on an unrelated identifier — returns ``None`` so those
+    errors flow through unchanged.
+    """
+    for match in _REFERENCE_ERROR_RE.finditer(message):
+        name = match.group(1)
+        if name in BROWSER_ONLY_GLOBALS:
+            return name
+    return None
+
+
+class BrowserGlobalRenderError(ComponentRenderError):
+    """A render failed because a browser-only global was evaluated during SSR.
+
+    Raised in place of a bare :class:`ComponentRenderError` when the Node
+    render error is a ``ReferenceError`` on one of
+    :data:`BROWSER_ONLY_GLOBALS`. The message explains why the global is
+    missing on the server, names the page's ``.pyxl`` source file, and points
+    at the remedy. It is surfaced in development only (error overlay, dev
+    error page, server log); production HTTP responses stay generic and the
+    rich message reaches the server log alone.
+    """
+
+    def __init__(self, *, global_name: str, source_file: str, original_message: str) -> None:
+        """Build the enriched message from the failing global and source file.
+
+        ``global_name`` is the browser global the component evaluated,
+        ``source_file`` identifies the page's ``.pyxl`` source (e.g.
+        ``pages/dashboard.pyxl``), and ``original_message`` is the Node
+        runtime's raw error text, preserved verbatim at the front of the
+        enriched message.
+        """
+        self.global_name = global_name
+        self.source_file = source_file
+        self.original_message = original_message
+        super().__init__(
+            f"{original_message}. '{global_name}' is a browser global, and browser "
+            f"globals do not exist during server-side rendering: the component in "
+            f"{source_file} runs in Node on the server first, where there is no "
+            f"'{global_name}'. Move the browser-only code into a useEffect hook or "
+            "an event handler (neither runs during the server render), or render "
+            "the subtree client-only with <ClientOnly>. See the Client Components "
+            "guide (docs/guides/client-components.md)."
+        )
 
 
 @dataclass(frozen=True)
@@ -420,9 +497,12 @@ def pool_render_factory(pool: Any) -> _RenderFactory:
 
 
 __all__ = [
+    "BROWSER_ONLY_GLOBALS",
+    "BrowserGlobalRenderError",
     "ComponentRenderError",
     "ComponentRenderer",
     "InlineStyleFragment",
     "RenderResult",
+    "detect_browser_only_global",
     "pool_render_factory",
 ]
