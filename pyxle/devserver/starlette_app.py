@@ -1390,6 +1390,26 @@ async def _dispatch_action(
             payload["fields"] = exc.fields
         return JSONResponse(payload, status_code=exc.status_code)
     except Exception as exc:
+        from pyxle.ssr.view import (  # noqa: PLC0415
+            MissingRequestStateError,
+            missing_state_attribute,
+        )
+
+        # A read of an unset ``request.state`` attribute means a plugin or
+        # middleware isn't configured — wrap the bare AttributeError with
+        # guidance (chained, so the original traceback stays in the log).
+        # Every other exception flows through unchanged.
+        attribute = missing_state_attribute(exc)
+        if attribute is not None:
+            import logging as _logging  # noqa: PLC0415
+
+            state_error = MissingRequestStateError(attribute)
+            state_error.__cause__ = exc
+            _logging.getLogger(__name__).error(
+                "Action '%s' failed: %s", action_name, state_error, exc_info=state_error
+            )
+            error_msg = str(state_error) if debug else "Internal server error"
+            return JSONResponse({"ok": False, "error": error_msg}, status_code=500)
         error_msg = str(exc) if debug else "Internal server error"
         return JSONResponse({"ok": False, "error": error_msg}, status_code=500)
 

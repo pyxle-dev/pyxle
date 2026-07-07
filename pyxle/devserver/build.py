@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -127,11 +128,33 @@ def _load_metadata(path: Path) -> BuildMetadata | None:
 
 
 def _write_metadata(path: Path, metadata: BuildMetadata) -> None:
-    payload = metadata.to_dict()
+    """Persist ``metadata`` to ``path`` — write-if-changed and atomic.
+
+    Identical content is never rewritten, so a no-op build pass leaves the
+    file's mtime untouched (the same guard every other stable generated
+    artifact uses). Changed content lands via a temp file + ``os.replace`` so
+    a concurrent reader can never observe a truncated ``meta.json`` — a torn
+    read here used to be misdiagnosed as a schema mismatch, wiping the entire
+    build cache.
+    """
+    payload = json.dumps(metadata.to_dict(), indent=2, sort_keys=True) + "\n"
+
+    if path.exists():
+        try:
+            current = path.read_text(encoding="utf-8")
+        except OSError:  # pragma: no cover - unreadable cache file; rewrite it
+            current = None
+        if current == payload:
+            return
+
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as file:
-        json.dump(payload, file, indent=2, sort_keys=True)
-        file.write("\n")
+    temp_path = path.with_name(path.name + ".tmp")
+    try:
+        temp_path.write_text(payload, encoding="utf-8")
+        os.replace(temp_path, path)
+    finally:
+        if temp_path.exists():  # pragma: no cover - only on a failed write
+            temp_path.unlink(missing_ok=True)
 
 
 def load_build_metadata(build_root: Path, *, schema_version: str = BUILD_CACHE_SCHEMA_VERSION) -> BuildMetadata:

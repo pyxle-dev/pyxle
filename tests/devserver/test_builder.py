@@ -211,3 +211,84 @@ def test_build_once_syncs_global_scripts(tmp_path: Path) -> None:
     summary = build_once(settings)
     assert summary.synced_scripts == ["scripts/analytics.js"]
     assert "updated" in generated.read_text(encoding="utf-8")
+
+
+def test_build_once_leaves_unchanged_generated_files_untouched(
+    project: DevServerSettings,
+) -> None:
+    """A rebuild must not rewrite stable generated artifacts.
+
+    Rewriting ``vite.config.js`` with identical content still bumps its mtime,
+    and Vite answers a config-file change with a full dev-server restart — so
+    an unchanged config (and unchanged ``meta.json``) must keep its mtime.
+    """
+    import time
+
+    from pyxle.devserver.client_files import VITE_CONFIG_FILENAME
+
+    build_once(project, force_rebuild=True)
+
+    vite_config = project.client_build_dir / VITE_CONFIG_FILENAME
+    meta_json = project.build_root / "meta.json"
+    assert vite_config.exists()
+    assert meta_json.exists()
+
+    before = {
+        path: path.stat().st_mtime_ns for path in (vite_config, meta_json)
+    }
+    time.sleep(0.02)
+
+    build_once(project)
+
+    for path, mtime in before.items():
+        assert path.stat().st_mtime_ns == mtime, f"{path.name} was rewritten"
+
+
+def test_build_once_serializes_concurrent_invocations(
+    project: DevServerSettings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Overlapping build_once calls (debounce-timer race) run one at a time.
+
+    A concurrent pass used to read ``meta.json`` while another pass was
+    mid-write, misdiagnose the torn read as a schema mismatch, and wipe the
+    build cache (recreating ``vite.config.js`` → spurious Vite restart).
+    """
+    import threading
+    import time
+
+    from pyxle.devserver import builder as builder_module
+
+    active = 0
+    max_active = 0
+    gauge_lock = threading.Lock()
+    real_scan = builder_module.scan_source_tree
+
+    def tracking_scan(settings: DevServerSettings):
+        nonlocal active, max_active
+        with gauge_lock:
+            active += 1
+            max_active = max(max_active, active)
+        time.sleep(0.05)
+        with gauge_lock:
+            active -= 1
+        return real_scan(settings)
+
+    monkeypatch.setattr(builder_module, "scan_source_tree", tracking_scan)
+
+    errors: list[BaseException] = []
+
+    def run_build() -> None:
+        try:
+            build_once(project)
+        except BaseException as exc:  # pragma: no cover - fails the assertion below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=run_build) for _ in range(3)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert errors == []
+    assert max_active == 1, "build passes overlapped"
