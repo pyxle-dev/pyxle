@@ -91,6 +91,9 @@ def test_run_init_custom_import_alias_threads_through(tmp_path, monkeypatch) -> 
     )
     jsconfig = (tmp_path / "demo" / "jsconfig.json").read_text(encoding="utf-8")
     assert '"~/*": ["./*"]' in jsconfig
+    # TS 6 deprecates baseUrl (removed in TS 7); paths are tsconfig-relative and
+    # must stand alone so fresh projects open warning-free in editors.
+    assert "baseUrl" not in jsconfig
     components = (tmp_path / "demo" / "components.json").read_text(encoding="utf-8")
     assert '"utils": "~/lib/utils"' in components
 
