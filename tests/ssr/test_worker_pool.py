@@ -615,14 +615,18 @@ async def test_pool_round_robin_dispatch(tmp_path: Path) -> None:
 
     w1 = MagicMock()
     w1.alive = True
+    w1.in_flight = 0
     w2 = MagicMock()
     w2.alive = True
+    w2.in_flight = 0
     w3 = MagicMock()
     w3.alive = True
+    w3.in_flight = 0
 
     pool = SsrWorkerPool(size=3, project_root=project_root, client_root=client_root)
     pool._workers = [w1, w2, w3]
 
+    # All idle (equal in_flight) -> ties broken round-robin, so the classic cycle.
     picked = [pool._pick_worker() for _ in range(6)]
     assert picked == [w1, w2, w3, w1, w2, w3]
 
@@ -637,8 +641,10 @@ async def test_pool_pick_worker_skips_dead_workers(tmp_path: Path) -> None:
 
     w_dead = MagicMock()
     w_dead.alive = False
+    w_dead.in_flight = 0
     w_alive = MagicMock()
     w_alive.alive = True
+    w_alive.in_flight = 0
 
     pool = SsrWorkerPool(size=2, project_root=project_root, client_root=client_root)
     pool._workers = [w_dead, w_alive]

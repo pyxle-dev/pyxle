@@ -625,7 +625,8 @@ def serve(
         None,
         "--ssr-workers",
         help="Number of persistent Node.js SSR worker processes per server worker "
-        "(0 = auto-size to CPU cores, capped at 4; default: 1).",
+        "(0 = auto-size to CPU cores, capped at 4). Defaults to auto so production "
+        "renders concurrently instead of one stream at a time.",
         show_default=False,
         min=0,
     ),
@@ -672,9 +673,12 @@ def serve(
     resolved_styles = _resolve_global_style_entries(project_root, production_config)
     resolved_scripts = _resolve_global_script_entries(project_root, production_config)
 
-    serve_extra: dict[str, object] = {}
-    if ssr_workers is not None:
-        serve_extra["ssr_workers"] = ssr_workers
+    # `pyxle serve` defaults SSR workers to auto-size (0 -> min(cpu_count, 4) via
+    # pyxle.build.production._resolve_pool_size) so production renders stream
+    # concurrently rather than one-at-a-time. `pyxle dev` keeps its single worker
+    # (one developer, simpler logs). An explicit --ssr-workers always wins.
+    effective_ssr_workers = 0 if ssr_workers is None else ssr_workers
+    serve_extra: dict[str, object] = {"ssr_workers": effective_ssr_workers}
 
     try:
         settings = DevServerSettings.from_project_root(  # type: ignore[union-attr]
@@ -720,7 +724,7 @@ def serve(
             resolved_dist=resolved_dist,
             host=settings.starlette_host,
             port=settings.starlette_port,
-            ssr_workers=ssr_workers,
+            ssr_workers=effective_ssr_workers,
             serve_static=serve_static,
             workers=workers,
             logger=logger,

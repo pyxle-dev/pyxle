@@ -25,6 +25,7 @@
  * path for non-streaming renders.
  */
 
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { Console } from 'node:console';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -92,6 +93,92 @@ for (const method of ['log', 'info', 'warn', 'error', 'debug', 'dir', 'trace']) 
 }
 
 /**
+ * Per-request SSR context, propagated via ``AsyncLocalStorage``.
+ *
+ * The four ``__PYXLE_*`` names the render pipeline reads — the request
+ * pathname, the CSRF token, the style-registration hook, and the head registry
+ * — used to be plain globals that ``loadComponentForRender`` mutated per render
+ * and restored afterwards. That approach forced streaming renders to run
+ * one-at-a-time: a second request could not begin until the first restored the
+ * globals, otherwise one user's CSRF token / head tags / styles could bleed
+ * into another user's page while their streams interleaved.
+ *
+ * These names are now *configurable getters* that resolve against the current
+ * async context's store. Each render runs inside ``ssrContext.run(context, …)``,
+ * so React Suspense continuations, ``onShellReady``/``onAllReady`` callbacks,
+ * and the streamed-chunk writes scheduled from within ``run`` all observe only
+ * their own request's values. Reads made outside any render (no active store)
+ * return ``undefined``, which keeps every existing ``typeof`` guard at the read
+ * sites (in the browser bundle and ``render_component.mjs``) working unchanged.
+ *
+ * No code writes these globals any more, so the getters intentionally have no
+ * setter — an accidental assignment would throw in strict mode, surfacing the
+ * bug instead of silently reintroducing shared mutable state.
+ */
+const ssrContext = new AsyncLocalStorage();
+
+const _SSR_CONTEXT_GLOBALS = [
+  ['__PYXLE_CURRENT_PATHNAME__', 'pathname'],
+  ['__PYXLE_CSRF_TOKEN__', 'csrfToken'],
+  ['__PYXLE_REGISTER_SSR_STYLE__', 'registerStyle'],
+  ['__PYXLE_HEAD_REGISTRY__', 'headRegistry'],
+];
+for (const [globalName, storeKey] of _SSR_CONTEXT_GLOBALS) {
+  Object.defineProperty(globalThis, globalName, {
+    configurable: true,
+    get() {
+      const store = ssrContext.getStore();
+      return store ? store[storeKey] : undefined;
+    },
+  });
+}
+
+// Maximum number of render requests one worker processes concurrently.
+//
+// Buffered renders are synchronous (``renderToString``, a few ms) so they never
+// really overlap, but a streaming render spends almost all of its wall-clock
+// time IDLE — awaiting loader promises and Suspense boundaries. Blocking the
+// stdin read loop on that idle time (``await handle(request)`` inline) serialised
+// the whole site: with the default single worker, four concurrent streaming
+// requests each waited for the previous stream to fully flush before their first
+// byte. Handling requests concurrently — each isolated by ``ssrContext`` — lets
+// interleaved streams progress independently. The cap bounds in-flight renders
+// so a burst can't spawn unlimited concurrent work; override via the env var to
+// tune for a workload with many slow, I/O-bound loaders.
+const DEFAULT_WORKER_CONCURRENCY = 16;
+
+function resolveWorkerConcurrency() {
+  const raw = process.env.PYXLE_SSR_WORKER_CONCURRENCY;
+  if (raw === undefined || raw === '') {
+    return DEFAULT_WORKER_CONCURRENCY;
+  }
+  const parsed = Number(raw);
+  if (Number.isInteger(parsed) && parsed > 0) {
+    return parsed;
+  }
+  process.stderr.write(
+    `SSR worker: ignoring invalid PYXLE_SSR_WORKER_CONCURRENCY=${raw}; ` +
+      `using ${DEFAULT_WORKER_CONCURRENCY}\n`,
+  );
+  return DEFAULT_WORKER_CONCURRENCY;
+}
+
+const WORKER_CONCURRENCY = resolveWorkerConcurrency();
+
+/**
+ * Write one protocol frame to stdout as exactly one ``write()`` call.
+ *
+ * Node serialises a whole ``write()`` chunk on a pipe, so emitting each frame
+ * with a single write keeps concurrent streams' bytes from interleaving inside
+ * a frame (which would corrupt the NDJSON the Python read loop parses). Returns
+ * the ``write()`` backpressure signal so a streaming render can pause its React
+ * pipe until stdout drains.
+ */
+function writeFrame(frame) {
+  return process.stdout.write(JSON.stringify(frame) + String.fromCharCode(10));
+}
+
+/**
  * Verify that a resolved path stays within the given boundary directory.
  *
  * Returns `true` when the resolved path is equal to or nested inside the
@@ -144,6 +231,13 @@ const _moduleCache = createLruCache(10);
 // Bounded to 100 entries — a large app may have hundreds of pages but only a
 // subset is rendered between invalidation cycles.
 const _bundleCache = createLruCache(100);
+
+// In-flight resolutions keyed by resolved component path. Now that renders run
+// concurrently, two simultaneous cold requests for the SAME uncached component
+// would otherwise both run esbuild against the same deterministic outfile and
+// could read a torn bundle. The first caller compiles; the rest await its
+// promise. Entries are cleared once the resolution settles.
+const _bundleInFlight = new Map();
 
 // Cache postcss.config.* presence per project root so we don't stat the
 // filesystem on every render.  Bounded to 5 — effectively 1 per project.
@@ -223,9 +317,80 @@ function getProjectModules(projectRoot) {
   return modules;
 }
 
-// Main read loop: process requests from stdin serially.
+/**
+ * Handle a single render request end to end, writing its response frame(s).
+ *
+ * Buffered requests get one ``{ok}`` frame; streaming requests get a sequence
+ * of ``chunk``/``end``/``error`` frames sharing the request id. A pre-first-byte
+ * streaming failure (component load / esbuild) becomes one terminal ``error``
+ * frame so the Python side can fall back to a buffered error render.
+ */
+async function handleRequest(request) {
+  const { id } = request;
+  if (request.stream === true) {
+    const emit = (frame) => writeFrame({ id, ...frame });
+    try {
+      await renderRequestStream(request, emit);
+    } catch (error) {
+      emit({ type: 'error', error: String(error.message || error) });
+    }
+    return;
+  }
+  try {
+    const result = await renderRequest(request);
+    writeFrame({ id, ok: true, ...result });
+  } catch (error) {
+    writeFrame({ id, ok: false, message: String(error.message || error) });
+  }
+}
+
+// Main read loop: parse stdin lines and dispatch renders concurrently.
+//
+// Requests are launched without awaiting them inline, so a slow streaming
+// render never blocks the next request from starting. A bounded semaphore caps
+// the number of in-flight renders: the loop only pauses reading once
+// ``WORKER_CONCURRENCY`` renders are already running, then resumes as soon as
+// one frees its slot. On stdin EOF, every in-flight render is awaited before the
+// process exits so no response is truncated.
 async function main() {
   let buffer = '';
+  let inFlight = 0;
+  const waiters = [];
+  const pending = new Set();
+
+  const acquireSlot = async () => {
+    if (inFlight < WORKER_CONCURRENCY) {
+      inFlight += 1;
+      return;
+    }
+    // At capacity: block until a finishing render hands its slot to us. The
+    // releaser resolves this promise WITHOUT decrementing ``inFlight`` (a direct
+    // hand-off), so the count never dips and never exceeds the cap.
+    await new Promise((resolve) => waiters.push(resolve));
+  };
+
+  const releaseSlot = () => {
+    const next = waiters.shift();
+    if (next) {
+      next();
+    } else {
+      inFlight -= 1;
+    }
+  };
+
+  const launch = (request) => {
+    const task = (async () => {
+      try {
+        await handleRequest(request);
+      } finally {
+        releaseSlot();
+      }
+    })();
+    pending.add(task);
+    // Errors are already handled inside ``handleRequest``; this only reaps the
+    // tracking entry once the render settles.
+    task.finally(() => pending.delete(task));
+  };
 
   for await (const chunk of process.stdin) {
     buffer += chunk.toString();
@@ -246,41 +411,27 @@ async function main() {
       }
       const { id } = request;
 
-      // Handle cache invalidation messages.
+      // Cache invalidation is synchronous and cheap; answer inline without
+      // consuming a render slot so it can't be delayed behind slow streams.
       if (request.type === 'invalidate') {
         if (request.componentPath) {
           _bundleCache.delete(path.resolve(request.componentPath));
         } else {
           _bundleCache.clear();
         }
-        process.stdout.write(JSON.stringify({ id, ok: true, invalidated: true }) + '\n');
+        writeFrame({ id, ok: true, invalidated: true });
         continue;
       }
 
-      if (request.stream === true) {
-        // Streaming render: emit framed NDJSON sharing the request id.
-        const emit = (frame) => process.stdout.write(JSON.stringify({ id, ...frame }) + '\n');
-        try {
-          await renderRequestStream(request, emit);
-        } catch (error) {
-          // A failure before the first byte (component load / esbuild) is a
-          // terminal error frame; the Python side falls back to a buffered
-          // error render.
-          emit({ type: 'error', error: String(error.message || error) });
-        }
-        continue;
-      }
-
-      try {
-        const result = await renderRequest(request);
-        const response = JSON.stringify({ id, ok: true, ...result });
-        process.stdout.write(response + '\n');
-      } catch (error) {
-        const response = JSON.stringify({ id, ok: false, message: String(error.message || error) });
-        process.stdout.write(response + '\n');
-      }
+      // Bounded concurrency: pause reading only when the cap is reached.
+      await acquireSlot();
+      launch(request);
     }
   }
+
+  // stdin closed: let every in-flight render finish before exiting so its
+  // response frames are fully written.
+  await Promise.allSettled([...pending]);
   process.exit(0);
 }
 
@@ -300,10 +451,20 @@ async function resolveComponentBundle(resolvedPath, componentPath, workingDir, p
     return cached;
   }
 
+  // Coalesce concurrent cold resolutions of the same component onto one compile.
+  const pending = _bundleInFlight.get(resolvedPath);
+  if (pending) {
+    return pending;
+  }
+
   const registry = createStyleRegistry(projectRoot);
-  const previousStyleHook = globalThis.__PYXLE_REGISTER_SSR_STYLE__;
-  globalThis.__PYXLE_REGISTER_SSR_STYLE__ = (entry) => registry.register(entry);
-  try {
+  // The ``pyxle-inline-css`` plugin below emits module code that registers each
+  // stylesheet by reading ``globalThis.__PYXLE_REGISTER_SSR_STYLE__`` as the
+  // bundle is imported. Run the compile+import inside an ``ssrContext`` store
+  // that points that hook at THIS component's own ephemeral registry, so
+  // concurrent bundle resolutions never cross-register styles and the cached
+  // ``styleDescriptors`` belong to this component alone.
+  const resolution = ssrContext.run({ registerStyle: (entry) => registry.register(entry) }, async () => {
     const { esbuild } = getProjectModules(projectRoot);
     const tempDir = getStableTempDir(projectRoot);
     const bundleHash = crypto.createHash('sha1').update(resolvedPath).digest('hex');
@@ -397,17 +558,30 @@ export default entry.contents;
     const entry = { moduleExports, styleDescriptors: registry.list() };
     _bundleCache.set(resolvedPath, entry);
     return entry;
+  });
+
+  // Register before the first await so a concurrent caller coalesces; clear on
+  // settle (success populates ``_bundleCache``; failure must not pin a rejected
+  // promise so the next request can retry).
+  _bundleInFlight.set(resolvedPath, resolution);
+  try {
+    return await resolution;
   } finally {
-    globalThis.__PYXLE_REGISTER_SSR_STYLE__ = previousStyleHook;
+    _bundleInFlight.delete(resolvedPath);
   }
 }
 
 /**
  * Resolve, compile (or load from the bundle cache), and instantiate the page
- * component for a render request. Installs the per-render SSR globals (style
- * and head registries, request pathname, CSRF token) and returns a
- * ``restoreGlobals`` closure the caller MUST invoke once rendering finishes so
- * the pathname/CSRF globals don't leak into the next request.
+ * component for a render request. Builds the per-request SSR *context* (style
+ * and head registries, request pathname, CSRF token, and the render-time
+ * style-registration hook) and returns it alongside the component.
+ *
+ * The caller runs the actual React render inside ``ssrContext.run(context, …)``
+ * so every read of the ``__PYXLE_*`` globals — including from React Suspense
+ * continuations of concurrently-interleaved streams — resolves against this
+ * request's context and never another's. Nothing is mutated globally, so there
+ * is no per-request teardown to remember.
  *
  * When the request carries a ``fallbackPath`` (a compiled ``loading.pyxl``),
  * its component is loaded too and returned as ``FallbackComponent`` so the
@@ -443,7 +617,6 @@ async function loadComponentForRender({
   const skipInlineCss = detectPostcssConfig(projectRoot) !== null;
 
   const headRegistry = createHeadRegistry();
-  globalThis.__PYXLE_HEAD_REGISTRY__ = headRegistry;
 
   // Load the page bundle and replay its (isolated) style descriptors into this
   // render's registry.
@@ -470,43 +643,24 @@ async function loadComponentForRender({
       fallbackBundle.moduleExports.default ?? fallbackBundle.moduleExports.Component ?? null;
   }
 
-  // Render-time style registration (rare) lands in this render's registry.
-  globalThis.__PYXLE_REGISTER_SSR_STYLE__ = (entry) => styleRegistry.register(entry);
-
   const Component = pageBundle.moduleExports.default ?? pageBundle.moduleExports.Component;
 
   if (typeof Component !== 'function') {
     throw new Error('Component does not export a default function.');
   }
 
-  // Make the request path / CSRF token visible to SSR code (e.g.
-  // usePathname, <Form>'s hidden field). The returned ``restoreGlobals``
-  // resets them so a later request without these values can't inherit the
-  // previous request's value via the global.
-  const previousPathname = globalThis.__PYXLE_CURRENT_PATHNAME__;
-  const previousCsrf = globalThis.__PYXLE_CSRF_TOKEN__;
-  if (typeof requestPathname === 'string') {
-    globalThis.__PYXLE_CURRENT_PATHNAME__ = requestPathname;
-  } else {
-    delete globalThis.__PYXLE_CURRENT_PATHNAME__;
-  }
-  if (typeof csrfToken === 'string' && csrfToken.length > 0) {
-    globalThis.__PYXLE_CSRF_TOKEN__ = csrfToken;
-  } else {
-    delete globalThis.__PYXLE_CSRF_TOKEN__;
-  }
-
-  const restoreGlobals = () => {
-    if (previousPathname === undefined) {
-      delete globalThis.__PYXLE_CURRENT_PATHNAME__;
-    } else {
-      globalThis.__PYXLE_CURRENT_PATHNAME__ = previousPathname;
-    }
-    if (previousCsrf === undefined) {
-      delete globalThis.__PYXLE_CSRF_TOKEN__;
-    } else {
-      globalThis.__PYXLE_CSRF_TOKEN__ = previousCsrf;
-    }
+  // The per-request context backing the ``__PYXLE_*`` getters while this render
+  // runs. Absent values are ``undefined`` so the getters report ``undefined``
+  // (matching the old "delete the global" behaviour) and the ``typeof`` guards
+  // at the read sites skip cleanly — e.g. a request without a CSRF token can't
+  // inherit another request's token.
+  const context = {
+    pathname: typeof requestPathname === 'string' ? requestPathname : undefined,
+    csrfToken: typeof csrfToken === 'string' && csrfToken.length > 0 ? csrfToken : undefined,
+    styleRegistry,
+    headRegistry,
+    // Render-time style registration (rare) lands in this render's registry.
+    registerStyle: (entry) => styleRegistry.register(entry),
   };
 
   return {
@@ -516,27 +670,25 @@ async function loadComponentForRender({
     FallbackComponent,
     styleRegistry,
     headRegistry,
-    restoreGlobals,
+    context,
   };
 }
 
 /**
  * Buffered render: produce the complete HTML string in one shot via
  * ``renderToString``. This is the hot path for non-streaming, cacheable, and
- * statically generated pages — its behaviour is unchanged.
+ * statically generated pages — its behaviour is unchanged. The synchronous
+ * render runs inside ``ssrContext.run`` so its ``__PYXLE_*`` reads resolve
+ * against this request's context.
  */
 async function renderRequest(request) {
-  const { React, ReactDOMServer, Component, styleRegistry, headRegistry, restoreGlobals } =
+  const { React, ReactDOMServer, Component, styleRegistry, headRegistry, context } =
     await loadComponentForRender(request);
-  try {
+  return ssrContext.run(context, () => {
     const element = React.createElement(Component, request.props);
     const html = ReactDOMServer.renderToString(element);
-    const styles = styleRegistry.list();
-    const headElements = headRegistry.list();
-    return { html, styles, headElements };
-  } finally {
-    restoreGlobals();
-  }
+    return { html, styles: styleRegistry.list(), headElements: headRegistry.list() };
+  });
 }
 
 /**
@@ -549,6 +701,13 @@ async function renderRequest(request) {
  * propagates end-to-end: when stdout can't accept more, the pipe pauses until
  * it drains. A render that never completes (e.g. a Suspense boundary that
  * hangs) is aborted after ``streamTimeout`` ms so the worker is never wedged.
+ *
+ * The whole render is driven inside ``ssrContext.run(context, …)``:
+ * ``renderToPipeableStream`` is invoked synchronously within ``run``, so React
+ * captures this request's async context and every Suspense continuation,
+ * ``onShellReady`` callback, and streamed-chunk write it later schedules reads
+ * the correct request's pathname / CSRF token / head registry — never a
+ * concurrently-interleaved request's.
  */
 async function renderRequestStream(request, emit) {
   const {
@@ -558,10 +717,10 @@ async function renderRequestStream(request, emit) {
     FallbackComponent,
     styleRegistry,
     headRegistry,
-    restoreGlobals,
+    context,
   } = await loadComponentForRender(request);
 
-  await new Promise((resolve) => {
+  await ssrContext.run(context, () => new Promise((resolve) => {
     let settled = false;
     let piped = false;
     let shellReady = false;
@@ -572,7 +731,6 @@ async function renderRequestStream(request, emit) {
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);
-      restoreGlobals();
       if (frame) emit(frame);
       resolve();
     };
@@ -648,7 +806,7 @@ async function renderRequestStream(request, emit) {
       }
     }, timeoutMs);
     if (typeof timer.unref === 'function') timer.unref();
-  });
+  }));
 }
 
 // --- Helpers (shared with render_component.mjs) ---

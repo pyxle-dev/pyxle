@@ -71,6 +71,12 @@ class _WorkerState:
     # protocols coexist on one worker connection.
     streaming: dict[str, "asyncio.Queue[Any]"] = field(default_factory=dict)
     alive: bool = True
+    # Number of renders (buffered or streaming) currently dispatched to this
+    # worker and not yet finished. A single worker now handles several concurrent
+    # streams (the Node worker interleaves them and the read loop demuxes frames
+    # by request id), so load is tracked explicitly and the pool dispatches to the
+    # least-loaded worker instead of blindly round-robin.
+    in_flight: int = 0
     reader_task: asyncio.Task[None] | None = field(default=None, compare=False, repr=False)
 
     async def send(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -348,6 +354,7 @@ class SsrWorkerPool:
         if csrf_token is not None:
             payload["csrfToken"] = csrf_token
 
+        worker.in_flight += 1
         try:
             result = await asyncio.wait_for(
                 worker.send(payload), timeout=self._render_timeout
@@ -363,6 +370,8 @@ class SsrWorkerPool:
             self._workers = [w for w in self._workers if w is not worker]
             asyncio.get_running_loop().create_task(self._replenish())
             raise
+        finally:
+            worker.in_flight -= 1
 
         return result
 
@@ -412,6 +421,7 @@ class SsrWorkerPool:
             # compiled loading.pyxl component.
             payload["fallbackPath"] = str(fallback_path.resolve())
 
+        worker.in_flight += 1
         try:
             async for frame in worker.send_stream(
                 payload, frame_timeout=self._render_timeout
@@ -421,6 +431,8 @@ class SsrWorkerPool:
             self._workers = [w for w in self._workers if w is not worker]
             asyncio.get_running_loop().create_task(self._replenish())
             raise
+        finally:
+            worker.in_flight -= 1
 
     async def invalidate(
         self,
@@ -449,10 +461,21 @@ class SsrWorkerPool:
                 pass  # worker is dying; skip gracefully
 
     def _pick_worker(self) -> _WorkerState | None:
+        """Return the least-loaded alive worker, breaking ties round-robin.
+
+        Least-in-flight keeps a slow streaming render from piling every new
+        request onto the same worker: a worker already carrying an open stream
+        is skipped in favour of an idle one. When several workers are equally
+        loaded (the common case, and always true for a one-worker pool) the tie
+        is broken with the existing round-robin cursor so distribution stays
+        fair and deterministic.
+        """
         alive = [w for w in self._workers if w.alive]
         if not alive:
             return None
-        worker = alive[self._rr_index % len(alive)]
+        min_load = min(w.in_flight for w in alive)
+        candidates = [w for w in alive if w.in_flight == min_load]
+        worker = candidates[self._rr_index % len(candidates)]
         self._rr_index += 1
         return worker
 
