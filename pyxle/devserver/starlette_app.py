@@ -7,6 +7,7 @@ import inspect
 import math
 import mimetypes
 import sys
+import threading
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
@@ -191,6 +192,40 @@ def _index_static_files(directory: Path | None, *, prefix: str = "") -> frozense
     return frozenset(paths)
 
 
+class StaticFileIndex:
+    """Thread-safe set of URL paths served from a static directory.
+
+    Reads (``path in index``) are lock-free: a refresh computes a whole new
+    frozenset off to the side and swaps it in under a lock (copy-on-write), so a
+    concurrent membership test always sees a complete, consistent snapshot.
+
+    In production the index is built once and never mutated — an O(1),
+    effectively-immutable membership check on the request hot path (the build
+    output is immutable, so no watcher touches it). In development the file
+    watcher calls :meth:`resync` when a ``public/`` file is added or removed, so
+    a newly created or deleted asset becomes (un)discoverable without restarting
+    ``pyxle dev``.
+    """
+
+    def __init__(self, directory: Path | None, *, prefix: str = "") -> None:
+        self._directory = Path(directory) if directory is not None else None
+        self._prefix = prefix
+        self._lock = threading.Lock()
+        self._paths = _index_static_files(self._directory, prefix=prefix)
+
+    def __contains__(self, path: object) -> bool:
+        return path in self._paths
+
+    def __len__(self) -> int:
+        return len(self._paths)
+
+    def resync(self) -> None:
+        """Rewalk the directory and atomically replace the served-path snapshot."""
+        fresh = _index_static_files(self._directory, prefix=self._prefix)
+        with self._lock:
+            self._paths = fresh
+
+
 # Per-file and per-process budgets for the in-memory static cache. Both are
 # enforced once at startup (the production build is immutable, so the cache
 # never grows afterwards — bounded by construction, no runtime eviction).
@@ -198,15 +233,22 @@ _STATIC_CACHE_MAX_FILE_BYTES = 1024 * 1024
 _STATIC_CACHE_MAX_TOTAL_BYTES = 32 * 1024 * 1024
 
 
-def _static_cache_control(path: str, *, is_client: bool) -> bytes:
+def _static_cache_control(path: str, *, is_client: bool, debug: bool = False) -> bytes:
     """Cache-Control value for a static asset URL path.
 
-    Vite content-hashed bundles (``/client/.../dist/assets/...``) are
-    immutable and cacheable forever; everything else revalidates hourly.
+    Vite content-hashed bundles (``/client/.../dist/assets/...``) are immutable
+    and cacheable forever regardless of mode. In production, other assets get a
+    one-hour cache. In development, public assets get ``no-cache`` so the browser
+    revalidates on every request — a change to a ``public/`` file is reflected on
+    the next refresh (a 304 is still returned while it is unchanged) instead of
+    being masked by an hour-long cache. Dev never long-caches public assets, but
+    hashed client bundles stay immutable either way.
     """
 
     if is_client and "/dist/assets/" in path:
         return b"public, max-age=31536000, immutable"
+    if debug and not is_client:
+        return b"no-cache"
     return b"public, max-age=3600"
 
 
@@ -323,10 +365,13 @@ class StaticAssetsMiddleware:
         public_directory: Path | None = None,
         client_directory: Path | None = None,
         cache_in_memory: bool = False,
+        debug: bool = False,
+        public_index: StaticFileIndex | None = None,
         cache_max_file_bytes: int = _STATIC_CACHE_MAX_FILE_BYTES,
         cache_max_total_bytes: int = _STATIC_CACHE_MAX_TOTAL_BYTES,
     ) -> None:
         self.app = app
+        self._debug = debug
         self._public_static = (
             HttpOnlyStaticFiles(directory=public_directory, check_dir=False)
             if public_directory is not None
@@ -339,8 +384,12 @@ class StaticAssetsMiddleware:
         )
         # Snapshot the served files so a dynamic request skips the stat + 404
         # that StaticFiles would otherwise incur on a miss (see
-        # _index_static_files). Production build output is immutable.
-        self._public_paths = _index_static_files(public_directory)
+        # _index_static_files). The public index may be supplied by the caller
+        # (dev: shared with the file watcher, which refreshes it on add/remove);
+        # otherwise it is built here. The client build output is immutable.
+        self._public_paths = (
+            public_index if public_index is not None else StaticFileIndex(public_directory)
+        )
         self._client_paths = _index_static_files(client_directory, prefix="/client")
 
         self._memory_cache: dict[str, _CachedAsset] = {}
@@ -386,12 +435,13 @@ class StaticAssetsMiddleware:
                 receive,
                 send,
                 prefix="/client",
+                debug=self._debug,
             ):
                 return
 
         if self._public_static is not None and not path.startswith("/client"):
             if path in self._public_paths and await self._try_static(
-                self._public_static, scope, receive, send
+                self._public_static, scope, receive, send, debug=self._debug
             ):
                 return
 
@@ -434,6 +484,7 @@ class StaticAssetsMiddleware:
         send: Send,
         *,
         prefix: str = "",
+        debug: bool = False,
     ) -> bool:
         selected_scope = scope
         original_path = scope.get("path", "")
@@ -451,7 +502,7 @@ class StaticAssetsMiddleware:
         # Vite hashed assets (e.g. /client/dist/assets/index-a1b2c3d4.js)
         # are immutable and can be cached forever; see _static_cache_control.
         cache_control = _static_cache_control(
-            original_path, is_client=prefix == "/client"
+            original_path, is_client=prefix == "/client", debug=debug
         )
 
         async def _send_with_cache_headers(message):
@@ -1944,16 +1995,27 @@ def create_starlette_app(
             if vite_proxy is not None:
                 await vite_proxy.close()
 
+    static_public_index: StaticFileIndex | None = None
     if serve_static:
         public_directory = public_static_dir or settings.public_dir
+        public_dir_arg = public_directory if public_directory.exists() else None
+        # Share one index between the middleware and (in dev) the file watcher,
+        # which calls ``resync()`` when a public/ file is added or removed so it
+        # becomes discoverable without a restart. In production nothing mutates
+        # it — the build output is immutable.
+        static_public_index = StaticFileIndex(public_dir_arg)
         static_middleware = Middleware(
             StaticAssetsMiddleware,
-            public_directory=public_directory if public_directory.exists() else None,
+            public_directory=public_dir_arg,
             client_directory=client_static_dir if client_static_dir and client_static_dir.exists() else None,
             # Memory-cache small assets only when serving an immutable
             # production build; dev keeps reading from disk so edits to
             # public/ files show up without a restart.
             cache_in_memory=not settings.debug,
+            # In dev, public assets are served with a revalidating (no-cache)
+            # header so a browser refresh reflects an edited asset.
+            debug=settings.debug,
+            public_index=static_public_index,
         )
 
     middleware_stack: list[Middleware] = []
@@ -2088,6 +2150,10 @@ def create_starlette_app(
     )
 
     app.state.pyxle_metrics = metrics_registry
+    # Shared public static-file index (None when static serving is off). The dev
+    # file watcher calls ``.resync()`` on it when a public/ file is added or
+    # removed so it becomes discoverable without a restart.
+    app.state.pyxle_static_index = static_public_index
     # The SSR worker pool (None in subprocess/inline render mode) backs the
     # /readyz dependency check — a server with no live workers can't render.
     app.state.pyxle_ssr_pool = pool

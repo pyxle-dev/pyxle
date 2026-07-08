@@ -167,7 +167,18 @@ class DevServer:
                     tailwind_process = TailwindProcess(settings, logger=logger)
                     await tailwind_process.start()
 
-            watcher = ProjectWatcher(settings, logger=logger, on_rebuild=_handle_rebuild)
+            # Let the watcher refresh the static-file index when a public/ file
+            # is added or removed, so it becomes discoverable without a restart.
+            static_index = getattr(app.state, "pyxle_static_index", None)
+            public_index_refresh = (
+                static_index.resync if static_index is not None else None
+            )
+            watcher = ProjectWatcher(
+                settings,
+                logger=logger,
+                on_rebuild=_handle_rebuild,
+                public_index_refresh=public_index_refresh,
+            )
             self._watcher = watcher
 
             logger.debug(

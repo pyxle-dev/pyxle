@@ -86,6 +86,94 @@ def test_load_config_rejects_unknown_navigation_keys(tmp_path: Path) -> None:
     assert "navigation" in str(excinfo.value)
 
 
+def test_load_config_dev_block_defaults_to_empty(tmp_path: Path) -> None:
+    # No dev block at all → both lists empty.
+    config = load_config(tmp_path)
+    assert config.dev.watch == ()
+    assert config.dev.ignore == ()
+    # Empty dev block → still empty.
+    write_config(tmp_path, {"dev": {}})
+    config = load_config(tmp_path)
+    assert config.dev.watch == ()
+    assert config.dev.ignore == ()
+
+
+def test_load_config_parses_dev_block(tmp_path: Path) -> None:
+    (tmp_path / "lib").mkdir()
+    (tmp_path / "components").mkdir()
+    write_config(
+        tmp_path,
+        {"dev": {"watch": ["lib", "components"], "ignore": ["pages/generated/*", "*.tmp"]}},
+    )
+
+    config = load_config(tmp_path)
+    assert config.dev.watch == ("lib", "components")
+    assert config.dev.ignore == ("pages/generated/*", "*.tmp")
+    # The dev block plumbs through to the devserver kwargs.
+    kwargs = config.to_devserver_kwargs()
+    assert kwargs["dev_watch"] == ("lib", "components")
+    assert kwargs["dev_ignore"] == ("pages/generated/*", "*.tmp")
+
+
+def test_load_config_rejects_non_object_dev_block(tmp_path: Path) -> None:
+    write_config(tmp_path, {"dev": "nope"})
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(tmp_path)
+
+    assert "dev" in str(excinfo.value)
+
+
+def test_load_config_rejects_unknown_dev_keys(tmp_path: Path) -> None:
+    write_config(tmp_path, {"dev": {"reload": True}})
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(tmp_path)
+
+    assert "dev" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("bad", ["nope", 5, {"lib": True}])
+def test_load_config_rejects_non_list_dev_watch(tmp_path: Path, bad: object) -> None:
+    write_config(tmp_path, {"dev": {"watch": bad}})
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(tmp_path)
+
+    assert "dev.watch" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("bad", ["", "   ", 5, None])
+def test_load_config_rejects_bad_dev_watch_entry(tmp_path: Path, bad: object) -> None:
+    write_config(tmp_path, {"dev": {"watch": [bad]}})
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(tmp_path)
+
+    assert "dev.watch" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("evil", ["../secrets", "lib/../../etc", "/etc/passwd"])
+def test_load_config_rejects_dev_watch_traversal(tmp_path: Path, evil: str) -> None:
+    write_config(tmp_path, {"dev": {"watch": [evil]}})
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(tmp_path)
+
+    message = str(excinfo.value)
+    assert "dev.watch" in message
+    assert "escapes" in message or "absolute" in message
+
+
+def test_load_config_rejects_bad_dev_ignore_entry(tmp_path: Path) -> None:
+    write_config(tmp_path, {"dev": {"ignore": [""]}})
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(tmp_path)
+
+    assert "dev.ignore" in str(excinfo.value)
+
+
 def test_load_config_rate_limit_defaults_to_disabled(tmp_path: Path) -> None:
     # No rateLimit block at all → disabled.
     config = load_config(tmp_path)

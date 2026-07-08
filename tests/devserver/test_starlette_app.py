@@ -2794,12 +2794,111 @@ def test_static_cache_disabled_reads_live_from_disk(tmp_path: Path) -> None:
     assert client.get("/live.txt").text == "after"
 
 
+def test_static_assets_middleware_dev_public_uses_no_cache(tmp_path: Path) -> None:
+    """In dev (debug=True), a public asset is served with a revalidating
+    ``no-cache`` header so a browser refresh reflects an edit — not the
+    hour-long production cache."""
+    from starlette.middleware import Middleware
+
+    from pyxle.devserver.starlette_app import StaticAssetsMiddleware
+
+    public_dir = tmp_path / "public"
+    public_dir.mkdir()
+    (public_dir / "logo.svg").write_text("<svg/>", encoding="utf-8")
+
+    app = Starlette(
+        middleware=[
+            Middleware(StaticAssetsMiddleware, public_directory=public_dir, debug=True)
+        ]
+    )
+    app.router.add_route(
+        "/{path:path}", lambda r: PlainTextResponse("X"), methods=["GET"]
+    )
+    client = TestClient(app)
+
+    resp = client.get("/logo.svg")
+    assert resp.status_code == 200
+    assert resp.headers["cache-control"] == "no-cache"
+
+
+def test_static_assets_middleware_dev_client_hashed_stays_immutable(
+    tmp_path: Path,
+) -> None:
+    """Debug mode must not weaken hashed client-bundle caching — those stay
+    immutable regardless of mode."""
+    from starlette.middleware import Middleware
+
+    from pyxle.devserver.starlette_app import StaticAssetsMiddleware
+
+    client_dir = tmp_path / "client"
+    hashed_dir = client_dir / "dist" / "assets"
+    hashed_dir.mkdir(parents=True)
+    (hashed_dir / "index-a1b2c3d4.js").write_text("export const x = 1;", encoding="utf-8")
+
+    app = Starlette(
+        middleware=[
+            Middleware(StaticAssetsMiddleware, client_directory=client_dir, debug=True)
+        ]
+    )
+    app.router.add_route(
+        "/{path:path}", lambda r: PlainTextResponse("X"), methods=["GET"]
+    )
+    client = TestClient(app)
+
+    resp = client.get("/client/dist/assets/index-a1b2c3d4.js")
+    assert resp.status_code == 200
+    assert resp.headers["cache-control"] == "public, max-age=31536000, immutable"
+
+
+def test_static_file_index_resync_discovers_new_file(tmp_path: Path) -> None:
+    """A file added after startup is not served until the shared index is
+    resync'd — then it becomes discoverable without rebuilding the app."""
+    from starlette.middleware import Middleware
+
+    from pyxle.devserver.starlette_app import StaticAssetsMiddleware, StaticFileIndex
+
+    public_dir = tmp_path / "public"
+    public_dir.mkdir()
+
+    index = StaticFileIndex(public_dir)
+    assert "/late.txt" not in index
+
+    async def fallthrough(request):  # noqa: ANN001
+        return PlainTextResponse("FELL-THROUGH")
+
+    app = Starlette(
+        middleware=[
+            Middleware(
+                StaticAssetsMiddleware,
+                public_directory=public_dir,
+                debug=True,
+                public_index=index,
+            )
+        ]
+    )
+    app.router.add_route("/{path:path}", fallthrough, methods=["GET"])
+    client = TestClient(app)
+
+    # Not yet indexed → the request falls through to the app.
+    assert client.get("/late.txt").text == "FELL-THROUGH"
+
+    # Create the file and refresh the shared index (what the dev watcher does).
+    (public_dir / "late.txt").write_text("HELLO", encoding="utf-8")
+    index.resync()
+    assert "/late.txt" in index
+
+    resp = client.get("/late.txt")
+    assert resp.status_code == 200
+    assert resp.text == "HELLO"
+
+
 def test_create_starlette_app_enables_static_cache_only_in_production(
     project: DevServerSettings,
     monkeypatch,
 ) -> None:
     """The app assembly memory-caches static assets only when not in debug
-    mode — dev keeps serving public/ straight from disk."""
+    mode — dev keeps serving public/ straight from disk — and threads the
+    debug flag + a shared static index the dev watcher can refresh."""
 
     from pyxle.devserver.starlette_app import StaticAssetsMiddleware
 
@@ -2819,10 +2918,17 @@ def test_create_starlette_app_enables_static_cache_only_in_production(
         raise AssertionError("StaticAssetsMiddleware not installed")
 
     dev_app = create_starlette_app(project, table)
-    assert _static_kwargs(dev_app)["cache_in_memory"] is False
+    dev_kwargs = _static_kwargs(dev_app)
+    assert dev_kwargs["cache_in_memory"] is False
+    assert dev_kwargs["debug"] is True
+    # The shared index is exposed for the dev watcher and passed to the middleware.
+    assert dev_app.state.pyxle_static_index is not None
+    assert dev_kwargs["public_index"] is dev_app.state.pyxle_static_index
 
     prod_app = create_starlette_app(replace(project, debug=False), table)
-    assert _static_kwargs(prod_app)["cache_in_memory"] is True
+    prod_kwargs = _static_kwargs(prod_app)
+    assert prod_kwargs["cache_in_memory"] is True
+    assert prod_kwargs["debug"] is False
 
 
 def test_hot_route_refresh_keeps_streaming_wired(

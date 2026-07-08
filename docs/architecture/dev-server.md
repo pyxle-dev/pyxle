@@ -81,9 +81,10 @@ $ pyxle dev
    │
    ▼
 6. Start the file watcher (watcher.py)
-   - Watch pages/, public/, global stylesheets/scripts
+   - Rebuild watch: pages/, dev.watch dirs, global stylesheets/scripts
+   - Index-only watch: public/ (served live — never rebuilds/reloads)
    - Debounce events for 250ms
-   - On change: rebuild via builder.py and reload registry
+   - On a rebuild-watch change: rebuild via builder.py and reload registry
    │
    ▼
 7. Start uvicorn on port 8000
@@ -256,15 +257,41 @@ new code.
 
 By default, the watcher observes:
 
-- `pages/` — recursive
-- `public/` — recursive
+- `pages/` — recursive, on the **rebuild** watch (a change runs
+  `build_once()` and reloads the browser)
+- Any directory listed in [`dev.watch`](../reference/configuration.md#development)
+  — also on the rebuild watch, so a shared Python module imported from
+  outside `pages/` (e.g. `lib/`) hot-reloads
 - Any file referenced in `globalStyles` or `globalScripts` config
+- `public/` — recursive, but on a **lightweight index-only** watch that
+  never rebuilds or reloads (see below)
 - The `pyxle.config.json` itself (changing the config triggers a
   full restart, not a hot-reload)
 
-It does **not** watch `node_modules/`, `.pyxle-build/`, `dist/`, or
-any dotfiles. Those are either output directories (changing them
-would loop) or noise.
+On the rebuild watch, generated build output is ignored so a rebuild's
+own writes don't trigger another rebuild: `.pyxle-build/` and
+`__pycache__/` trees, `*.pyc` bytecode, and `*.db`/`*.db-wal`/`*.db-shm`
+journals. A [`dev.ignore`](../reference/configuration.md#development) list
+adds extra glob patterns on top of these built-ins — it can add ignores
+but never clear them. The watcher does not watch `node_modules/` or
+`dist/`.
+
+### `public/` is served live, not rebuilt
+
+Changes under `public/` **do not** rebuild or reload the page — matching
+Next.js, which never rebuilds on `public/` changes. Public assets are
+served straight from disk (dev serves them with a revalidating
+`no-cache` header), so an **edited** file is reflected on the next
+request/refresh with no watcher action.
+
+The watcher still keeps a lightweight watch on `public/` for one job: a
+**newly created or deleted** file changes which URLs resolve, so those
+structural events refresh the static-file index the static middleware
+uses for its O(1) membership check. That's how a freshly added public
+asset becomes reachable without restarting `pyxle dev`. This index
+watch never calls `build_once()` and never touches the browser-reload
+channel. (`pyxle serve` builds the index once and runs no watcher — the
+production tree is immutable.)
 
 ---
 

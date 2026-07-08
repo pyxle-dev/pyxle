@@ -222,6 +222,34 @@ class LlmsConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class DevConfig:
+    """Development-server-only settings that shape the file watcher.
+
+    Both fields are **dev-only** — they influence hot reloading under
+    ``pyxle dev`` and are ignored by ``pyxle serve`` (production serves a
+    pre-built, immutable tree and runs no watcher).
+
+    ``watch`` lists extra project-relative directories to watch for hot reload,
+    in addition to the always-watched ``pages/``. Pyxle only watches ``pages/``
+    by default, so a shared Python module imported from outside ``pages/`` (e.g.
+    ``lib/`` or ``components/``) would not otherwise trigger a reload; listing
+    its directory here closes that gap. A change under a watched directory runs
+    the normal rebuild + module-invalidation + browser-reload path.
+
+    ``ignore`` lists extra glob patterns matched against the project-relative
+    path of each changed file; a match suppresses the rebuild/reload for that
+    event. These are **additive** to Pyxle's built-in generated-output ignores
+    (compiled bytecode, ``.pyxle-build``/``__pycache__`` trees, SQLite
+    journals). The built-ins are load-bearing — they prevent a self-sustaining
+    rebuild loop — and always remain in force; a user ``ignore`` list can only
+    add to them, never clear them.
+    """
+
+    watch: tuple[str, ...] = ()
+    ignore: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class PyxleConfig:
     """Resolved configuration values for a Pyxle project."""
 
@@ -246,6 +274,7 @@ class PyxleConfig:
     rate_limit: RateLimitConfig = RateLimitConfig()
     observability: ObservabilityConfig = ObservabilityConfig()
     llms: LlmsConfig = LlmsConfig()
+    dev: DevConfig = DevConfig()
     # Plugin entries as the raw payload from ``pyxle.config.json`` —
     # either a bare string (``"pyxle-auth"``) or an object
     # (``{"name": "pyxle-auth", "settings": {...}}``). Resolved into
@@ -277,6 +306,8 @@ class PyxleConfig:
             "rate_limit": self.rate_limit,
             "observability": self.observability,
             "llms": self.llms,
+            "dev_watch": self.dev.watch,
+            "dev_ignore": self.dev.ignore,
             "plugins": self.plugins,
         }
 
@@ -386,6 +417,7 @@ def _parse_config_dict(data: Dict[str, Any], *, source: Path) -> PyxleConfig:
         "rateLimit",
         "observability",
         "llms",
+        "dev",
         "plugins",
     }
     unknown_keys = set(data) - allowed_top_keys
@@ -422,6 +454,7 @@ def _parse_config_dict(data: Dict[str, Any], *, source: Path) -> PyxleConfig:
     rate_limit_config = _parse_rate_limit_block(data.get("rateLimit"), source=source)
     observability_config = _parse_observability_block(data.get("observability"), source=source)
     llms_config = _parse_llms_block(data.get("llms"), source=source)
+    dev_config = _parse_dev_block(data.get("dev"), source=source)
     plugins = _parse_plugins_block(data.get("plugins"), source=source)
 
     return PyxleConfig(
@@ -446,8 +479,78 @@ def _parse_config_dict(data: Dict[str, Any], *, source: Path) -> PyxleConfig:
         rate_limit=rate_limit_config,
         observability=observability_config,
         llms=llms_config,
+        dev=dev_config,
         plugins=plugins,
     )
+
+
+def _parse_dev_block(value: Any, *, source: Path) -> DevConfig:
+    """Parse the ``dev`` block — development-server file-watcher settings.
+
+    ``dev.watch`` and ``dev.ignore`` are both optional lists of strings. Each
+    ``watch`` entry must be a project-relative directory that stays inside the
+    project root (the config file's directory); an absolute path or one that
+    escapes the root via ``..`` is rejected with a clear :class:`ConfigError`.
+    ``ignore`` entries are glob patterns and are validated only as non-empty
+    strings.
+    """
+    if value is None:
+        return DevConfig()
+    if not isinstance(value, Mapping):
+        raise ConfigError(
+            f"Invalid value for 'dev' in '{source}': expected an object with "
+            "'watch'/'ignore' lists."
+        )
+
+    _reject_unknown_keys(value, allowed={"watch", "ignore"}, block="dev", source=source)
+
+    watch = _parse_dev_watch_list(value.get("watch"), source=source)
+    ignore = _parse_string_list(value.get("ignore"), source=source, field_name="dev.ignore")
+    return DevConfig(watch=watch, ignore=ignore)
+
+
+def _parse_dev_watch_list(value: Any, *, source: Path) -> tuple[str, ...]:
+    """Validate ``dev.watch`` — project-relative directories to also watch.
+
+    Rejects absolute paths and any entry that resolves outside the project
+    root (path traversal). Returns the normalised project-relative strings;
+    the directories are resolved to absolute paths later, when the dev-server
+    settings are built.
+    """
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise ConfigError(
+            f"Invalid value for 'dev.watch' in '{source}': expected a list of "
+            "project-relative directory paths."
+        )
+
+    project_root = source.parent.resolve()
+    normalized: list[str] = []
+    for index, entry in enumerate(value):
+        if not isinstance(entry, str) or not entry.strip():
+            raise ConfigError(
+                f"Invalid entry at index {index} in 'dev.watch' within '{source}': "
+                "expected a non-empty string."
+            )
+        candidate = entry.strip()
+        relative = Path(candidate)
+        if relative.is_absolute():
+            raise ConfigError(
+                f"Invalid 'dev.watch' entry '{candidate}' in '{source}': expected a "
+                "project-relative path, not an absolute one."
+            )
+        resolved = (project_root / relative).resolve()
+        try:
+            resolved.relative_to(project_root)
+        except ValueError as exc:
+            raise ConfigError(
+                f"Invalid 'dev.watch' entry '{candidate}' in '{source}': path escapes "
+                "the project root."
+            ) from exc
+        normalized.append(candidate)
+
+    return tuple(normalized)
 
 
 def _parse_plugins_block(value: Any, *, source: Path) -> tuple[Any, ...]:
@@ -1121,6 +1224,7 @@ __all__ = [
     "ConfigError",
     "CorsConfig",
     "CsrfConfig",
+    "DevConfig",
     "CSRF_COOKIE_NAME_PREFIX",
     "default_csrf_cookie_name",
     "load_config",

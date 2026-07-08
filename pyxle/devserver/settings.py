@@ -44,6 +44,14 @@ class DevServerSettings:
     page_manifest: dict[str, Any] | None = None
     global_stylesheets: tuple[GlobalStylesheet, ...] = ()
     global_scripts: tuple[GlobalScript, ...] = ()
+    # Dev-only file-watcher extras (see ``pyxle.config.DevConfig``). Ignored by
+    # ``pyxle serve`` — production runs no watcher. ``dev_watch_dirs`` are extra
+    # absolute directories to watch for hot reload (in addition to ``pages/``);
+    # ``dev_ignore_globs`` are extra glob patterns, additive to the built-in
+    # generated-output ignores, matched against each changed file's
+    # project-relative path.
+    dev_watch_dirs: tuple[Path, ...] = ()
+    dev_ignore_globs: tuple[str, ...] = ()
     # CORS / CSRF config objects (optional, default = disabled)
     cors: Any = None
     csrf: Any = None
@@ -84,6 +92,8 @@ class DevServerSettings:
         page_manifest: dict[str, Any] | None = None,
         global_stylesheets: Sequence[str] | Sequence[GlobalStylesheet] | None = None,
         global_scripts: Sequence[str] | Sequence[GlobalScript] | None = None,
+        dev_watch: Sequence[str] | None = None,
+        dev_ignore: Sequence[str] | None = None,
         ssr_workers: int = 1,
         cors: Any = None,
         csrf: Any = None,
@@ -127,6 +137,18 @@ class DevServerSettings:
                     script_specs = (first_script, *iterator)  # type: ignore[arg-type]
                 else:
                     script_specs = resolve_global_scripts(root, global_scripts)  # type: ignore[arg-type]
+        # Resolve extra watch directories against the project root, dropping any
+        # that escape it (defence in depth — config parsing already rejects
+        # traversal, but this keeps a direct caller from smuggling one in).
+        dev_watch_paths: list[Path] = []
+        for entry in dev_watch or ():
+            resolved_dir = (root / entry).resolve()
+            try:
+                resolved_dir.relative_to(root)
+            except ValueError:
+                continue
+            if resolved_dir not in dev_watch_paths:
+                dev_watch_paths.append(resolved_dir)
         return cls(
             project_root=root,
             build_root=build_root_path,
@@ -147,6 +169,8 @@ class DevServerSettings:
             page_manifest=page_manifest,
             global_stylesheets=style_specs,
             global_scripts=script_specs,
+            dev_watch_dirs=tuple(dev_watch_paths),
+            dev_ignore_globs=tuple(dev_ignore) if dev_ignore else (),
             ssr_workers=max(0, ssr_workers),
             cors=cors,
             csrf=csrf,
