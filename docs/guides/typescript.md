@@ -110,10 +110,11 @@ TypeScript support today is **consumption-only**. The following are not yet avai
 - **No OpenAPI → TypeScript client generation** from your action models.
 - **No single `pyxle/client.d.ts` barrel.** Types are per-module plus `index.d.ts`; the `pyxle/client.js` barrel itself resolves as plain JS via `allowJs`.
 
-These are tracked for a later phase. The strict `tsconfig` scaffold and the framework `.d.ts` set are delivered today; loader-type generation and `.tsx` authoring remain pending.
+These are tracked for a later phase. The strict `tsconfig` scaffold and the framework `.d.ts` set are delivered today; loader-type generation and `.tsx` authoring remain pending. For the full picture of where the type story is heading — authoring your client in TypeScript and forwarding Python types to the client — see [The road to a fully-typed Pyxle](fully-typed-pyxle.md).
 
 ## Next steps
 
+- Where this is heading: [The road to a fully-typed Pyxle](fully-typed-pyxle.md)
 - Configure your editor: [Editor setup](editor-setup.md)
 - Validate action inputs with types: [Server actions](../core-concepts/server-actions.md#validating-request-bodies-with-pydantic)
 - CLI reference for `pyxle typecheck`: [CLI](../reference/cli.md)
