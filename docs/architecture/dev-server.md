@@ -28,7 +28,7 @@ when you save a file, and how to read the dev server's source code.
 | `error_pages.py` (~140) | Discovers `error.pyxl` and `not-found.pyxl` boundaries |
 | `route_hooks.py` (~225) | Per-route middleware policies |
 | `middleware.py` (~75) | Loads custom user middleware modules |
-| `tailwind.py` (~300) | Optional Tailwind CSS watcher |
+| `tailwind.py` (~300) | Legacy standalone Tailwind v3 watcher (Tailwind v4 runs through the `@tailwindcss/vite` plugin instead) |
 | `csrf.py` (~160) | CSRF protection middleware |
 | `client_files.py` (~2170) | Bundled client runtime sources |
 | `scripts.py`, `styles.py` | Global script and stylesheet resolution |

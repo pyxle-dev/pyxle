@@ -137,7 +137,7 @@ def _run_babel_parser(source_path: str, target_components: set[str] | None) -> J
     except FileNotFoundError:
         return JSXParseResult(
             components=(),
-            error="Node.js not found. Install Node.js >=18 to parse JSX components.",
+            error="Node.js not found. Install Node.js >=20.19 to parse JSX components.",
         )
     except subprocess.TimeoutExpired:
         return JSXParseResult(components=(), error="JSX parser timed out.")

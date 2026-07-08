@@ -1,299 +1,147 @@
 # Styling
 
-Pyxle ships with Tailwind CSS configured in a fresh `pyxle init` project. The
-recommended way to load your stylesheets is to **import them from a JSX module**
-so Vite can compile, bundle, and content-hash them — exactly like it does for
-JavaScript modules. This means you never have to hand-bump a `?v=N` query string
-after a deploy to invalidate stale browser caches.
+Pyxle delegates all CSS to **Vite**. Import a stylesheet from a JSX module and
+Vite compiles, bundles, hot-reloads (in dev), and content-hashes it (in build)
+— exactly like it does for JavaScript. You never hand-bump a `?v=N` query
+string to bust a cache, and there's no separate CSS build step to run.
 
-> **Prerequisite: a project-root `postcss.config.*` is required for Tailwind.**
-> Vite compiles your CSS through PostCSS, and it only loads the Tailwind plugin
-> when it discovers a `postcss.config.{cjs,js,mjs,ts}` at the project root. The
-> scaffold ships this file, so a fresh project works immediately — but a
-> **hand-built or upgraded project with no `postcss.config.*` silently fails**:
-> the raw `@tailwind base/components/utilities` directives are inlined uncompiled
-> and the page renders **unstyled, with no error**. If your Tailwind classes do
-> nothing, check for this file first.
+Three things work out of the box in **every** project, with or without Tailwind:
 
-## Recommended: Vite-managed CSS (auto-hashed)
+- **Plain CSS** — `import './styles/app.css'`
+- **CSS Modules** — `import styles from './Badge.module.css'` (locally scoped, hashed class names)
+- **Any npm CSS** — `import 'highlight.js/styles/github-dark.css'`
 
-When your project has a `postcss.config.{cjs,js,mjs,ts}` file alongside the
-Tailwind config, Pyxle delegates CSS processing to Vite + PostCSS. The
-standalone Tailwind CLI watcher is automatically skipped (you'll see a clear
-log line on dev server start), and any CSS file you import from a JSX module
-flows through PostCSS, gets a content hash, and is listed in the Vite
-manifest under your page entry.
+Tailwind CSS is **opt-in** — choose it at `pyxle init` (or add it later).
 
-The SSR template reads that manifest on every request and emits
+## The default: plain CSS + CSS Modules
 
-```html
-<link rel="stylesheet" href="/client/dist/assets/style-DEADBEEF.css" />
-```
-
-automatically. The hash changes only when the CSS source changes, so users
-with old caches always see the latest styles after a deploy.
-
-### Setup
-
-A new Pyxle project has everything wired by default. If you're upgrading an
-existing project, here's the full setup:
-
-**1. Add `postcss.config.cjs` to your project root:**
-
-```javascript
-module.exports = {
-  plugins: {
-    tailwindcss: {},
-    autoprefixer: {},
-  },
-};
-```
-
-**2. Make sure `tailwindcss`, `autoprefixer`, and `postcss` are in `devDependencies`:**
-
-```bash
-npm install --save-dev tailwindcss autoprefixer postcss
-```
-
-(The `postcss.config.cjs` above references `tailwindcss: {}`, so all three must be installed.)
-
-**3. Import your stylesheet from a JSX module.** The cleanest place is the
-root `pages/layout.pyxl` so every route picks it up via the layout wrapper:
+A project scaffolded **without** Tailwind ships a plain-CSS baseline. The
+starter imports a global stylesheet and demonstrates a CSS Module:
 
 ```jsx
-import './styles/tailwind.css';
-import React from 'react';
+// pages/index.pyxl (JSX section)
+import './styles/app.css';          // global CSS — applies everywhere it's imported
+import Badge from './components/Badge.jsx';
+```
 
-export default function RootLayout({ children }) {
-  return <div className="min-h-screen">{children}</div>;
+```jsx
+// pages/components/Badge.jsx
+import styles from './Badge.module.css';   // CSS Module — class names are scoped + hashed
+
+export default function Badge({ children }) {
+  return <span className={styles.badge}>{children}</span>;
 }
 ```
 
-**4. Delete any manual `<link rel="stylesheet" href="/styles/tailwind.css" />`
-tags from your `<Head>` blocks.** Vite owns the link now.
+CSS Module class names are **deterministic and identical on the server and the
+client**, so the server-rendered HTML and the hydrated React tree always agree
+— no hydration mismatch. In a production build each stylesheet becomes a
+content-hashed asset (`Badge-C9bn1NFT.css`) that the SSR template links
+automatically.
 
-**5. (Optional) remove the now-inert `dev:css` and `build:css` scripts from
-`package.json`.** Only relevant when upgrading an older project that defined
-them — the current scaffold's `package.json` ships just `dev`/`build`/`lint`,
-so a fresh project has nothing to remove. When PostCSS is configured, Pyxle
-skips the standalone watcher, so those scripts never run on their own anyway.
+## Tailwind CSS (opt-in, v4, Vite-native)
 
-### Verifying the setup
-
-Start the dev server:
+Enable Tailwind when you scaffold:
 
 ```bash
-pyxle dev
+pyxle init my-app --tailwind
+# or answer "y" to "Use Tailwind CSS?" in the interactive prompt
 ```
 
-You should see a log line like:
+That gives you Tailwind **v4**, wired directly into Vite via the
+[`@tailwindcss/vite`](https://tailwindcss.com/docs/installation/using-vite)
+plugin. There is **no `tailwind.config.js`, no `postcss.config.js`, and no
+standalone `tailwindcss --watch` process** — Tailwind runs inside Vite's normal
+CSS pipeline, so it hot-reloads in dev and is hashed in build like any other
+stylesheet.
 
+The entire Tailwind setup is a single CSS entry:
+
+```css
+/* pages/styles/app.css */
+@import "tailwindcss";
 ```
-ℹ️  Detected postcss.config.cjs — skipping standalone Tailwind watcher;
-   CSS will be processed and hashed by Vite via PostCSS.
+
+imported once from a JSX module (the scaffold imports it from
+`pages/index.pyxl`). Use utility classes anywhere:
+
+```jsx
+<main className="flex min-h-screen items-center justify-center bg-slate-50">
+  <h1 className="text-2xl font-semibold tracking-tight">Hello</h1>
+</main>
 ```
 
-Open the page in your browser. Tailwind classes work as before. In dev mode
-Vite serves the CSS through its own runtime (with HMR), so changes hot-reload
-instantly. There's a brief flash of unstyled content on the very first paint
-in dev — this is a Vite quirk and does **not** happen in production builds.
+Tailwind v4 auto-detects your content — it scans the files Vite processes, so
+there's no `content` glob to maintain. Customise your theme with `@theme` in the
+same CSS file; see the [Tailwind v4 docs](https://tailwindcss.com/docs).
 
-For production:
+### Adding Tailwind to an existing project
+
+If you scaffolded without Tailwind and want it later:
 
 ```bash
-pyxle build
+npm install -D tailwindcss @tailwindcss/vite
 ```
 
-Inspect `dist/page-manifest.json` and you'll see each route's `client.css`
-array pointing at content-hashed assets:
+Pyxle detects `@tailwindcss/vite` in your `package.json` and adds the plugin to
+the Vite config it generates. Then replace your CSS entry's contents with
+`@import "tailwindcss";` (keep any custom rules below it) and restart `pyxle dev`.
 
-```json
-{
-  "/": {
-    "client": {
-      "file": "dist/assets/index-DEADBEEF.js",
-      "css": ["dist/assets/index-CAFEBABE.css"]
-    }
-  }
-}
-```
+## shadcn/ui
 
-Two consecutive builds with no source changes produce the **same** hash. A
-build after editing `tailwind.css` (or any source it depends on) produces a
-**different** hash. Cache-busting is automatic.
+Enable it at scaffold time (`pyxle init --shadcn`, which implies Tailwind). See
+the [Third-party packages guide](third-party-packages.md#shadcnui) for the full,
+verified `npx shadcn@latest add` walkthrough.
 
-### Tailwind config
+## Using another CSS library
 
-The Tailwind config still lives at `tailwind.config.cjs` (or `.js`, `.ts`,
-`.mjs`). PostCSS calls it during compilation, so your `content` globs still
-control which files Tailwind scans for class names:
-
-```javascript
-module.exports = {
-  content: ['./pages/**/*.{pyxl,jsx,js,tsx,ts}'],
-  darkMode: 'class',
-  theme: {
-    extend: {},
-  },
-  plugins: [
-    require('@tailwindcss/forms'),
-    require('@tailwindcss/typography'),
-  ],
-};
-```
-
-### Dark mode
-
-The scaffold includes a theme toggle script that reads from `localStorage`
-and respects `prefers-color-scheme`. Toggle the `dark` class on `<html>` to
-switch themes:
+Any CSS or CSS-in-JS library that works with React 19 and SSR works with Pyxle.
+Install it with npm and import it in your JSX section — Vite handles the rest.
 
 ```jsx
-function toggleTheme() {
-  document.documentElement.classList.toggle('dark');
-}
-```
-
-Use Tailwind's `dark:` modifier for dark-mode styles:
-
-```jsx
-<div className="bg-white dark:bg-slate-900 text-black dark:text-white">
-  Content
-</div>
-```
-
-## Importing CSS from any JSX module
-
-The same pattern works for any CSS file, not just Tailwind. Component-scoped
-stylesheets, third-party CSS modules, or vanilla CSS files all work:
-
-```jsx
-import './hero.css';
+// A third-party stylesheet:
 import 'highlight.js/styles/github-dark.css';
-import React from 'react';
 
-export default function Hero() {
-  return <section className="hero">…</section>;
-}
+// A UI kit's styles:
+import 'some-ui-kit/dist/style.css';
 ```
 
-Vite resolves the specifier relative to the importer, runs it through
-PostCSS, hashes the output, and lists it under the page's manifest entry.
-The SSR template emits a `<link>` for every CSS file the page transitively
-imports.
+CSS-in-JS libraries (styled-components, Emotion, etc.) install the same way —
+`npm install` and import in the JSX section. Pick libraries with SSR support so
+server- and client-rendered markup match.
 
-## Global stylesheets (config-driven)
+## Global stylesheets (config-driven, inlined)
 
-For CSS that should be **inlined** on every page (no separate request, no
-hashing — embedded directly in the SSR HTML), register it in `pyxle.config.json`:
+For CSS that should be **inlined** on every page (embedded in the SSR HTML, no
+separate request), register it in `pyxle.config.json`:
 
 ```json
 {
   "styling": {
-    "globalStyles": [
-      "styles/reset.css",
-      "styles/typography.css"
-    ]
+    "globalStyles": ["styles/reset.css", "styles/typography.css"]
   }
 }
 ```
 
-Paths are relative to the project root. Global styles are loaded in order
-and inlined as `<style>` tags, so they work even before JavaScript loads.
-Use this for tiny critical CSS — for anything substantial, prefer the
-JSX-import path so Vite can hash and cache it properly.
+Paths are relative to the project root; styles are inlined as `<style>` tags in
+order, so they apply before JavaScript loads. Use this for tiny critical CSS —
+for anything substantial prefer the JSX-import path so Vite can hash and cache
+it.
 
 ## Global scripts
 
-Register JavaScript files loaded on every page:
+Register JavaScript loaded on every page:
 
 ```json
 {
   "styling": {
-    "globalScripts": [
-      "scripts/analytics.js"
-    ]
+    "globalScripts": ["scripts/analytics.js"]
   }
 }
 ```
-
-## Legacy: standalone Tailwind CLI watcher
-
-If you don't want Vite-managed CSS (e.g. you're integrating with an external
-build pipeline), you can use the standalone Tailwind CLI watcher instead.
-**Skip the `postcss.config.*` file** — its presence is what tells Pyxle to
-defer to Vite — and add the watcher scripts to `package.json`:
-
-> **The legacy watcher does not compile JSX-imported CSS.** It writes a separate
-> compiled file (e.g. `public/styles/tailwind.css`) that you must link manually
-> (below). A stylesheet you `import './styles/tailwind.css'` from a JSX module is
-> **not** processed by this watcher — without a `postcss.config.*`, that import
-> is inlined with its `@tailwind` directives uncompiled, so the page renders
-> unstyled. Use this path only when you link the watcher's output by hand and do
-> **not** rely on JSX CSS imports.
-
-```json
-{
-  "scripts": {
-    "dev:css": "tailwindcss -i ./pages/styles/tailwind.css -o ./public/styles/tailwind.css --watch",
-    "build:css": "tailwindcss -i ./pages/styles/tailwind.css -o ./public/styles/tailwind.css --minify"
-  }
-}
-```
-
-`pyxle dev` will auto-start the watcher whenever it detects a Tailwind
-config and no PostCSS config. You can disable it explicitly with:
-
-```bash
-pyxle dev --no-tailwind
-```
-
-Then link the compiled output manually:
-
-```jsx
-import { Head } from 'pyxle/client';
-
-export default function Layout({ children }) {
-  return (
-    <>
-      <Head>
-        <link rel="stylesheet" href="/styles/tailwind.css" />
-      </Head>
-      {children}
-    </>
-  );
-}
-```
-
-Trade-off: this path has **no automatic cache-busting**. If you deploy a CSS
-change and a user has the old file cached, they'll see stale styles until
-their cache expires. Workarounds (`?v=N` query strings, hand-rolled
-fingerprints) are inevitable. The Vite-managed path avoids all of this.
-
-### Dev server rebuilds in a loop
-
-The standalone Tailwind watcher writes its compiled CSS into `public/`. In
-Pyxle **0.7.0 and later** `pyxle dev` never rebuilds on `public/` changes at
-all — static assets are served live from disk and picked up on refresh (like
-Next.js) — so this happens automatically and you don't need to do anything.
-Your edits to the Tailwind *input* (`pages/styles/tailwind.css`) still
-hot-reload normally through the source-watch path.
-
-On **earlier versions** `public/` was on the rebuild watch, so the watcher
-reacted to Tailwind's own output write as if it were an edit, rebuilt, and the
-rebuild let Tailwind re-emit the CSS — a self-sustaining loop that rebuilds
-roughly once a second with no edits (very visible on Linux, where inotify
-reports every write; subtler on macOS). If you see that on an older version,
-either upgrade, point the watcher's `-o` output outside `public/` and link it
-from there, or run `pyxle dev --no-tailwind` and drive `tailwindcss --watch`
-yourself.
-
-## CSS-in-JS
-
-Any CSS-in-JS library that works with React 18 and SSR should work with
-Pyxle. Install it via npm and import it in your JSX section.
 
 ## Next steps
 
 - Manage document head elements: [Head Management](head-management.md)
 - Add scripts with loading strategies: [Client Components](client-components.md)
+- Install packages and set up shadcn/ui: [Third-party packages](third-party-packages.md)

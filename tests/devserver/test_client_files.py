@@ -344,6 +344,79 @@ def test_vite_config_aliases_cover_client_runtime(tmp_path: Path) -> None:
     assert "find: 'pyxle/client'" not in vite_config
 
 
+def _write_package_json(root: Path, *, tailwind: bool) -> None:
+    dev = {"vite": "^7"}
+    if tailwind:
+        dev["@tailwindcss/vite"] = "^4"
+        dev["tailwindcss"] = "^4"
+    (root / "package.json").write_text(
+        json.dumps({"devDependencies": dev}), encoding="utf-8"
+    )
+
+
+def test_vite_config_injects_tailwind_plugin_only_when_present(tmp_path: Path) -> None:
+    settings = create_project(tmp_path)
+    root = settings.project_root
+
+    # No @tailwindcss/vite in package.json -> plugin absent.
+    assert "@tailwindcss/vite" not in _render_vite_config(settings)
+    assert "plugins: [react()]" in _render_vite_config(settings)
+
+    # Declaring the dependency turns the plugin on.
+    _write_package_json(root, tailwind=True)
+    tailwind_config = _render_vite_config(settings)
+    assert "import tailwindcss from '@tailwindcss/vite';" in tailwind_config
+    assert "plugins: [react(), tailwindcss()]" in tailwind_config
+
+
+def test_vite_config_injects_jsconfig_import_alias(tmp_path: Path) -> None:
+    settings = create_project(tmp_path)
+    root = settings.project_root
+
+    # No jsconfig -> no user alias entry.
+    assert "find: '@'" not in _render_vite_config(settings)
+
+    (root / "jsconfig.json").write_text(
+        json.dumps({"compilerOptions": {"baseUrl": ".", "paths": {"@/*": ["./*"]}}}),
+        encoding="utf-8",
+    )
+    config = _render_vite_config(settings)
+    assert "{ find: '@', replacement: projectRoot }" in config
+
+
+def test_vite_config_ignores_malformed_project_files(tmp_path: Path) -> None:
+    """Broken package.json / jsconfig.json must degrade gracefully — no Tailwind
+    plugin, no user alias, and never a crash."""
+    settings = create_project(tmp_path)
+    root = settings.project_root
+    (root / "package.json").write_text("{ not json", encoding="utf-8")
+    (root / "jsconfig.json").write_text("{ also not json", encoding="utf-8")
+
+    config = _render_vite_config(settings)
+    assert "@tailwindcss/vite" not in config
+    assert "find: '@'" not in config
+
+
+def test_vite_config_alias_resolves_subdirectory_target(tmp_path: Path) -> None:
+    settings = create_project(tmp_path)
+    (settings.project_root / "jsconfig.json").write_text(
+        json.dumps({"compilerOptions": {"paths": {"~/*": ["./src/*"]}}}),
+        encoding="utf-8",
+    )
+    config = _render_vite_config(settings)
+    assert "{ find: '~', replacement: path.resolve(projectRoot, 'src') }" in config
+
+
+def test_vite_config_pins_deterministic_css_module_names(tmp_path: Path) -> None:
+    """A deterministic generateScopedName is required so SSR + client CSS Module
+    class names match exactly (no React hydration mismatch)."""
+    settings = create_project(tmp_path)
+    config = _render_vite_config(settings)
+
+    assert "function pyxleCssModuleClass(name, filename, css)" in config
+    assert "generateScopedName: pyxleCssModuleClass" in config
+
+
 def test_vite_config_has_explicit_build_block(tmp_path: Path) -> None:
     settings = create_project(tmp_path)
     vite_config = _render_vite_config(settings)

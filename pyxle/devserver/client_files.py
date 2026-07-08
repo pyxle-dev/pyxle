@@ -391,15 +391,96 @@ def _render_client_runtime_index() -> str:
     )
 
 
+def _project_uses_tailwind(project_root: Path) -> bool:
+    """Return ``True`` when the project depends on ``@tailwindcss/vite``.
+
+    Tailwind v4 is wired into Vite via the ``@tailwindcss/vite`` plugin, so its
+    presence in ``package.json`` (either dependency section) is the signal that
+    the generated config should load the plugin. Reading ``package.json`` keeps
+    detection robust whether Tailwind was scaffolded or added by hand later.
+    """
+
+    package_json = project_root / "package.json"
+    try:
+        import json  # noqa: PLC0415
+
+        data = json.loads(package_json.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    for section in ("dependencies", "devDependencies"):
+        deps = data.get(section)
+        if isinstance(deps, dict) and "@tailwindcss/vite" in deps:
+            return True
+    return False
+
+
+def _project_import_aliases(project_root: Path) -> list[tuple[str, str]]:
+    """Return ``(prefix, target)`` import aliases declared in ``jsconfig.json``.
+
+    Each ``"<prefix>/*": ["<target>/*"]`` entry becomes a Vite path alias so an
+    import like ``@/lib/utils`` resolves the same way the editor and shadcn/ui
+    resolve it. ``target`` is a project-root-relative POSIX path (``.`` for the
+    default ``@/* -> ./*``); malformed configs are ignored.
+    """
+
+    jsconfig = project_root / "jsconfig.json"
+    try:
+        import json  # noqa: PLC0415
+
+        data = json.loads(jsconfig.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+
+    options = data.get("compilerOptions")
+    paths = options.get("paths") if isinstance(options, dict) else None
+    if not isinstance(paths, dict):
+        return []
+
+    aliases: list[tuple[str, str]] = []
+    for key, value in paths.items():
+        if not isinstance(key, str) or not key.endswith("/*"):
+            continue
+        if not isinstance(value, list) or not value or not isinstance(value[0], str):
+            continue
+        prefix = key[:-2]
+        target_glob = value[0]
+        target = target_glob[:-2] if target_glob.endswith("/*") else target_glob
+        # Normalise ``./`` and empty targets to the project root marker ``.``.
+        target = target.lstrip("./") or "."
+        if not prefix or "/" in prefix or "'" in prefix or "\\" in prefix:
+            continue
+        aliases.append((prefix, target))
+    return aliases
+
+
 def _render_vite_config(settings: DevServerSettings) -> str:
     vite_host = settings.vite_host
     vite_port = settings.vite_port
     define_block = _build_public_env_defines()
+
+    uses_tailwind = _project_uses_tailwind(settings.project_root)
+    tailwind_import = (
+        "\n            import tailwindcss from '@tailwindcss/vite';" if uses_tailwind else ""
+    )
+    plugin_calls = "react(), tailwindcss()" if uses_tailwind else "react()"
+
+    alias_entries: list[str] = []
+    for prefix, target in _project_import_aliases(settings.project_root):
+        replacement = (
+            "projectRoot"
+            if target == "."
+            else f"path.resolve(projectRoot, {target!r})"
+        )
+        alias_entries.append(
+            f"                  {{ find: '{prefix}', replacement: {replacement} }},"
+        )
+    user_alias_block = ("\n" + "\n".join(alias_entries)) if alias_entries else ""
+
     return (
         dedent(
             f"""
             import {{ defineConfig }} from 'vite';
-            import react from '@vitejs/plugin-react';
+            import react from '@vitejs/plugin-react';{tailwind_import}
             import path from 'node:path';
 
             const clientRoot = __dirname;
@@ -423,11 +504,13 @@ def _render_vite_config(settings: DevServerSettings) -> str:
                 : viteHost;
             const vitePort = Number(process.env.PYXLE_VITE_PORT ?? {vite_port});
 
+            __PYXLE_CSS_MODULE_HELPER__
+
             export default defineConfig({{
               base,
               root: clientRoot,
               publicDir: path.resolve(projectRoot, 'public'),
-              plugins: [react()],{define_block}
+              plugins: [{plugin_calls}],{define_block}
               build: {{
                 // esbuild minification + Rollup tree-shaking/code-splitting are
                 // Vite's production defaults; these make the rest explicit.
@@ -438,8 +521,17 @@ def _render_vite_config(settings: DevServerSettings) -> str:
                 // slower gzip-size reporting to keep production builds fast.
                 reportCompressedSize: false,
               }},
+              css: {{
+                // Deterministic CSS Module class names so the server-rendered
+                // markup and the client bundle agree exactly — no React
+                // hydration mismatch. The same algorithm runs in Pyxle's SSR
+                // runtime (see ssr/render_component.mjs).
+                modules: {{
+                  generateScopedName: pyxleCssModuleClass,
+                }},
+              }},
               resolve: {{
-                alias: [
+                alias: [{user_alias_block}
                   {{ find: '/pages', replacement: path.resolve(clientRoot, 'pages') }},
                   {{ find: '/routes', replacement: path.resolve(clientRoot, 'routes') }},
                   {{ find: /^pyxle\\/client$/, replacement: path.resolve(pyxleClientDir, 'client.js') }},
@@ -459,7 +551,30 @@ def _render_vite_config(settings: DevServerSettings) -> str:
             """
         ).strip()
         + "\n"
-    )
+    ).replace("__PYXLE_CSS_MODULE_HELPER__", CSS_MODULE_SCOPED_NAME_JS)
+
+
+# Canonical CSS-Module class-name generator, shared verbatim between the Vite
+# client build (as ``css.modules.generateScopedName``) and Pyxle's SSR runtimes
+# (``ssr/render_component.mjs`` + ``ssr/ssr_worker.mjs``). Because the scoped
+# name is derived only from the file's basename, the local class name, and the
+# stylesheet contents — never an absolute path — it produces identical output
+# in dev, build, and production serve, so server- and client-rendered markup
+# always carry the same class names (no React hydration mismatch).
+CSS_MODULE_SCOPED_NAME_JS = dedent(
+    """
+    function pyxleCssModuleClass(name, filename, css) {
+      const file = String(filename).split(/[\\\\/]/).pop() || 'module';
+      const base = file.replace(/\\.module\\.css$/i, '').replace(/[^a-zA-Z0-9_-]/g, '-');
+      const seed = base + '|' + name + '|' + (css || '');
+      let hash = 5381;
+      for (let index = 0; index < seed.length; index += 1) {
+        hash = ((hash << 5) + hash + seed.charCodeAt(index)) >>> 0;
+      }
+      return base + '_' + name + '_' + hash.toString(36).slice(0, 6);
+    }
+    """
+).strip()
 
 
 def _build_public_env_defines() -> str:

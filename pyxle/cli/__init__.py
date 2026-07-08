@@ -22,6 +22,7 @@ from pyxle.devserver.scripts import GlobalScriptConfigError
 from pyxle.devserver.styles import GlobalStyleConfigError
 from pyxle.env import EnvFileError, load_env_files
 
+from .init import DEFAULT_IMPORT_ALIAS
 from .init import log_next_steps as _log_next_steps
 from .init import run_init as _run_init
 from .logger import ConsoleLogger, LogFormat, Verbosity
@@ -111,20 +112,58 @@ def _resolve_run_build():
     return _run_build
 
 
+def _stdin_is_interactive() -> bool:
+    """Return ``True`` when stdin is an interactive TTY.
+
+    Used to decide whether ``pyxle init`` may prompt. When stdin is not a TTY
+    (CI, a pipe, a scripted invocation) prompting would block forever, so the
+    command falls back to flags/defaults instead.
+    """
+
+    try:
+        return sys.stdin.isatty()
+    except (AttributeError, ValueError):  # pragma: no cover - detached stdin
+        return False
+
+
 @app.command(help="Create a new Pyxle project scaffold.")
 def init(
-    name: str = typer.Argument(..., help="Name of the project directory to create."),
+    name: Optional[str] = typer.Argument(
+        None,
+        help="Project directory to create. Use '.' (or omit) to scaffold into the current directory.",
+    ),
     force: bool = typer.Option(
         False,
         "--force",
         "-f",
-        help="Overwrite the target directory if it already exists.",
+        help="Overwrite the target directory (or scaffold into a non-empty current directory).",
     ),
     template: str = typer.Option(
         "default",
         "--template",
         "-t",
         help="Specify the project template to use (placeholder).",
+    ),
+    tailwind: Optional[bool] = typer.Option(
+        None,
+        "--tailwind/--no-tailwind",
+        help="Set up Tailwind CSS v4. Prompted interactively when unset.",
+    ),
+    shadcn: Optional[bool] = typer.Option(
+        None,
+        "--shadcn/--no-shadcn",
+        help="Set up shadcn/ui (implies Tailwind). Prompted interactively when Tailwind is enabled.",
+    ),
+    import_alias: Optional[str] = typer.Option(
+        None,
+        "--import-alias",
+        help=f"Import alias for project modules (default '{DEFAULT_IMPORT_ALIAS}').",
+    ),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        "-y",
+        help="Accept all defaults without prompting (no Tailwind, no shadcn, default alias).",
     ),
     install_deps: bool = typer.Option(
         False,
@@ -136,23 +175,71 @@ def init(
     """Entry-point for the ``pyxle init`` command."""
 
     logger = get_logger()
+    interactive = (not yes) and _stdin_is_interactive()
+
+    # 1. Tailwind CSS.
+    if tailwind is None:
+        if shadcn:
+            tailwind_choice = True
+        elif interactive:
+            tailwind_choice = typer.confirm("Use Tailwind CSS?", default=False)
+        else:
+            tailwind_choice = False
+    else:
+        tailwind_choice = tailwind
+
+    # 2. shadcn/ui — only offered/effective when Tailwind is enabled.
+    if shadcn is None:
+        if not tailwind_choice:
+            shadcn_choice = False
+        elif interactive:
+            shadcn_choice = typer.confirm("Add shadcn/ui components?", default=False)
+        else:
+            shadcn_choice = False
+    else:
+        shadcn_choice = shadcn
+        if shadcn_choice:
+            tailwind_choice = True
+
+    # 3. Import alias.
+    if import_alias is None:
+        if interactive:
+            alias_choice = typer.prompt("Import alias", default=DEFAULT_IMPORT_ALIAS)
+        else:
+            alias_choice = DEFAULT_IMPORT_ALIAS
+    else:
+        alias_choice = import_alias
+
     try:
         project_path = _run_init(
-            name,
+            name if name is not None else ".",
             force,
             template,
             logger,
+            tailwind=tailwind_choice,
+            shadcn=shadcn_choice,
+            import_alias=alias_choice,
             log_steps=not install_deps,
         )
     except typer.Exit:
         raise
+    except typer.BadParameter as exc:
+        # Invalid name / template / import alias: surface the message and exit 1
+        # (a clean, single-line CLI error) rather than Typer's usage dump.
+        logger.error(str(exc))
+        raise typer.Exit(code=1) from exc
     except Exception as exc:  # pragma: no cover - unexpected runtime errors
         logger.error(f"Unexpected error: {exc}")
         raise typer.Exit(code=1) from exc
 
     if install_deps:
         _install_dependencies(project_path, logger=logger)
-        _log_next_steps(logger, project_path, include_install_hint=False)
+        _log_next_steps(
+            logger,
+            project_path,
+            include_install_hint=False,
+            in_place=(project_path == Path(".")),
+        )
 
 
 def _ensure_directory(directory: Path, logger: ConsoleLogger) -> Path:

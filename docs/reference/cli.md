@@ -18,20 +18,33 @@ The `pyxle` CLI manages Pyxle projects from scaffolding to production.
 Create a new Pyxle project.
 
 ```bash
-pyxle init <name> [options]
+pyxle init [name] [options]
 ```
 
-| Argument / Flag | Description |
-|----------------|-------------|
-| `name` | Project directory name (required) |
-| `--force` / `-f` | Overwrite existing directory |
-| `--template` / `-t` | Project template. Only `"default"` is supported today (other values error). |
-| `--install` / `--no-install` | Run `pip install` and `npm install` after scaffolding (default: no) |
+`pyxle init` is **interactive**: when stdin is a terminal and no flag pins the
+choice, it prompts for Tailwind CSS, shadcn/ui (only if Tailwind is enabled),
+and the import alias. When stdin is **not** a terminal (CI, pipes), it never
+prompts — it uses the flags and defaults below.
+
+| Argument / Flag | Default | Description |
+|----------------|---------|-------------|
+| `name` | `.` | Project directory to create. Use `.` (or omit) to scaffold into the current directory and derive the name from it. |
+| `--force` / `-f` | `false` | Overwrite an existing directory (or scaffold into a non-empty current directory). |
+| `--template` / `-t` | `default` | Project template. Only `"default"` is supported today (other values error). |
+| `--tailwind` / `--no-tailwind` | prompt → off | Set up Tailwind CSS v4 (wired into Vite). |
+| `--shadcn` / `--no-shadcn` | prompt → off | Set up shadcn/ui (implies `--tailwind`). |
+| `--import-alias` | `@/*` | Import alias for project modules (e.g. `~/*`). |
+| `--yes` / `-y` | `false` | Accept all defaults without prompting (no Tailwind, no shadcn, default alias). |
+| `--install` / `--no-install` | `false` | Run `pip install` and `npm install` after scaffolding. |
 
 **Examples:**
 
 ```bash
-pyxle init my-app
+pyxle init my-app                          # interactive prompts
+pyxle init my-app --yes                     # accept defaults (no Tailwind)
+pyxle init my-app --tailwind --no-shadcn    # Tailwind only, no prompts
+pyxle init my-app --shadcn                  # shadcn/ui (implies Tailwind)
+pyxle init .                                # scaffold into an empty current dir
 pyxle init my-app --force --install
 ```
 
@@ -80,7 +93,7 @@ pyxle dev [directory] [options]
 | `--ssr-workers` | `1` | Number of persistent SSR worker processes (`0` = per-request subprocess mode) |
 | `--config` | -- | Path to `pyxle.config.json` |
 | `--print-config` / `--no-print-config` | `false` | Print merged configuration before starting |
-| `--tailwind` / `--no-tailwind` | `true` | Auto-start Tailwind CSS watcher |
+| `--tailwind` / `--no-tailwind` | `true` | Auto-start the **legacy** standalone Tailwind v3 CLI watcher when a hand-written `tailwind.config.*` is present. Tailwind **v4** projects (the scaffold default when you opt into Tailwind) run through the `@tailwindcss/vite` plugin and ignore this flag. |
 | `--dashboard` / `--no-dashboard` | `false` | Periodically print a live [observability](../guides/observability.md#dev-dashboard) panel (request/SSR metrics) to the terminal |
 | `--verbose` / `-v` | `false` | Restore full output: the raw Vite log firehose, debug-level internals, and `DEBUG` server logs in the browser console. Equivalent to the global `pyxle -v dev`. |
 
@@ -98,8 +111,8 @@ pyxle dev --verbose             # troubleshoot: full Vite + debug output
 
 1. Loads configuration from `pyxle.config.json` + environment variables + CLI flags
 2. Compiles `.pyxl` files into Python and JSX modules
-3. Starts the Vite dev server for React hot reload
-4. Starts the Tailwind watcher (if detected)
+3. Starts the Vite dev server for React hot reload (Tailwind v4 compiles here via the `@tailwindcss/vite` plugin)
+4. Starts the legacy Tailwind v3 watcher only if a hand-written `tailwind.config.*` is detected
 5. Starts the Starlette ASGI server
 6. Watches for file changes and recompiles automatically
 

@@ -8,7 +8,39 @@ Create a working Pyxle app in under 5 minutes.
 pyxle init my-app
 ```
 
+`pyxle init` is **interactive** — it asks a few questions and generates a project tailored to your answers:
+
+```
+? Use Tailwind CSS? (y/N)
+? Add shadcn/ui components? (y/N)      # only asked when Tailwind is enabled
+? Import alias: (@/*)
+```
+
+- **Tailwind CSS** — opt in to Tailwind v4, wired straight into Vite (no `postcss.config`, no separate watcher). Decline it and you get a clean baseline where plain CSS **and** CSS Modules work out of the box.
+- **shadcn/ui** — sets up [shadcn/ui](https://ui.shadcn.com) (implies Tailwind), so `npx shadcn@latest add button` just works.
+- **Import alias** — the path alias for your own modules (default `@/*`, e.g. `import { Button } from '@/components/ui/button'`).
+
 This creates a `my-app/` directory with a complete starter project.
+
+### Non-interactive (CI / scripts)
+
+When stdin isn't a terminal, `pyxle init` never blocks on a prompt — it uses flags and defaults. Drive it explicitly:
+
+```bash
+pyxle init my-app --yes                      # accept all defaults (no Tailwind)
+pyxle init my-app --tailwind --no-shadcn     # Tailwind, no shadcn
+pyxle init my-app --shadcn                   # shadcn (implies Tailwind)
+pyxle init my-app --import-alias '~/*'       # custom alias
+```
+
+### Scaffold into the current directory
+
+Already made the directory (or ran `git init`)? Scaffold in place with `.` — the project name is derived from the directory name:
+
+```bash
+mkdir my-app && cd my-app
+pyxle init .            # requires an empty directory (or pass --force)
+```
 
 ## 2. Install dependencies
 
@@ -45,7 +77,7 @@ Open [http://localhost:8000](http://localhost:8000) in your browser. You should 
 
 Each edit you save prints one concise `Rebuilt … in X ms` line. Your server-side `logging` output also streams to the **browser** devtools console (prefixed `[pyxle:server]`) so you can follow loaders and actions without switching windows. Need the full picture — raw Vite logs and debug internals? Run `pyxle dev --verbose`. See the [CLI reference](../reference/cli.md#pyxle-dev) for details.
 
-Tailwind compiles automatically because the scaffold ships with `postcss.config.cjs` — PostCSS runs as part of the Vite pipeline, so there's nothing separate to start.
+CSS just works: Vite compiles every stylesheet you import — plain CSS, CSS Modules, and (if you enabled it) Tailwind v4 via the `@tailwindcss/vite` plugin — with hot reload. There's nothing separate to start. See the [Styling guide](../guides/styling.md).
 
 ## What just happened?
 

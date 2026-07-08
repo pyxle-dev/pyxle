@@ -5,15 +5,15 @@
 Pyxle requires:
 
 - **Python 3.10+** (3.12 recommended)
-- **Node.js 18+** (for Vite, React, and SSR)
+- **Node.js 20.19+** (for Vite 7, React 19, and SSR). Node 18 is end-of-life and no longer supported.
 - **npm** (ships with Node.js)
 
 Verify your setup:
 
 ```bash
 python --version   # Python 3.10 or later
-node --version     # v18 or later
-npm --version      # 9 or later
+node --version     # v20.19 or later
+npm --version      # 10 or later
 ```
 
 ## Install Pyxle
@@ -52,7 +52,7 @@ The `pyxle` package includes:
 | Uvicorn | ASGI server runner (installed as a dependency) |
 | `pyxle-langkit` | Language toolkit powering `pyxle check`'s JSX validation (installed as a dependency) |
 
-Node.js dependencies (React, Vite, Tailwind) are installed per-project via `npm install` -- they are **not** global.
+Node.js dependencies (React 19, Vite 7, and — if you opt in — Tailwind CSS v4) are installed per-project via `npm install` -- they are **not** global.
 
 ## Next steps
 

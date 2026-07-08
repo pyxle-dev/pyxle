@@ -116,11 +116,11 @@ from the very first prompt — no priming, no setup.
 
 - **`.pyxl` files** — Python + React in one file, split at compile time
 - **`@server` / `@action`** — typed data loading and server mutations, called from the client with zero API boilerplate
-- **SSR** — server-side rendering (esbuild + React 18) with hydration
+- **SSR** — server-side rendering (esbuild + React 19) with hydration
 - **File-based routing** — `pages/` maps to URLs; `[param].pyxl` for dynamic segments
 - **Layouts & slots** — nested layouts and slot composition
-- **Vite HMR** — instant hot reload in development
-- **Tailwind** — preconfigured out of the box
+- **Vite HMR** — instant hot reload in development (Vite 7)
+- **Styling** — plain CSS and CSS Modules out of the box; opt into Tailwind v4 or shadcn/ui at `pyxle init`
 - **Production build** — `pyxle build` + `pyxle serve`; deploy anywhere Python runs
 - **AI accessibility** — serve any page as clean Markdown (append `.md`, or `Accept: text/markdown`) plus an `llms.txt` index, so AI agents read your app as text — one flag, agent-friendly out of the box
 - **Editor tooling** — LSP, linter, and a [VS Code extension](https://marketplace.visualstudio.com/items?itemName=pyxle.pyxle-language-tools)
@@ -159,7 +159,7 @@ pyxle serve           Serve the production build
 
 ## Requirements
 
-Python 3.10+ and Node.js 18+.
+Python 3.10+ and Node.js 20.19+.
 
 ## Contributing
 

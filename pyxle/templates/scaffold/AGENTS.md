@@ -189,12 +189,31 @@ handlers — that's separate from `@action`.
 pages/             routes (.pyxl) + pages/api/*.py endpoints
   index.pyxl       the home page
   layout.pyxl      root layout
-  styles/          tailwind.css (imported from the JSX section)
+  styles/          app.css (imported from the JSX section)
+  components/       shared JSX + CSS Modules (only when Tailwind is off, by default)
 public/            static files served at /
 db.py              (you add this) — e.g. SQLite helpers; import with `from db import ...`
+jsconfig.json      import alias (default `@/*`) + editor hints
+vite.config.js     re-exports Pyxle's generated Vite config (for shadcn/editor tooling)
 pyxle.config.json  project config
 requirements.txt   Python deps · package.json — Node deps
 ```
+
+## Styling — this project
+
+The stack is **React 19 + Vite 7**. CSS goes through Vite: `import './styles/app.css'`
+(plain CSS) and `import styles from './x.module.css'` (CSS Modules) both work in
+dev and build. **Tailwind is opt-in** and may or may not be set up here:
+
+- **No Tailwind (default):** `pages/styles/app.css` is plain CSS. Don't invent
+  `className="bg-slate-50"` Tailwind utilities — they won't do anything. Add real
+  CSS rules, or a CSS Module (`pages/components/Badge.module.css` is an example).
+- **Tailwind enabled:** `pages/styles/app.css` contains `@import "tailwindcss";`
+  and utility classes work. There is **no** `tailwind.config.js` or
+  `postcss.config.js` (Tailwind v4 runs through `@tailwindcss/vite`) — don't add them.
+
+Check `pages/styles/app.css` to see which mode you're in. Import project modules
+with the alias, e.g. `import { cn } from '@/lib/utils'`.
 
 ## Commands
 

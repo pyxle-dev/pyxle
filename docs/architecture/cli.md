@@ -92,16 +92,24 @@ Under the hood:
 2. **Resolves the template.** Defaults to `default`. Templates live
    in `pyxle/templates/scaffold/` inside the package — they're
    shipped with `pyxle-framework`.
-3. **Copies the template files** into the new directory using
-   `shutil.copytree`. The template includes:
+3. **Renders the template files** into the new directory. A
+   `TemplateRegistry` composed from the user's choices maps each output path to
+   a `string.Template` resource under `pyxle/templates/scaffold/`, rendered with
+   a context (project name, framework requirement, feature-conditional
+   dependency lines, import alias). The always-present set includes:
    - `pages/index.pyxl` — a working "Hello, Pyxle" page
    - `pages/api/pulse.py` — a sample API route
-   - `package.json` — Vite + React 18 + Tailwind dependencies
+   - `package.json` — Vite 7 + React 19 (plus Tailwind/shadcn deps when chosen)
    - `pyxle.config.json` — minimal config (`{"middleware": []}`)
    - `requirements.txt` — pinned `pyxle-framework` version
-   - `postcss.config.cjs`, `tailwind.config.cjs` — Tailwind setup
+   - `jsconfig.json` + `vite.config.js` — import alias + Vite-ecosystem config
    - `public/` — favicon and a few static files
    - `.gitignore` — sensible defaults
+
+   Feature-conditional files: a Tailwind v4 CSS entry (or a plain-CSS +
+   CSS-Modules baseline when Tailwind is declined), and shadcn/ui's
+   `components.json` + `lib/utils.js` when selected. There are no
+   `tailwind.config`/`postcss.config` files — Tailwind v4 runs through Vite.
 4. **Optionally installs dependencies.** With `--install` (the
    default), runs `pip install -e .` and `npm install` in the new
    directory. With `--no-install`, skips both — useful for CI or
@@ -152,7 +160,7 @@ Runs the development server. The full lifecycle is documented in
 | `--debug / --no-debug` | `--debug` | Dev mode toggle |
 | `--config <path>` | `pyxle.config.json` | Config file path |
 | `--ssr-workers <n>` | from config | Override SSR worker count |
-| `--tailwind / --no-tailwind` | auto | Force/disable Tailwind watcher |
+| `--tailwind / --no-tailwind` | auto | Force/disable the legacy Tailwind v3 watcher |
 
 ### What it does
 
@@ -171,20 +179,19 @@ Source: `cli/__init__.py:247-398`.
 
 ### Tailwind handling
 
-Pyxle has optional first-class Tailwind support. The CLI auto-detects
-Tailwind by checking for `tailwind.config.cjs` or `tailwind.config.js`
-in the project root. If found:
+Tailwind is **opt-in** at `pyxle init`. When chosen, the scaffold uses
+**Tailwind v4** via the `@tailwindcss/vite` plugin: the generated Vite config
+(`devserver/client_files.py::_render_vite_config`) adds the plugin whenever the
+project's `package.json` depends on `@tailwindcss/vite`, so Tailwind compiles
+inside Vite's normal CSS pipeline with HMR — no config files, no separate
+process.
 
-- A separate Tailwind watcher process is spawned alongside Vite.
-- The watcher rebuilds the Tailwind CSS file whenever a Tailwind
-  source class changes.
-- When `postcss.config.cjs` *also* exists, the standalone Tailwind
-  watcher is *skipped* — Vite handles Tailwind via PostCSS instead,
-  which is faster and integrates with HMR.
-
-The flag `--tailwind / --no-tailwind` lets you force one mode or the
-other. Most users never touch it. Source:
-`cli/__init__.py:343-378`, `devserver/tailwind.py`.
+A **legacy** path remains for hand-configured Tailwind v3 projects: if the CLI
+finds a `tailwind.config.{cjs,js}` in the project root (and no PostCSS config),
+it spawns a standalone `tailwindcss --watch` process alongside Vite. The
+`--tailwind / --no-tailwind` flag forces or disables that legacy watcher; it has
+no effect on Tailwind v4 (Vite-plugin) projects. Source:
+`cli/__init__.py`, `devserver/tailwind.py`.
 
 ---
 

@@ -1,0 +1,104 @@
+/* Global styles for your Pyxle app.
+ *
+ * This file is imported from `pages/index.pyxl` so Vite compiles, bundles, and
+ * content-hashes it — no build step to run yourself, and cache-busting is
+ * automatic. Plain CSS and CSS Modules both work out of the box: see
+ * `pages/components/Badge.module.css` for a locally-scoped module example. */
+
+:root {
+  --bg: #f8fafc;
+  --surface: #ffffff;
+  --border: #e2e8f0;
+  --text: #0f172a;
+  --muted: #64748b;
+  --faint: #94a3b8;
+  --accent: #059669;
+  --radius: 0.75rem;
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-sans);
+  color: var(--text);
+  background: var(--bg);
+}
+
+.page {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+  padding: 1.5rem;
+}
+
+.card {
+  width: 100%;
+  max-width: 28rem;
+  text-align: center;
+}
+
+.mark {
+  width: 4rem;
+  height: 4rem;
+  margin: 0 auto;
+}
+
+.title {
+  margin-top: 1.5rem;
+  font-size: 1.5rem;
+  font-weight: 600;
+  letter-spacing: -0.025em;
+}
+
+.meta {
+  margin-top: 0.5rem;
+  font-size: 0.875rem;
+  color: var(--muted);
+}
+
+.code {
+  margin-top: 2rem;
+  padding: 1rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  text-align: left;
+  font-family: var(--font-mono);
+  font-size: 0.875rem;
+}
+
+.code-comment {
+  margin: 0;
+  color: var(--faint);
+}
+
+.code-path {
+  margin: 0.25rem 0 0;
+  color: var(--accent);
+}
+
+.nav {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 1.5rem;
+  margin-top: 2rem;
+  font-size: 0.875rem;
+}
+
+.nav a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.nav a:hover {
+  text-decoration: underline;
+}

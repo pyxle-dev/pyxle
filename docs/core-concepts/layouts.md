@@ -186,5 +186,5 @@ When Pyxle compiles your pages, it:
 
 ## Next steps
 
-- Style your layouts with Tailwind: [Styling](../guides/styling.md)
+- Style your layouts (plain CSS, CSS Modules, or opt-in Tailwind): [Styling](../guides/styling.md)
 - Add navigation between pages: [Client Components](../guides/client-components.md)

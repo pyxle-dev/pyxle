@@ -1,29 +1,36 @@
 # Project Structure
 
-After running `pyxle init my-app`, you get this file tree:
+`pyxle init` is interactive — the exact files depend on your answers. A default
+project (no Tailwind) looks like this:
 
 ```
 my-app/
   pages/
     api/
       pulse.py            # Example API route
+    components/
+      Badge.jsx           # Example component using a CSS Module
+      Badge.module.css    # Locally-scoped, hashed class names
     styles/
-      tailwind.css        # Tailwind CSS input file
-    index.pyxl             # Home page (Python + React)
-    layout.pyxl            # Root layout wrapper (React only)
+      app.css             # Global CSS (imported from index.pyxl)
+    index.pyxl            # Home page (Python + React)
+    layout.pyxl           # Root layout wrapper (React only)
   public/
     branding/             # SVG logos and assets
-    styles/
-      tailwind.css        # Compiled Tailwind output (pre-built in scaffold)
     favicon.ico
   AGENTS.md               # Conventions guide for AI coding agents
+  jsconfig.json           # Import alias (@/*) + editor hints
+  vite.config.js          # Re-exports Pyxle's generated Vite config
   package.json            # Node.js dependencies and scripts
   pyxle.config.json       # Framework configuration
   requirements.txt        # Python dependencies
-  tailwind.config.cjs     # Tailwind CSS configuration
-  postcss.config.cjs      # PostCSS configuration
   .gitignore
 ```
+
+Opting into **Tailwind** replaces `pages/styles/app.css` with an
+`@import "tailwindcss";` entry (and drops the CSS-Module example) — there are no
+`tailwind.config` or `postcss.config` files. Opting into **shadcn/ui** adds
+`components.json` and `lib/utils.js`. See [Styling](../guides/styling.md).
 
 ## Key directories
 
@@ -151,28 +158,21 @@ Defines Node.js dependencies and npm scripts:
 
 | Script | Purpose |
 |--------|---------|
-| `npm run dev` | Start Vite dev server (used internally by `pyxle dev`) |
-| `npm run build` | Bundle with Vite (used by `pyxle build`); Tailwind is compiled in-pipeline via PostCSS |
+| `npm run dev` | Alias for `pyxle dev` |
+| `npm run build` | Alias for `pyxle build` |
 
-Tailwind is wired through PostCSS (see `postcss.config.cjs`), so Vite
-handles CSS on both `dev` and `build` without a separate script. If you
-want a standalone Tailwind watcher anyway, see
-[Styling guide → Standalone Tailwind](../guides/styling.md).
+It also declares `"engines": { "node": ">=20.19" }` (Vite 7's floor). Vite
+compiles CSS on both `pyxle dev` and `pyxle build` — including Tailwind v4 via
+the `@tailwindcss/vite` plugin when you opt into it — so there's no separate CSS
+script. See [Styling](../guides/styling.md).
 
-### `tailwind.config.cjs`
+### `jsconfig.json` and `vite.config.js`
 
-Tailwind CSS configuration. The scaffold configures it to scan your `pages/` directory for class names:
-
-```javascript
-module.exports = {
-  content: [
-    './pages/**/*.{pyxl,js,jsx,ts,tsx}',
-    './.pyxle-build/client/pages/**/*.{js,jsx,ts,tsx}',
-  ],
-  theme: { extend: {} },
-  plugins: [],
-};
-```
+`jsconfig.json` declares the import alias (default `@/*`) so `@/lib/utils`
+resolves from anywhere; Pyxle wires the same alias into both the Vite build and
+the SSR runtime. `vite.config.js` re-exports Pyxle's generated config so the
+wider Vite ecosystem (shadcn/ui, editor plugins) finds a config at the project
+root — you normally never edit it.
 
 ## Next steps
 

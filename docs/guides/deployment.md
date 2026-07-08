@@ -11,7 +11,7 @@ pyxle build
 This:
 
 1. Compiles all `.pyxl` files into Python and JSX modules
-2. Runs `npm run build` — Vite bundles JS and processes CSS through PostCSS (Tailwind is compiled in-pipeline when `postcss.config.cjs` is present, which is the scaffold default)
+2. Runs a Vite production build — bundling JS and compiling every imported stylesheet (plain CSS, CSS Modules, and Tailwind v4 via the `@tailwindcss/vite` plugin when enabled) into content-hashed assets
 3. Outputs production artifacts to the `dist/` directory
 
 ### Build options

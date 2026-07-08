@@ -4,7 +4,7 @@ Pyxle is a Python-first full-stack web framework that brings the Next.js develop
 
 **Status:** beta (`0.x`) — see the [changelog](../changelog.md) for the current release.
 
-> **Prerequisites:** Python **3.10+** (3.12 recommended) and **Node.js 18+** with npm — Pyxle drives Vite and React under the hood. See [Installation](installation.md).
+> **Prerequisites:** Python **3.10+** (3.12 recommended) and **Node.js 20.19+** with npm — Pyxle drives Vite and React under the hood. See [Installation](installation.md).
 
 ## One file, two languages
 
@@ -30,7 +30,7 @@ The loader's return value *is* the component's `data` prop. There's no `fetch`, 
 ## Why Pyxle
 
 - **No API plumbing.** A `@server` loader feeds props straight into your component; an `@action` is an endpoint you call with `useAction` instead of hand-writing `fetch` + a route.
-- **Real React.** `npm install` any React library and use it directly — Pyxle renders genuine React 18 with server-side rendering and hydration, not a Python wrapper around a component library.
+- **Real React.** `npm install` any React library and use it directly — Pyxle renders genuine React 19 with server-side rendering and hydration, not a Python wrapper around a component library.
 - **Convention over configuration.** File-based routing, automatic SSR, and zero config for the common cases. Run `pyxle init` and you're shipping.
 - **Batteries includable.** Official plugins for [database](../plugins/pyxle-db.md), [auth](../plugins/pyxle-auth.md), and [email](../plugins/pyxle-mail.md), plus hooks for middleware, edge caching, and your own integrations.
 - **AI-first DX.** Predictable patterns, strong types, and clear errors make Pyxle one of the easiest frameworks for an AI coding agent to ship a whole feature in a single pass. See [Pyxle for AI coding agents](../guides/for-ai-agents.md).
