@@ -108,15 +108,18 @@ type `pyxle dev`, this is what happens:
    public assets, and a catch-all 404 handler. Details:
    [The dev server § The Starlette app](dev-server.md#the-starlette-app).
 
-When all six are up, the console shows:
+When all six are up, the console shows a curated startup summary:
 
 ```
-✅ Initial build completed — 1 page(s) compiled
-✅ Vite dev server ready at http://127.0.0.1:5173 (0.20s)
-ℹ️  Starting Starlette on http://127.0.0.1:8000 (Vite proxy at http://127.0.0.1:5173)
+✅ Pyxle dev server ready in 512 ms
+ℹ️    Local:   http://127.0.0.1:8000
+ℹ️    Vite:    http://127.0.0.1:5173
+ℹ️    Routes:  1 page(s), 1 API route(s)
 ```
 
-You're ready to take requests.
+You're ready to take requests. The per-line Vite firehose and the step-by-step
+internal build chatter are hidden by default — pass `pyxle dev --verbose` to
+restore them. See [The dev server § lifecycle](dev-server.md#lifecycle-in-one-diagram).
 
 ---
 

@@ -227,6 +227,28 @@ def test_client_entry_omits_overlay_in_production(tmp_path: Path) -> None:
     assert "/__pyxle__/overlay" not in prod_entry
 
 
+def test_client_entry_forwards_server_logs_to_console_in_dev(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    (root / "pages").mkdir(parents=True)
+    (root / "public").mkdir()
+
+    dev_settings = DevServerSettings.from_project_root(root, debug=True)
+    prod_settings = DevServerSettings.from_project_root(root, debug=False)
+
+    dev_entry = _render_client_entry(dev_settings)
+    prod_entry = _render_client_entry(prod_settings)
+
+    # The dev overlay client consumes the "log" event, maps the level to the
+    # matching console method, and prefixes it as a server log.
+    assert "payload.type === 'log'" in dev_entry
+    assert "[pyxle:server]" in dev_entry
+    assert "console[method]" in dev_entry
+
+    # Strictly dev-only: never present in the production bundle.
+    assert "payload.type === 'log'" not in prod_entry
+    assert "[pyxle:server]" not in prod_entry
+
+
 def test_client_entry_includes_nav_progress_bar(tmp_path: Path) -> None:
     """Client runtime ships a navigation progress bar IIFE that
     ``markNavigating`` calls on start/finish. The bar is always

@@ -342,10 +342,24 @@ def dev(
         help="Periodically print a live observability panel (request/SSR metrics) to the terminal.",
         show_default=True,
     ),
+    verbose: bool = typer.Option(  # noqa: FBT002 - CLI option signature.
+        False,
+        "--verbose",
+        "-v",
+        help="Restore full output: raw Vite logs, debug internals, and DEBUG "
+        "server logs in the browser console. Equivalent to `pyxle -v dev`.",
+        is_flag=True,
+    ),
 ) -> None:
     """Entry-point for the ``pyxle dev`` command."""
 
     logger = get_logger()
+    # `pyxle dev --verbose` mirrors the global `pyxle -v dev`: both raise the
+    # shared ConsoleLogger to VERBOSE, which the dev server, Vite pipe, and
+    # watcher all read. Only ever raise verbosity here — never lower it — so a
+    # global `-v` (or `-q`) set on the root callback is preserved.
+    if verbose:
+        logger.set_verbosity(Verbosity.VERBOSE)
     project_root = directory.expanduser().resolve()
 
     global DevServer, DevServerSettings
@@ -417,7 +431,7 @@ def dev(
         logger.error(str(exc))
         raise typer.Exit(code=1) from exc
 
-    logger.info(
+    logger.debug(
         "Starting Pyxle dev server on http://"
         f"{settings.starlette_host}:{settings.starlette_port}"
         f" with Vite proxy at http://{settings.vite_host}:{settings.vite_port}"

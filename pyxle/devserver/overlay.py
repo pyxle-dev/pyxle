@@ -135,6 +135,41 @@ class OverlayManager:
             )
         )
 
+    async def notify_log(
+        self,
+        *,
+        level: str,
+        message: str,
+        logger_name: str = "",
+    ) -> None:
+        """Forward a server-side log record to connected overlay clients.
+
+        Dev-only. Sends a ``"log"`` event whose ``level`` names the browser
+        ``console`` method the client should call (``"log"``, ``"info"``,
+        ``"warn"``, ``"error"`` or ``"debug"``). Used by
+        :class:`pyxle.devserver.log_forwarding.BrowserConsoleLogHandler` to
+        surface server logs in the browser devtools console.
+
+        Parameters
+        ----------
+        level:
+            The ``console`` method name the client should invoke.
+        message:
+            The already-formatted log message.
+        logger_name:
+            The originating logger's name (shown alongside the message).
+        """
+        await self.broadcast(
+            OverlayEvent(
+                type="log",
+                payload={
+                    "level": level,
+                    "message": message,
+                    "logger": logger_name,
+                },
+            )
+        )
+
     async def websocket_endpoint(self, websocket: WebSocket) -> None:
         origin = websocket.headers.get("origin", "")
         if not self._is_allowed_origin(origin):

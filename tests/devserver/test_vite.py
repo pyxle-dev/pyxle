@@ -6,7 +6,7 @@ from typing import Any, Iterable
 
 import pytest
 
-from pyxle.cli.logger import ConsoleLogger
+from pyxle.cli.logger import ConsoleLogger, Verbosity
 from pyxle.devserver.settings import DevServerSettings
 from pyxle.devserver.vite import ViteProcess, ViteSupervisionError
 
@@ -129,7 +129,9 @@ class ProcessStub:
 async def test_vite_process_start_and_stop(settings: DevServerSettings) -> None:
 	stub = ProcessStub(stdout_lines=["ready"], stderr_lines=["warning"])
 	capture: list[str] = []
+	# Raw Vite stdout is debug-level (the firehose); run VERBOSE to observe it.
 	logger = ConsoleLogger(secho=lambda msg, **_: capture.append(msg))
+	logger.set_verbosity(Verbosity.VERBOSE)
 
 	vite = ViteProcess(
 		settings,
@@ -195,7 +197,10 @@ async def test_vite_process_handles_missing_streams(settings: DevServerSettings)
 async def test_vite_process_ignores_blank_stream_lines(settings: DevServerSettings) -> None:
 	stub = ProcessStub(stdout_lines=["", "ready"], stderr_lines=["", "error"])
 	capture: list[str] = []
+	# Raw Vite stdout is forwarded at debug (the firehose), so run VERBOSE to
+	# observe both stdout ("ready") and stderr ("error") lines here.
 	logger = ConsoleLogger(secho=lambda msg, **_: capture.append(msg))
+	logger.set_verbosity(Verbosity.VERBOSE)
 
 	vite = ViteProcess(settings, logger=logger, process_factory=stub, stop_timeout=0.1)
 
@@ -206,6 +211,48 @@ async def test_vite_process_ignores_blank_stream_lines(settings: DevServerSettin
 	assert any("ready" in msg for msg in capture)
 	assert any("error" in msg for msg in capture)
 	assert not any(msg.rstrip().endswith("[vite]") for msg in capture)
+
+
+async def test_vite_stdout_firehose_suppressed_by_default(settings: DevServerSettings) -> None:
+	"""By default the per-line Vite stdout firehose is hidden; stderr stays."""
+	stub = ProcessStub(
+		stdout_lines=["hmr update /src/app.jsx", "page reload"],
+		stderr_lines=["Internal server error"],
+	)
+	capture: list[str] = []
+	logger = ConsoleLogger(secho=lambda msg, **_: capture.append(msg))  # NORMAL
+
+	vite = ViteProcess(settings, logger=logger, process_factory=stub, stop_timeout=0.1)
+
+	await vite.start()
+	await asyncio.sleep(0.05)
+	await vite.stop()
+
+	# The raw stdout firehose is suppressed by default …
+	assert not any("hmr update" in msg for msg in capture)
+	assert not any("page reload" in msg for msg in capture)
+	# … but genuine stderr errors are always visible.
+	assert any("Internal server error" in msg for msg in capture)
+
+
+async def test_vite_stdout_firehose_visible_with_verbose(settings: DevServerSettings) -> None:
+	"""`--verbose` (VERBOSE logger) restores the raw Vite stdout firehose."""
+	stub = ProcessStub(
+		stdout_lines=["hmr update /src/app.jsx", "page reload"],
+		stderr_lines=[],
+	)
+	capture: list[str] = []
+	logger = ConsoleLogger(secho=lambda msg, **_: capture.append(msg))
+	logger.set_verbosity(Verbosity.VERBOSE)
+
+	vite = ViteProcess(settings, logger=logger, process_factory=stub, stop_timeout=0.1)
+
+	await vite.start()
+	await asyncio.sleep(0.05)
+	await vite.stop()
+
+	assert any("hmr update" in msg for msg in capture)
+	assert any("page reload" in msg for msg in capture)
 
 
 async def test_vite_process_restarts_after_crash(settings: DevServerSettings) -> None:
@@ -532,7 +579,10 @@ async def test_vite_process_falls_back_to_npx_when_install_fails(
 async def test_vite_process_wait_until_ready_success(settings: DevServerSettings) -> None:
 	stub = ProcessStub()
 	capture: list[str] = []
+	# The per-probe "Vite dev server ready at ..." confirmation is debug-level
+	# (the curated startup summary carries the ready signal); run VERBOSE here.
 	logger = ConsoleLogger(secho=lambda msg, **_: capture.append(msg))
+	logger.set_verbosity(Verbosity.VERBOSE)
 	probe_calls: list[tuple[str, int]] = []
 
 	async def probe(host: str, port: int) -> bool:
@@ -614,7 +664,10 @@ async def test_vite_process_wait_until_ready_logs_wait(settings: DevServerSettin
 	stub = ProcessStub()
 	attempts: list[int] = []
 	capture: list[str] = []
+	# "Waiting for Vite" is info (visible by default); the readiness confirmation
+	# is debug, so run VERBOSE to assert both here.
 	logger = ConsoleLogger(secho=lambda msg, **_: capture.append(msg))
+	logger.set_verbosity(Verbosity.VERBOSE)
 
 	async def probe(host: str, port: int) -> bool:
 		attempts.append(1)

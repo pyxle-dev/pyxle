@@ -14,7 +14,7 @@ import uvicorn
 from .builder import BuildSummary, build_once
 from .client_files import write_client_bootstrap_files
 from .registry import build_metadata_registry
-from .routes import build_route_table
+from .routes import RouteTable, build_route_table
 from .settings import DevServerSettings
 from .starlette_app import create_starlette_app
 from .tailwind import TailwindProcess, detect_postcss_config, detect_tailwind_config
@@ -23,6 +23,29 @@ from .watcher import ProjectWatcher, WatcherStatistics
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle guard
     from pyxle.cli.logger import ConsoleLogger
+
+    from .log_forwarding import BrowserConsoleLogHandler
+    from .overlay import OverlayManager
+
+
+def _attach_log_forwarding(
+    overlay: "OverlayManager",
+    loop: asyncio.AbstractEventLoop,
+    logger: "ConsoleLogger",
+) -> "BrowserConsoleLogHandler":
+    """Attach the dev-only server-log → browser-console forwarding handler.
+
+    Forwards INFO+ records to connected overlay clients; in verbose mode it also
+    forwards DEBUG and the framework's own internal loggers.
+    """
+    from pyxle.cli.logger import Verbosity  # noqa: PLC0415
+
+    from .log_forwarding import BrowserConsoleLogHandler  # noqa: PLC0415
+
+    verbose = getattr(logger, "verbosity", None) == Verbosity.VERBOSE
+    handler = BrowserConsoleLogHandler(overlay, loop, verbose=verbose)
+    handler.attach()
+    return handler
 
 
 def _default_logger() -> "ConsoleLogger":
@@ -49,10 +72,11 @@ class DevServer:
         """Run the development server until the underlying uvicorn server exits."""
 
         logger = self.logger
+        start_time = time.perf_counter()
         settings = self._ensure_vite_port_available(self.settings)
         self.settings = settings
 
-        logger.info("Preparing Pyxle development server")
+        logger.debug("Preparing Pyxle development server")
 
         await self._ensure_node_modules(settings)
 
@@ -63,7 +87,7 @@ class DevServer:
 
         registry = build_metadata_registry(settings)
         route_table = build_route_table(registry)
-        logger.info(
+        logger.debug(
             f"Discovered {len(route_table.pages)} page route(s) and {len(route_table.apis)} API route(s)"
         )
 
@@ -124,6 +148,7 @@ class DevServer:
         vite_process: ViteProcess | None = None
         tailwind_process: TailwindProcess | None = None
         dashboard_task: asyncio.Task | None = None
+        log_forwarder: "BrowserConsoleLogHandler | None" = None
 
         try:
             vite_process = ViteProcess(settings, logger=logger)
@@ -145,7 +170,7 @@ class DevServer:
             watcher = ProjectWatcher(settings, logger=logger, on_rebuild=_handle_rebuild)
             self._watcher = watcher
 
-            logger.info(
+            logger.debug(
                 "Starting Starlette on http://"
                 f"{settings.starlette_host}:{settings.starlette_port} "
                 f"(Vite proxy at http://{settings.vite_host}:{settings.vite_port})"
@@ -153,6 +178,15 @@ class DevServer:
 
             watcher.start()
             _set_app_ready_flag(app, True)
+
+            # Dev-only: forward server-side ``logging`` records to the browser
+            # devtools console over the overlay WebSocket. Attached here (after
+            # the app is ready) and detached in the ``finally`` below so nothing
+            # leaks past shutdown. Never runs under ``pyxle serve``.
+            if settings.debug and overlay is not None:
+                log_forwarder = _attach_log_forwarding(overlay, loop, logger)
+
+            self._log_ready_summary(logger, settings, route_table, start_time)
             dashboard_task = self._start_dashboard(app, loop)
             try:
                 await server.serve()
@@ -162,6 +196,8 @@ class DevServer:
                 raise
         finally:
             _set_app_ready_flag(app, False)
+            if log_forwarder is not None:
+                log_forwarder.detach()
             if dashboard_task is not None:
                 dashboard_task.cancel()
             if watcher is not None:
@@ -171,7 +207,7 @@ class DevServer:
                 await tailwind_process.stop()
             if vite_process is not None:
                 await vite_process.stop()
-            logger.info("Dev server stopped")
+            logger.debug("Dev server stopped")
 
     def _start_dashboard(self, app, loop) -> "Optional[asyncio.Task]":
         """Start the terminal observability dashboard task, if enabled."""
@@ -264,9 +300,37 @@ class DevServer:
                 f"{total_removed} artifact(s) removed",
             ]
             message = "; ".join(parts)
-            self.logger.success(f"Initial build completed — {message}")
+            # Detailed build breakdown is verbose-only noise; the curated ready
+            # summary reports the route count. `--verbose` restores this.
+            self.logger.debug(f"Initial build completed — {message}")
         else:
-            self.logger.info("Initial build completed with no changes detected")
+            self.logger.debug("Initial build completed with no changes detected")
+
+    def _log_ready_summary(
+        self,
+        logger: "ConsoleLogger",
+        settings: DevServerSettings,
+        route_table: RouteTable,
+        start_time: float,
+    ) -> None:
+        """Emit the curated, always-visible dev-server startup summary.
+
+        Shows the local URL, the Vite URL, the route count, and the total
+        startup time — the signal a developer actually wants — while the raw
+        Vite firehose and internal build chatter stay behind ``--verbose``.
+        """
+        elapsed_ms = (time.perf_counter() - start_time) * 1000
+        logger.success(f"Pyxle dev server ready in {elapsed_ms:.0f} ms")
+        logger.info(
+            f"  Local:   http://{settings.starlette_host}:{settings.starlette_port}"
+        )
+        logger.info(
+            f"  Vite:    http://{settings.vite_host}:{settings.vite_port}"
+        )
+        logger.info(
+            f"  Routes:  {len(route_table.pages)} page(s), "
+            f"{len(route_table.apis)} API route(s)"
+        )
 
     def _ensure_vite_port_available(self, settings: DevServerSettings) -> DevServerSettings:
         host = settings.vite_host

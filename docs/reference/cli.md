@@ -82,6 +82,7 @@ pyxle dev [directory] [options]
 | `--print-config` / `--no-print-config` | `false` | Print merged configuration before starting |
 | `--tailwind` / `--no-tailwind` | `true` | Auto-start Tailwind CSS watcher |
 | `--dashboard` / `--no-dashboard` | `false` | Periodically print a live [observability](../guides/observability.md#dev-dashboard) panel (request/SSR metrics) to the terminal |
+| `--verbose` / `-v` | `false` | Restore full output: the raw Vite log firehose, debug-level internals, and `DEBUG` server logs in the browser console. Equivalent to the global `pyxle -v dev`. |
 
 **Examples:**
 
@@ -90,6 +91,7 @@ pyxle dev
 pyxle dev --host 0.0.0.0 --port 3000
 pyxle dev --no-tailwind --ssr-workers 4
 pyxle dev ./my-app --print-config
+pyxle dev --verbose             # troubleshoot: full Vite + debug output
 ```
 
 **What it does:**
@@ -100,6 +102,25 @@ pyxle dev ./my-app --print-config
 4. Starts the Tailwind watcher (if detected)
 5. Starts the Starlette ASGI server
 6. Watches for file changes and recompiles automatically
+
+**Console output.** By default `pyxle dev` prints a clean, curated console — a
+startup summary (the local URL, the Vite URL, the route count, and the total
+"ready in X ms"), a concise one-line notice per incremental rebuild
+(`Rebuilt … in X ms`), and any warnings or errors. The raw line-by-line Vite
+firehose and debug-level internals are hidden. Pass `--verbose` (or `-v`, or the
+global `pyxle -v dev`) to restore the full output when troubleshooting. Genuine
+signal — errors, warnings, the URLs, and rebuild success/failure — is always
+shown, at every verbosity.
+
+**Server logs in the browser console (dev only).** While `pyxle dev` is running,
+your server-side `logging` output (from loaders, actions, and your own modules)
+is forwarded to the browser devtools console, prefixed `[pyxle:server]` and
+mapped to the matching `console` method (`info` → `console.info`, `warning` →
+`console.warn`, `error` → `console.error`). This lets you follow server logs
+without leaving the browser. By default only `INFO` and above from your own
+loggers are forwarded; `--verbose` additionally forwards `DEBUG` records and the
+framework's own internal loggers. This is strictly a development feature — it
+never runs under `pyxle serve` and never appears in the production bundle.
 
 ## `pyxle build`
 

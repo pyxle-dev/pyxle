@@ -218,6 +218,8 @@ def test_devserver_start_runs_with_stubbed_uvicorn(monkeypatch, tmp_path: Path) 
 
     assert watcher_instances and watcher_instances[0].started is True
     assert watcher_instances[0].closed is True
-    assert any("Starting Starlette" in message for message in capture)
+    # The curated startup summary is always visible; the "Starting Starlette"
+    # line moved to debug (verbose-only).
+    assert any("Pyxle dev server ready" in message for message in capture)
     assert overlay_calls and overlay_calls[0]
     assert overlay_calls[0][0].endswith("pages/index.pyxl")

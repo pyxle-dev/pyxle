@@ -128,7 +128,7 @@ class ViteProcess:
             self._restart_attempts = 0
 
         command = self._build_launch_command()
-        self._logger.info("Launching Vite dev server: " + " ".join(command))
+        self._logger.debug("Launching Vite dev server: " + " ".join(command))
         env = self._build_env()
 
         try:
@@ -146,7 +146,7 @@ class ViteProcess:
                 ) from exc
 
             command = self._build_launch_command()
-            self._logger.info("Retrying Vite launch with resolved command: " + " ".join(command))
+            self._logger.debug("Retrying Vite launch with resolved command: " + " ".join(command))
             process = await self._process_factory(
                 *command,
                 stdout=PIPE,
@@ -177,7 +177,11 @@ class ViteProcess:
             if await self._probe(host, port):
                 if not already_reported:
                     self._latest_ready_elapsed = time.perf_counter() - start
-                    self._logger.success(
+                    # The curated startup summary reports the Vite URL and total
+                    # ready time; keep this per-probe confirmation at debug so
+                    # the default console stays clean while `--verbose` still
+                    # surfaces it.
+                    self._logger.debug(
                         f"Vite dev server ready at http://{host}:{port} "
                         f"({self._latest_ready_elapsed:.2f}s)"
                     )
@@ -226,7 +230,7 @@ class ViteProcess:
             with suppress(asyncio.CancelledError):
                 await self._monitor_task
 
-        self._logger.info("Vite dev server stopped")
+        self._logger.debug("Vite dev server stopped")
         self._process = None
         self._monitor_task = None
 
@@ -350,7 +354,7 @@ class ViteProcess:
         for line in stdout_text.splitlines():
             line = line.strip()
             if line:
-                self._logger.info(f"[{prefix}] {line}")
+                self._logger.debug(f"[{prefix}] {line}")
 
         for line in stderr_text.splitlines():
             line = line.strip()
@@ -381,7 +385,7 @@ class ViteProcess:
         if returncode not in (0, None):
             self._logger.error(f"[vite] process exited with code {returncode}")
         else:
-            self._logger.info("[vite] process exited")
+            self._logger.debug("[vite] process exited")
 
         if self._stopping:
             return
@@ -409,7 +413,10 @@ class ViteProcess:
             if is_error:
                 self._logger.error(f"[vite] {message}")
             else:
-                self._logger.info(f"[vite] {message}")
+                # Vite's per-line stdout (startup banner, HMR updates, transform
+                # logs) is the noisy firehose. Keep it at debug so the default
+                # `pyxle dev` console stays clean; `--verbose` restores it.
+                self._logger.debug(f"[vite] {message}")
 
     async def _restart_after_exit(self) -> None:
         """Relaunch Vite after an unexpected exit, with backoff and a budget.

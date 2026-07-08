@@ -10,7 +10,7 @@ from starlette.applications import Starlette
 from starlette.responses import HTMLResponse
 from starlette.testclient import TestClient
 
-from pyxle.cli.logger import ConsoleLogger
+from pyxle.cli.logger import ConsoleLogger, Verbosity
 from pyxle.devserver import (
     DevServer,
     DevServerSettings,
@@ -145,7 +145,9 @@ async def test_devserver_start_configures_uvicorn_and_watcher(anyio_backend, mon
     assert server_state.get("served") is True
     assert server_state.get("ready_during_serve") is True
     assert server._watcher is None
-    assert any("Initial build completed" in message for message in capture.messages)
+    # The detailed initial-build breakdown is verbose-only now; the curated
+    # startup summary is what stays visible by default.
+    assert any("Pyxle dev server ready" in message for message in capture.messages)
     assert bootstrap_calls == [server.settings]
     assert vite_instances and vite_instances[0].started is True
     assert vite_instances[0].ready is True
@@ -391,6 +393,8 @@ def test_devserver_logs_initial_build_without_changes(tmp_path: Path) -> None:
     settings = DevServerSettings.from_project_root(tmp_path)
     capture = LogCapture()
     logger = ConsoleLogger(secho=capture)
+    # The initial-build breakdown is verbose-only now.
+    logger.set_verbosity(Verbosity.VERBOSE)
     server = DevServer(settings=settings, logger=logger)
 
     summary = BuildSummary(compiled_pages=[], copied_api_modules=[], removed=[])

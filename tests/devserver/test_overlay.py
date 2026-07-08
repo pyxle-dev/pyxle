@@ -95,6 +95,36 @@ async def test_overlay_manager_broadcasts_reload_event() -> None:
 
 
 @pytest.mark.anyio
+async def test_overlay_manager_broadcasts_log_event() -> None:
+    manager = OverlayManager(logger=StubLogger())
+    socket = StubWebSocket()
+
+    await manager.register(socket)
+
+    await manager.notify_log(level="warn", message="db slow", logger_name="app.db")
+
+    assert socket.sent, "expected log payload"
+    message = json.loads(socket.sent[0])
+    assert message["type"] == "log"
+    assert message["payload"]["level"] == "warn"
+    assert message["payload"]["message"] == "db slow"
+    assert message["payload"]["logger"] == "app.db"
+
+
+@pytest.mark.anyio
+async def test_overlay_manager_log_event_defaults_logger_name() -> None:
+    manager = OverlayManager(logger=StubLogger())
+    socket = StubWebSocket()
+
+    await manager.register(socket)
+
+    await manager.notify_log(level="info", message="hello")
+
+    message = json.loads(socket.sent[0])
+    assert message["payload"]["logger"] == ""
+
+
+@pytest.mark.anyio
 async def test_overlay_manager_endpoint_unregisters_on_disconnect() -> None:
     manager = OverlayManager(logger=StubLogger())
     socket = StubWebSocket()

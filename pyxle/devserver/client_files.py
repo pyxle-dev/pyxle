@@ -2227,6 +2227,17 @@ def _render_client_entry(settings: DevServerSettings) -> str:
                 const reason = changed.length ? changed.join(', ') : 'server changes';
                 console.info(`[Pyxle] Reloading due to ${reason}`);
                 window.location.reload();
+              } else if (payload.type === 'log') {
+                // Dev-only: a server-side log record forwarded so it surfaces
+                // in the browser devtools console. `level` names the console
+                // method to call; fall back to `console.log` if unknown.
+                const data = payload.payload ?? {};
+                const level = data.level;
+                const method = typeof console[level] === 'function' ? level : 'log';
+                const source = data.logger
+                  ? `[pyxle:server ${data.logger}]`
+                  : '[pyxle:server]';
+                console[method](source, data.message ?? '');
               }
             } catch (error) {
               console.error('[Pyxle] Failed to parse overlay message', error);
