@@ -16,10 +16,47 @@ from pyxle.cli.logger import ConsoleLogger
 
 from .builder import BuildSummary, build_once
 from .settings import DevServerSettings
+from .tailwind import resolve_tailwind_output_path
 
 _RebuildCallback = Callable[[Sequence[Path]], None]
 _RebuildListener = Callable[["WatcherStatistics"], None]
 _TimerFactory = Callable[[float, Callable[[], None]], "_TimerHandle"]
+
+#: Directory names whose contents are generated build artefacts, never sources.
+#: A write anywhere beneath one of these is a side effect of a rebuild (compiled
+#: output, cached bytecode) and must not trigger another rebuild.
+_GENERATED_DIR_NAMES = frozenset({".pyxle-build", "__pycache__"})
+
+#: File suffixes that identify generated output the watcher must ignore: Python
+#: bytecode and SQLite database journals written by the running application.
+_GENERATED_SUFFIXES = frozenset({".pyc", ".db", ".db-wal", ".db-shm"})
+
+
+def _is_generated_output(path: Path, generated_files: frozenset[Path]) -> bool:
+    """Return ``True`` when *path* is a build artefact the watcher must ignore.
+
+    Rebuilds write files back into the watched tree — the Tailwind CLI rewrites
+    its output CSS, the app touches its SQLite journals, Python caches bytecode.
+    Treating those writes as source edits creates a self-sustaining reload loop:
+    the rebuild regenerates the very file whose change triggered it. Paths are
+    resolved (following symlinks, tolerating a path that vanished mid-event) so
+    the comparison is robust to symlinked directories and to Windows separators.
+
+    ``generated_files`` holds pre-resolved absolute paths of known outputs (the
+    Tailwind output CSS); membership, suffix, and directory-name checks together
+    cover every generated artefact without a per-project hardcoded list.
+    """
+
+    try:
+        resolved = path.resolve()
+    except OSError:
+        # Path vanished mid-event or a symlink loop — classify the raw path.
+        resolved = path
+    if resolved in generated_files:
+        return True
+    if resolved.suffix.lower() in _GENERATED_SUFFIXES:
+        return True
+    return any(part in _GENERATED_DIR_NAMES for part in resolved.parts)
 
 
 class _TimerHandle:
@@ -77,14 +114,23 @@ class _DebouncedChangeBuffer:
 class _ProjectEventHandler(FileSystemEventHandler):
     """Watchdog handler that feeds events into a debounced buffer."""
 
-    def __init__(self, sink: Callable[[Path], None]) -> None:
+    def __init__(
+        self,
+        sink: Callable[[Path], None],
+        *,
+        ignore: Callable[[Path], bool] | None = None,
+    ) -> None:
         super().__init__()
         self._sink = sink
+        self._ignore = ignore
 
     def on_any_event(self, event: FileSystemEvent) -> None:
         if event.is_directory:
             return
-        target_path = Path(event.dest_path) if hasattr(event, "dest_path") else Path(event.src_path)
+        dest = getattr(event, "dest_path", "")
+        target_path = Path(dest) if dest else Path(event.src_path)
+        if self._ignore is not None and self._ignore(target_path):
+            return
         self._sink(target_path)
 
 
@@ -151,7 +197,16 @@ class ProjectWatcher:
             debounce_seconds=debounce_seconds,
             timer_factory=timer_factory,
         )
-        self._handler = _ProjectEventHandler(self._buffer.enqueue)
+        # Pre-resolve generated output paths once so the per-event ignore check
+        # (see ``_is_generated_output``) stays a cheap set/suffix lookup instead
+        # of re-deriving the Tailwind output location on every filesystem event.
+        self._generated_files = frozenset(
+            {resolve_tailwind_output_path(settings.project_root)}
+        )
+        self._handler = _ProjectEventHandler(
+            self._buffer.enqueue,
+            ignore=self._is_generated_output,
+        )
         self._latest_stats: WatcherStatistics | None = None
         self._config_warn_handle: _TimerHandle | None = None
 
@@ -236,6 +291,15 @@ class ProjectWatcher:
             self._buffer.enqueue(path)
 
     # Internal orchestration -------------------------------------------------
+
+    def _is_generated_output(self, path: Path) -> bool:
+        """Ignore predicate for the project event handler.
+
+        Delegates to :func:`_is_generated_output` with this watcher's resolved
+        set of generated output paths.
+        """
+
+        return _is_generated_output(path, self._generated_files)
 
     def _handle_paths(self, paths: Sequence[Path]) -> None:
         start = time.perf_counter()

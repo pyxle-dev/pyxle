@@ -17,6 +17,7 @@ from pyxle.devserver.watcher import (
     WatcherStatistics,
     _default_timer_factory,
     _invalidate_python_modules,
+    _is_generated_output,
     _module_name_from_path,
     _ProjectEventHandler,
 )
@@ -488,6 +489,168 @@ def test_project_event_handler_prefers_dest_path(project: DevServerSettings) -> 
     handler.on_any_event(DummyEvent())
 
     assert captured == [Path(DummyEvent.dest_path)]
+
+
+def test_project_event_handler_uses_src_when_dest_empty(project: DevServerSettings) -> None:
+    """A non-move event (empty ``dest_path``) falls back to ``src_path``."""
+    captured: List[Path] = []
+    handler = _ProjectEventHandler(lambda path: captured.append(path))
+
+    class DummyEvent:
+        is_directory = False
+        src_path = str(project.pages_dir / "index.pyxl")
+        dest_path = ""
+
+    handler.on_any_event(DummyEvent())
+
+    assert captured == [Path(DummyEvent.src_path)]
+
+
+def test_project_event_handler_skips_ignored_paths(project: DevServerSettings) -> None:
+    """The handler drops events for which the ignore predicate returns True."""
+    captured: List[Path] = []
+    tailwind_output = project.public_dir / "styles" / "tailwind.css"
+    handler = _ProjectEventHandler(
+        lambda path: captured.append(path),
+        ignore=lambda path: path == tailwind_output,
+    )
+
+    class Ignored:
+        is_directory = False
+        src_path = str(tailwind_output)
+        dest_path = ""
+
+    class Kept:
+        is_directory = False
+        src_path = str(project.pages_dir / "index.pyxl")
+        dest_path = ""
+
+    handler.on_any_event(Ignored())
+    handler.on_any_event(Kept())
+
+    assert captured == [Path(Kept.src_path)]
+
+
+def test_is_generated_output_ignores_tailwind_output(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    (root / "pages").mkdir(parents=True)
+    (root / "public" / "styles").mkdir(parents=True)
+    settings = DevServerSettings.from_project_root(root)
+    watcher = ProjectWatcher(
+        settings,
+        logger=make_logger()[0],
+        timer_factory=lambda delay, callback: ManualTimerHandle(callback),
+        build_function=lambda s, **_: BuildSummary(),
+    )
+
+    output_css = settings.public_dir / "styles" / "tailwind.css"
+    output_css.write_text("/* generated */", encoding="utf-8")
+
+    assert watcher._is_generated_output(output_css) is True
+
+
+def test_is_generated_output_ignores_build_artefacts(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    (root / "pages").mkdir(parents=True)
+    (root / "public").mkdir()
+    settings = DevServerSettings.from_project_root(root)
+    watcher = ProjectWatcher(
+        settings,
+        logger=make_logger()[0],
+        timer_factory=lambda delay, callback: ManualTimerHandle(callback),
+        build_function=lambda s, **_: BuildSummary(),
+    )
+
+    ignored = [
+        root / ".pyxle-build" / "client" / "pages" / "index.jsx",
+        root / "pages" / "__pycache__" / "index.cpython-312.pyc",
+        root / "pages" / "index.cpython-312.pyc",
+        root / "data" / "pyxle.db",
+        root / "data" / "pyxle.db-wal",
+        root / "data" / "pyxle.db-shm",
+    ]
+    for candidate in ignored:
+        assert watcher._is_generated_output(candidate) is True, candidate
+
+
+def test_is_generated_output_keeps_real_sources(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    (root / "pages").mkdir(parents=True)
+    (root / "public").mkdir()
+    settings = DevServerSettings.from_project_root(root)
+    watcher = ProjectWatcher(
+        settings,
+        logger=make_logger()[0],
+        timer_factory=lambda delay, callback: ManualTimerHandle(callback),
+        build_function=lambda s, **_: BuildSummary(),
+    )
+
+    kept = [
+        root / "pages" / "index.pyxl",
+        root / "pages" / "api" / "pulse.py",
+        root / "pages" / "styles" / "tailwind.css",
+        root / "public" / "favicon.ico",
+    ]
+    for candidate in kept:
+        assert watcher._is_generated_output(candidate) is False, candidate
+
+
+def test_is_generated_output_tolerates_unresolvable_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A path that can't be resolved (vanished mid-event / symlink loop) is
+    still classified from its raw form rather than raising."""
+
+    def _raise(self: Path, *args: object, **kwargs: object) -> Path:
+        raise OSError("path vanished mid-event")
+
+    monkeypatch.setattr(Path, "resolve", _raise)
+
+    # Falls back to the unresolved path and still matches on suffix, so the
+    # generated file is ignored instead of crashing the event handler.
+    assert _is_generated_output(tmp_path / "pages" / "x.pyc", frozenset()) is True
+    assert _is_generated_output(tmp_path / "pages" / "index.pyxl", frozenset()) is False
+
+
+def test_watcher_ignores_tailwind_output_event_no_rebuild(tmp_path: Path) -> None:
+    """End-to-end: a write to the Tailwind output CSS enqueues no rebuild.
+
+    This is the exact event that produced the infinite reload loop — the
+    Tailwind CLI writing ``public/styles/tailwind.css`` into the watched tree.
+    """
+    root = tmp_path / "project"
+    (root / "pages").mkdir(parents=True)
+    (root / "public" / "styles").mkdir(parents=True)
+    settings = DevServerSettings.from_project_root(root)
+
+    build_calls: List[object] = []
+    watcher = ProjectWatcher(
+        settings,
+        logger=make_logger()[0],
+        timer_factory=lambda delay, callback: ManualTimerHandle(callback),
+        build_function=lambda s, **_: build_calls.append(s) or BuildSummary(),
+    )
+
+    output_css = settings.public_dir / "styles" / "tailwind.css"
+    output_css.write_text("/* generated */", encoding="utf-8")
+
+    class TailwindWrite:
+        is_directory = False
+        src_path = str(output_css)
+        dest_path = ""
+
+    class PageEdit:
+        is_directory = False
+        src_path = str(settings.pages_dir / "index.pyxl")
+        dest_path = ""
+
+    watcher._handler.on_any_event(TailwindWrite())
+    watcher.flush()
+    assert build_calls == []  # the generated write did not trigger a build
+
+    watcher._handler.on_any_event(PageEdit())
+    watcher.flush()
+    assert len(build_calls) == 1  # a real source edit still rebuilds
 
 
 def test_format_paths_truncates_and_handles_external(project: DevServerSettings) -> None:
