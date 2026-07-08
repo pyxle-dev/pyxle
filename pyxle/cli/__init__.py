@@ -126,6 +126,37 @@ def _stdin_is_interactive() -> bool:
         return False
 
 
+def _prompt_yes_no(question: str, *, default: bool = False) -> bool:
+    """Arrow-key Yes/No selection for ``pyxle init``.
+
+    Rendered with questionary (imported lazily — this runs only on the
+    interactive prompt path). A user abort (Ctrl-C / EOF) exits the command
+    cleanly instead of tracebacking.
+    """
+    import questionary  # noqa: PLC0415 - lazy: interactive prompt path only
+
+    answer = questionary.select(
+        question,
+        choices=["No", "Yes"],
+        default="Yes" if default else "No",
+        qmark="◆",
+        instruction="(↑/↓ + Enter)",
+    ).ask()
+    if answer is None:  # Ctrl-C / EOF
+        raise typer.Exit(code=1)
+    return answer == "Yes"
+
+
+def _prompt_text(question: str, *, default: str) -> str:
+    """Free-text prompt with a pre-filled default, matching the select styling."""
+    import questionary  # noqa: PLC0415 - lazy: interactive prompt path only
+
+    answer = questionary.text(question, default=default, qmark="◆").ask()
+    if answer is None:  # Ctrl-C / EOF
+        raise typer.Exit(code=1)
+    return answer.strip() or default
+
+
 @app.command(help="Create a new Pyxle project scaffold.")
 def init(
     name: Optional[str] = typer.Argument(
@@ -182,7 +213,7 @@ def init(
         if shadcn:
             tailwind_choice = True
         elif interactive:
-            tailwind_choice = typer.confirm("Use Tailwind CSS?", default=False)
+            tailwind_choice = _prompt_yes_no("Use Tailwind CSS?")
         else:
             tailwind_choice = False
     else:
@@ -193,7 +224,7 @@ def init(
         if not tailwind_choice:
             shadcn_choice = False
         elif interactive:
-            shadcn_choice = typer.confirm("Add shadcn/ui components?", default=False)
+            shadcn_choice = _prompt_yes_no("Add shadcn/ui components?")
         else:
             shadcn_choice = False
     else:
@@ -201,10 +232,14 @@ def init(
         if shadcn_choice:
             tailwind_choice = True
 
-    # 3. Import alias.
+    # 3. Import alias — asked as an optional customization (create-next-app
+    # style): almost everyone keeps the default, so the value input is shown
+    # only after an explicit "Yes".
     if import_alias is None:
-        if interactive:
-            alias_choice = typer.prompt("Import alias", default=DEFAULT_IMPORT_ALIAS)
+        if interactive and _prompt_yes_no(
+            f"Customize the default import alias ({DEFAULT_IMPORT_ALIAS})?"
+        ):
+            alias_choice = _prompt_text("Import alias", default=DEFAULT_IMPORT_ALIAS)
         else:
             alias_choice = DEFAULT_IMPORT_ALIAS
     else:
