@@ -1329,6 +1329,51 @@ def test_serve_command_ssr_workers_flag(monkeypatch) -> None:
         assert captured["settings"].ssr_workers == 3  # type: ignore[union-attr]
 
 
+def test_serve_command_defaults_ssr_workers_to_auto(monkeypatch) -> None:
+    """Without --ssr-workers, `pyxle serve` defaults to auto-size (0).
+
+    Auto (0) resolves to min(cpu_count, 4) so production renders concurrently by
+    default instead of one stream at a time. `pyxle dev` keeps its single worker.
+    """
+    with runner.isolated_filesystem():
+        project = Path("demo")
+        project.mkdir(parents=True)
+        dist = project / "dist"
+        dist.mkdir()
+        manifest = dist / "page-manifest.json"
+        manifest.write_text('{"pages": {}, "generated_at": "2024-01-01"}')
+        (dist / "public").mkdir()
+        (dist / "client").mkdir()
+
+        captured: dict[str, object] = {}
+
+        def fake_create_app(settings, *a, **kw):
+            captured["settings"] = settings
+            from starlette.applications import Starlette
+            app_obj = Starlette()
+            app_obj.state.pyxle_ready = False
+            return app_obj
+
+        monkeypatch.setattr("pyxle.build.production.create_starlette_app", fake_create_app)
+        monkeypatch.setattr("pyxle.build.production.load_manifest", lambda p: {"pages": {}, "generated_at": "2024-01-01"})
+        monkeypatch.setattr("pyxle.build.production.build_metadata_registry", lambda s: {})
+        monkeypatch.setattr("pyxle.build.production.build_route_table", lambda r: [])
+        monkeypatch.setattr("pyxle.cli.asyncio.run", lambda coro: coro.close())
+
+        async def _noop_serve(self):
+            pass
+
+        import uvicorn
+        monkeypatch.setattr(uvicorn, "Server", lambda cfg: type("S", (), {"serve": _noop_serve})())
+
+        result = runner.invoke(
+            app, ["serve", "demo", "--skip-build"], catch_exceptions=False
+        )
+
+        assert result.exit_code == 0, result.stdout
+        assert captured["settings"].ssr_workers == 0  # type: ignore[union-attr]
+
+
 def test_serve_command_workers_runs_multiprocess_factory(monkeypatch) -> None:
     """`serve --workers N` (N>1) hands uvicorn the importable app factory in
     multi-worker mode and exports the PYXLE_SERVE_* env, instead of building the

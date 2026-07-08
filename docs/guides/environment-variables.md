@@ -125,6 +125,17 @@ cross-worker delivery under `pyxle serve --workers N`.
 
 The `redis` broker needs `pip install 'pyxle-framework[redis]'`.
 
+## SSR rendering
+
+These tune the [server-side rendering](../guides/streaming.md) worker pool. The
+number of SSR **processes** is set with `pyxle serve --ssr-workers` (auto-sized
+by default); this variable tunes how many renders each of those processes runs
+concurrently.
+
+| Variable | Meaning |
+|----------|---------|
+| `PYXLE_SSR_WORKER_CONCURRENCY` | Max renders one SSR worker process handles concurrently (default `16`). Because streaming renders are mostly idle (awaiting loaders / `<Suspense>`), one worker interleaves many of them; raise this only for workloads dominated by slow, I/O-bound loaders |
+
 ## Using environment variables in loaders
 
 ```python

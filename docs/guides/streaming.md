@@ -127,6 +127,22 @@ after the full ~600 ms a buffered render would wait. The slower the boundary,
 the bigger the win; a page with no slow boundary gains nothing, which is exactly
 why streaming is opt-in.
 
+### Concurrent streams don't queue
+
+Overlapping requests to a streaming page render **concurrently**, even against a
+single SSR worker. A streaming render spends almost all of its wall-clock time
+idle — awaiting your `@server` loader and each `<Suspense>` boundary — and the
+worker interleaves those idle windows across requests. Four visitors hitting the
+same slow streaming page all get their shell's first byte in tens of
+milliseconds; none waits for the others' boundaries to resolve first.
+
+Each render is fully isolated: its pathname, CSRF token, `<Head>` tags, and
+styles are scoped to that request, so interleaving never bleeds one visitor's
+page into another's. Adding SSR **processes** (`--ssr-workers`, auto-sized by
+default under `pyxle serve`) adds CPU-parallel throughput on top; the in-worker
+concurrency handles the idle-wait overlap. See
+[Deployment → SSR workers](deployment.md#ssr-workers).
+
 ## When a page does **not** stream
 
 Streaming is deliberately narrow. A page falls back to the buffered render when:
@@ -140,9 +156,12 @@ Streaming is deliberately narrow. A page falls back to the buffered render when:
   render buffered. Streaming helps the dynamic, per-request pages that *can't*
   be cached.
 - **The server is running without an SSR worker pool.** Streaming needs the
-  pool's multi-frame transport. Both `pyxle dev` and `pyxle serve` run the pool
-  by default (`--ssr-workers 1`), so streaming works in development too; only
-  `--ssr-workers 0` (per-request subprocess mode) disables it.
+  pool's multi-frame transport. `pyxle serve` auto-sizes the pool by default and
+  `pyxle dev` runs a single worker, so streaming works out of the box in both.
+  The only way to lose it is `pyxle dev --ssr-workers 0`, which selects the
+  per-request subprocess renderer (no pool, no streaming). Under `pyxle serve`,
+  `--ssr-workers 0` means *auto-size* (one worker per CPU, capped at 4), not
+  subprocess mode — so it keeps streaming.
 
 A streamed response is always `Cache-Control: private, no-cache` — it is a
 per-request render and is never shared between visitors.

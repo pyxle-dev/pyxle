@@ -47,7 +47,7 @@ behind gzip in production rather than buffering the whole response.
 | `--host` | `127.0.0.1` | Bind address |
 | `--port` | `8000` | Port number |
 | `--workers` / `-w` | `1` | Server worker processes — one per CPU core ([multi-core](#multi-core-worker-processes)) |
-| `--ssr-workers` | `1` | Persistent Node.js SSR processes, **per server worker** (`0` = auto-size to CPU cores, capped at 4) |
+| `--ssr-workers` | `auto` | Persistent Node.js SSR processes, **per server worker** (`0`/`auto` = size to CPU cores, capped at 4). `pyxle serve` defaults to auto; pass a number to pin it |
 | `--dist-dir` | `dist/` | Directory with production artifacts |
 | `--skip-build` | `false` | Skip running build first |
 | `--serve-static/--no-serve-static` | `true` | Serve static assets directly (disable when a CDN hosts them) |
@@ -89,25 +89,43 @@ don't set them yourself.
 ### SSR workers
 
 Server-side rendering runs in persistent Node.js processes that stay warm
-between requests:
+between requests. `pyxle serve` **auto-sizes** the pool by default — the pool
+grows to the machine's CPU count, capped at 4, per server worker — so you don't
+have to think about it for most deployments:
 
 ```bash
-pyxle serve --ssr-workers 2
+pyxle serve                 # auto-sized SSR pool (default)
+pyxle serve --ssr-workers 2 # pin the pool to exactly 2 processes per server worker
 ```
 
 `--ssr-workers` applies **per server worker**, so the total number of Node.js
-render processes is `workers × ssr-workers`. For an SSR-heavy app,
-`--workers $(nproc) --ssr-workers 1` is a good starting point — scale
-`--ssr-workers` up only if profiling shows render queueing. Passing `0`
+render processes is `workers × ssr-workers`. Passing `0` (or omitting the flag)
 auto-sizes the pool to the machine's CPU count (capped at 4) per server worker.
+
+#### Concurrency within a worker
+
+Each SSR worker handles **many renders concurrently**, not one at a time. This
+matters most for [streaming SSR](streaming.md): a streaming render spends almost
+all of its wall-clock time idle, awaiting loader promises and `<Suspense>`
+boundaries. The worker interleaves those idle windows, so overlapping requests
+to a streaming page all start rendering immediately instead of queueing behind
+each other. Per-request state (pathname, CSRF token, `<Head>` tags, styles) is
+isolated per render, so interleaving never mixes one visitor's page into
+another's.
+
+The in-worker concurrency cap defaults to 16 in-flight renders and is tunable
+with the `PYXLE_SSR_WORKER_CONCURRENCY` environment variable — raise it only for
+a workload dominated by slow, I/O-bound loaders where renders sit idle waiting
+on the network. Because the cap governs *idle* concurrency, adding SSR
+**processes** (`--ssr-workers`) is what adds CPU-parallel render throughput.
 
 ### Sizing guidance
 
 | Workload | Suggestion |
 |----------|------------|
 | API-heavy, little SSR | `--workers $(nproc)` |
-| SSR-heavy pages | `--workers $(nproc) --ssr-workers 1`, raise SSR workers if renders queue |
-| Small VPS (1–2 cores) | Defaults (`--workers 1`) are fine |
+| SSR-heavy / streaming pages | Defaults are fine — the auto-sized pool renders concurrently. Raise `--ssr-workers` only if CPU-bound renders queue |
+| Small VPS (1–2 cores) | Defaults (`--workers 1`, auto SSR pool) are fine |
 | Memory-constrained | Each worker is a full process — reduce `--workers` before reducing `--ssr-workers` |
 
 ### Per-worker state (multi-worker caveats)
