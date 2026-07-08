@@ -90,22 +90,25 @@ $ pyxle dev
    - The Starlette app is now serving requests
 ```
 
-When all seven steps are done, the console shows:
+When all seven steps are done, the console shows a curated startup summary:
 
 ```
-ℹ️  Starting Pyxle dev server on http://127.0.0.1:8000 with Vite proxy at http://127.0.0.1:5173
-ℹ️  Preparing Pyxle development server
-✅ Initial build completed — 14 page(s) compiled; 1 API module(s) copied
-ℹ️  Discovered 13 page route(s) and 1 API route(s)
-ℹ️  Launching Vite dev server: vite dev --config ... --port 5173
-ℹ️  [vite]   VITE v5.4.21  ready in 188 ms
-✅ Vite dev server ready at http://127.0.0.1:5173 (0.30s)
-ℹ️  Starting Starlette on http://127.0.0.1:8000 (Vite proxy at http://127.0.0.1:5173)
+✅ Pyxle dev server ready in 512 ms
+ℹ️    Local:   http://127.0.0.1:8000
+ℹ️    Vite:    http://127.0.0.1:5173
+ℹ️    Routes:  13 page(s), 1 API route(s)
 ```
 
-You can read those lines in order against the seven steps above —
-each `ℹ️` log is one piece of the lifecycle reporting that it's
-done.
+By default the per-line Vite firehose and the internal step-by-step lifecycle
+chatter (`Preparing …`, `Launching Vite …`, `Discovered … route(s)`, the raw
+`[vite] …` output) are hidden so the console stays readable. Each incremental
+rebuild then prints a single concise line (`✅ Rebuilt … in X ms`). Run
+`pyxle dev --verbose` (or `pyxle -v dev`) to restore the full firehose and the
+debug-level internals — every one of those hidden lines is emitted at debug
+level, so verbose mode surfaces the entire lifecycle for troubleshooting.
+
+Genuine signal — errors, warnings, the URLs, and rebuild success/failure — is
+always shown regardless of verbosity.
 
 ---
 
@@ -396,6 +399,25 @@ Event types:
   client uses this to dismiss any visible error overlay.
 - `"reload"` — sent after a successful rebuild. The client triggers
   a soft reload of the current page.
+- `"log"` — a server-side `logging` record forwarded to the browser
+  devtools console (dev only). The payload carries the target
+  `console` method (`info`/`warn`/`error`/`debug`), the formatted
+  message, and the originating logger name; the client prints it
+  prefixed `[pyxle:server]`. A bounded `logging.Handler`
+  (`devserver/log_forwarding.py`) is attached to the root logger while
+  the dev server runs and detached on shutdown. It never blocks the
+  event loop, drops records when no client is connected or the send
+  fails, guards against re-entrancy, and throttles bursts. By default
+  only `INFO`+ from your own loggers is forwarded; `--verbose` also
+  forwards `DEBUG` and the framework's internal loggers. To make those
+  records reachable (Python's root logger defaults to `WARNING`, which
+  drops `INFO` before any handler sees it), the handler lowers the root
+  logger level to `INFO` (`DEBUG` under `--verbose`) for the lifetime of
+  the dev session and restores the previous level on shutdown. A side
+  effect is that if your app has configured its own root handler (e.g.
+  via `logging.basicConfig`), your `INFO` logs also become visible in the
+  terminal during `pyxle dev`. This is dev-only; `pyxle serve` never
+  touches your logging configuration.
 
 The browser-side overlay client lives in `pyxle/client/` and is
 included in the default scaffold.

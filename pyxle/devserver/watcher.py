@@ -305,7 +305,7 @@ class ProjectWatcher:
         start = time.perf_counter()
         formatted = self._format_paths(paths)
         files_changed = len(paths)
-        self._logger.step("Rebuild", detail=f"{files_changed} file(s) changed: {formatted}")
+        self._logger.debug(f"Rebuild triggered — {files_changed} file(s) changed: {formatted}")
 
         try:
             summary = self._build_function(self._settings, force_rebuild=False)
@@ -346,9 +346,12 @@ class ProjectWatcher:
         _invalidate_python_modules(paths, self._settings.project_root)
 
         if summary.any_changes():
-            self._logger.success(
-                "Rebuild completed in "
-                f"{elapsed:.2f}s — pages: {len(summary.compiled_pages)}, "
+            # Curated one-liner: what rebuilt and how long it took. The full
+            # per-category breakdown stays at debug (`--verbose`).
+            self._logger.success(f"Rebuilt {formatted} in {elapsed * 1000:.0f} ms")
+            self._logger.debug(
+                "Rebuild breakdown — "
+                f"pages: {len(summary.compiled_pages)}, "
                 f"apis: {len(summary.copied_api_modules)}, "
                 f"client assets: {len(summary.copied_client_assets)}, "
                 f"global styles: {len(summary.synced_stylesheets)}, "
@@ -356,7 +359,7 @@ class ProjectWatcher:
                 f"removed: {len(summary.removed)}"
             )
         else:
-            self._logger.info(
+            self._logger.debug(
                 f"Rebuild finished in {elapsed:.2f}s with no material changes (debounced {files_changed} event(s))"
             )
 

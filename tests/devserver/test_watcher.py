@@ -9,7 +9,7 @@ from typing import Callable, List, Tuple
 
 import pytest
 
-from pyxle.cli.logger import ConsoleLogger
+from pyxle.cli.logger import ConsoleLogger, Verbosity
 from pyxle.devserver.builder import BuildSummary, build_once
 from pyxle.devserver.settings import DevServerSettings
 from pyxle.devserver.watcher import (
@@ -318,8 +318,10 @@ def test_rebuild_triggers_once_after_debounce(
     handles[-1].trigger()
 
     assert len(rebuild_calls) == 1
-    assert any(message.startswith("▶️  Rebuild") for message in messages)
-    assert any("Rebuild completed" in message for message in messages)
+    # The curated rebuild output is a concise one-liner ("Rebuilt <files> in
+    # <ms> ms"); the pre-step and per-category breakdown are debug-only.
+    assert any(message.startswith("✅ Rebuilt ") for message in messages)
+    assert not any("Rebuild breakdown" in message for message in messages)
 
 
 def test_project_watcher_invokes_rebuild_callback(
@@ -357,11 +359,36 @@ def test_project_watcher_flush_without_pending(project: DevServerSettings) -> No
     watcher.flush()  # exercise branch where buffer is empty
 
 
+def test_rebuild_breakdown_shown_only_in_verbose(
+    project: DevServerSettings, timer_factory: Tuple[Callable[[float, Callable[[], None]], ManualTimerHandle], List[ManualTimerHandle]]
+) -> None:
+    factory, handles = timer_factory
+    logger, messages = make_logger()
+    logger.set_verbosity(Verbosity.VERBOSE)
+
+    watcher = ProjectWatcher(
+        project,
+        logger=logger,
+        timer_factory=factory,
+        build_function=lambda settings, **_: BuildSummary(
+            compiled_pages=["index.pyxl"], copied_api_modules=["api/pulse.py"], removed=[]
+        ),
+    )
+
+    watcher.notify_paths([project.pages_dir / "index.pyxl"])
+    handles[-1].trigger()
+
+    assert any(message.startswith("✅ Rebuilt ") for message in messages)
+    assert any("Rebuild breakdown" in message for message in messages)
+
+
 def test_rebuild_logs_no_changes_when_summary_empty(
     project: DevServerSettings, timer_factory: Tuple[Callable[[float, Callable[[], None]], ManualTimerHandle], List[ManualTimerHandle]]
 ) -> None:
     factory, handles = timer_factory
     logger, messages = make_logger()
+    # The "no material changes" notice is debug-level (verbose-only).
+    logger.set_verbosity(Verbosity.VERBOSE)
 
     watcher = ProjectWatcher(
         project,

@@ -32,7 +32,18 @@ npm install
 pyxle dev
 ```
 
+The console prints a short summary — the local URL, the Vite URL, the route count, and how long startup took — then stays quiet unless something needs your attention:
+
+```
+✅ Pyxle dev server ready in 512 ms
+ℹ️    Local:   http://127.0.0.1:8000
+ℹ️    Vite:    http://127.0.0.1:5173
+ℹ️    Routes:  1 page(s), 1 API route(s)
+```
+
 Open [http://localhost:8000](http://localhost:8000) in your browser. You should see the Pyxle starter page — a centered card showing the framework version, server time, and a link to edit `pages/index.pyxl`.
+
+Each edit you save prints one concise `Rebuilt … in X ms` line. Your server-side `logging` output also streams to the **browser** devtools console (prefixed `[pyxle:server]`) so you can follow loaders and actions without switching windows. Need the full picture — raw Vite logs and debug internals? Run `pyxle dev --verbose`. See the [CLI reference](../reference/cli.md#pyxle-dev) for details.
 
 Tailwind compiles automatically because the scaffold ships with `postcss.config.cjs` — PostCSS runs as part of the Vite pipeline, so there's nothing separate to start.
 

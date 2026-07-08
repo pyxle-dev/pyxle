@@ -637,6 +637,66 @@ def test_dev_command_invokes_devserver(monkeypatch) -> None:
         assert captured.get("logger").__class__.__name__ == "ConsoleLogger"
 
 
+@pytest.mark.parametrize("argv", [["dev", "demo", "--verbose"], ["-v", "dev", "demo"]])
+def test_dev_command_verbose_sets_verbose_verbosity(monkeypatch, argv) -> None:
+    """Both `pyxle dev --verbose` and `pyxle -v dev` raise the shared logger."""
+    from pyxle.cli.logger import Verbosity
+
+    with runner.isolated_filesystem():
+        project = Path("demo")
+        (project / "pages").mkdir(parents=True)
+        (project / "public").mkdir(parents=True)
+
+        captured: dict[str, object] = {}
+
+        class StubDevServer:
+            def __init__(self, settings, logger, **kwargs):
+                captured["verbosity"] = logger.verbosity
+
+            async def start(self) -> None:  # pragma: no cover - not awaited
+                captured["started"] = True
+
+        from pyxle.devserver import DevServerSettings as _RealSettings
+
+        monkeypatch.setattr("pyxle.cli.DevServer", StubDevServer)
+        monkeypatch.setattr("pyxle.cli.DevServerSettings", _RealSettings)
+        monkeypatch.setattr("pyxle.cli.asyncio.run", lambda coro: coro.close())
+
+        result = runner.invoke(app, argv, catch_exceptions=False)
+
+        assert result.exit_code == 0, result.stdout
+        assert captured["verbosity"] == Verbosity.VERBOSE
+
+
+def test_dev_command_default_verbosity_is_normal(monkeypatch) -> None:
+    from pyxle.cli.logger import Verbosity
+
+    with runner.isolated_filesystem():
+        project = Path("demo")
+        (project / "pages").mkdir(parents=True)
+        (project / "public").mkdir(parents=True)
+
+        captured: dict[str, object] = {}
+
+        class StubDevServer:
+            def __init__(self, settings, logger, **kwargs):
+                captured["verbosity"] = logger.verbosity
+
+            async def start(self) -> None:  # pragma: no cover - not awaited
+                captured["started"] = True
+
+        from pyxle.devserver import DevServerSettings as _RealSettings
+
+        monkeypatch.setattr("pyxle.cli.DevServer", StubDevServer)
+        monkeypatch.setattr("pyxle.cli.DevServerSettings", _RealSettings)
+        monkeypatch.setattr("pyxle.cli.asyncio.run", lambda coro: coro.close())
+
+        result = runner.invoke(app, ["dev", "demo"], catch_exceptions=False)
+
+        assert result.exit_code == 0, result.stdout
+        assert captured["verbosity"] == Verbosity.NORMAL
+
+
 def test_dev_command_dashboard_flag(monkeypatch) -> None:
     with runner.isolated_filesystem():
         project = Path("demo")
