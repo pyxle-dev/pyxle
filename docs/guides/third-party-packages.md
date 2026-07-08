@@ -40,6 +40,21 @@ browser-only package should be used inside a `useEffect`, an event handler, or a
 
 Run both installers at once with `pyxle install`.
 
+### CommonJS packages and SSR
+
+The server render bundles your page as an ES module, with React provided by the
+runtime rather than bundled in. Pyxle resolves dependencies **ESM-first** (it
+prefers a package's `module`/ESM entry over its CommonJS `main`), so libraries
+that ship both — including `lucide-react` and most of the shadcn/ui ecosystem —
+render on the server with no extra configuration.
+
+A package that ships **only** CommonJS and calls `require('react')` internally
+can't be linked into the ES-module server bundle. If one does, the server
+render fails with an actionable error that names the package's `require(...)`
+and your page file, and suggests the fix: use a version that ships an ES module,
+or render that part of the page client-only with `<ClientOnly>` so it never runs
+during the server render.
+
 ### The import alias
 
 `pyxle init` sets up an import alias (default `@/*`) in `jsconfig.json`, and

@@ -15,6 +15,7 @@ from pyxle.devserver.settings import DevServerSettings
 from pyxle.ssr import view as ssr_view
 from pyxle.ssr.renderer import (
     BrowserGlobalRenderError,
+    CjsDependencyRenderError,
     ComponentRenderError,
     InlineStyleFragment,
     RenderResult,
@@ -3063,3 +3064,73 @@ async def test_build_streaming_page_response_enriches_browser_global_shell_error
     assert "matchMedia is not defined" in body
     assert "pages/index.pyxl" in body
     assert "useEffect" in body
+
+
+DYNAMIC_REQUIRE_MSG = 'Dynamic require of "react" is not supported'
+
+
+def test_enrich_render_error_upgrades_dynamic_require(tmp_path: Path) -> None:
+    """A "Dynamic require of X" error becomes a CjsDependencyRenderError."""
+    page = _page_route(tmp_path, loader_name=None)
+    original = ComponentRenderError(DYNAMIC_REQUIRE_MSG)
+
+    enriched = ssr_view._enrich_render_error(original, page)
+
+    assert isinstance(enriched, CjsDependencyRenderError)
+    assert enriched.module_name == "react"
+    assert enriched.source_file == "pages/index.pyxl"
+    assert enriched.__cause__ is original
+    # Already-enriched errors pass through untouched.
+    assert ssr_view._enrich_render_error(enriched, page) is enriched
+
+
+@pytest.mark.anyio
+async def test_build_page_response_enriches_cjs_require_error_in_dev(
+    settings: DevServerSettings, tmp_path: Path
+) -> None:
+    page = _page_route(tmp_path, loader_name=None)
+    renderer = _failing_renderer(DYNAMIC_REQUIRE_MSG)
+    overlay = StubOverlay()
+
+    response = await build_page_response(
+        request=_plain_request(),
+        settings=settings,
+        page=page,
+        renderer=renderer,
+        overlay=overlay,
+    )
+
+    body = (await _read_response_body(response)).decode()
+    assert response.status_code == 500
+    assert "pages/index.pyxl" in body
+    # 'require(...)' is HTML-escaped in the dev page; assert on plain-text spans.
+    assert "CommonJS dependency" in body
+    assert "ES module" in body
+    assert "CjsDependencyRenderError" in body
+
+
+@pytest.mark.anyio
+async def test_build_page_response_cjs_require_error_is_generic_in_production(
+    settings: DevServerSettings, tmp_path: Path, caplog
+) -> None:
+    prod_settings = replace(settings, debug=False)
+    page = _page_route(tmp_path, loader_name=None)
+    renderer = _failing_renderer(DYNAMIC_REQUIRE_MSG)
+
+    with caplog.at_level("ERROR"):
+        response = await build_page_response(
+            request=_plain_request(),
+            settings=prod_settings,
+            page=page,
+            renderer=renderer,
+            overlay=None,
+        )
+
+    body = (await _read_response_body(response)).decode()
+    assert response.status_code == 500
+    assert "Server Error" in body
+    assert "react" not in body
+    assert "pages/" not in body
+    assert "CjsDependencyRenderError" not in body
+    # The enriched detail reaches the server log only.
+    assert "require('react')" in caplog.text
