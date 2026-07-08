@@ -113,6 +113,39 @@ def test_from_project_root_accepts_str_and_path(project_root: Path | str) -> Non
     assert settings.project_root.exists()
 
 
+def test_settings_resolve_dev_watch_dirs(tmp_path: Path) -> None:
+    """dev_watch entries resolve to absolute dirs under the root; dev_ignore
+    globs are stored verbatim."""
+    root = tmp_path / "app"
+    (root / "pages").mkdir(parents=True)
+    (root / "public").mkdir()
+
+    settings = DevServerSettings.from_project_root(
+        root,
+        dev_watch=("lib", "components"),
+        dev_ignore=("pages/generated/*",),
+    )
+
+    assert settings.dev_watch_dirs == ((root / "lib").resolve(), (root / "components").resolve())
+    assert settings.dev_ignore_globs == ("pages/generated/*",)
+
+
+def test_settings_dev_watch_drops_out_of_bounds_and_dedupes(tmp_path: Path) -> None:
+    """Defence in depth: a direct caller passing a traversal path has it dropped,
+    and duplicate entries collapse to one."""
+    root = tmp_path / "app"
+    (root / "pages").mkdir(parents=True)
+    (root / "public").mkdir()
+
+    settings = DevServerSettings.from_project_root(
+        root,
+        dev_watch=("lib", "lib", "../escape"),
+    )
+
+    # Only the in-bounds directory survives, and it appears once.
+    assert settings.dev_watch_dirs == ((root / "lib").resolve(),)
+
+
 def test_devserver_start_runs_with_stubbed_uvicorn(monkeypatch, tmp_path: Path) -> None:
     settings = DevServerSettings.from_project_root(tmp_path)
     capture: list[str] = []

@@ -558,24 +558,6 @@ def test_project_event_handler_skips_ignored_paths(project: DevServerSettings) -
     assert captured == [Path(Kept.src_path)]
 
 
-def test_is_generated_output_ignores_tailwind_output(tmp_path: Path) -> None:
-    root = tmp_path / "project"
-    (root / "pages").mkdir(parents=True)
-    (root / "public" / "styles").mkdir(parents=True)
-    settings = DevServerSettings.from_project_root(root)
-    watcher = ProjectWatcher(
-        settings,
-        logger=make_logger()[0],
-        timer_factory=lambda delay, callback: ManualTimerHandle(callback),
-        build_function=lambda s, **_: BuildSummary(),
-    )
-
-    output_css = settings.public_dir / "styles" / "tailwind.css"
-    output_css.write_text("/* generated */", encoding="utf-8")
-
-    assert watcher._is_generated_output(output_css) is True
-
-
 def test_is_generated_output_ignores_build_artefacts(tmp_path: Path) -> None:
     root = tmp_path / "project"
     (root / "pages").mkdir(parents=True)
@@ -597,7 +579,7 @@ def test_is_generated_output_ignores_build_artefacts(tmp_path: Path) -> None:
         root / "data" / "pyxle.db-shm",
     ]
     for candidate in ignored:
-        assert watcher._is_generated_output(candidate) is True, candidate
+        assert watcher._should_ignore(candidate) is True, candidate
 
 
 def test_is_generated_output_keeps_real_sources(tmp_path: Path) -> None:
@@ -619,7 +601,7 @@ def test_is_generated_output_keeps_real_sources(tmp_path: Path) -> None:
         root / "public" / "favicon.ico",
     ]
     for candidate in kept:
-        assert watcher._is_generated_output(candidate) is False, candidate
+        assert watcher._should_ignore(candidate) is False, candidate
 
 
 def test_is_generated_output_tolerates_unresolvable_path(
@@ -635,15 +617,18 @@ def test_is_generated_output_tolerates_unresolvable_path(
 
     # Falls back to the unresolved path and still matches on suffix, so the
     # generated file is ignored instead of crashing the event handler.
-    assert _is_generated_output(tmp_path / "pages" / "x.pyc", frozenset()) is True
-    assert _is_generated_output(tmp_path / "pages" / "index.pyxl", frozenset()) is False
+    assert _is_generated_output(tmp_path / "pages" / "x.pyc") is True
+    assert _is_generated_output(tmp_path / "pages" / "index.pyxl") is False
 
 
-def test_watcher_ignores_tailwind_output_event_no_rebuild(tmp_path: Path) -> None:
-    """End-to-end: a write to the Tailwind output CSS enqueues no rebuild.
+def test_public_change_refreshes_index_without_rebuild(tmp_path: Path) -> None:
+    """A public/ change refreshes the static index but never rebuilds/reloads.
 
-    This is the exact event that produced the infinite reload loop — the
-    Tailwind CLI writing ``public/styles/tailwind.css`` into the watched tree.
+    Public assets are served live from disk (like Next.js), so a new or removed
+    file is made discoverable by refreshing the index — no build_once, no
+    browser reload. This is also the structural replacement for the old Tailwind
+    reload-loop guard: the Tailwind CLI writing ``public/styles/tailwind.css``
+    now lands on the public handler, which cannot rebuild.
     """
     root = tmp_path / "project"
     (root / "pages").mkdir(parents=True)
@@ -651,33 +636,209 @@ def test_watcher_ignores_tailwind_output_event_no_rebuild(tmp_path: Path) -> Non
     settings = DevServerSettings.from_project_root(root)
 
     build_calls: List[object] = []
+    reload_calls: List[WatcherStatistics] = []
+    refresh_calls: List[int] = []
+    handles: List[ManualTimerHandle] = []
+
+    def factory(delay: float, callback: Callable[[], None]) -> ManualTimerHandle:
+        handle = ManualTimerHandle(callback)
+        handles.append(handle)
+        return handle
+
+    watcher = ProjectWatcher(
+        settings,
+        logger=make_logger()[0],
+        timer_factory=factory,
+        build_function=lambda s, **_: build_calls.append(s) or BuildSummary(),
+        on_rebuild=reload_calls.append,
+        public_index_refresh=lambda: refresh_calls.append(1),
+    )
+
+    new_asset = settings.public_dir / "styles" / "tailwind.css"
+    new_asset.write_text("/* generated */", encoding="utf-8")
+
+    class PublicCreate:
+        is_directory = False
+        event_type = "created"
+        src_path = str(new_asset)
+        dest_path = ""
+
+    # A structural public event schedules an index refresh — not a rebuild.
+    watcher._public_handler.on_any_event(PublicCreate())
+    watcher.flush()  # drain the (empty) rebuild buffer
+    assert build_calls == []
+    assert reload_calls == []
+    # Fire the debounced refresh timer.
+    handles[-1].trigger()
+    assert refresh_calls == [1]
+
+
+def test_public_modified_event_is_ignored(tmp_path: Path) -> None:
+    """A plain 'modified' public event does not even refresh the index — the
+    served set is unchanged, so there is nothing to do."""
+    root = tmp_path / "project"
+    (root / "pages").mkdir(parents=True)
+    (root / "public").mkdir()
+    settings = DevServerSettings.from_project_root(root)
+
+    refresh_calls: List[int] = []
     watcher = ProjectWatcher(
         settings,
         logger=make_logger()[0],
         timer_factory=lambda delay, callback: ManualTimerHandle(callback),
-        build_function=lambda s, **_: build_calls.append(s) or BuildSummary(),
+        build_function=lambda s, **_: BuildSummary(),
+        public_index_refresh=lambda: refresh_calls.append(1),
     )
 
-    output_css = settings.public_dir / "styles" / "tailwind.css"
-    output_css.write_text("/* generated */", encoding="utf-8")
-
-    class TailwindWrite:
+    class PublicModify:
         is_directory = False
-        src_path = str(output_css)
+        event_type = "modified"
+        src_path = str(settings.public_dir / "favicon.ico")
         dest_path = ""
 
-    class PageEdit:
-        is_directory = False
-        src_path = str(settings.pages_dir / "index.pyxl")
-        dest_path = ""
+    watcher._public_handler.on_any_event(PublicModify())
+    assert refresh_calls == []
 
-    watcher._handler.on_any_event(TailwindWrite())
-    watcher.flush()
-    assert build_calls == []  # the generated write did not trigger a build
 
-    watcher._handler.on_any_event(PageEdit())
+def test_public_handler_scheduled_not_rebuild_handler(project: DevServerSettings) -> None:
+    """start() wires public/ to the lightweight index handler, and pages/ to the
+    rebuild handler — a public change can never reach build_once."""
+    from pyxle.devserver.watcher import _ProjectEventHandler, _PublicAssetEventHandler
+
+    observer = DummyObserver()
+    watcher = ProjectWatcher(
+        project,
+        logger=make_logger()[0],
+        observer_factory=lambda: observer,
+        timer_factory=lambda delay, callback: ManualTimerHandle(callback),
+        build_function=lambda settings, **_: BuildSummary(),
+    )
+    watcher.start()
+
+    by_path = {Path(path): handler for handler, path, _ in observer.scheduled}
+    assert isinstance(by_path[project.pages_dir], _ProjectEventHandler)
+    assert isinstance(by_path[project.public_dir], _PublicAssetEventHandler)
+
+
+def test_dev_watch_dir_rebuilds_and_invalidates(tmp_path: Path) -> None:
+    """An extra ``dev.watch`` directory joins the rebuild watch: a change there
+    rebuilds, reloads, and invalidates the imported Python module."""
+    root = tmp_path / "project"
+    (root / "pages").mkdir(parents=True)
+    (root / "public").mkdir()
+    lib_dir = root / "lib"
+    lib_dir.mkdir()
+    (lib_dir / "util.py").write_text("VALUE = 1\n", encoding="utf-8")
+
+    settings = DevServerSettings.from_project_root(root, dev_watch=("lib",))
+
+    observer = DummyObserver()
+    build_calls: List[object] = []
+    reload_calls: List[WatcherStatistics] = []
+    watcher = ProjectWatcher(
+        settings,
+        logger=make_logger()[0],
+        observer_factory=lambda: observer,
+        timer_factory=lambda delay, callback: ManualTimerHandle(callback),
+        build_function=lambda s, **_: build_calls.append(s)
+        or BuildSummary(compiled_pages=["index.pyxl"]),
+        on_rebuild=reload_calls.append,
+    )
+    watcher.start()
+
+    # The extra directory is scheduled on the rebuild handler.
+    from pyxle.devserver.watcher import _ProjectEventHandler
+
+    by_path = {Path(path).resolve(): handler for handler, path, _ in observer.scheduled}
+    assert isinstance(by_path[lib_dir.resolve()], _ProjectEventHandler)
+
+    # A change under it rebuilds + reloads + invalidates the module.
+    sys.modules["lib.util"] = ModuleType("lib.util")
+    watcher.notify_paths([lib_dir / "util.py"])
     watcher.flush()
-    assert len(build_calls) == 1  # a real source edit still rebuilds
+    assert len(build_calls) == 1
+    assert len(reload_calls) == 1
+    assert "lib.util" not in sys.modules
+
+
+def test_dev_watch_missing_dir_warns_and_is_skipped(tmp_path: Path) -> None:
+    """A configured ``dev.watch`` directory that doesn't exist is skipped with a
+    warning rather than silently ignored (catches typo'd paths)."""
+    root = tmp_path / "project"
+    (root / "pages").mkdir(parents=True)
+    (root / "public").mkdir()
+
+    settings = DevServerSettings.from_project_root(root, dev_watch=("nope",))
+
+    observer = DummyObserver()
+    logger, messages = make_logger()
+    watcher = ProjectWatcher(
+        settings,
+        logger=logger,
+        observer_factory=lambda: observer,
+        timer_factory=lambda delay, callback: ManualTimerHandle(callback),
+        build_function=lambda s, **_: BuildSummary(),
+    )
+    watcher.start()
+
+    scheduled = {Path(path).resolve() for _, path, _ in observer.scheduled}
+    assert (root / "nope").resolve() not in scheduled
+    assert any("dev.watch directory does not exist" in m and "nope" in m for m in messages)
+
+
+def test_dev_watch_inside_public_is_skipped(tmp_path: Path) -> None:
+    """A ``dev.watch`` entry inside public/ is refused (public is served live,
+    index-only) — rebuild-watching it could reintroduce the reload loop."""
+    root = tmp_path / "project"
+    (root / "pages").mkdir(parents=True)
+    (root / "public" / "styles").mkdir(parents=True)
+
+    settings = DevServerSettings.from_project_root(root, dev_watch=("public/styles",))
+
+    observer = DummyObserver()
+    logger, messages = make_logger()
+    watcher = ProjectWatcher(
+        settings,
+        logger=logger,
+        observer_factory=lambda: observer,
+        timer_factory=lambda delay, callback: ManualTimerHandle(callback),
+        build_function=lambda s, **_: BuildSummary(),
+    )
+    watcher.start()
+
+    from pyxle.devserver.watcher import _ProjectEventHandler
+
+    rebuild_watched = {
+        Path(path).resolve()
+        for handler, path, _ in observer.scheduled
+        if isinstance(handler, _ProjectEventHandler)
+    }
+    assert (root / "public" / "styles").resolve() not in rebuild_watched
+    assert any("inside public/" in m for m in messages)
+
+
+def test_dev_ignore_is_additive_to_builtins(tmp_path: Path) -> None:
+    """A user ``dev.ignore`` glob suppresses matching events, but the built-in
+    generated-output ignores stay in force regardless of the user list."""
+    root = tmp_path / "project"
+    (root / "pages").mkdir(parents=True)
+    (root / "public").mkdir()
+    settings = DevServerSettings.from_project_root(root, dev_ignore=("pages/generated/*",))
+
+    watcher = ProjectWatcher(
+        settings,
+        logger=make_logger()[0],
+        timer_factory=lambda delay, callback: ManualTimerHandle(callback),
+        build_function=lambda s, **_: BuildSummary(),
+    )
+
+    # User glob suppresses a matching source path.
+    assert watcher._should_ignore(root / "pages" / "generated" / "schema.py") is True
+    # A non-matching source is still watched.
+    assert watcher._should_ignore(root / "pages" / "index.pyxl") is False
+    # Built-in ignores remain in force even though a user list is present.
+    assert watcher._should_ignore(root / "pages" / "index.cpython-312.pyc") is True
+    assert watcher._should_ignore(root / "pages" / "__pycache__" / "x.pyc") is True
 
 
 def test_format_paths_truncates_and_handles_external(project: DevServerSettings) -> None:

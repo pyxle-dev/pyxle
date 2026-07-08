@@ -96,10 +96,14 @@ type `pyxle dev`, this is what happens:
    round-trip is ~30-80ms; spawning a fresh subprocess per request would
    be 200-400ms. Details: [SSR § Worker pool mode](ssr.md#worker-pool-mode).
 
-5. **Start the file watcher.** Pyxle watches `pages/`, `public/`, and any
-   global stylesheets/scripts. When a file changes, the watcher debounces
-   for 250ms (so saving twice in quick succession is one rebuild), then
-   recompiles only the changed files. Details:
+5. **Start the file watcher.** Pyxle watches `pages/` (plus any `dev.watch`
+   directories and global stylesheets/scripts) for hot reload. When a watched
+   file changes, the watcher debounces for 250ms (so saving twice in quick
+   succession is one rebuild), then recompiles only the changed files and
+   reloads the browser. Changes under `public/` are **not** rebuilt — static
+   assets are served live from disk and picked up on the next refresh (like
+   Next.js); the watcher only keeps `public/`'s file index current so a newly
+   added asset resolves without a restart. Details:
    [The dev server § The watcher](dev-server.md#the-watcher).
 
 6. **Start Starlette on port 8000.** This is the ASGI app that actually

@@ -272,18 +272,21 @@ fingerprints) are inevitable. The Vite-managed path avoids all of this.
 
 ### Dev server rebuilds in a loop
 
-The standalone watcher writes its compiled CSS into `public/` — the same tree
-`pyxle dev` watches for source changes. In Pyxle **0.7.0 and later** the dev
-server recognizes that output as a generated artefact and ignores it, so this
-happens automatically and you don't need to do anything.
+The standalone Tailwind watcher writes its compiled CSS into `public/`. In
+Pyxle **0.7.0 and later** `pyxle dev` never rebuilds on `public/` changes at
+all — static assets are served live from disk and picked up on refresh (like
+Next.js) — so this happens automatically and you don't need to do anything.
+Your edits to the Tailwind *input* (`pages/styles/tailwind.css`) still
+hot-reload normally through the source-watch path.
 
-On **earlier versions** the watcher reacted to Tailwind's own write as if it
-were an edit, rebuilt, and the rebuild let Tailwind re-emit the CSS — a
-self-sustaining loop that rebuilds roughly once a second with no edits (very
-visible on Linux, where inotify reports every write; subtler on macOS). If you
-see that on an older version, either upgrade, point the watcher's `-o` output
-outside `public/` and link it from there, or run `pyxle dev --no-tailwind` and
-drive `tailwindcss --watch` yourself.
+On **earlier versions** `public/` was on the rebuild watch, so the watcher
+reacted to Tailwind's own output write as if it were an edit, rebuilt, and the
+rebuild let Tailwind re-emit the CSS — a self-sustaining loop that rebuilds
+roughly once a second with no edits (very visible on Linux, where inotify
+reports every write; subtler on macOS). If you see that on an older version,
+either upgrade, point the watcher's `-o` output outside `public/` and link it
+from there, or run `pyxle dev --no-tailwind` and drive `tailwindcss --watch`
+yourself.
 
 ## CSS-in-JS
 

@@ -69,6 +69,10 @@ Pyxle is configured via `pyxle.config.json` in the project root. All fields are 
     "enabled": false,
     "autoConvert": false
   },
+  "dev": {
+    "watch": [],
+    "ignore": []
+  },
   "plugins": []
 }
 ```
@@ -347,6 +351,31 @@ Serve a clean **markdown** rendition of every page — at its URL with `.md` app
 **Where the markdown comes from** is *not* config — it lives in your project, resolved in this order (first hit wins): a co-located `<page>.md` file → a `to_markdown` handler in the page's server module → a `to_markdown` in the nearest ancestor `llms.py` (covers a route subtree; `pages/llms.py` is app-wide) → `autoConvert` (if on) → otherwise the `.md` URL redirects to the page. A root `pages/llms.py` may also define `wrap_markdown(ctx, markdown)` to frame every `.md` response with a header/footer. Likewise `/llms.txt` comes from a static `public/llms.txt`, else a `llms_txt` function in the root `pages/llms.py`, else a generated index. See the [guide](../guides/llms.md).
 
 > **Deploying handlers.** Co-located `.md` files and `llms.py` handlers are part of your source, so they must be present alongside `pages/` when you `pyxle serve`. (A page's own `to_markdown`, compiled into the build, works regardless.)
+
+## Development
+
+The `dev` block tunes the `pyxle dev` file watcher. **Both fields are dev-only** — `pyxle serve` runs no watcher (it serves a pre-built, immutable tree), so they are ignored in production.
+
+```json
+{
+  "dev": {
+    "watch": ["lib", "components"],
+    "ignore": ["pages/generated/*", "*.tmp"]
+  }
+}
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `dev` | `object` | `{}` | Development-server file-watcher settings. |
+| `dev.watch` | `string[]` | `[]` | Extra project-relative directories to watch for hot reload, **in addition to** the always-watched `pages/`. A change under a watched directory runs the normal rebuild + module-reload path. Each entry must resolve to a path **inside the project root** — an absolute path or one that escapes the root via `..` is rejected at config load. |
+| `dev.ignore` | `string[]` | `[]` | Extra glob patterns matched against each changed file's project-relative path; a match suppresses the rebuild/reload for that event. |
+
+**Why `dev.watch`.** Pyxle only watches `pages/` by default (unlike Next.js, which watches whatever the import graph touches). A shared Python module imported from outside `pages/` — say `lib/util.py` used by a loader — would not otherwise trigger a reload when you edit it. Listing its directory here closes that gap.
+
+**`dev.ignore` is additive, never subtractive.** Pyxle always ignores its own generated build output on the rebuild watch — compiled bytecode (`*.pyc`), `.pyxle-build`/`__pycache__` trees, and SQLite journals (`*.db`, `*.db-wal`, `*.db-shm`). Those built-in ignores are **load-bearing** (they prevent a self-sustaining rebuild loop) and stay in force regardless of config — a `dev.ignore` list can only add more patterns, it cannot clear them.
+
+> **Note on `public/`.** Changes under `public/` are never rebuilt or reloaded — static assets are served live from disk and picked up on the next refresh (like Next.js). You don't need to (and can't usefully) list `public/` in `dev.watch`. See [Architecture → the watcher](../architecture/dev-server.md#the-watcher).
 
 ## Plugins
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fnmatch
 import sys
 import threading
 import time
@@ -16,7 +17,6 @@ from pyxle.cli.logger import ConsoleLogger
 
 from .builder import BuildSummary, build_once
 from .settings import DevServerSettings
-from .tailwind import resolve_tailwind_output_path
 
 _RebuildCallback = Callable[[Sequence[Path]], None]
 _RebuildListener = Callable[["WatcherStatistics"], None]
@@ -29,22 +29,25 @@ _GENERATED_DIR_NAMES = frozenset({".pyxle-build", "__pycache__"})
 
 #: File suffixes that identify generated output the watcher must ignore: Python
 #: bytecode and SQLite database journals written by the running application.
+#: These guard the rebuild watch (``pages/`` and any ``dev.watch`` extras): the
+#: rebuild imports user Python, so ``.pyc`` bytecode is written back into a
+#: watched tree, and a watched extra directory may hold a runtime SQLite file.
 _GENERATED_SUFFIXES = frozenset({".pyc", ".db", ".db-wal", ".db-shm"})
 
 
-def _is_generated_output(path: Path, generated_files: frozenset[Path]) -> bool:
-    """Return ``True`` when *path* is a build artefact the watcher must ignore.
+def _is_generated_output(path: Path) -> bool:
+    """Return ``True`` when *path* is a build artefact the rebuild watch ignores.
 
-    Rebuilds write files back into the watched tree — the Tailwind CLI rewrites
-    its output CSS, the app touches its SQLite journals, Python caches bytecode.
-    Treating those writes as source edits creates a self-sustaining reload loop:
-    the rebuild regenerates the very file whose change triggered it. Paths are
-    resolved (following symlinks, tolerating a path that vanished mid-event) so
-    the comparison is robust to symlinked directories and to Windows separators.
+    A rebuild writes files back into a watched tree — Python caches ``.pyc``
+    bytecode, the app touches its SQLite journals. Treating those writes as
+    source edits would create a self-sustaining reload loop: the rebuild
+    regenerates the very file whose change triggered it. Paths are resolved
+    (following symlinks, tolerating a path that vanished mid-event) so the check
+    is robust to symlinked directories and to Windows separators.
 
-    ``generated_files`` holds pre-resolved absolute paths of known outputs (the
-    Tailwind output CSS); membership, suffix, and directory-name checks together
-    cover every generated artefact without a per-project hardcoded list.
+    These built-in ignores are load-bearing and always apply; a user's
+    ``dev.ignore`` list (see :func:`_matches_ignore_glob`) is only ever additive
+    on top of them.
     """
 
     try:
@@ -52,11 +55,28 @@ def _is_generated_output(path: Path, generated_files: frozenset[Path]) -> bool:
     except OSError:
         # Path vanished mid-event or a symlink loop — classify the raw path.
         resolved = path
-    if resolved in generated_files:
-        return True
     if resolved.suffix.lower() in _GENERATED_SUFFIXES:
         return True
     return any(part in _GENERATED_DIR_NAMES for part in resolved.parts)
+
+
+def _matches_ignore_glob(path: Path, project_root: Path, globs: Sequence[str]) -> bool:
+    """Return ``True`` when *path* matches one of the user's ``dev.ignore`` globs.
+
+    Patterns are matched against the file's POSIX project-relative path (falling
+    back to the absolute POSIX path when it lies outside the project root), using
+    :func:`fnmatch.fnmatch` semantics. This is purely additive to the built-in
+    generated-output ignores — it can suppress extra events but never re-enables
+    a built-in-ignored one.
+    """
+
+    if not globs:
+        return False
+    try:
+        relative = path.resolve().relative_to(project_root.resolve()).as_posix()
+    except (OSError, ValueError):
+        relative = path.as_posix()
+    return any(fnmatch.fnmatch(relative, pattern) for pattern in globs)
 
 
 class _TimerHandle:
@@ -159,6 +179,34 @@ class _SingleFileEventHandler(FileSystemEventHandler):
                 continue
 
 
+class _PublicAssetEventHandler(FileSystemEventHandler):
+    """Watchdog handler for the ``public/`` tree that keeps the dev static-file
+    index current — and never rebuilds or reloads.
+
+    Public assets are served live from disk (like Next.js), so a *modified*
+    existing file is picked up on the next request with no watcher action. Only
+    the *set* of discoverable paths needs maintaining: a newly created or
+    deleted file changes which URLs resolve, so those structural events refresh
+    the index. This handler deliberately does not touch the rebuild pipeline or
+    the browser-reload channel.
+    """
+
+    #: Event types that change which public URLs resolve. A plain ``modified``
+    #: event leaves the served set unchanged, so it is ignored.
+    _STRUCTURAL_EVENTS = frozenset({"created", "deleted", "moved"})
+
+    def __init__(self, on_structural_change: Callable[[], None]) -> None:
+        super().__init__()
+        self._on_structural_change = on_structural_change
+
+    def on_any_event(self, event: FileSystemEvent) -> None:
+        if event.is_directory:
+            return
+        if event.event_type not in self._STRUCTURAL_EVENTS:
+            return
+        self._on_structural_change()
+
+
 @dataclass(slots=True)
 class WatcherStatistics:
     """Outcome details for a rebuild triggered by the watcher."""
@@ -182,6 +230,7 @@ class ProjectWatcher:
         observer_factory: Callable[[], Observer] | None = None,
         timer_factory: _TimerFactory = _default_timer_factory,
         on_rebuild: _RebuildListener | None = None,
+        public_index_refresh: Callable[[], None] | None = None,
     ) -> None:
         self._settings = settings
         self._logger = logger or ConsoleLogger()
@@ -190,6 +239,14 @@ class ProjectWatcher:
         self._observer_factory = observer_factory or Observer
         self._timer_factory = timer_factory
         self._on_rebuild = on_rebuild
+        # Refreshes the dev static-file index when a public/ file is added or
+        # removed, so it becomes discoverable without a restart. ``None`` when
+        # no static index is wired (unit tests, static serving disabled) — the
+        # public/ watch then simply does nothing on an event.
+        self._public_index_refresh = public_index_refresh
+        # User-supplied extra ignore globs (``dev.ignore``), additive to the
+        # built-in generated-output ignores in ``_is_generated_output``.
+        self._ignore_globs = tuple(settings.dev_ignore_globs)
 
         self._observer: Observer | None = None
         self._buffer = _DebouncedChangeBuffer(
@@ -197,18 +254,14 @@ class ProjectWatcher:
             debounce_seconds=debounce_seconds,
             timer_factory=timer_factory,
         )
-        # Pre-resolve generated output paths once so the per-event ignore check
-        # (see ``_is_generated_output``) stays a cheap set/suffix lookup instead
-        # of re-deriving the Tailwind output location on every filesystem event.
-        self._generated_files = frozenset(
-            {resolve_tailwind_output_path(settings.project_root)}
-        )
         self._handler = _ProjectEventHandler(
             self._buffer.enqueue,
-            ignore=self._is_generated_output,
+            ignore=self._should_ignore,
         )
+        self._public_handler = _PublicAssetEventHandler(self._schedule_index_refresh)
         self._latest_stats: WatcherStatistics | None = None
         self._config_warn_handle: _TimerHandle | None = None
+        self._index_refresh_handle: _TimerHandle | None = None
 
     @property
     def running(self) -> bool:
@@ -226,10 +279,46 @@ class ProjectWatcher:
         pages_dir = self._settings.pages_dir
         public_dir = self._settings.public_dir
         observer.schedule(self._handler, str(pages_dir), recursive=True)
-        observer.schedule(self._handler, str(public_dir), recursive=True)
+        # public/ gets the lightweight index-refresh handler — NOT the rebuild
+        # handler. Public assets are served live from disk (like Next.js), so a
+        # change never rebuilds or reloads; only newly added/removed files need
+        # the static index refreshed so they become discoverable in dev.
+        observer.schedule(self._public_handler, str(public_dir), recursive=True)
         pages_root = pages_dir.resolve()
         public_root = public_dir.resolve()
         watched_extras: set[Path] = set()
+        # Extra ``dev.watch`` directories join the rebuild watch: a change under
+        # one runs the normal rebuild + module-invalidation + reload path, so an
+        # imported module outside ``pages/`` (e.g. ``lib/``) hot-reloads.
+        for directory in self._settings.dev_watch_dirs:
+            try:
+                resolved = directory.resolve()
+            except OSError:
+                continue
+            if not resolved.exists():
+                # A typo'd or not-yet-created path would otherwise be watched by
+                # nothing with no feedback — surface it so it isn't silent.
+                self._logger.warning(
+                    f"dev.watch directory does not exist and is skipped: "
+                    f"{directory.as_posix()} (restart 'pyxle dev' after creating it)"
+                )
+                continue
+            if resolved == pages_root:
+                continue
+            if resolved == public_root or resolved.is_relative_to(public_root):
+                # public/ is served live and index-only — never rebuild-watched.
+                # Rebuild-watching it (or a subdirectory) would defeat that and
+                # could reintroduce the reload loop (e.g. a Tailwind write to
+                # public/styles/tailwind.css).
+                self._logger.warning(
+                    f"dev.watch directory is inside public/ and is skipped: "
+                    f"{directory.as_posix()} (public assets are served live, not rebuilt)"
+                )
+                continue
+            if resolved in watched_extras:
+                continue
+            observer.schedule(self._handler, str(resolved), recursive=True)
+            watched_extras.add(resolved)
         for directory in _global_stylesheet_directories(self._settings):
             try:
                 resolved = directory.resolve()
@@ -292,14 +381,39 @@ class ProjectWatcher:
 
     # Internal orchestration -------------------------------------------------
 
-    def _is_generated_output(self, path: Path) -> bool:
-        """Ignore predicate for the project event handler.
+    def _should_ignore(self, path: Path) -> bool:
+        """Ignore predicate for the rebuild event handler.
 
-        Delegates to :func:`_is_generated_output` with this watcher's resolved
-        set of generated output paths.
+        Combines the built-in generated-output ignores (always in force) with
+        any user-supplied ``dev.ignore`` globs (additive only).
         """
 
-        return _is_generated_output(path, self._generated_files)
+        if _is_generated_output(path):
+            return True
+        return _matches_ignore_glob(
+            path, self._settings.project_root, self._ignore_globs
+        )
+
+    def _schedule_index_refresh(self) -> None:
+        """Debounce public/ structural events into one static-index refresh.
+
+        Editors and some platforms emit several events per file operation, so
+        coalesce them before rewalking the public tree.
+        """
+        if self._index_refresh_handle is not None:
+            self._index_refresh_handle.cancel()
+        self._index_refresh_handle = self._timer_factory(
+            self._debounce_seconds, self._run_index_refresh
+        )
+
+    def _run_index_refresh(self) -> None:
+        self._index_refresh_handle = None
+        if self._public_index_refresh is None:
+            return
+        try:
+            self._public_index_refresh()
+        except Exception as error:  # pragma: no cover - defensive logging
+            self._logger.warning(f"Static index refresh failed: {error}")
 
     def _handle_paths(self, paths: Sequence[Path]) -> None:
         start = time.perf_counter()
