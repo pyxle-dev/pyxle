@@ -15,6 +15,7 @@ from pyxle.devserver.tailwind import (
     _parse_tailwind_paths_from_package_json,
     detect_postcss_config,
     detect_tailwind_config,
+    resolve_tailwind_output_path,
     resolve_tailwind_paths,
 )
 
@@ -199,6 +200,41 @@ def test_resolve_tailwind_paths_none_without_config(tmp_path: Path) -> None:
 def test_resolve_tailwind_paths_none_without_input_file(tmp_path: Path) -> None:
     (tmp_path / "tailwind.config.cjs").write_text("module.exports = {}")
     assert resolve_tailwind_paths(tmp_path) is None
+
+
+# --- resolve_tailwind_output_path ---
+
+
+def test_resolve_tailwind_output_path_uses_default(tmp_path: Path) -> None:
+    """Without Tailwind configured, the resolver returns the default output."""
+    root = tmp_path.resolve()
+    assert resolve_tailwind_output_path(root) == root / "public" / "styles" / "tailwind.css"
+
+
+def test_resolve_tailwind_output_path_follows_config(tmp_path: Path) -> None:
+    """When Tailwind is configured, the resolver honours the resolved output."""
+    (tmp_path / "tailwind.config.cjs").write_text("module.exports = {}")
+    styles_dir = tmp_path / "pages" / "styles"
+    styles_dir.mkdir(parents=True)
+    (styles_dir / "tailwind.css").write_text("@tailwind base;")
+
+    root = tmp_path.resolve()
+    assert resolve_tailwind_output_path(root) == root / "public" / "styles" / "tailwind.css"
+
+
+def test_resolve_tailwind_output_path_honours_package_json(tmp_path: Path) -> None:
+    """A custom ``-o`` in the npm script drives the resolved output path."""
+    (tmp_path / "tailwind.config.js").write_text("export default {}")
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+    (src_dir / "app.css").write_text("@tailwind base;")
+    package = {
+        "scripts": {"dev:css": "tailwindcss -i ./src/app.css -o ./dist/app.css --watch"}
+    }
+    (tmp_path / "package.json").write_text(json.dumps(package))
+
+    root = tmp_path.resolve()
+    assert resolve_tailwind_output_path(root) == root / "dist" / "app.css"
 
 
 # --- TailwindProcess ---

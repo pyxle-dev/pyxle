@@ -115,6 +115,23 @@ def resolve_tailwind_paths(
     return input_css, output_css
 
 
+def resolve_tailwind_output_path(project_root: Path) -> Path:
+    """Return the absolute path of the compiled Tailwind output CSS.
+
+    The Tailwind CLI regenerates this file on every rebuild, so the dev-server
+    file watcher must ignore writes to it — reacting would recompile, which
+    regenerates the file, which fires another event, an endless loop. Resolving
+    the path through :func:`resolve_tailwind_paths` (falling back to the default
+    ``public/styles/tailwind.css`` when Tailwind is not configured) keeps the
+    watcher and the compiler agreed on a single source of truth rather than
+    duplicating the output location.
+    """
+
+    paths = resolve_tailwind_paths(project_root)
+    output_css = paths[1] if paths is not None else _DEFAULT_OUTPUT_CSS
+    return (project_root / output_css).resolve()
+
+
 class TailwindProcess:
     """Launch and supervise the Tailwind CSS watcher subprocess."""
 
@@ -295,5 +312,6 @@ __all__ = [
     "TailwindProcess",
     "detect_postcss_config",
     "detect_tailwind_config",
+    "resolve_tailwind_output_path",
     "resolve_tailwind_paths",
 ]

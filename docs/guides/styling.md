@@ -270,6 +270,21 @@ change and a user has the old file cached, they'll see stale styles until
 their cache expires. Workarounds (`?v=N` query strings, hand-rolled
 fingerprints) are inevitable. The Vite-managed path avoids all of this.
 
+### Dev server rebuilds in a loop
+
+The standalone watcher writes its compiled CSS into `public/` — the same tree
+`pyxle dev` watches for source changes. In Pyxle **0.7.0 and later** the dev
+server recognizes that output as a generated artefact and ignores it, so this
+happens automatically and you don't need to do anything.
+
+On **earlier versions** the watcher reacted to Tailwind's own write as if it
+were an edit, rebuilt, and the rebuild let Tailwind re-emit the CSS — a
+self-sustaining loop that rebuilds roughly once a second with no edits (very
+visible on Linux, where inotify reports every write; subtler on macOS). If you
+see that on an older version, either upgrade, point the watcher's `-o` output
+outside `public/` and link it from there, or run `pyxle dev --no-tailwind` and
+drive `tailwindcss --watch` yourself.
+
 ## CSS-in-JS
 
 Any CSS-in-JS library that works with React 18 and SSR should work with
