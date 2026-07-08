@@ -25,10 +25,12 @@ from pyxle.devserver.settings import DevServerSettings
 
 from .renderer import (
     BrowserGlobalRenderError,
+    CjsDependencyRenderError,
     ComponentRenderer,
     ComponentRenderError,
     InlineStyleFragment,
     detect_browser_only_global,
+    detect_dynamic_require,
 )
 from .template import (
     _AUTH_SEED_ABSENT,
@@ -183,20 +185,30 @@ def _enrich_render_error(exc: ComponentRenderError, page: PageRoute) -> Componen
     sanitized to a generic document, so no file path or internals reach the
     HTTP body (CLAUDE.md rule 18).
     """
-    if isinstance(exc, BrowserGlobalRenderError):
+    if isinstance(exc, (BrowserGlobalRenderError, CjsDependencyRenderError)):
         return exc
+    source_file = f"pages/{page.source_relative_path.as_posix()}"
     global_name = detect_browser_only_global(str(exc))
-    if global_name is None:
-        return exc
-    enriched = BrowserGlobalRenderError(
-        global_name=global_name,
-        source_file=f"pages/{page.source_relative_path.as_posix()}",
-        original_message=str(exc),
-    )
-    # Preserve the original exception as the cause so log tracebacks keep the
-    # raw Node runtime failure alongside the enriched explanation.
-    enriched.__cause__ = exc
-    return enriched
+    if global_name is not None:
+        enriched: ComponentRenderError = BrowserGlobalRenderError(
+            global_name=global_name,
+            source_file=source_file,
+            original_message=str(exc),
+        )
+        enriched.__cause__ = exc
+        return enriched
+    module_name = detect_dynamic_require(str(exc))
+    if module_name is not None:
+        enriched = CjsDependencyRenderError(
+            module_name=module_name,
+            source_file=source_file,
+            original_message=str(exc),
+        )
+        # Preserve the original exception as the cause so log tracebacks keep the
+        # raw Node runtime failure alongside the enriched explanation.
+        enriched.__cause__ = exc
+        return enriched
+    return exc
 
 
 def _error_response(

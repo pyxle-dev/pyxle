@@ -18,7 +18,9 @@ from pyxle.ssr.renderer import (
     _derive_project_paths,
     _format_node_error,
     _parse_runtime_output,
+    CjsDependencyRenderError,
     detect_browser_only_global,
+    detect_dynamic_require,
 )
 from tests.ssr.utils import ensure_test_node_modules
 
@@ -638,3 +640,41 @@ def test_browser_global_render_error_message_and_attributes() -> None:
     assert "event handler" in message
     assert "<ClientOnly>" in message
     assert "docs/guides/client-components.md" in message
+
+
+# --------------------------------------------------------------------------- #
+# CJS dynamic-require detection (a CommonJS dep require()'d react during SSR)  #
+# --------------------------------------------------------------------------- #
+
+
+def test_detect_dynamic_require_matches_module_name() -> None:
+    assert detect_dynamic_require('Dynamic require of "react" is not supported') == "react"
+
+
+def test_detect_dynamic_require_matches_inside_larger_message() -> None:
+    msg = 'ComponentRenderError: Dynamic require of "react-dom" is not supported\n at foo'
+    assert detect_dynamic_require(msg) == "react-dom"
+
+
+@pytest.mark.parametrize(
+    "message",
+    ["window is not defined", "some other failure", "require is not defined", ""],
+)
+def test_detect_dynamic_require_ignores_unrelated_errors(message: str) -> None:
+    assert detect_dynamic_require(message) is None
+
+
+def test_cjs_dependency_render_error_message_and_attributes() -> None:
+    error = CjsDependencyRenderError(
+        module_name="react",
+        source_file="pages/index.pyxl",
+        original_message='Dynamic require of "react" is not supported',
+    )
+    assert isinstance(error, ComponentRenderError)
+    assert error.module_name == "react"
+    assert error.source_file == "pages/index.pyxl"
+    message = str(error)
+    assert "require('react')" in message
+    assert "pages/index.pyxl" in message
+    assert "ES module" in message
+    assert "<ClientOnly>" in message

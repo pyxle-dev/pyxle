@@ -40,6 +40,26 @@ _REFERENCE_ERROR_RE = re.compile(
 )
 
 
+#: Matches esbuild's ESM-output shim error for a CommonJS ``require()`` of a
+#: module that isn't bundled — ``Dynamic require of "<name>" is not
+#: supported`` — and captures the required module name.
+_DYNAMIC_REQUIRE_RE = re.compile(r'Dynamic require of "([^"]+)" is not supported')
+
+
+def detect_dynamic_require(message: str) -> str | None:
+    """Return the module named in a "Dynamic require of X" SSR error, if any.
+
+    A CommonJS dependency that reaches the SSR bundle and calls
+    ``require("react")`` (or another runtime-provided/external module) cannot be
+    linked into Pyxle's ES-module SSR output: esbuild emits a shim that throws
+    ``Dynamic require of "react" is not supported`` at render time. This helper
+    recognizes that shape and returns the required module name; any other
+    message returns ``None`` so unrelated errors flow through unchanged.
+    """
+    match = _DYNAMIC_REQUIRE_RE.search(message)
+    return match.group(1) if match else None
+
+
 def detect_browser_only_global(message: str) -> str | None:
     """Return the browser-only global named in a Node ``ReferenceError`` message.
 
@@ -90,6 +110,36 @@ class BrowserGlobalRenderError(ComponentRenderError):
             "an event handler (neither runs during the server render), or render "
             "the subtree client-only with <ClientOnly>. See the Client Components "
             "guide (docs/guides/client-components.md)."
+        )
+
+
+class CjsDependencyRenderError(ComponentRenderError):
+    """A render failed because a CommonJS dependency did a dynamic ``require``.
+
+    Raised in place of a bare :class:`ComponentRenderError` when the Node
+    render error is esbuild's ``Dynamic require of "<module>" is not
+    supported``. That happens when a dependency resolves to a CommonJS build
+    that calls ``require()`` for a module Pyxle provides externally (React, or
+    another runtime module) — which can't be linked into the ES-module SSR
+    bundle. Pyxle prefers packages' ES-module entry points, so this almost
+    always means the offending package ships *only* CommonJS. Surfaced in
+    development only; production responses stay generic.
+    """
+
+    def __init__(self, *, module_name: str, source_file: str, original_message: str) -> None:
+        self.module_name = module_name
+        self.source_file = source_file
+        self.original_message = original_message
+        super().__init__(
+            f"{original_message}. A CommonJS dependency imported by {source_file} "
+            f"called require('{module_name}') during server-side rendering, which "
+            "cannot be linked into Pyxle's ES-module SSR bundle (React and other "
+            "runtime modules are provided externally, not bundled). Pyxle already "
+            "prefers a package's ES-module build, so this usually means the "
+            "package ships CommonJS only. Use a version/package that provides an "
+            "ES module, or render the subtree client-only with <ClientOnly> so it "
+            "never runs during the server render. See the Client Components guide "
+            "(docs/guides/client-components.md)."
         )
 
 
@@ -504,5 +554,7 @@ __all__ = [
     "InlineStyleFragment",
     "RenderResult",
     "detect_browser_only_global",
+    "detect_dynamic_require",
+    "CjsDependencyRenderError",
     "pool_render_factory",
 ]

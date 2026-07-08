@@ -605,6 +605,17 @@ async function resolveComponentBundle(resolvedPath, componentPath, workingDir, p
       bundle: true,
       format: 'esm',
       platform: 'node',
+      // Prefer a dependency's ESM build (``module`` field) over its CommonJS
+      // ``main`` when it declares no ``exports`` map. Node's esbuild default is
+      // ``['main', 'module']`` (CJS first); a CJS build that does
+      // ``require('react')`` then breaks under our ESM output with a runtime
+      // "Dynamic require of \"react\" is not supported", because React is
+      // marked external. Preferring ESM (as Vite's SSR resolution does) makes
+      // such packages — e.g. lucide-react and much of the shadcn/ui ecosystem —
+      // resolve to an ``import``-based build that links cleanly against the
+      // external React. Packages that ship an ``exports`` map are unaffected
+      // (esbuild already picks the ``import`` condition for our ESM entry).
+      mainFields: ['module', 'main'],
       outfile,
       jsx: 'automatic',
       sourcemap: false,
