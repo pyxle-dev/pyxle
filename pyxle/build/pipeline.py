@@ -94,20 +94,39 @@ def _log(logger: Any, level: str, message: str) -> None:
         fn(message)
 
 
+def _package_json_has_script(project_root: Path, script: str) -> bool:
+    """Return ``True`` when the project's ``package.json`` declares *script*.
+
+    Reading the manifest lets the build avoid invoking ``npm run <script>`` for
+    a script that doesn't exist — which exits non-zero and would otherwise log a
+    misleading failure warning on every build of a modern (Vite-managed CSS)
+    scaffold. A missing or unreadable manifest is treated as "no such script".
+    """
+    try:
+        data = json.loads((project_root / "package.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    scripts = data.get("scripts")
+    return isinstance(scripts, dict) and script in scripts
+
+
 def _run_npm_build(project_root: Path, logger: Any, *, settings: DevServerSettings) -> None:
     package_json = project_root / "package.json"
     if not package_json.exists():
         _log(logger, "warning", "No package.json found; skipping npm build")
         return
 
-    # Step 1: Run the standalone Tailwind CSS build (legacy path) only when
-    # the project does NOT have a PostCSS config. When PostCSS is wired up,
-    # Vite runs all CSS imports through it during the bundle step below, so
-    # invoking ``npm run build:css`` would either be a no-op (if the script
-    # doesn't exist, producing a noisy ``missing script`` warning) or
-    # duplicate work (if it does). Skipping it keeps the build output quiet
-    # for new projects on the recommended Vite-managed CSS path.
-    if detect_postcss_config(project_root) is None:
+    # Step 1: Run the standalone Tailwind CSS build (legacy v3 path) only when
+    # the project actually declares a ``build:css`` script *and* has no PostCSS
+    # config. Modern scaffolds (Tailwind v4 via ``@tailwindcss/vite``, or no
+    # Tailwind) let Vite own CSS during the bundle step below and declare no
+    # ``build:css`` script — so this is skipped, keeping the build output quiet
+    # instead of logging a misleading "script failed" warning for a script that
+    # never existed. When PostCSS is wired up, Vite runs CSS through it during
+    # the bundle step, so ``build:css`` would be duplicate work — also skipped.
+    if detect_postcss_config(project_root) is None and _package_json_has_script(
+        project_root, "build:css"
+    ):
         _run_npm_script(project_root, "build:css", logger, required=False)
 
     # Step 2: Run Vite build with explicit --config pointing to

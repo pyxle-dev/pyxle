@@ -1,0 +1,68 @@
+from __future__ import annotations
+
+from datetime import datetime, timezone
+
+from pyxle import __version__
+
+
+@server
+async def load_home(request):
+    """Runs on the server. The returned dict becomes { data } in the component."""
+    now = datetime.now(tz=timezone.utc)
+    return {
+        "version": __version__,
+        "time": now.strftime("%H:%M:%S UTC"),
+        "message": "You're ready to build with Pyxle.",
+    }
+
+
+import './styles/app.css';
+import React from 'react';
+import { Head } from 'pyxle/client';
+
+import Badge from './components/Badge.jsx';
+
+export default function HomePage({ data }) {
+    return (
+        <main className="page">
+            <Head>
+                <title>Pyxle App</title>
+                <meta name="description" content="A fresh Pyxle project." />
+                <link rel="icon" href="/favicon.ico" />
+            </Head>
+            <div className="card">
+                <img src="/branding/pyxle-mark.svg" alt="Pyxle" className="mark" />
+
+                <h1 className="title">{data.message}</h1>
+
+                <p className="meta">
+                    Pyxle v{data.version} &middot; {data.time}
+                </p>
+
+                <p style={{ marginTop: '1rem' }}>
+                    <Badge>Styled with plain CSS + CSS Modules</Badge>
+                </p>
+
+                <div className="code">
+                    <p className="code-comment">{"// Get started by editing"}</p>
+                    <p className="code-path">pages/index.pyxl</p>
+                </div>
+
+                <nav className="nav">
+                    <a href="https://docs.pyxle.dev" target="_blank" rel="noreferrer">
+                        Docs
+                    </a>
+                    <a href="https://pyxle.dev" target="_blank" rel="noreferrer">
+                        Homepage
+                    </a>
+                    <a href="https://github.com/pyxle-dev/pyxle" target="_blank" rel="noreferrer">
+                        GitHub
+                    </a>
+                    <a href="/api/pulse" target="_blank" rel="noreferrer">
+                        API
+                    </a>
+                </nav>
+            </div>
+        </main>
+    );
+}

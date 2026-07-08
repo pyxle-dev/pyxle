@@ -10,8 +10,10 @@ from pathlib import Path
 
 __all__ = [
     "InvalidProjectName",
+    "InvalidImportAlias",
     "slugify_project_name",
     "validate_project_name",
+    "validate_import_alias",
     "FilesystemWriter",
 ]
 
@@ -20,8 +22,13 @@ class InvalidProjectName(ValueError):
     """Raised when the provided project name is not filesystem safe."""
 
 
+class InvalidImportAlias(ValueError):
+    """Raised when the provided import alias is not a valid module prefix."""
+
+
 _SLUG_PATTERN = re.compile(r"[^a-z0-9-]+")
 _MULTIPLE_HYPHENS = re.compile(r"-{2,}")
+_ALIAS_PREFIX_PATTERN = re.compile(r"^[A-Za-z0-9@~._-]+$")
 
 
 def slugify_project_name(value: str) -> str:
@@ -59,13 +66,50 @@ def validate_project_name(value: str) -> str:
     return slug
 
 
+def validate_import_alias(value: str) -> str:
+    """Validate an import alias and return it normalised to ``<prefix>/*``.
+
+    Accepts the bare prefix (``@``), a trailing slash (``@/``), or the full
+    glob (``@/*``); all normalise to ``@/*``. The prefix may contain letters,
+    digits, and ``@ ~ . _ -`` — anything else (notably a path separator) is
+    rejected so it maps cleanly to a single Vite/jsconfig alias entry.
+    """
+
+    stripped = value.strip()
+    if not stripped:
+        raise InvalidImportAlias("Import alias cannot be blank.")
+
+    if stripped.endswith("/*"):
+        prefix = stripped[:-2]
+    elif stripped.endswith("/"):
+        prefix = stripped[:-1]
+    else:
+        prefix = stripped
+
+    if not prefix or not _ALIAS_PREFIX_PATTERN.match(prefix):
+        raise InvalidImportAlias(
+            f"Invalid import alias '{value}'. Use a prefix such as '@/*' "
+            "(letters, digits, and @ ~ . _ - only)."
+        )
+
+    return f"{prefix}/*"
+
+
 @dataclass
 class FilesystemWriter:
     """Helper encapsulating safe file and directory writes."""
 
     root: Path
 
-    def ensure_root(self, force: bool = False) -> None:
+    def ensure_root(self, force: bool = False, keep_root: bool = False) -> None:
+        if keep_root:
+            # Scaffolding into an existing directory (e.g. ``pyxle init .``):
+            # never delete the directory itself. Require it to be empty unless
+            # ``force`` is set, in which case existing files may be overwritten.
+            self.root.mkdir(parents=True, exist_ok=True)
+            if not force and any(self.root.iterdir()):
+                raise FileExistsError(f"Target directory '{self.root}' is not empty.")
+            return
         if self.root.exists() and not force:
             raise FileExistsError(f"Target directory '{self.root}' already exists.")
         if force and self.root.exists():

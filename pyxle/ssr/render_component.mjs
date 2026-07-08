@@ -89,6 +89,132 @@ function detectPostcssConfig(projectRoot) {
   return null;
 }
 
+/**
+ * Detect whether the project drives CSS through the ``@tailwindcss/vite``
+ * plugin (Tailwind v4). When it does, Vite owns every stylesheet — inlining
+ * the raw source here would dump an unresolved ``@import "tailwindcss"`` into a
+ * ``<style>`` block — so the SSR runtime skips inlining, exactly as it does for
+ * a PostCSS-configured project.
+ */
+function detectTailwindVite(projectRoot) {
+  if (!projectRoot) return false;
+  try {
+    const data = JSON.parse(
+      fs.readFileSync(path.join(projectRoot, 'package.json'), 'utf8'),
+    );
+    for (const section of ['dependencies', 'devDependencies']) {
+      const deps = data[section];
+      if (deps && typeof deps === 'object' && '@tailwindcss/vite' in deps) {
+        return true;
+      }
+    }
+  } catch {
+    // No/invalid package.json -- assume no Tailwind plugin.
+  }
+  return false;
+}
+
+/**
+ * Deterministic CSS Module class-name generator. MUST stay byte-for-byte
+ * identical to ``CSS_MODULE_SCOPED_NAME_JS`` in
+ * ``pyxle/devserver/client_files.py`` (used as Vite's
+ * ``css.modules.generateScopedName``) so server- and client-rendered markup
+ * carry the same class names and React hydration never mismatches. The name
+ * derives only from the file basename, the local class name, and the
+ * stylesheet contents — never an absolute path — so it is stable across dev,
+ * build, and production serve.
+ */
+function pyxleCssModuleClass(name, filename, css) {
+  const file = String(filename).split(/[\\/]/).pop() || 'module';
+  const base = file.replace(/\.module\.css$/i, '').replace(/[^a-zA-Z0-9_-]/g, '-');
+  const seed = base + '|' + name + '|' + (css || '');
+  let hash = 5381;
+  for (let index = 0; index < seed.length; index += 1) {
+    hash = ((hash << 5) + hash + seed.charCodeAt(index)) >>> 0;
+  }
+  return base + '_' + name + '_' + hash.toString(36).slice(0, 6);
+}
+
+/**
+ * Read the project's import aliases from ``jsconfig.json`` so the SSR bundle
+ * resolves ``@/…`` specifiers the same way Vite and the editor do. Returns
+ * ``[{ prefix, dir }]`` where ``dir`` is the absolute directory the prefix maps
+ * to (project root for the default ``@/* -> ./*``). Malformed configs yield an
+ * empty list — the page simply has no path aliases.
+ */
+function readProjectImportAliases(projectRoot) {
+  if (!projectRoot) return [];
+  try {
+    const data = JSON.parse(
+      fs.readFileSync(path.join(projectRoot, 'jsconfig.json'), 'utf8'),
+    );
+    const paths = data.compilerOptions && data.compilerOptions.paths;
+    if (!paths || typeof paths !== 'object') return [];
+    const out = [];
+    for (const [key, value] of Object.entries(paths)) {
+      if (!key.endsWith('/*') || !Array.isArray(value) || value.length === 0) continue;
+      const prefix = key.slice(0, -2);
+      if (!prefix || prefix.includes('/')) continue;
+      let target = String(value[0]);
+      target = target.endsWith('/*') ? target.slice(0, -2) : target;
+      target = target.replace(/^\.\//, '') || '.';
+      out.push({ prefix, dir: path.resolve(projectRoot, target) });
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+const _ALIAS_RESOLVE_EXTS = ['', '.jsx', '.js', '.tsx', '.ts', '.mjs', '.cjs', '.json'];
+const _ALIAS_INDEX_EXTS = ['.jsx', '.js', '.tsx', '.ts', '.mjs'];
+
+/** Resolve an aliased base path to a concrete file, probing extensions/index. */
+function resolveAliasTarget(baseAbsPath) {
+  for (const ext of _ALIAS_RESOLVE_EXTS) {
+    const candidate = baseAbsPath + ext;
+    try {
+      if (fs.statSync(candidate).isFile()) return candidate;
+    } catch {
+      // keep probing
+    }
+  }
+  for (const ext of _ALIAS_INDEX_EXTS) {
+    const candidate = path.join(baseAbsPath, 'index' + ext);
+    try {
+      if (fs.statSync(candidate).isFile()) return candidate;
+    } catch {
+      // keep probing
+    }
+  }
+  return null;
+}
+
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+const _CSS_MODULE_CLASS_RE = /\.(-?[_a-zA-Z][\w-]*)/g;
+
+/**
+ * Build the ``local -> scoped`` class-name map for a ``*.module.css`` file,
+ * matching the map Vite hands the client bundle. Used as the default export of
+ * a CSS-module import during SSR so ``styles.foo`` resolves to the same class
+ * name the browser renders.
+ */
+function buildCssModuleExports(css, filename) {
+  const exportsMap = {};
+  let match;
+  _CSS_MODULE_CLASS_RE.lastIndex = 0;
+  while ((match = _CSS_MODULE_CLASS_RE.exec(css)) !== null) {
+    const local = match[1];
+    if (!(local in exportsMap)) {
+      exportsMap[local] = pyxleCssModuleClass(local, filename, css);
+    }
+  }
+  return exportsMap;
+}
+
 async function render() {
   const [, , componentPath, propsJson, clientRoot, projectRootArg] = process.argv;
 
@@ -106,7 +232,8 @@ async function render() {
   }
   const styleRegistry = createStyleRegistry(projectRoot);
   globalThis.__PYXLE_REGISTER_SSR_STYLE__ = (entry) => styleRegistry.register(entry);
-  const skipInlineCss = detectPostcssConfig(projectRoot) !== null;
+  const skipInlineCss =
+    detectPostcssConfig(projectRoot) !== null || detectTailwindVite(projectRoot);
   const projectRequire = createProjectRequire(projectRoot);
   const esbuild = loadDependency('esbuild', projectRequire, projectRoot);
   const React = loadDependency('react', projectRequire, projectRoot);
@@ -151,12 +278,57 @@ async function render() {
               }
               return { path: resolved };
             });
+
+            // Resolve project import aliases (e.g. `@/components/ui/button`)
+            // declared in jsconfig.json, mirroring the Vite client build so
+            // shadcn/ui and other alias-based imports render on the server too.
+            const importAliases = readProjectImportAliases(projectRoot);
+            if (importAliases.length > 0) {
+              const pattern = new RegExp(
+                '^(' + importAliases.map((a) => escapeRegExp(a.prefix)).join('|') + ')/',
+              );
+              build.onResolve({ filter: pattern }, (args) => {
+                for (const { prefix, dir } of importAliases) {
+                  if (args.path !== prefix && !args.path.startsWith(prefix + '/')) {
+                    continue;
+                  }
+                  const sub = args.path.slice(prefix.length).replace(/^\//, '');
+                  const baseAbs = path.resolve(dir, sub);
+                  if (!isPathWithinBoundary(baseAbs, projectRoot)) {
+                    return {
+                      errors: [
+                        { text: `Import path resolves outside the project: ${args.path}` },
+                      ],
+                    };
+                  }
+                  const resolved = resolveAliasTarget(baseAbs);
+                  if (!resolved) {
+                    return { errors: [{ text: `Could not resolve "${args.path}"` }] };
+                  }
+                  return { path: resolved };
+                }
+                return null;
+              });
+            }
           },
         },
         {
           name: 'pyxle-inline-css',
           setup(build) {
             build.onLoad({ filter: /\.css$/ }, async (args) => {
+              if (/\.module\.css$/i.test(args.path)) {
+                // CSS Module: export the local -> scoped class-name map so
+                // `styles.foo` resolves to the exact class Vite emits on the
+                // client (no hydration mismatch). The stylesheet's own rules
+                // are compiled and delivered by Vite via the manifest link.
+                const moduleCss = await fs.promises.readFile(args.path, 'utf8');
+                const exportsMap = buildCssModuleExports(moduleCss, args.path);
+                return {
+                  contents: `export default ${JSON.stringify(exportsMap)};`,
+                  loader: 'js',
+                  resolveDir: path.dirname(args.path),
+                };
+              }
               if (skipInlineCss) {
                 // Project has postcss.config.* -- Vite owns CSS via the
                 // manifest pipeline. Reading and inlining the raw source

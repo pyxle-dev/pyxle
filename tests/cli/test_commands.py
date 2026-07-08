@@ -33,13 +33,21 @@ def test_init_scaffolds_project_structure() -> None:
         assert (project_dir / "pages" / "layout.pyxl").exists()
         assert (project_dir / "pages" / "index.pyxl").exists()
         assert (project_dir / "pages" / "api" / "pulse.py").exists()
-        assert (project_dir / "pages" / "styles" / "tailwind.css").exists()
-        assert (project_dir / "tailwind.config.cjs").exists()
-        assert (project_dir / "postcss.config.cjs").exists()
-        assert (project_dir / "public" / "styles" / "tailwind.css").exists()
+        # Default scaffold: plain CSS + CSS Modules, no Tailwind.
+        assert (project_dir / "pages" / "styles" / "app.css").exists()
+        assert (project_dir / "pages" / "components" / "Badge.jsx").exists()
+        assert (project_dir / "pages" / "components" / "Badge.module.css").exists()
+        assert (project_dir / "jsconfig.json").exists()
+        assert (project_dir / "vite.config.js").exists()
+        # Legacy Tailwind-v3 side-channel is gone from the default scaffold.
+        assert not (project_dir / "tailwind.config.cjs").exists()
+        assert not (project_dir / "postcss.config.cjs").exists()
+        assert not (project_dir / "public" / "styles" / "tailwind.css").exists()
+        # No Tailwind by default: no Tailwind CSS entry, no shadcn files.
+        assert not (project_dir / "components.json").exists()
+        assert not (project_dir / "lib" / "utils.js").exists()
         branding_dir = project_dir / "public" / "branding"
         assert (branding_dir / "pyxle-mark.svg").exists()
-        assert not (project_dir / "pages" / "components").exists()
         assert (project_dir / "public" / "favicon.ico").read_bytes() == default_favicon_bytes()
 
         package_json = read_json(project_dir / "package.json")
@@ -201,22 +209,53 @@ def test_framework_requirement_unparseable_version_left_unpinned() -> None:
     assert framework_requirement("unknown") == "pyxle-framework"
 
 
-def test_scaffold_package_json_pins_audit_clean_vite(tmp_path, monkeypatch) -> None:
-    """The scaffold must pin vite >= 6 — the vite 5 range resolves a transitive
-    esbuild <= 0.24.2 that `npm audit` flags (GHSA-67mh-4wv8-2f99) on every
-    fresh project, and plugin-react >= 4.4 to match."""
+def test_scaffold_package_json_modern_stack(tmp_path, monkeypatch) -> None:
+    """The scaffold must pin the modern, audit-clean stack: React 19, Vite 7,
+    and the Vite-7-compatible @vitejs/plugin-react 5. Node 18 is EOL, so the
+    engines floor must be >= 20.19 (Vite 7's minimum)."""
     from pyxle.cli.init import run_init
 
     monkeypatch.chdir(tmp_path)
     run_init("demo", force=False, template="default", logger=cli.ConsoleLogger(), log_steps=False)
 
     manifest = read_json(tmp_path / "demo" / "package.json")
+    deps = manifest["dependencies"]
     dev_deps = manifest["devDependencies"]
-    vite_major = int(dev_deps["vite"].lstrip("^~").split(".", 1)[0])
-    assert vite_major >= 6
-    plugin_spec = dev_deps["@vitejs/plugin-react"].lstrip("^~")
-    plugin_major, plugin_minor = (int(part) for part in plugin_spec.split(".")[:2])
-    assert (plugin_major, plugin_minor) >= (4, 4)
+
+    assert int(deps["react"].lstrip("^~").split(".", 1)[0]) >= 19
+    assert int(deps["react-dom"].lstrip("^~").split(".", 1)[0]) >= 19
+    assert int(dev_deps["vite"].lstrip("^~").split(".", 1)[0]) >= 7
+    assert int(dev_deps["@vitejs/plugin-react"].lstrip("^~").split(".", 1)[0]) >= 5
+
+    engines = manifest["engines"]["node"]
+    assert engines == ">=20.19"
+
+    # The default scaffold declines Tailwind, so no Tailwind dependencies leak in.
+    assert "tailwindcss" not in dev_deps
+    assert "@tailwindcss/vite" not in dev_deps
+
+
+def test_scaffold_tailwind_adds_vite_plugin_deps(tmp_path, monkeypatch) -> None:
+    """Choosing Tailwind adds the v4 `@tailwindcss/vite` plugin + `tailwindcss`
+    (and nothing PostCSS-related — the legacy side-channel is gone)."""
+    from pyxle.cli.init import run_init
+
+    monkeypatch.chdir(tmp_path)
+    run_init(
+        "demo",
+        force=False,
+        template="default",
+        logger=cli.ConsoleLogger(),
+        tailwind=True,
+        log_steps=False,
+    )
+
+    manifest = read_json(tmp_path / "demo" / "package.json")
+    dev_deps = manifest["devDependencies"]
+    assert int(dev_deps["@tailwindcss/vite"].lstrip("^~").split(".", 1)[0]) >= 4
+    assert int(dev_deps["tailwindcss"].lstrip("^~").split(".", 1)[0]) >= 4
+    assert "autoprefixer" not in dev_deps
+    assert "postcss" not in dev_deps
 
 
 def test_scaffold_agents_md_documents_auto_injected_runtime_names(tmp_path, monkeypatch) -> None:

@@ -59,7 +59,8 @@ The fundamentals of how Pyxle works.
 Practical guides for common tasks.
 
 - [Comparison](guides/comparison.md) -- Pyxle vs. Reflex, Django, NiceGUI, Streamlit, and Next.js + FastAPI
-- [Styling](guides/styling.md) -- Tailwind CSS, global stylesheets, and inline styles
+- [Styling](guides/styling.md) -- Plain CSS, CSS Modules, opt-in Tailwind v4, and global stylesheets
+- [Third-party packages](guides/third-party-packages.md) -- Adding npm/pip packages, the import alias, and shadcn/ui
 - [Head Management](guides/head-management.md) -- `<Head>` component, the `HEAD` variable, and dynamic meta tags
 - [Caching](guides/caching.md) -- Server-side page caching, `revalidate`, the `CACHE` directive, and static generation
 - [Streaming SSR](guides/streaming.md) -- Streaming `<Suspense>` pages with `renderToPipeableStream` for faster time-to-first-byte

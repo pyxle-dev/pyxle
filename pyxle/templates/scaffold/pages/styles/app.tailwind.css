@@ -1,0 +1,8 @@
+/* Tailwind CSS v4.
+ *
+ * This single import pulls in Tailwind. The `@tailwindcss/vite` plugin (wired
+ * into Pyxle's generated Vite config) scans your `.pyxl`/`.jsx` files for
+ * class names and generates only the utilities you use — no `tailwind.config`
+ * or `postcss.config` file needed, and Vite compiles, hot-reloads, and
+ * content-hashes it for you. Add your own CSS below the import. */
+@import "tailwindcss";

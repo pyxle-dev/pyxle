@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 from pyxle.build.pipeline import run_build
 from pyxle.cli.logger import ConsoleLogger
@@ -254,3 +255,68 @@ def test_build_page_manifest_populates_js_imports(tmp_path) -> None:
     client = manifest["/"]["client"]
     assert client["file"] == "dist/assets/index-A.js"
     assert client["imports"] == ["dist/assets/vendor-B.js"]
+
+
+def _npm_build_project(tmp_path: Path, scripts: dict) -> tuple[Path, DevServerSettings]:
+    project_root = tmp_path / "project"
+    client_build_dir = project_root / ".pyxle-build" / "client"
+    client_build_dir.mkdir(parents=True)
+    (client_build_dir / "vite.config.js").write_text("export default {}\n", encoding="utf-8")
+    (project_root / "package.json").write_text(
+        json.dumps({"scripts": scripts}), encoding="utf-8"
+    )
+    return project_root, DevServerSettings.from_project_root(project_root)
+
+
+def test_run_npm_build_skips_build_css_when_not_declared(monkeypatch, tmp_path):
+    """A modern scaffold (Vite-managed CSS, no ``build:css`` script) must not
+    invoke ``build:css`` — doing so exits non-zero and would log a misleading
+    'script failed' warning on every build."""
+    from pyxle.build import pipeline
+
+    project_root, settings = _npm_build_project(tmp_path, {"build": "vite build"})
+
+    called: list[str] = []
+    monkeypatch.setattr(
+        pipeline,
+        "_run_npm_script",
+        lambda root, script, logger, *, required=True: called.append(script),
+    )
+    monkeypatch.setattr(
+        pipeline.subprocess,
+        "run",
+        lambda *a, **k: SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+
+    messages: list[str] = []
+    logger = ConsoleLogger(secho=lambda msg, **_: messages.append(str(msg)))
+    pipeline._run_npm_build(project_root, logger, settings=settings)
+
+    assert "build:css" not in called
+    assert not any("build:css" in m for m in messages)
+
+
+def test_run_npm_build_runs_build_css_when_declared(monkeypatch, tmp_path):
+    """The legacy Tailwind-v3 path (a declared ``build:css`` script, no PostCSS)
+    still runs ``build:css`` before the Vite build."""
+    from pyxle.build import pipeline
+
+    project_root, settings = _npm_build_project(
+        tmp_path, {"build:css": "tailwindcss -i in.css -o out.css"}
+    )
+
+    called: list[str] = []
+    monkeypatch.setattr(
+        pipeline,
+        "_run_npm_script",
+        lambda root, script, logger, *, required=True: called.append(script),
+    )
+    monkeypatch.setattr(
+        pipeline.subprocess,
+        "run",
+        lambda *a, **k: SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+
+    pipeline._run_npm_build(project_root, silent_logger(), settings=settings)
+
+    assert "build:css" in called

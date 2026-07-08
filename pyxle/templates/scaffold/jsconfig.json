@@ -1,0 +1,9 @@
+{
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "$import_alias": ["./*"]
+    }
+  },
+  "include": ["pages", "components", "lib"]
+}

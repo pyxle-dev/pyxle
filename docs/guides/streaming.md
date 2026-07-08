@@ -10,7 +10,7 @@ heavy below-the-fold widget — the visitor stares at a blank screen until the
 in as they become ready. Time-to-first-byte drops to the time it takes to
 render the shell instead of the whole page.
 
-Streaming is built on React 18's `renderToPipeableStream` and is **opt-in**: a
+Streaming is built on React's `renderToPipeableStream` and is **opt-in**: a
 page streams only when it uses a `<Suspense>` boundary. Every other page keeps
 the buffered render, unchanged.
 
@@ -51,16 +51,16 @@ streamable — there's no configuration and no flag to set. A page with no
 > `<Boundary>` — compiles fine but is **not** marked streamable and renders
 > buffered, with no warning.
 
-`<Suspense>` works the way it does in any React 18 app: a child suspends by
+`<Suspense>` works the way it does in any React app: a child suspends by
 throwing a promise (via `React.lazy` or your own promise-throwing data source),
 and React shows the `fallback` until it resolves. Pyxle's `@server` loader still
 runs first and passes its result as `data` props, exactly as for a buffered page
 — streaming governs how the **rendered** page is delivered, not how the loader
 runs.
 
-> Pyxle ships React 18.3.1, which does **not** have `React.use` — that hook is
-> React 19 only. Don't reach for `use(promise)` to suspend; use `React.lazy` (the
-> zero-effort mechanism) or a hand-thrown promise.
+> Pyxle ships **React 19**, so the `use(promise)` hook is available if you prefer
+> it. `React.lazy` remains the zero-effort way to make a subtree suspend and
+> stream.
 
 ## Route-level loading states with `loading.pyxl`
 
@@ -109,7 +109,7 @@ is updated before the fallback renders, so a fallback's `<Head>` is ignored.
 ## Hydration
 
 Nothing changes about hydration. The browser hydrates the same component it
-always did; React 18 reconciles the streamed markup (including the parts that
+always did; React reconciles the streamed markup (including the parts that
 arrived after the shell) natively. A streaming page is hydrated exactly like a
 buffered one.
 

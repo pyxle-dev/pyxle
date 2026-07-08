@@ -243,6 +243,44 @@ async def test_renderer_default_factory_produces_html(tmp_path: Path) -> None:
 
 @pytest.mark.anyio
 @pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is required for SSR rendering tests")
+async def test_renderer_css_module_emits_scoped_class(tmp_path: Path) -> None:
+    """A ``*.module.css`` import must render deterministic scoped class names on
+    the server so they match Vite's client output — otherwise React 19 flags a
+    hydration mismatch on the default (no-Tailwind) scaffold."""
+    project_root = tmp_path / "project"
+    component = project_root / ".pyxle-build" / "client" / "pages" / "card.jsx"
+    component.parent.mkdir(parents=True, exist_ok=True)
+    module_css = component.parent / "styles" / "card.module.css"
+    module_css.parent.mkdir(parents=True, exist_ok=True)
+    module_css.write_text(".box { color: red; }\n", encoding="utf-8")
+
+    component.write_text(
+        dedent(
+            """
+            import React from 'react';
+            import styles from './styles/card.module.css';
+
+            export default function Card() {
+                return <div className={styles.box}>hi</div>;
+            }
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    ensure_test_node_modules(project_root)
+
+    renderer = ComponentRenderer()
+    result = await renderer.render(component, {})
+
+    # Scoped, not the raw local name — basename_local_<hash>.
+    assert 'class="card_box_' in result.html
+    assert 'class="box"' not in result.html
+
+
+@pytest.mark.anyio
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is required for SSR rendering tests")
 async def test_renderer_substitutes_public_env_during_ssr(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

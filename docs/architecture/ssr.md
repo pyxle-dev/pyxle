@@ -526,9 +526,9 @@ The browser starts receiving bytes immediately. Practical effect:
   but time-to-first-paint is much faster than a non-streaming
   response would be.
 
-### What about React 18 streaming SSR?
+### What about React's streaming SSR?
 
-React 18 has its own streaming SSR via `renderToPipeableStream`,
+React has its own streaming SSR via `renderToPipeableStream`,
 which can interleave Suspense boundaries with the document. Pyxle
 *does not* use that yet — the current renderer uses
 `renderToString`, which is synchronous on the React side.

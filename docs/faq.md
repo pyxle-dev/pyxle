@@ -34,7 +34,7 @@ Python 3.10 or later. Python 3.12 is recommended.
 
 ### What Node.js version do I need?
 
-Node.js 18 or later. Node.js 20+ is recommended.
+Node.js **20.19** or later (Vite 7's minimum). Node 18 is end-of-life and no longer supported.
 
 ## `.pyxl` files
 
@@ -48,7 +48,7 @@ No. The Python and JSX sections are compiled into separate files. Python code ru
 
 ### Can I use any React library?
 
-Yes. Any npm package that works with React 18 and Vite should work. Install it via `npm install` and import it in your JSX section.
+Yes. Any npm package that works with React 19 and Vite should work. Install it via `npm install` and import it in your JSX section.
 
 ### Can I have multiple loaders in one file?
 
@@ -112,7 +112,7 @@ If you raise `LoaderError`, the nearest `error.pyxl` is rendered. Other exceptio
 
 ### Do I have to use Tailwind CSS?
 
-No. Tailwind is included in the scaffold for convenience, but you can remove it and use any CSS approach: plain CSS files, CSS Modules, Sass, CSS-in-JS libraries, etc.
+No. Tailwind is **opt-in** — `pyxle init` asks whether you want it. Decline it and a fresh project uses plain CSS and CSS Modules out of the box; you can also add Sass or any CSS-in-JS library. Choose it and you get Tailwind v4 wired into Vite. See [Styling](guides/styling.md).
 
 ### How do I add a global CSS reset?
 
@@ -197,11 +197,11 @@ Run `pyxle install` or `npm install` in your project directory.
 
 ### The page renders without styles
 
-`pyxle dev` compiles Tailwind through PostCSS automatically when
-`postcss.config.cjs` is present (the scaffold default). If you removed
-that file or are on a custom stylesheet setup, re-check your
-[styling configuration](guides/styling.md) — specifically that the
-relevant CSS is imported from a page or layout.
+Vite compiles every stylesheet you **import from a JSX module**, so the most
+common cause is a stylesheet that isn't imported anywhere. Make sure your CSS
+(e.g. `pages/styles/app.css`) is imported from a page or layout. If you enabled
+Tailwind, confirm that entry contains `@import "tailwindcss";`. See the
+[styling guide](guides/styling.md).
 
 ### Hot reload is not working
 

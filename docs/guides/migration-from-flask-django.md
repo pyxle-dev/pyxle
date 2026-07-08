@@ -85,7 +85,7 @@ There is no Python template engine in Pyxle. Jinja and the Django Template Langu
 | `{% include %}` | a React component you import |
 | `{% static 'x.css' %}` | import the CSS from JSX (Vite hashes it) or reference `public/` at `/x.css` |
 
-This is real React 18, server-rendered and hydrated — not a string-templating layer. Page `<title>`/meta come from the `HEAD` variable or the `<Head>` component, not a `{% block title %}`. See [.pyxl files](../core-concepts/pyxl-files.md), [Layouts](../core-concepts/layouts.md), and [Head management](head-management.md).
+This is real React 19, server-rendered and hydrated — not a string-templating layer. Page `<title>`/meta come from the `HEAD` variable or the `<Head>` component, not a `{% block title %}`. See [.pyxl files](../core-concepts/pyxl-files.md), [Layouts](../core-concepts/layouts.md), and [Head management](head-management.md).
 
 ## Forms and mutations
 
@@ -175,7 +175,7 @@ Middleware is ASGI/Starlette, not WSGI. See [Middleware](middleware.md) and the 
 
 ## Static files and styling
 
-`public/` is served at the root URL (`public/favicon.ico` → `/favicon.ico`) — no `collectstatic`, no `{% static %}`. App CSS/JS is better **imported from JSX** so Vite bundles and content-hashes it; `pyxle build` produces hashed assets and a manifest. Tailwind works out of the box. See [Styling](styling.md).
+`public/` is served at the root URL (`public/favicon.ico` → `/favicon.ico`) — no `collectstatic`, no `{% static %}`. App CSS/JS is better **imported from JSX** so Vite bundles and content-hashes it; `pyxle build` produces hashed assets and a manifest. Plain CSS and CSS Modules work out of the box; Tailwind v4 is one prompt away at `pyxle init`. See [Styling](styling.md).
 
 ## Background work and signals
 

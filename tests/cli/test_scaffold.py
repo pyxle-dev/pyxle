@@ -4,10 +4,41 @@ import pytest
 
 from pyxle.cli.scaffold import (
     FilesystemWriter,
+    InvalidImportAlias,
     InvalidProjectName,
     slugify_project_name,
+    validate_import_alias,
     validate_project_name,
 )
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [("@/*", "@/*"), ("@", "@/*"), ("@/", "@/*"), ("~/*", "~/*"), ("  @/*  ", "@/*")],
+)
+def test_validate_import_alias_normalises(value: str, expected: str) -> None:
+    assert validate_import_alias(value) == expected
+
+
+@pytest.mark.parametrize("value", ["", "  ", "@/nested/*", "a b", "@/foo"])
+def test_validate_import_alias_rejects_invalid(value: str) -> None:
+    with pytest.raises(InvalidImportAlias):
+        validate_import_alias(value)
+
+
+def test_filesystem_writer_keep_root_requires_empty(tmp_path: Path) -> None:
+    root = tmp_path / "inplace"
+    root.mkdir()
+    (root / "occupied.txt").write_text("x", encoding="utf-8")
+    writer = FilesystemWriter(root)
+
+    with pytest.raises(FileExistsError):
+        writer.ensure_root(keep_root=True)
+
+    # With force it keeps the directory (and its contents) but proceeds.
+    writer.ensure_root(force=True, keep_root=True)
+    assert root.is_dir()
+    assert (root / "occupied.txt").exists()
 
 
 def test_slugify_and_validate_happy_path():
