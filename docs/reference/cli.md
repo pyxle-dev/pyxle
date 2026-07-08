@@ -22,9 +22,11 @@ pyxle init [name] [options]
 ```
 
 `pyxle init` is **interactive**: when stdin is a terminal and no flag pins the
-choice, it prompts for Tailwind CSS, shadcn/ui (only if Tailwind is enabled),
-and the import alias. When stdin is **not** a terminal (CI, pipes), it never
-prompts — it uses the flags and defaults below.
+choice, it walks you through arrow-key selections — Tailwind CSS, shadcn/ui
+(only if Tailwind is enabled), and whether to customize the default import
+alias (`@/*`; the value input appears only if you say yes). When stdin is
+**not** a terminal (CI, pipes), it never prompts — it uses the flags and
+defaults below.
 
 | Argument / Flag | Default | Description |
 |----------------|---------|-------------|

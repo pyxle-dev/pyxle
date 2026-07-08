@@ -11,14 +11,17 @@ pyxle init my-app
 `pyxle init` is **interactive** — it asks a few questions and generates a project tailored to your answers:
 
 ```
-? Use Tailwind CSS? (y/N)
-? Add shadcn/ui components? (y/N)      # only asked when Tailwind is enabled
-? Import alias: (@/*)
+◆ Use Tailwind CSS?                          › No / Yes   (↑/↓ + Enter)
+◆ Add shadcn/ui components?                  › No / Yes   (only when Tailwind is on)
+◆ Customize the default import alias (@/*)?  › No / Yes
 ```
+
+Each question is an arrow-key selection with the default highlighted — press
+Enter to accept it.
 
 - **Tailwind CSS** — opt in to Tailwind v4, wired straight into Vite (no `postcss.config`, no separate watcher). Decline it and you get a clean baseline where plain CSS **and** CSS Modules work out of the box.
 - **shadcn/ui** — sets up [shadcn/ui](https://ui.shadcn.com) (implies Tailwind), so `npx shadcn@latest add button` just works.
-- **Import alias** — the path alias for your own modules (default `@/*`, e.g. `import { Button } from '@/components/ui/button'`).
+- **Import alias** — the shorthand for absolute imports of your own modules: `import { Button } from '@/components/ui/button'` instead of a brittle `../../` path. `@/*` is the convention (and what shadcn expects); almost everyone keeps it, so the value input only appears if you choose to customize.
 
 This creates a `my-app/` directory with a complete starter project.
 

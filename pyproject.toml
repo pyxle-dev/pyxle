@@ -56,6 +56,11 @@ dependencies = [
   # would inevitably drift from the langkit source of truth. The module
   # boundary holds: langkit only imports ``pyxle.compiler``.
   "pyxle-langkit>=0.3.4,<0.4",
+  # questionary renders the interactive ``pyxle init`` prompts (arrow-key
+  # Yes/No selections with a highlighted default, instead of bare text input).
+  # Built on prompt_toolkit; imported lazily on the prompt path only, so it
+  # never loads on the compile/serve hot path.
+  "questionary>=2.0,<3.0",
 ]
 
 [project.urls]
@@ -71,6 +76,11 @@ PyPI = "https://pypi.org/project/pyxle-framework/"
 # ``pyxle-framework[langkit]`` keep working; the floor matches the default dep.
 langkit = [
   "pyxle-langkit>=0.3.4,<0.4",
+  # questionary renders the interactive ``pyxle init`` prompts (arrow-key
+  # Yes/No selections with a highlighted default, instead of bare text input).
+  # Built on prompt_toolkit; imported lazily on the prompt path only, so it
+  # never loads on the compile/serve hot path.
+  "questionary>=2.0,<3.0",
 ]
 # Shared Redis backends — the server-side page cache
 # (PYXLE_PAGE_CACHE_BACKEND=redis) and the cross-worker realtime broker
