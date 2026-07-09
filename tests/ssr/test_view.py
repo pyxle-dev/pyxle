@@ -3134,3 +3134,189 @@ async def test_build_page_response_cjs_require_error_is_generic_in_production(
     assert "CjsDependencyRenderError" not in body
     # The enriched detail reaches the server log only.
     assert "require('react')" in caplog.text
+
+
+# --------------------------------------------------------------------------- #
+# Error boundary + ancestor layout loaders (F6 regression)                     #
+# --------------------------------------------------------------------------- #
+
+
+def _write_layout_with_loader(settings) -> None:
+    (settings.pages_dir / "layout.pyxl").write_text(
+        "from pyxle.runtime import server\n"
+        "\n"
+        "@server\n"
+        "async def load_layout(request):\n"
+        "    return {'site': 'Pyxle Blog'}\n"
+        "\n"
+        "import React from 'react';\n"
+        "\n"
+        "export default function Layout({ children, data }) {\n"
+        "    return <div>{data.site}{children}</div>;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+
+@pytest.mark.anyio
+async def test_error_boundary_receives_layout_loader_data(
+    settings: DevServerSettings, tmp_path: Path
+) -> None:
+    """The error boundary render includes ancestor layout loader data.
+
+    The compiled error.pyxl is wrapped in the layout chain like any page; a
+    layout with a @server loader used to get NO layoutData during the boundary
+    render, crash on the missing props, and silently fall back to the default
+    error document (in dev AND prod)."""
+    _write_layout_with_loader(settings)
+    (settings.pages_dir / "error.pyxl").write_text(
+        "import React from 'react';\n"
+        "export default function ErrorPage({ error }) {\n"
+        "    return <h1>{error.message}</h1>;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    (settings.pages_dir / "index.pyxl").write_text(
+        "from pyxle.runtime import server\n"
+        "\n"
+        "@server\n"
+        "async def load(request):\n"
+        "    raise LoaderError('Teapot', status_code=418)\n"
+        "\n"
+        "import React from 'react';\n"
+        "export default function Home({ data }) {\n"
+        "    return <div>home</div>;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    from pyxle.devserver.builder import build_once
+    from pyxle.devserver.error_pages import build_error_boundary_registry
+    from pyxle.devserver.registry import load_metadata_registry
+    from pyxle.devserver.routes import build_route_table
+
+    build_once(settings)
+    registry = load_metadata_registry(settings)
+    routes = build_route_table(registry)
+    page = routes.find_page("/")
+    assert page is not None
+    boundaries = build_error_boundary_registry(list(routes.error_boundary_pages))
+
+    renderer = StubRenderer()
+    renderer.responses.append(RenderResult(html="<h1>Teapot</h1>"))
+    request = Request({"type": "http", "method": "GET", "path": "/", "query_string": b"", "headers": []})
+
+    response = await build_page_response(
+        request=request,
+        settings=settings,
+        page=page,
+        renderer=renderer,
+        error_boundaries=boundaries,
+    )
+
+    assert response.status_code == 418
+    body = (await _read_response_body(response)).decode()
+    assert "<h1>Teapot</h1>" in body  # the BOUNDARY rendered, not the default doc
+    boundary_props = renderer.calls[-1][1]
+    assert boundary_props["error"]["message"] == "Teapot"
+    assert boundary_props["layoutData"] == {"site": "Pyxle Blog"}
+
+
+@pytest.mark.anyio
+async def test_error_boundary_survives_failing_layout_loader(
+    settings: DevServerSettings, tmp_path: Path, caplog
+) -> None:
+    """A layout loader that raises during the boundary render must not mask
+    the boundary: it renders with error-only props and the failure is logged."""
+    (settings.pages_dir / "layout.pyxl").write_text(
+        "from pyxle.runtime import server\n"
+        "\n"
+        "@server\n"
+        "async def load_layout(request):\n"
+        "    raise RuntimeError('layout db down')\n"
+        "\n"
+        "import React from 'react';\n"
+        "export default function Layout({ children }) {\n"
+        "    return <div>{children}</div>;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    (settings.pages_dir / "error.pyxl").write_text(
+        "import React from 'react';\n"
+        "export default function ErrorPage({ error }) {\n"
+        "    return <h1>{error.message}</h1>;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    (settings.pages_dir / "index.pyxl").write_text(
+        "from pyxle.runtime import server\n"
+        "\n"
+        "@server\n"
+        "async def load(request):\n"
+        "    raise LoaderError('nope', status_code=500)\n"
+        "\n"
+        "import React from 'react';\n"
+        "export default function Home({ data }) {\n"
+        "    return <div>home</div>;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    from pyxle.devserver.builder import build_once
+    from pyxle.devserver.error_pages import build_error_boundary_registry
+    from pyxle.devserver.registry import load_metadata_registry
+    from pyxle.devserver.routes import build_route_table
+
+    build_once(settings)
+    registry = load_metadata_registry(settings)
+    routes = build_route_table(registry)
+    page = routes.find_page("/")
+    assert page is not None
+    boundaries = build_error_boundary_registry(list(routes.error_boundary_pages))
+
+    renderer = StubRenderer()
+    renderer.responses.append(RenderResult(html="<h1>nope</h1>"))
+    request = Request({"type": "http", "method": "GET", "path": "/", "query_string": b"", "headers": []})
+
+    with caplog.at_level("WARNING"):
+        response = await build_page_response(
+            request=request,
+            settings=settings,
+            page=page,
+            renderer=renderer,
+            error_boundaries=boundaries,
+        )
+
+    assert response.status_code == 500
+    body = (await _read_response_body(response)).decode()
+    assert "<h1>nope</h1>" in body
+    boundary_props = renderer.calls[-1][1]
+    assert "layoutData" not in boundary_props
+    assert "Layout loader failed while rendering error boundary" in caplog.text
+
+
+@pytest.mark.anyio
+async def test_error_boundary_failure_is_logged(
+    settings: DevServerSettings, tmp_path: Path, caplog
+) -> None:
+    """A boundary that itself fails falls back to the default error document —
+    and says so in the log instead of swapping silently."""
+    page = _page_route(tmp_path, loader_name=None)
+    boundary = _boundary_page(tmp_path, filename="error.pyxl", module_key="pyxle.server.pages.errlog")
+    from pyxle.devserver.error_pages import ErrorBoundaryRegistry
+
+    registry = ErrorBoundaryRegistry(error_pages={".": boundary}, not_found_pages={})
+
+    renderer = _failing_renderer("render boom")
+
+    with caplog.at_level("WARNING"):
+        response = await build_page_response(
+            request=_plain_request(),
+            settings=settings,
+            page=page,
+            renderer=renderer,
+            error_boundaries=registry,
+        )
+
+    assert response.status_code == 500
+    assert "failed to render; serving the default error document" in caplog.text
