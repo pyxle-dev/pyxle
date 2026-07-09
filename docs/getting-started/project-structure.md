@@ -24,6 +24,7 @@ my-app/
   package.json            # Node.js dependencies and scripts
   pyxle.config.json       # Framework configuration
   requirements.txt        # Python dependencies
+  .env.local              # Generated dev secret (PYXLE_SECRET_KEY) — gitignored
   .gitignore
 ```
 
@@ -165,6 +166,13 @@ It also declares `"engines": { "node": ">=20.19" }` (Vite 7's floor). Vite
 compiles CSS on both `pyxle dev` and `pyxle build` — including Tailwind v4 via
 the `@tailwindcss/vite` plugin when you opt into it — so there's no separate CSS
 script. See [Styling](../guides/styling.md).
+
+### `.env.local`
+
+Every scaffold generates a `.env.local` with a unique `PYXLE_SECRET_KEY` for
+development (it signs the CSRF tokens). The file is gitignored — never commit
+it; set a real secret in your production environment instead. See
+[Environment Variables](../guides/environment-variables.md).
 
 ### `jsconfig.json` and `vite.config.js`
 

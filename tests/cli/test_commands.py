@@ -3181,3 +3181,35 @@ def test_install_no_break_flag_by_default(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(cli, "_in_virtualenv", lambda: True)
     cli._install_dependencies(tmp_path, logger=cli.ConsoleLogger(), install_node=False)
     assert "--break-system-packages" not in calls[0]
+
+
+def test_sigterm_helper_raises_keyboard_interrupt(monkeypatch) -> None:
+    """The dev command's SIGTERM handler reuses the Ctrl-C cleanup path."""
+    import signal as signal_module
+
+    import pyxle.cli as cli_module
+
+    installed: dict[str, object] = {}
+
+    def fake_signal(signum, handler):
+        installed["signum"] = signum
+        installed["handler"] = handler
+        return "previous-handler"
+
+    monkeypatch.setattr(cli_module.signal, "signal", fake_signal)
+    previous = cli_module._install_sigterm_keyboard_interrupt(logger=None)
+    assert previous == "previous-handler"
+    assert installed["signum"] == signal_module.SIGTERM
+    with pytest.raises(KeyboardInterrupt):
+        installed["handler"](signal_module.SIGTERM, None)
+
+    restored: dict[str, object] = {}
+    monkeypatch.setattr(
+        cli_module.signal, "signal", lambda s, h: restored.update(signum=s, handler=h)
+    )
+    cli_module._restore_sigterm_handler("previous-handler")
+    assert restored["handler"] == "previous-handler"
+    # None (installation failed) restores nothing.
+    restored.clear()
+    cli_module._restore_sigterm_handler(None)
+    assert restored == {}

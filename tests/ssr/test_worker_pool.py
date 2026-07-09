@@ -1178,3 +1178,15 @@ async def test_pool_rerenders_after_source_change(tmp_path: Path) -> None:
         assert "VERSION_ALPHA" not in second["html"]
     finally:
         await pool.stop()
+
+
+def test_build_node_env_forwards_worker_concurrency(monkeypatch, tmp_path) -> None:
+    """The documented PYXLE_SSR_WORKER_CONCURRENCY knob must survive the
+    sanitized spawn environment (it was silently stripped, a documented no-op)."""
+    from pyxle.ssr.worker_pool import _build_node_env
+
+    monkeypatch.setenv("PYXLE_SSR_WORKER_CONCURRENCY", "4")
+    monkeypatch.setenv("NODE_OPTIONS", "--evil")  # must still be stripped
+    env = _build_node_env(tmp_path)
+    assert env.get("PYXLE_SSR_WORKER_CONCURRENCY") == "4"
+    assert "NODE_OPTIONS" not in env

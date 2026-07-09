@@ -110,6 +110,21 @@ CSS-in-JS libraries (styled-components, Emotion, etc.) install the same way —
 `npm install` and import in the JSX section. Pick libraries with SSR support so
 server- and client-rendered markup match.
 
+## Legacy Tailwind v3 projects
+
+Projects that hand-wired Tailwind v3 — a `tailwind.config.*` at the root, a
+`build:css` npm script, and a compiled stylesheet in `public/` — keep working:
+`pyxle dev` starts the standalone Tailwind watcher when it detects that shape,
+and `pyxle build` runs the declared `build:css` script. Two things to know:
+
+- Files under `public/` are served live from disk and are never part of the
+  rebuild watch, so the compiled CSS updating in place never triggers reloads —
+  refresh the browser to pick it up.
+- The Tailwind v3 CLI's `--watch` mode can skip its initial write when its
+  output is piped (non-TTY). If styles look missing under a process manager,
+  run the build script once manually — or better, migrate to the v4 setup
+  above (`@tailwindcss/vite`), which has neither issue.
+
 ## Global stylesheets (config-driven, inlined)
 
 For CSS that should be **inlined** on every page (embedded in the SSR HTML, no

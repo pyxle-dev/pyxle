@@ -15,6 +15,7 @@ from pyxle.devserver import (
     DevServer,
     DevServerSettings,
     _maybe_schedule_reload,
+    _notify_rebuild_error,
     _set_app_ready_flag,
 )
 from pyxle.devserver.builder import BuildSummary
@@ -952,3 +953,40 @@ async def test_devserver_skips_tailwind_when_postcss_config_present(monkeypatch,
         "postcss.config.cjs" in m and "skipping standalone Tailwind watcher" in m
         for m in capture.messages
     ), f"Expected skip log line, got: {capture.messages}"
+
+async def test_notify_rebuild_error_broadcasts_to_overlay(monkeypatch) -> None:
+    """A failed rebuild reaches the overlay (as the architecture docs promise)."""
+    loop = asyncio.get_running_loop()
+    captured: list[dict] = []
+
+    class StubOverlay:
+        async def notify_error(self, *, route_path, error, stack=None, breadcrumbs=None):
+            captured.append({"route": route_path, "error": str(error), "breadcrumbs": breadcrumbs})
+
+    stats = WatcherStatistics(
+        elapsed_seconds=0.02,
+        summary=None,
+        error=ValueError("Unexpected token at line 3"),
+        changed_paths=[Path("pages/index.pyxl")],
+    )
+    monkeypatch.setattr(
+        "pyxle.devserver.asyncio.run_coroutine_threadsafe",
+        lambda coro, loop: loop.create_task(coro),
+    )
+
+    assert _notify_rebuild_error(StubOverlay(), loop, stats) is True
+    await asyncio.sleep(0)
+    assert captured and "Unexpected token" in captured[0]["error"]
+    assert captured[0]["breadcrumbs"][0]["status"] == "failed"
+    assert "pages/index.pyxl" in captured[0]["breadcrumbs"][0]["detail"]
+
+
+async def test_notify_rebuild_error_ignores_success_and_missing_overlay() -> None:
+    loop = asyncio.get_running_loop()
+    ok = WatcherStatistics(elapsed_seconds=0.01, summary=BuildSummary(), error=None, changed_paths=[])
+    assert _notify_rebuild_error(None, loop, ok) is False
+    failed = WatcherStatistics(
+        elapsed_seconds=0.01, summary=None, error=RuntimeError("boom"), changed_paths=[]
+    )
+    # No overlay connected: still reports failure handled (True), never raises.
+    assert _notify_rebuild_error(None, loop, failed) is True

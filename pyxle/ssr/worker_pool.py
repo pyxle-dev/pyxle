@@ -34,6 +34,9 @@ _STREAM_TERMINATED = object()
 _ALLOWED_ENV_KEYS: frozenset[str] = frozenset({
     "PATH", "HOME", "LANG", "TERM", "USER", "SHELL", "TMPDIR",
     "SYSTEMROOT", "APPDATA",  # Windows support
+    # The worker reads its in-process render concurrency cap from this
+    # documented variable — it must survive the sanitized spawn env.
+    "PYXLE_SSR_WORKER_CONCURRENCY",
 })
 
 
