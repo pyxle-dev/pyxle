@@ -2,7 +2,7 @@
 
 Release notes for Pyxle. While we're in beta (`0.x`), minor versions may include breaking changes — those are called out explicitly here. To upgrade, run `pip install --upgrade pyxle-framework`.
 
-## 0.7.0 — Unreleased
+## 0.7.0 — 2026-07-09
 
 - **Fix: `error.pyxl` renders even when an ancestor layout has a `@server` loader.** The error boundary is compiled wrapped in its layout chain like any page, but its render received no layout loader data — the layout component crashed on the missing props and the request silently fell back to the built-in error document (in dev *and* production, with no log). Boundary renders now execute ancestor layout loaders exactly like a normal page; a loader that fails during the boundary render no longer masks the boundary (it renders with error-only props and the failure is logged), and a boundary that itself fails now logs the fallback instead of swapping silently. Also: honest scope wording for `pyxle typecheck` (page JSX isn't checked without `checkJs` — planned, see [the typed-Pyxle roadmap](guides/fully-typed-pyxle.md)), the pyxle-auth doc header says 0.4.0, the `useAuth` seed claim matches real SSR behavior, the `username-available` `reason` field is documented, six missing guides join the docs index, and three dead anchors are fixed.
 
