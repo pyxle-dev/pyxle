@@ -74,6 +74,12 @@ Practical guides for common tasks.
 - [The road to a fully-typed Pyxle](guides/fully-typed-pyxle.md) -- Roadmap: authoring in TypeScript and forwarding Python types to the client
 - [Security](guides/security.md) -- CSRF protection, CORS, and HEAD sanitisation
 - [Deployment](guides/deployment.md) -- `pyxle build`, `pyxle serve`, and hosting in production
+- [AI accessibility (llms.txt & .md)](guides/llms.md) -- Serve every page as Markdown for AI agents: .md URLs, llms.txt, and conversion hooks
+- [Editor setup](guides/editor-setup.md) -- VS Code extension, the Pyxle language server, and CI linting
+- [Background Tasks](guides/background-tasks.md) -- request.state.background and the in-process task queue
+- [Build Optimization](guides/build-optimization.md) -- pyxle build --analyze, modulepreload hints, and the <Image> component
+- [Migrating from Flask/Django](guides/migration-from-flask-django.md) -- Route, template, and ORM equivalents in Pyxle
+- [Migrating .pyx to .pyxl](guides/migration-pyx-to-pyxl.md) -- The legacy extension migration
 - [Pyxle for AI coding agents](guides/for-ai-agents.md) -- Why Pyxle is the framework most optimised for pairing with Claude, Cursor, Copilot, and other AI coding agents
 
 ## Reference

@@ -89,12 +89,12 @@ reject them. `paths` work without `baseUrl`: they resolve relative to the
 
 Two honest notes on coverage:
 
-- `checkJs` is **not** enabled, so your own page JSX isn't deeply type-checked on its own. The real value is that **misuse of the typed framework imports is caught** — wrong props on `<Image>`, a bad `useAction` call, etc.
+- `checkJs` is **not** enabled, so your own page JSX — including how it calls the typed framework imports — isn't type-checked yet: `tsc` skips the bodies of `.jsx` files unless `checkJs` is on. What the gate verifies today is the framework surface itself (the generated declarations, config, and path wiring) plus any TypeScript sources you add. Checking page JSX against the framework types (wrong `<Image>` props, a bad `useAction` call) requires `checkJs` + React types and is planned — see [The road to a fully-typed Pyxle](fully-typed-pyxle.md).
 - `include` covers `./pages/**/*.jsx` but not `./routes/**/*.jsx`, so files under a `routes/` source root currently fall outside the type-check glob.
 
 ## `pyxle typecheck`
 
-`pyxle typecheck` compiles your `.pyxl` files to `.jsx` and runs `tsc --noEmit` against the generated `tsconfig.json`, surfacing any type errors against the framework declarations. It looks for `tsc` in your local `node_modules/.bin`, then globally — TypeScript must actually be installed (locally is recommended: `npm install --save-dev typescript`); if it isn't, the command fails fast with that instruction rather than invoking anything. It's the recommended CI gate for catching framework-API misuse. See the [CLI reference](../reference/cli.md).
+`pyxle typecheck` compiles your `.pyxl` files to `.jsx` and runs `tsc --noEmit` against the generated `tsconfig.json`, surfacing any type errors against the framework declarations. It looks for `tsc` in your local `node_modules/.bin`, then globally — TypeScript must actually be installed (locally is recommended: `npm install --save-dev typescript`); if it isn't, the command fails fast with that instruction rather than invoking anything. It's a useful CI gate for the generated client project and any TypeScript you add — see the honest scope note above for what it does and doesn't check today. See the [CLI reference](../reference/cli.md).
 
 ## Editor setup
 

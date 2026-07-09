@@ -130,7 +130,7 @@ Returning `None` **declines** and defers to the next ancestor (and ultimately to
 
 If nothing above resolves and you've set `"autoConvert": true`, Pyxle renders the page and converts its HTML to Markdown with a small, **dependency-free** converter. It's **off by default** and deliberately best-effort: headings, paragraphs, lists, links, emphasis, and code survive; layout chrome, tables, and rich components may not. Treat it as "something is better than a redirect" — prefer an authored `.md` or a handler for anything you care about.
 
-Converted pages keep agents **on the Markdown channel**: internal links to other pages are rewritten to their `.md` renditions — `[About](/about)` becomes `[About](/about.md)`, with query strings and fragments preserved (`/about?x=1#y` → `/about.md?x=1#y`). External URLs, `mailto:`/`tel:` links, `/api/` routes, asset paths with a file extension, and links already ending in `.md` are left untouched. See [`html_to_markdown`](#ctxrender_html--post-processing-the-rendered-page) for the same behavior in your own handlers.
+Converted pages keep agents **on the Markdown channel**: internal links to other pages are rewritten to their `.md` renditions — `[About](/about)` becomes `[About](/about.md)`, with query strings and fragments preserved (`/about?x=1#y` → `/about.md?x=1#y`). External URLs, `mailto:`/`tel:` links, `/api/` routes, asset paths with a file extension, and links already ending in `.md` are left untouched. See [`html_to_markdown`](#ctxrender_html-post-processing-the-rendered-page) for the same behavior in your own handlers.
 
 ### The redirect fallback
 

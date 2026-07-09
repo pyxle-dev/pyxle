@@ -805,7 +805,12 @@ async def build_not_found_response(
         return HTMLResponse(document, status_code=404)
     except Exception:
         # If the not-found boundary itself fails, give up and let the caller
-        # use the default 404 response.
+        # use the default 404 response. Never silently — log the swap.
+        _logger.warning(
+            "not-found boundary %s failed to render; serving the default 404",
+            boundary_page.source_relative_path.as_posix(),
+            exc_info=True,
+        )
         return None
 
 
@@ -1192,11 +1197,34 @@ async def _try_error_boundary(
     # Build error context that the error page component receives as props.
     error_context = _build_error_context(error, status_code, debug=settings.debug)
 
+    # The compiled boundary is wrapped in its ancestor layout chain exactly
+    # like a normal page, so a layout with a ``@server`` loader needs its
+    # loader data here too — without it the layout component crashes on the
+    # missing props and the boundary silently degrades to the default error
+    # document. A loader failing *while rendering the boundary* must never
+    # mask the boundary itself: fall back to error-only props and let the
+    # render proceed with whatever the layout can do without data.
+    try:
+        layout_data = await _execute_layout_loaders(
+            settings=settings, page=boundary_page, request=request
+        )
+    except Exception as layout_exc:
+        _logger.warning(
+            "Layout loader failed while rendering error boundary %s: %s",
+            boundary_page.source_relative_path.as_posix(),
+            layout_exc,
+        )
+        layout_data = None
+
+    boundary_props: dict[str, Any] = {"error": error_context}
+    if layout_data:
+        boundary_props["layoutData"] = layout_data
+
     try:
         _boundary_render_start = time.perf_counter()
         render_result = await renderer.render(
             boundary_page.client_module_path,
-            {"error": error_context},
+            boundary_props,
             request_pathname=request.url.path,
             csrf_token=_csrf_token_for_request(request),
         )
@@ -1209,7 +1237,7 @@ async def _try_error_boundary(
             settings=settings,
             page=boundary_page,
             body_html=render_result.html,
-            props={"error": error_context},
+            props=boundary_props,
             script_nonce=script_nonce,
             head_elements=head_elements,
             inline_styles=render_result.inline_styles,
@@ -1219,6 +1247,12 @@ async def _try_error_boundary(
     except Exception:
         # If the error boundary itself fails, let the caller fall back to the
         # default error document — we must not enter an infinite error loop.
+        # Never silently: the fallback swap is invisible without this log.
+        _logger.warning(
+            "Error boundary %s failed to render; serving the default error document",
+            boundary_page.source_relative_path.as_posix(),
+            exc_info=True,
+        )
         return None
 
 

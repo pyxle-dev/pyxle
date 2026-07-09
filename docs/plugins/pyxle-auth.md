@@ -2,7 +2,7 @@
 
 `pyxle-auth` is Pyxle's official authentication plugin: email- **or** username-based password accounts, sliding sessions, password-reset and email-verification flows, role-based access control, and scoped API tokens — wired into your app with one config entry. It never sends email and never renders UI; it gives you hardened primitives and stays out of your templates.
 
-> **Version 0.3.0.** Runs on [pyxle-db](pyxle-db.md) (SQLite, PostgreSQL, or MySQL — the full account lifecycle is tested against real servers in CI), or on any database layer satisfying the `DatabaseLike` contract.
+> **Version 0.4.0.** Runs on [pyxle-db](pyxle-db.md) (SQLite, PostgreSQL, or MySQL — the full account lifecycle is tested against real servers in CI), or on any database layer satisfying the `DatabaseLike` contract.
 
 ## Install
 
@@ -118,7 +118,7 @@ is_free       = await auth.username_available("ada")                        # Fa
 
 - **Normalised:** usernames are trimmed and lowercased, so uniqueness is case-insensitive on every backend (`Ada` and `ada` are one account).
 - **Policy (configurable):** `usernameMinLength` / `usernameMaxLength` (3–30), `usernamePattern` (`^[a-z0-9_-]+$`), and a reserved-name block-list (~90 system/route names like `admin`, `api`, `login`) that blocks impersonation and route collisions.
-- **Availability is public** but **per-IP rate-limited** (`rateLimitUsernameCheckPerHour`, default 120) so it can't bulk-scrape the user list: `GET /auth/username-available?u=<name>` returns `{ "available": true | false }`, so a picker can check live as the user types. Sign-in stays enumeration-safe — a missing or malformed handle is an ordinary `InvalidCredentials`, never a distinct error.
+- **Availability is public** but **per-IP rate-limited** (`rateLimitUsernameCheckPerHour`, default 120) so it can't bulk-scrape the user list: `GET /auth/username-available?u=<name>` returns `{ "available": true | false }` — plus an optional human-readable `reason` (e.g. for reserved names) your picker UI can surface directly, so a picker can check live as the user types. Sign-in stays enumeration-safe — a missing or malformed handle is an ordinary `InvalidCredentials`, never a distinct error.
 - **Optional email:** username mode may still accept an email at sign-up (e.g. for a future reset) — pass both; only the configured identifier is required.
 - **No per-person limit:** anyone can register as many usernames as they like; tune `rateLimitSignUpPerHour` if you want to throttle.
 
@@ -191,7 +191,7 @@ function Account() {
 }
 ```
 
-The signed-in user is **seeded into the server render** (`window.__PYXLE_AUTH__`), so `useAuth` shows the right state on the first frame — no flash of "logged out", no extra round-trip.
+The signed-in user is **seeded into the page** (`window.__PYXLE_AUTH__`), so `useAuth` resolves without a network round-trip and shows the right state from the first post-hydration frame. The server-rendered markup itself renders the logged-out state (session-aware SSR is on the roadmap) — gate any flash-sensitive UI on `useAuth().loading`, or render it client-side.
 
 ### CSRF
 
@@ -213,7 +213,7 @@ curl -s -b jar.txt -H "X-CSRF-Token: $TOKEN" \
      http://localhost:8000/auth/login
 ```
 
-The cookie and header names (and how to customise or exempt paths from the check) are documented in [Security → CSRF protection](../guides/security.md#csrf-protection). For token-authenticated API clients that can't run this dance, see the exempt-paths note under [JWT](#jwt-for-api--mobile-clients).
+The cookie and header names (and how to customise or exempt paths from the check) are documented in [Security → CSRF protection](../guides/security.md#csrf-protection). For token-authenticated API clients that can't run this dance, see the exempt-paths note under [JWT](#jwt-for-api-mobile-clients).
 
 ## Guards
 
