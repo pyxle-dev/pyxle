@@ -138,7 +138,7 @@ a `Starlette` instance with:
 - **Health endpoints** — `/healthz` and `/readyz` for orchestration.
 - **Catch-all 404** — walks up the request path looking for the
   nearest `not-found.pyxl` boundary.
-- **WebSocket route** at `/__pyxle/overlay` — used by the dev
+- **WebSocket route** at `/__pyxle__/overlay` — used by the dev
   overlay client.
 
 ### Middleware stack

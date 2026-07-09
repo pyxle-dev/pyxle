@@ -106,6 +106,8 @@ class DevServer:
         loop = asyncio.get_running_loop()
 
         def _handle_rebuild(stats: WatcherStatistics) -> None:
+            if _notify_rebuild_error(overlay, loop, stats):
+                return
             _maybe_schedule_reload(overlay, loop, stats)
             if stats.summary is None or not stats.summary.any_changes():
                 return
@@ -420,6 +422,43 @@ def _apply_refreshed_routes(app, new_routes, error_boundaries) -> None:
     renderer = getattr(app.state, "ssr_renderer", None)
     if renderer is not None:
         renderer.clear()
+
+
+def _notify_rebuild_error(overlay, loop, stats: WatcherStatistics) -> bool:
+    """Broadcast a failed rebuild to the browser overlay.
+
+    The architecture docs promise that a build failure (e.g. a parser error
+    saved mid-edit) reaches the WebSocket overlay so the browser shows it
+    inline — the watcher thread marshals the notification onto the event
+    loop here. Returns ``True`` when the stats describe a failure (whether
+    or not an overlay is connected), so the caller can stop processing.
+    """
+    if stats.error is None:
+        return False
+    if overlay is not None:
+        changed = ", ".join(
+            path.as_posix() if isinstance(path, Path) else str(path)
+            for path in stats.changed_paths
+        )
+        breadcrumbs = [
+            {
+                "label": "Rebuild",
+                "status": "failed",
+                "detail": f"{stats.error} (changed: {changed or 'unknown'})",
+            }
+        ]
+        try:
+            asyncio.run_coroutine_threadsafe(
+                overlay.notify_error(
+                    route_path="(rebuild)",
+                    error=stats.error,
+                    breadcrumbs=breadcrumbs,
+                ),
+                loop,
+            )
+        except RuntimeError:  # loop shutting down — nothing to notify
+            pass
+    return True
 
 
 def _maybe_schedule_reload(overlay, loop, stats: WatcherStatistics) -> bool:

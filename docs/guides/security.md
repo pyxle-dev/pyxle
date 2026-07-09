@@ -27,7 +27,7 @@ Upgrading from an older Pyxle: a leftover `pyxle-csrf` cookie is simply ignored 
 
 Pyxle never buffers an unbounded request body to find `_csrf_token`:
 
-- `application/x-www-form-urlencoded` bodies are buffered up to 1 MB; a larger body without the header token is rejected with `413`.
+- `application/x-www-form-urlencoded` bodies are buffered up to 1 MiB; a larger body without the header token is rejected with `413`.
 - `multipart/form-data` bodies are **stream-parsed only until the `_csrf_token` field is found** — file parts after the token are passed through to your handler untouched, never buffered by the CSRF layer. `<Form>` renders the hidden token field first, so an upload of any size works out of the box. The scan is capped at 1 MiB of pre-token data; if the field hasn't appeared by then (or isn't present at all), the request is rejected with `403` and a message telling you to send the token in the `x-csrf-token` header or move `_csrf_token` before the file fields.
 
 ### Configuration

@@ -122,11 +122,15 @@ This prints the route table derived from your `pages/` directory:
 ℹ️  Routes for my-app/
 
   Pages:
-  ▶️  /  — pages/index.pyxl  [loader=load_home]
+  ▶️  / — index.pyxl  [loader=load_home]
 
   API Routes:
-  ▶️  /api/pulse  — pages/api/pulse.py
+  ▶️  /api/pulse — api/pulse.py
+
+✅ 2 route(s) found
 ```
+
+Paths are shown relative to `pages/`.
 
 ## 6. Validate your project
 

@@ -983,3 +983,40 @@ def test_invalidate_python_modules_purges_parents(tmp_path: Path) -> None:
     assert "pages" not in sys.modules
     assert "pages.components" not in sys.modules
     assert "pages.components.head" not in sys.modules
+
+
+def test_failed_rebuild_forces_the_next_pass(tmp_path: Path) -> None:
+    """After a failed build, the next trigger runs with force_rebuild=True so a
+    file reverted to its last-good content (hash-identical to the cache) still
+    rebuilds instead of stranding the terminal on 'Rebuild failed'."""
+    root = tmp_path / "project"
+    (root / "pages").mkdir(parents=True)
+    (root / "public").mkdir()
+    settings = DevServerSettings.from_project_root(root)
+
+    calls: list[bool] = []
+    fail_next = {"value": True}
+
+    def build(settings_, *, force_rebuild: bool = False):
+        calls.append(force_rebuild)
+        if fail_next["value"]:
+            fail_next["value"] = False
+            raise ValueError("mid-edit syntax error")
+        return BuildSummary(compiled_pages=["index.pyxl"])
+
+    watcher = ProjectWatcher(
+        settings,
+        logger=make_logger()[0],
+        timer_factory=lambda delay, callback: ManualTimerHandle(callback),
+        build_function=build,
+    )
+
+    watcher.notify_paths([root / "pages" / "index.pyxl"])
+    watcher.flush()  # fails
+    watcher.notify_paths([root / "pages" / "index.pyxl"])
+    watcher.flush()  # revert -> must force
+    watcher.notify_paths([root / "pages" / "index.pyxl"])
+    watcher.flush()  # healthy again -> back to incremental
+
+    assert calls == [False, True, False]
+    assert watcher.latest_statistics is not None and watcher.latest_statistics.error is None

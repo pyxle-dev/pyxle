@@ -260,6 +260,10 @@ class ProjectWatcher:
         )
         self._public_handler = _PublicAssetEventHandler(self._schedule_index_refresh)
         self._latest_stats: WatcherStatistics | None = None
+        # A failed build leaves the change cache unchanged, so reverting a file
+        # to its last-good content would hash-match and be skipped — stranding
+        # the terminal on "Rebuild failed". Force the pass after a failure.
+        self._force_next_rebuild = False
         self._config_warn_handle: _TimerHandle | None = None
         self._index_refresh_handle: _TimerHandle | None = None
 
@@ -421,9 +425,12 @@ class ProjectWatcher:
         files_changed = len(paths)
         self._logger.debug(f"Rebuild triggered — {files_changed} file(s) changed: {formatted}")
 
+        force_rebuild = self._force_next_rebuild
+        self._force_next_rebuild = False
         try:
-            summary = self._build_function(self._settings, force_rebuild=False)
+            summary = self._build_function(self._settings, force_rebuild=force_rebuild)
         except OSError as error:
+            self._force_next_rebuild = True
             elapsed = time.perf_counter() - start
             self._logger.error(f"Filesystem error during rebuild ({elapsed:.2f}s): {error}")
             stats = WatcherStatistics(
@@ -435,7 +442,8 @@ class ProjectWatcher:
             self._latest_stats = stats
             self._emit_rebuild(stats)
             return
-        except Exception as error:  # pragma: no cover - defensive guard
+        except Exception as error:
+            self._force_next_rebuild = True
             elapsed = time.perf_counter() - start
             self._logger.error(f"Rebuild failed ({elapsed:.2f}s): {error}")
             stats = WatcherStatistics(

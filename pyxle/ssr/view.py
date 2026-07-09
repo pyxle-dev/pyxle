@@ -75,7 +75,7 @@ def _missing_state_message(attribute: str) -> str:
         return (
             "request.state.db is not set — it is provided by the pyxle-db "
             'plugin. Add it to pyxle.config.json ("plugins": ["pyxle-db"]) '
-            "and restart the dev server."
+            "and restart the server."
         )
     return (
         f"request.state.{attribute} is not set — state attributes are "

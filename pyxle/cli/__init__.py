@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -110,6 +111,34 @@ def _resolve_run_build():
     from pyxle.build import run_build as _run_build  # noqa: PLC0415
 
     return _run_build
+
+
+def _install_sigterm_keyboard_interrupt(logger: object) -> object:
+    """Convert SIGTERM into ``KeyboardInterrupt`` for the dev-server run loop.
+
+    Returns the previous handler so the caller can restore it, or ``None``
+    when handlers can't be installed here (non-main thread, exotic platform)
+    — in that case shutdown falls back to the interpreter default.
+    """
+
+    def _raise_keyboard_interrupt(signum: int, frame: object) -> None:
+        raise KeyboardInterrupt
+
+    try:
+        return signal.signal(signal.SIGTERM, _raise_keyboard_interrupt)
+    except (ValueError, OSError, AttributeError):  # pragma: no cover - non-main thread
+        return None
+
+
+def _restore_sigterm_handler(previous: object) -> None:
+    """Put back the SIGTERM handler captured before the dev server ran."""
+
+    if previous is None:
+        return
+    try:
+        signal.signal(signal.SIGTERM, previous)  # type: ignore[arg-type]
+    except (ValueError, OSError, TypeError):  # pragma: no cover - non-main thread
+        return
 
 
 def _stdin_is_interactive() -> bool:
@@ -561,13 +590,21 @@ def dev(
 
     server = DevServer(settings, logger=logger, tailwind=tailwind, dashboard=dashboard)  # type: ignore[call-arg]
 
+    # Process managers, IDE stop buttons, and plain `kill` send SIGTERM.
+    # Route it through the same KeyboardInterrupt path as Ctrl-C so the whole
+    # child tree (Vite, esbuild service, SSR workers) is torn down instead of
+    # being orphaned holding its ports.
+    previous_sigterm = _install_sigterm_keyboard_interrupt(logger)
+
     try:
         asyncio.run(server.start())
     except KeyboardInterrupt:  # pragma: no cover - handled manually during runtime
-        logger.warning("Keyboard interrupt received; stopping dev server")
+        logger.warning("Interrupt received; stopping dev server")
     except Exception as exc:  # pragma: no cover - unexpected runtime errors
         logger.error(f"Dev server encountered an error: {exc}")
         raise typer.Exit(code=1) from exc
+    finally:
+        _restore_sigterm_handler(previous_sigterm)
 
 
 @app.command(help="Build production-ready assets for deployment.")
