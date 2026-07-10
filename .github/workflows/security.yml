@@ -1,0 +1,41 @@
+name: Security audit
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "27 5 * * 1" # weekly, Monday 05:27 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pip-audit:
+    name: pip-audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Install the package (editable) first, then audit the resolved runtime
+      # dependencies. Auditing the installed environment — rather than a fresh
+      # dry-run resolve of `.` — avoids tripping on the pyxle-framework /
+      # pyxle-langkit dependency cycle, exactly as the test jobs do.
+      - name: Install the package
+        run: pip install -e .
+
+      - name: Audit installed dependencies
+        run: |
+          pip install pip-audit
+          pip-audit --skip-editable

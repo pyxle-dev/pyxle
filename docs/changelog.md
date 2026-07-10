@@ -4,6 +4,7 @@ Release notes for Pyxle. While we're in beta (`0.x`), minor versions may include
 
 ## Unreleased
 
+- **Security: require Starlette ≥ 1.3.1.** Pyxle was pinned to `starlette>=0.37,<0.38`, holding it on 0.37.2 — which has known advisories including a `Host`-header URL-reconstruction **auth bypass** (PYSEC-2026-161), unbounded form-parsing **DoS** (PYSEC-2026-249, PYSEC-2026-1943), and a Windows `StaticFiles` UNC **SSRF/credential leak** (CVE-2026-48818). The dependency is now `starlette>=1.3.1,<2.0`, which fixes all of them. Pyxle's own API surface is unchanged; upgrade with `pip install --upgrade pyxle-framework`. (Apps that import Starlette internals directly should review the Starlette 1.0 release notes.) A new `pip-audit` CI job guards against dependency regressions going forward.
 - **A fresh project now ships a human `README.md`.** `pyxle init` scaffolded an `AGENTS.md` for AI agents but no README for people; new projects get a README covering prerequisites, the run commands, and the project layout.
 - **The [comparison guide](guides/comparison.md) now names what Pyxle doesn't have yet.** A new "What Pyxle doesn't have yet" section honestly lists the current edges — authoring the client in TypeScript (end-to-end Python types work today; TSX authoring is the [next milestone](guides/fully-typed-pyxle.md)), a first-class test client, automatic image byte- and font-optimization, and i18n — with how to bridge each one now, so the gaps read as roadmap rather than surprises.
 
