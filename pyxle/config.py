@@ -696,7 +696,9 @@ def _parse_network_block(value: Any, key: str, source: Path) -> tuple[str, int]:
 
 
 def _validate_port(value: Any, key: str) -> int:
-    if not isinstance(value, int):
+    # ``bool`` is a subclass of ``int`` — reject it explicitly so ``true``/``false``
+    # in JSON can't silently bind port 1/0 (matches the other integer validators).
+    if not isinstance(value, int) or isinstance(value, bool):
         raise ConfigError(f"Invalid value for '{key}': expected integer port value.")
     if value <= 0 or value > 65535:
         raise ConfigError(f"Port for '{key}' must be between 1 and 65535 (got {value}).")

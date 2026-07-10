@@ -2,6 +2,10 @@
 
 Release notes for Pyxle. While we're in beta (`0.x`), minor versions may include breaking changes — those are called out explicitly here. To upgrade, run `pip install --upgrade pyxle-framework`.
 
+## Unreleased
+
+- **Config: a boolean port is now rejected instead of silently binding port 1.** Because `bool` is a subclass of `int` in Python, `{"starlette": {"port": true}}` slipped past the port validator and bound port `1` (or `0`). `_validate_port` now rejects booleans with a clear `ConfigError`, matching every other integer setting in the config.
+
 ## 0.7.1 — 2026-07-10
 
 - **Security: require Starlette ≥ 1.3.1.** Pyxle was pinned to `starlette>=0.37,<0.38`, holding it on 0.37.2 — which has known advisories including a `Host`-header URL-reconstruction **auth bypass** (PYSEC-2026-161), unbounded form-parsing **DoS** (PYSEC-2026-249, PYSEC-2026-1943), and a Windows `StaticFiles` UNC **SSRF/credential leak** (CVE-2026-48818). The dependency is now `starlette>=1.3.1,<2.0`, which fixes all of them. Pyxle's own API surface is unchanged; upgrade with `pip install --upgrade pyxle-framework`. (Apps that import Starlette internals directly should review the Starlette 1.0 release notes.) A new `pip-audit` CI job guards against dependency regressions going forward.
