@@ -82,7 +82,27 @@ Wrap it in parentheses: `pages/(admin)/dashboard.pyxl` creates the route `/dashb
 
 ### My loader is slow. Can I cache results?
 
-Pyxle does not include built-in caching. Use your own caching strategy:
+Yes. Pyxle has a built-in **page cache**: return a `{"data": ..., "revalidate": <seconds>}`
+envelope from your `@server` loader, and the rendered page (loader result *and* SSR output) is
+served from cache until it goes stale, then refreshed in the background — so a slow loader runs at
+most once per window:
+
+```python
+@server
+async def load_post(request):
+    slug = request.path_params["slug"]
+    return {
+        "data": {"post": await _fetch_post(slug)},
+        "revalidate": 60,   # serve this render from cache for 60s
+    }
+```
+
+Only cache pages that render no per-user data — a cached render is shared with every visitor.
+Loader-less pages opt in with a module-level `CACHE = {"revalidate": N}` directive, and
+`pyxle build --static` pre-renders them at build time (SSG/ISR). See the [Caching guide](guides/caching.md).
+
+To cache just an expensive call *inside* a loader, a plain `functools.lru_cache` on the helper —
+or an async cache like `aiocache` — still works:
 
 ```python
 from functools import lru_cache
@@ -91,14 +111,7 @@ from functools import lru_cache
 def _fetch_post(slug):
     # expensive database call
     ...
-
-@server
-async def load_post(request):
-    slug = request.path_params["slug"]
-    return {"post": _fetch_post(slug)}
 ```
-
-For async caching, consider libraries like `aiocache`.
 
 ### Can I access the database from a loader?
 

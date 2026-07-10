@@ -653,9 +653,13 @@ optimize:
 - **Set worker count to your CPU core count** for production.
   `pyxle dev --ssr-workers 4` on a quad-core gives you four-way
   rendering parallelism.
-- **Cache loader results** if your data changes infrequently. Pyxle
-  doesn't have a built-in HTTP cache; use whatever caching layer
-  fits your stack (Redis, in-memory LRU, CDN).
+- **Cache the rendered page** if your data changes infrequently.
+  Pyxle ships a built-in server-side page cache — return a
+  `{"data": ..., "revalidate": N}` envelope from your loader (or a
+  module-level `CACHE` directive on a loader-less page) to serve the
+  stored HTML without re-running the loader or the Node render. A CDN
+  or a Redis cache backend can sit in front for multi-host
+  deployments. See the [Caching guide](../guides/caching.md).
 - **Don't import heavy modules at module top level.** Each
   hot-reload re-imports the module; deferring expensive imports to
   inside the loader function avoids paying the cost on every save.

@@ -45,7 +45,7 @@ The loader's return value *is* the component's `data` prop. There's no `fetch`, 
 
 ## What's new
 
-Pyxle 0.5.0 — the **depth release** — adds server-side **caching, SSG & ISR**, **streaming SSR**, **realtime WebSockets** (with a cross-worker Redis broker), **Pydantic-validated actions**, **observability**, **background tasks**, image optimization, and **multi-worker serving**. See the full [Changelog](../changelog.md) for release notes.
+Pyxle has grown into a depth-first full-stack framework: server-side **caching, SSG & ISR**, **streaming SSR**, **realtime WebSockets** (with a cross-worker Redis broker for multi-process serving), **Pydantic-validated actions**, **observability**, **background tasks**, **image optimization**, and **multi-worker serving** — plus serving any page as **clean Markdown** with an `llms.txt` index, so AI agents read your app as text. See the full [Changelog](../changelog.md) for what shipped in each release.
 
 ---
 
