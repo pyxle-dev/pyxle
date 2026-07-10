@@ -138,7 +138,7 @@ trade-off is that any **in-process** state is per-worker:
 |---------|----------------------|----------------------------|
 | [Page cache](caching.md) | Each worker has its own in-memory cache | Use the **Redis** backend (`PYXLE_PAGE_CACHE_BACKEND=redis`) — shared across workers and hosts |
 | [WebSocket pub/sub](websockets.md) | Messages reach only clients on the same worker | Use the **Redis** broker (`PYXLE_REALTIME_BROKER=redis`) — relays channels across workers and hosts |
-| [Metrics](observability.md) | `/metrics` reports that worker's numbers (with a `worker` label) | Aggregate at the Prometheus scraper |
+| [Metrics](observability.md) | `/api/__pyxle/metrics` (opt-in via `metricsEndpoint: true`) reports that worker's numbers (with a `worker` label) | Aggregate at the Prometheus scraper |
 | [Background tasks](background-tasks.md) | `pyxle.tasks` queue is per-worker | Use a real job queue (Celery / ARQ / Dramatiq) |
 
 This is by design: Pyxle keeps the default path stateless so workers fork
@@ -168,6 +168,18 @@ For zero-downtime deploys, don't restart Pyxle in place — drain and replace:
 **Blue-green (option 1) is the recommended zero-downtime path** — and it
 sidesteps the question of preloading entirely.
 
+> **Blue-green gotcha — pin the CSRF cookie name and share the secret.** The two
+> instances run on **different ports**, and by default the CSRF cookie is named
+> `pyxle-csrf-<port>` (per-port, so multiple apps on one host don't collide). In
+> a blue-green cutover that backfires: a token the blue instance issued as
+> `pyxle-csrf-8000` is rejected by green on `pyxle-csrf-8001`, so mid-shift POSTs
+> `403`. Pin an explicit, shared name so both instances agree:
+> ```json
+> { "csrf": { "cookieName": "pyxle-csrf" } }
+> ```
+> Both instances must also share the **same `PYXLE_SECRET_KEY`** — a token
+> signed by one is only valid on the other if the signing key matches.
+
 > **A note on preloading.** `pyxle serve` imports each worker's app *after*
 > forking (uvicorn's model), so there's no copy-on-write sharing of read-only
 > state between workers. In practice this rarely matters — Python's per-process
@@ -188,8 +200,16 @@ Set production settings via environment variables:
 export PYXLE_HOST=0.0.0.0
 export PYXLE_PORT=8000
 export PYXLE_DEBUG=false
+export PYXLE_SECRET_KEY=$(python -c "import secrets; print(secrets.token_hex(32))")
 pyxle serve --skip-build
 ```
+
+> **`PYXLE_SECRET_KEY` is required in production.** It signs CSRF tokens and any
+> signed cookies (sessions, unsubscribe links). `pyxle serve` **refuses to
+> start** without it (unless you've set `csrf.enabled=false`). Generate a long
+> random value once and keep it stable — store it in your process manager's
+> environment or a secrets manager, never in the repo. Rotating it invalidates
+> outstanding tokens and signed links.
 
 Or in a `.env.production` file:
 
@@ -202,6 +222,7 @@ PYXLE_PUBLIC_API_URL=https://api.production.com
 
 | Variable | Overrides |
 |----------|-----------|
+| `PYXLE_SECRET_KEY` | Signing secret for CSRF tokens and signed cookies (**required in production**) |
 | `PYXLE_HOST` | Bind address |
 | `PYXLE_PORT` | Port number |
 | `PYXLE_DEBUG` | Debug mode (`true`/`1` or `false`/`0`) |
@@ -327,9 +348,11 @@ Content-hashed client bundles (under `/client/.../dist/assets/`) are already sen
 ```dockerfile
 FROM python:3.12-slim
 
-# Install Node.js
+# Install Node.js — Pyxle requires Node.js >= 20.19 (Vite 7). The 22.x LTS
+# line satisfies that; the older setup_20.x stream can ship 20.16–20.18, which
+# Vite 7 rejects at startup, so use 22.x (or a 20.x image pinned to >= 20.19).
 RUN apt-get update && apt-get install -y curl \
-    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y nodejs \
     && rm -rf /var/lib/apt/lists/*
 
@@ -386,6 +409,9 @@ After=network.target
 User=app
 WorkingDirectory=/srv/myapp
 Environment=PYXLE_DEBUG=false
+# Keep the secret out of the unit file — point at an environment file that is
+# root-owned, chmod 600, and NOT in your repo.
+EnvironmentFile=/etc/myapp/pyxle.env       # contains PYXLE_SECRET_KEY=...
 ExecStart=/srv/myapp/.venv/bin/pyxle serve --skip-build --workers 4 \
     --host 127.0.0.1 --port 8000
 Restart=always
@@ -398,15 +424,48 @@ Build during deployment (`pyxle build`), then `systemctl restart myapp` —
 with `--skip-build` the restart is fast because the unit only boots the
 server. Node.js must be on the service's `PATH` for SSR.
 
+## Database migrations
+
+If your app uses [`pyxle-db`](../plugins/pyxle-db.md), schema changes live as
+checksum-tracked files in `migrations/` and are **applied automatically at
+startup** — so a plain deploy (build, restart) also migrates. For production you
+usually want migrations to be an **explicit, observable deploy step** instead of
+a side effect of the first request:
+
+```bash
+pyxle-db migrate     # apply pending migrations, then start the server
+pyxle serve --skip-build
+```
+
+Guidelines:
+
+- **Run migrations once per deploy, before starting the new server** — not per
+  worker. Each migration is applied exactly once and atomically, so a race is
+  safe, but running it up front keeps the outcome visible in your deploy logs.
+- **Never edit an already-applied migration** — the checksum tracker rejects it.
+  Add a new migration file instead.
+- **For zero-downtime (blue-green) deploys, keep migrations backward-compatible**
+  with the currently-running version (expand, then contract): add columns/tables
+  in one release, backfill, and only drop the old shape in a later release once no
+  instance references it. A destructive migration applied while the old instance
+  is still serving will break it mid-cutover.
+
+Using the ORM path? Drive Alembic as your migration step instead — pick one
+migration tool per app. See [pyxle-db → Migrations](../plugins/pyxle-db.md#migrations).
+
 ## Checklist
 
 Before deploying:
 
 - [ ] `pyxle check` passes with no errors
 - [ ] `pyxle build` completes successfully
+- [ ] Node.js is `>= 20.19` on the server's `PATH`
 - [ ] Set `PYXLE_DEBUG=false` in production
+- [ ] Set `PYXLE_SECRET_KEY` to a long random value (**required** — `pyxle serve` won't start without it)
+- [ ] Apply database migrations, if you use `pyxle-db` (see below)
 - [ ] Size `--workers` to the machine's CPU cores (multi-core serving)
 - [ ] Configure CSRF `cookieSecure: true` if using HTTPS
+- [ ] Pin a shared `csrf.cookieName` **and** `PYXLE_SECRET_KEY` across instances for blue-green deploys
 - [ ] Add CORS origins if serving APIs to other domains
 - [ ] Set up a reverse proxy for TLS
 - [ ] Declare publicly-cacheable routes in the `cache` block (and opt your CDN in)
