@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pyxle-framework"
-version = "0.7.1"
+version = "0.7.2"
 description = "Python-first full-stack framework with an intelligent CLI."
 readme = "README.md"
 authors = [
