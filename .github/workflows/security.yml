@@ -28,7 +28,14 @@ jobs:
         with:
           python-version: "3.12"
 
+      # Install the package (editable) first, then audit the resolved runtime
+      # dependencies. Auditing the installed environment — rather than a fresh
+      # dry-run resolve of `.` — avoids tripping on the pyxle-framework /
+      # pyxle-langkit dependency cycle, exactly as the test jobs do.
+      - name: Install the package
+        run: pip install -e .
+
       - name: Audit installed dependencies
-        uses: pypa/gh-action-pip-audit@v1.1.0
-        with:
-          inputs: .
+        run: |
+          pip install pip-audit
+          pip-audit --skip-editable
