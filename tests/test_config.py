@@ -68,6 +68,25 @@ def test_load_config_rejects_invalid_navigation_ttl(tmp_path: Path, bad: object)
     assert "defaultPrefetchTtl" in str(excinfo.value)
 
 
+@pytest.mark.parametrize(
+    "block",
+    [
+        {"starlette": {"port": True}},
+        {"starlette": {"port": False}},
+        {"vite": {"port": True}},
+    ],
+)
+def test_load_config_rejects_bool_port(tmp_path: Path, block: dict) -> None:
+    # ``bool`` is an ``int`` subclass; a JSON ``true`` must not silently bind
+    # port 1 — the validator rejects it like any other non-integer.
+    write_config(tmp_path, block)
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(tmp_path)
+
+    assert "port" in str(excinfo.value).lower()
+
+
 def test_load_config_rejects_non_object_navigation_block(tmp_path: Path) -> None:
     write_config(tmp_path, {"navigation": "nope"})
 
