@@ -61,6 +61,17 @@ Its execution model — the script re-runs top to bottom on every interaction �
 
 **Use Streamlit instead** for data and ML dashboards and quick analytical apps. **Reach for Pyxle** when you're building a general-purpose web application rather than a data tool.
 
+## What Pyxle doesn't have yet
+
+Pyxle is young and deliberately dependency-light, so some things you may expect from a mature React stack aren't built in yet. Here's an honest list and how to bridge each one today:
+
+- **Authoring your client in TypeScript.** Pyxle already gives you *end-to-end Python types* (typed `@server` loaders and Pydantic-validated `@action` bodies) and consumes typed npm packages, and `pyxle check` / `pyxle typecheck` validate your code. What's not here yet is writing the client block itself in **TSX** with types forwarded across the Python↔React boundary. That's the next milestone — see [the road to a fully-typed Pyxle](fully-typed-pyxle.md). JavaScript is fully first-class in the meantime.
+- **A first-class test client.** You can unit-test loaders and actions and write end-to-end tests today (see [Testing](testing.md)); an in-process `PyxleTestClient` that drives pages and actions without managing a server is on the roadmap.
+- **Automatic image byte-optimization and font optimization.** The built-in [`<Image>`](build-optimization.md) gives you responsive `srcset`, lazy-loading, and priority hints (layout parity with `next/image`), but *byte* optimization (resizing/format conversion) is opt-in via an image loader/CDN, not automatic. There's no `next/font` equivalent yet — self-host fonts with `@font-face` and `font-display: swap`.
+- **Internationalization.** There's no built-in i18n routing or message system yet. Use a React i18n library (e.g. `react-i18next`) in your client components, with the locale resolved in a `@server` loader.
+
+None of these block shipping a real app — they're the honest edges of a fast-moving 0.x, listed so you know exactly where you stand.
+
 ## So which should you choose?
 
 **Choose Pyxle when** you want a real React frontend *and* a Python backend without running two services, you value predictable conventions (for yourself or your AI agent), and you're happy being an early adopter of a framework that's moving quickly.
