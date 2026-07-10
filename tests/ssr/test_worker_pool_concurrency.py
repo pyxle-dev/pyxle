@@ -87,7 +87,7 @@ async def test_render_in_flight_returns_to_zero_after_success(tmp_path: Path) ->
     worker.alive = True
     worker.in_flight = 0
 
-    async def fake_send(payload: dict) -> dict:
+    async def fake_send(payload: dict, *, line: bytes | None = None) -> dict:
         # in_flight must reflect the active dispatch while the worker is busy.
         assert worker.in_flight == 1
         return {"id": payload["id"], "ok": True, "html": "<x/>"}

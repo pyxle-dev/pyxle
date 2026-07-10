@@ -46,6 +46,20 @@ def write_file(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
 
 
+@pytest.fixture(autouse=True)
+def _reset_layout_metadata_cache():
+    """Start every test with an empty layout-metadata cache.
+
+    The cache is module-level and keyed by absolute path; resetting keeps a
+    test that reuses a path from ever seeing a prior test's cached parse.
+    """
+    from pyxle.devserver.registry import invalidate_metadata_cache
+
+    invalidate_metadata_cache()
+    yield
+    invalidate_metadata_cache()
+
+
 def test_metadata_registry_includes_pages_and_apis(project: DevServerSettings) -> None:
     build_once(project)
 
@@ -400,4 +414,180 @@ def test_find_layout_loaders_nested_hierarchy(project: DevServerSettings) -> Non
     # Closest layout first
     assert loaders[0].loader_name == "load_posts"
     assert loaders[1].loader_name == "load_root"
+
+
+# ---------------------------------------------------------------------------
+# Layout-metadata cache (SSR hot-path optimization)
+# ---------------------------------------------------------------------------
+
+
+def _write_layout_metadata(path: Path, head_block: str) -> None:
+    """Write a minimal, valid layout metadata JSON file at *path*."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "route_path": "/layout",
+                "client_path": "/pages/layout.jsx",
+                "server_path": "/pages/layout.py",
+                "head_jsx_blocks": [head_block],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_load_page_metadata_cached_avoids_reread(tmp_path: Path, monkeypatch) -> None:
+    """A warm cache serves the parsed metadata without touching disk again."""
+    import pyxle.devserver.registry as registry_module
+
+    path = tmp_path / "layout.json"
+    _write_layout_metadata(path, "<title>V1</title>")
+
+    reads: list[Path] = []
+    original = registry_module._load_page_metadata
+
+    def counting_load(p: Path):
+        reads.append(p)
+        return original(p)
+
+    monkeypatch.setattr(registry_module, "_load_page_metadata", counting_load)
+
+    first = registry_module._load_page_metadata_cached(path)
+    second = registry_module._load_page_metadata_cached(path)
+
+    assert first is not None
+    assert first.head_jsx_blocks == ("<title>V1</title>",)
+    # Same parsed object returned from cache; the disk reader ran exactly once.
+    assert second is first
+    assert reads == [path]
+
+
+def test_metadata_cache_invalidation_picks_up_edits(tmp_path: Path) -> None:
+    """An on-disk edit is only observed after the cache is invalidated."""
+    from pyxle.devserver.registry import (
+        _load_page_metadata_cached,
+        invalidate_metadata_cache,
+    )
+
+    path = tmp_path / "layout.json"
+    _write_layout_metadata(path, "<title>V1</title>")
+
+    assert _load_page_metadata_cached(path).head_jsx_blocks == ("<title>V1</title>",)
+
+    # Edit the file: the cache must keep serving the old parse until invalidated.
+    _write_layout_metadata(path, "<title>V2</title>")
+    assert _load_page_metadata_cached(path).head_jsx_blocks == ("<title>V1</title>",)
+
+    invalidate_metadata_cache()
+    assert _load_page_metadata_cached(path).head_jsx_blocks == ("<title>V2</title>",)
+
+
+def test_metadata_cache_skips_store_on_racing_invalidation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A read whose generation was bumped mid-parse is returned but not cached.
+
+    Models the dev watcher thread invalidating the cache while a request is
+    parsing a layout file: the in-flight result is handed back to its caller,
+    but caching it would pin a value the rebuild superseded, so it is dropped
+    and the next caller re-reads.
+    """
+    import pyxle.devserver.registry as registry_module
+
+    path = tmp_path / "layout.json"
+    _write_layout_metadata(path, "<title>V1</title>")
+
+    original = registry_module._load_page_metadata
+
+    def load_then_invalidate(p: Path):
+        result = original(p)
+        # Simulate a concurrent rebuild landing while this parse is in flight.
+        registry_module.invalidate_metadata_cache()
+        return result
+
+    monkeypatch.setattr(registry_module, "_load_page_metadata", load_then_invalidate)
+
+    value = registry_module._load_page_metadata_cached(path)
+    assert value.head_jsx_blocks == ("<title>V1</title>",)
+    # The racing invalidation means nothing was cached under the stale key.
+    with registry_module._metadata_cache_lock:
+        assert path not in registry_module._metadata_cache
+
+
+def test_find_layout_walks_share_metadata_cache(tmp_path: Path, monkeypatch) -> None:
+    """The head-block and loader walks read each layout file from one cache."""
+    import pyxle.devserver.registry as registry_module
+    from pyxle.devserver.registry import (
+        find_layout_head_jsx_blocks,
+        find_layout_loaders,
+    )
+
+    settings = DevServerSettings.from_project_root(tmp_path / "project")
+    layout_json = (
+        settings.metadata_build_dir / "pages" / "layout.json"
+    )
+    layout_json.parent.mkdir(parents=True, exist_ok=True)
+    layout_json.write_text(
+        json.dumps(
+            {
+                "route_path": "/layout",
+                "client_path": "/pages/layout.jsx",
+                "server_path": "/pages/layout.py",
+                "head_jsx_blocks": ["<title>Shared</title>"],
+                "loader_name": "load_layout",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    reads: list[Path] = []
+    original = registry_module._load_page_metadata
+
+    def counting_load(p: Path):
+        reads.append(p)
+        return original(p)
+
+    monkeypatch.setattr(registry_module, "_load_page_metadata", counting_load)
+
+    blocks = find_layout_head_jsx_blocks(settings, Path("index.pyxl"))
+    loaders = find_layout_loaders(settings, Path("index.pyxl"))
+
+    assert any("<title>Shared</title>" in block for block in blocks)
+    assert len(loaders) == 1 and loaders[0].loader_name == "load_layout"
+    # Both walks visited layout.json but the shared cache read it from disk once.
+    assert reads.count(layout_json) == 1
+
+
+def test_find_layout_head_jsx_blocks_hot_reload(project: DevServerSettings) -> None:
+    """Rebuilding the registry re-reads an edited layout (dev hot-reload).
+
+    Proves the cache invalidation contract end-to-end: after a layout's
+    compiled metadata changes on disk, ``build_metadata_registry`` (which the
+    dev route-table refresh runs on every rebuild) drops the stale parse so the
+    next render sees the new ``<Head>`` blocks.
+    """
+    from pyxle.devserver.registry import find_layout_head_jsx_blocks
+
+    write_file(
+        project.pages_dir / "layout.pyxl",
+        """\n\nimport React from 'react';\n\nexport default function Layout({ children }) {\n    return <div>{children}</div>;\n}\n<Head>\n<meta name='layout-version' content='v1'/>\n</Head>\n""",
+    )
+    build_once(project)
+    build_metadata_registry(project)  # warms the cache for this generation
+
+    blocks = find_layout_head_jsx_blocks(project, Path("index.pyxl"))
+    assert any("v1" in block for block in blocks)
+
+    # Edit the layout and rebuild, exactly as the dev watcher does.
+    write_file(
+        project.pages_dir / "layout.pyxl",
+        """\n\nimport React from 'react';\n\nexport default function Layout({ children }) {\n    return <div>{children}</div>;\n}\n<Head>\n<meta name='layout-version' content='v2'/>\n</Head>\n""",
+    )
+    build_once(project)
+    build_metadata_registry(project)  # bumps the generation -> drops stale parse
+
+    refreshed = find_layout_head_jsx_blocks(project, Path("index.pyxl"))
+    assert any("v2" in block for block in refreshed)
+    assert not any("v1" in block for block in refreshed)
 

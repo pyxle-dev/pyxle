@@ -575,7 +575,7 @@ async function main() {
  * cache entry must never carry another page's styles. The caller replays the
  * returned descriptors into the active render's registry.
  */
-async function resolveComponentBundle(resolvedPath, componentPath, workingDir, projectRoot, skipInlineCss) {
+async function resolveComponentBundle(resolvedPath, componentPath, workingDir, projectRoot) {
   const cached = _bundleCache.get(resolvedPath);
   if (cached) {
     return cached;
@@ -586,6 +586,13 @@ async function resolveComponentBundle(resolvedPath, componentPath, workingDir, p
   if (pending) {
     return pending;
   }
+
+  // Whether Vite (not esbuild's inline-css plugin) owns CSS for this project.
+  // Only the esbuild ``onLoad`` plugin below consumes it, and that runs solely
+  // on this cache-miss compile — so it is detected here, per bundle build,
+  // rather than on every warm-bundle render.
+  const skipInlineCss =
+    detectPostcssConfig(projectRoot) !== null || detectTailwindVite(projectRoot);
 
   const registry = createStyleRegistry(projectRoot);
   // The ``pyxle-inline-css`` plugin below emits module code that registers each
@@ -800,15 +807,13 @@ async function loadComponentForRender({
 
   // Fresh registries for each render (head/style depend on props/render).
   const styleRegistry = createStyleRegistry(projectRoot);
-  const skipInlineCss =
-    detectPostcssConfig(projectRoot) !== null || detectTailwindVite(projectRoot);
 
   const headRegistry = createHeadRegistry();
 
   // Load the page bundle and replay its (isolated) style descriptors into this
   // render's registry.
   const pageBundle = await resolveComponentBundle(
-    resolvedComponentPath, componentPath, workingDir, projectRoot, skipInlineCss,
+    resolvedComponentPath, componentPath, workingDir, projectRoot,
   );
   for (const descriptor of pageBundle.styleDescriptors) {
     styleRegistry.register(descriptor);
@@ -821,7 +826,7 @@ async function loadComponentForRender({
   if (fallbackPath) {
     const resolvedFallbackPath = path.resolve(fallbackPath);
     const fallbackBundle = await resolveComponentBundle(
-      resolvedFallbackPath, fallbackPath, workingDir, projectRoot, skipInlineCss,
+      resolvedFallbackPath, fallbackPath, workingDir, projectRoot,
     );
     for (const descriptor of fallbackBundle.styleDescriptors) {
       styleRegistry.register(descriptor);

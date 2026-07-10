@@ -2,6 +2,10 @@
 
 Release notes for Pyxle. While we're in beta (`0.x`), minor versions may include breaking changes — those are called out explicitly here. To upgrade, run `pip install --upgrade pyxle-framework`.
 
+## Unreleased
+
+- **Faster SSR: the render hot path no longer does redundant per-request work.** Every page render previously read each ancestor `layout.pyxl`/`template.pyxl` metadata file **from disk twice** (once for `<Head>` blocks, once for layout loaders), serialized the component props **twice** (a throwaway validation encode plus the transport encode), and resolved the component path **twice**. These are now done once: layout metadata is memoized behind a generation counter that's invalidated on every route rebuild (so dev hot-reload still picks up edited layouts immediately), props are serialized exactly once and spliced into the worker transport line, and the resolved path is reused. Rendered output is byte-for-byte identical; the streaming/concurrency isolation is untouched. Removes synchronous disk I/O from the SSR request path.
+
 ## 0.7.1 — 2026-07-10
 
 - **Security: require Starlette ≥ 1.3.1.** Pyxle was pinned to `starlette>=0.37,<0.38`, holding it on 0.37.2 — which has known advisories including a `Host`-header URL-reconstruction **auth bypass** (PYSEC-2026-161), unbounded form-parsing **DoS** (PYSEC-2026-249, PYSEC-2026-1943), and a Windows `StaticFiles` UNC **SSRF/credential leak** (CVE-2026-48818). The dependency is now `starlette>=1.3.1,<2.0`, which fixes all of them. Pyxle's own API surface is unchanged; upgrade with `pip install --upgrade pyxle-framework`. (Apps that import Starlette internals directly should review the Starlette 1.0 release notes.) A new `pip-audit` CI job guards against dependency regressions going forward.

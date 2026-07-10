@@ -893,6 +893,108 @@ async def test_pool_render_factory_raises_on_unserializable_props() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Single-serialization / single-resolve transport (SSR hot-path optimization)
+# ---------------------------------------------------------------------------
+
+
+def test_encode_render_line_splice_matches_full_encode() -> None:
+    """Splicing pre-serialized props yields the same data as a full encode."""
+    from pyxle.ssr.worker_pool import _encode_render_line
+
+    payload = {
+        "id": "abc",
+        "componentPath": "/c.jsx",
+        "clientRoot": "/cr",
+        "projectRoot": "/pr",
+    }
+    props = {"title": "Hi", "n": 2, "emoji": "🚀"}
+    serialized = json.dumps(props, ensure_ascii=False, separators=(",", ":"))
+
+    spliced = _encode_render_line(dict(payload), props, serialized)
+    full = _encode_render_line(dict(payload), props, None)
+
+    assert spliced.endswith(b"\n") and full.endswith(b"\n")
+    parsed_spliced = json.loads(spliced.decode("utf-8"))
+    parsed_full = json.loads(full.decode("utf-8"))
+    # Same decoded document regardless of which path built the line.
+    assert parsed_spliced == parsed_full
+    assert parsed_spliced["props"] == props
+    assert parsed_spliced["id"] == "abc"
+
+
+@pytest.mark.anyio
+async def test_pool_render_uses_pre_serialized_props_and_resolved_path(
+    tmp_path: Path,
+) -> None:
+    """render() splices caller-provided props JSON and skips re-resolving path."""
+    project_root = tmp_path / "project"
+    client_root = project_root / ".pyxle-build" / "client"
+    project_root.mkdir(parents=True)
+    client_root.mkdir(parents=True)
+    component = client_root / "pages" / "page.jsx"
+    component.parent.mkdir(parents=True)
+    component.touch()
+
+    captured_payloads: list[dict[str, Any]] = []
+    read_queue: asyncio.Queue = asyncio.Queue()
+
+    async def fake_read(n: int = -1) -> bytes:
+        return await read_queue.get()
+
+    mock_proc = MagicMock()
+    mock_proc.stdin = MagicMock()
+    mock_proc.stdin.is_closing.return_value = False
+    mock_proc.stdin.close = MagicMock()
+    mock_proc.stdout = MagicMock()
+    mock_proc.stdout.read = fake_read
+    mock_proc.wait = AsyncMock(return_value=0)
+    mock_proc.kill = MagicMock()
+
+    def capture_write(data: bytes) -> None:
+        payload = json.loads(data.decode().strip())
+        captured_payloads.append(payload)
+        read_queue.put_nowait(
+            (
+                json.dumps(
+                    {"id": payload["id"], "ok": True, "html": "<x/>", "styles": [], "headElements": []}
+                )
+                + "\n"
+            ).encode()
+        )
+
+    mock_proc.stdin.write = MagicMock(side_effect=capture_write)
+    mock_proc.stdin.drain = AsyncMock()
+
+    props = {"title": "Hi", "n": 2}
+    serialized = json.dumps(props, ensure_ascii=False, separators=(",", ":"))
+
+    with (
+        patch("pyxle.ssr.worker_pool.shutil.which", return_value="/usr/bin/node"),
+        patch(
+            "pyxle.ssr.worker_pool.asyncio.create_subprocess_exec",
+            new_callable=AsyncMock,
+            return_value=mock_proc,
+        ),
+        patch("pyxle.ssr.worker_pool.Path.exists", return_value=True),
+    ):
+        pool = SsrWorkerPool(size=1, project_root=project_root, client_root=client_root)
+        await pool.start()
+        await pool.render(
+            component,
+            props,
+            serialized_props=serialized,
+            resolved_component_path="/custom/resolved/page.jsx",
+        )
+        await pool.stop()
+
+    sent = captured_payloads[0]
+    # Props survived the splice intact...
+    assert sent["props"] == props
+    # ...and the caller's resolved path was used verbatim (no second realpath).
+    assert sent["componentPath"] == "/custom/resolved/page.jsx"
+
+
+# ---------------------------------------------------------------------------
 # settings.py integration
 # ---------------------------------------------------------------------------
 

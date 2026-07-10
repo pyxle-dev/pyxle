@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -13,6 +14,76 @@ from .build import BuildMetadata, load_build_metadata
 from .path_utils import route_path_variants_from_relative
 from .scanner import SourceKind
 from .settings import DevServerSettings
+
+# ---------------------------------------------------------------------------
+# Layout-metadata cache (SSR hot path)
+# ---------------------------------------------------------------------------
+#
+# Every SSR page render walks the page's ancestor directories for layout.pyxl /
+# template.pyxl metadata twice — once for their ``<Head>`` blocks
+# (``find_layout_head_jsx_blocks``) and once for their ``@server`` loaders
+# (``find_layout_loaders``). Both walks parse the SAME immutable build
+# artifacts under ``<build>/metadata/`` from disk, so uncached they charge two
+# ``open()`` + ``json.load()`` calls per layout file to *every* request.
+#
+# The metadata JSON is regenerated only when the route tree is rebuilt (dev
+# hot-reload) — never between requests within a ``pyxle serve`` run — so we
+# memoize each file's parsed result and invalidate the whole cache exactly when
+# a rebuild happens (see ``invalidate_metadata_cache``, called at the top of
+# ``build_metadata_registry``). Keying on a monotonically increasing
+# *generation* lets a read that started before an invalidation drop its result
+# instead of caching a value the rebuild superseded.
+#
+# Eviction: the cache is cleared on every generation bump, so it never holds
+# more than one route generation's worth of files (a handful, bounded by the
+# project's directory depth). Access is guarded by a lock because the dev
+# watcher thread invalidates while event-loop request handlers read.
+_metadata_cache: Dict[Path, Optional[PageMetadata]] = {}
+_metadata_cache_generation = 0
+_metadata_cache_lock = threading.Lock()
+
+
+def invalidate_metadata_cache() -> None:
+    """Drop all memoized page/layout metadata and start a new generation.
+
+    Called whenever the route tree is (re)built so a dev hot-reload picks up an
+    edited ``layout.pyxl`` / ``template.pyxl`` (its new ``<Head>`` blocks or
+    ``@server`` loader) instead of serving the previous generation's cached
+    parse. A no-op cost in production ``serve``, where it runs once at startup.
+    """
+    global _metadata_cache_generation
+    with _metadata_cache_lock:
+        _metadata_cache_generation += 1
+        _metadata_cache.clear()
+
+
+def _load_page_metadata_cached(path: Path) -> Optional[PageMetadata]:
+    """Memoized :func:`_load_page_metadata` for the per-request layout walk.
+
+    Returns the cached parse when present; otherwise reads and parses the file
+    once (off the lock, so concurrent requests never serialize on disk I/O) and
+    stores it under the current generation. A parse that races an
+    :func:`invalidate_metadata_cache` (generation changed mid-read) is returned
+    to this caller but not cached, so the next caller re-reads fresh.
+    """
+    with _metadata_cache_lock:
+        generation = _metadata_cache_generation
+        cached = _metadata_cache.get(path, _CACHE_MISS)
+        if cached is not _CACHE_MISS:
+            return cached  # type: ignore[return-value]
+
+    metadata = _load_page_metadata(path)
+
+    with _metadata_cache_lock:
+        if generation == _metadata_cache_generation:
+            _metadata_cache[path] = metadata
+    return metadata
+
+
+#: Sentinel distinguishing "not cached" from a cached ``None`` (a file that is
+#: absent or malformed parses to ``None``, and that negative result is worth
+#: caching too so a missing layout isn't re-stat'd every request).
+_CACHE_MISS = object()
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,6 +203,11 @@ def build_metadata_registry(
     metadata: BuildMetadata | None = None,
 ) -> MetadataRegistry:
     """Derive routing metadata for pages and APIs."""
+
+    # A fresh route tree supersedes any previously cached layout metadata:
+    # start a new cache generation so an edited layout is re-read on the next
+    # render (dev hot-reload) rather than served stale from the prior build.
+    invalidate_metadata_cache()
 
     metadata = metadata or load_build_metadata(settings.build_root)
 
@@ -412,7 +488,7 @@ def find_layout_head_jsx_blocks(
             if ancestor_dir == Path("."):
                 metadata_path = settings.metadata_build_dir / "pages" / Path(filename).with_suffix(".json")
             
-            metadata = _load_page_metadata(metadata_path)
+            metadata = _load_page_metadata_cached(metadata_path)
             if metadata is not None:
                 # Include both JSX Head blocks and legacy HEAD variable elements
                 if metadata.head_jsx_blocks:
@@ -465,7 +541,7 @@ def find_layout_loaders(
             if ancestor_dir == Path("."):
                 metadata_path = settings.metadata_build_dir / "pages" / Path(filename).with_suffix(".json")
 
-            metadata = _load_page_metadata(metadata_path)
+            metadata = _load_page_metadata_cached(metadata_path)
             if metadata is None or not metadata.loader_name:
                 continue
 

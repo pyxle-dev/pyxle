@@ -59,6 +59,33 @@ def _build_node_env(project_root: Path) -> dict[str, str]:
     return env
 
 
+def _encode_render_line(
+    payload: dict[str, Any],
+    props: dict[str, Any],
+    serialized_props: str | None,
+) -> bytes:
+    """Encode a render request's newline-delimited JSON transport line.
+
+    ``payload`` carries every field except ``props``. When ``serialized_props``
+    is supplied — the caller already JSON-encoded ``props`` (which doubles as
+    the serializability check) — it is spliced in verbatim so ``props`` is
+    encoded exactly once per render instead of once to validate and again to
+    transport; otherwise ``props`` is encoded here with the rest. Explicit
+    UTF-8 keeps the transport locale-independent so astral characters (e.g. an
+    emoji in a prop) survive the Python↔Node round-trip.
+    """
+    if serialized_props is None:
+        full = {**payload, "props": props}
+        return (
+            json.dumps(full, ensure_ascii=False, separators=(",", ":")) + "\n"
+        ).encode("utf-8")
+    # ``payload`` always carries at least "id", so its encoding is a non-empty
+    # JSON object; splice the pre-encoded props before the closing brace to keep
+    # the line a single valid JSON document.
+    meta = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    return (meta[:-1] + ',"props":' + serialized_props + "}\n").encode("utf-8")
+
+
 class WorkerPoolError(RuntimeError):
     """Raised when the worker pool cannot process a render request."""
 
@@ -82,19 +109,31 @@ class _WorkerState:
     in_flight: int = 0
     reader_task: asyncio.Task[None] | None = field(default=None, compare=False, repr=False)
 
-    async def send(self, payload: dict[str, Any]) -> dict[str, Any]:
+    async def send(
+        self, payload: dict[str, Any], *, line: bytes | None = None
+    ) -> dict[str, Any]:
         """Write a request to the worker and await its response.
+
+        ``line`` is the pre-encoded NDJSON transport line (including its
+        trailing newline). The pool passes it so a render's props — already
+        serialized once by the caller for validation — are not re-encoded here;
+        callers that omit it (e.g. :meth:`SsrWorkerPool.invalidate`) have the
+        small payload encoded inline. ``payload`` is still required so the
+        response future can be keyed by its ``id``.
 
         Raises WorkerPoolError if the worker stdin is closed or dies mid-flight.
         """
         request_id: str = payload["id"]
+        # Explicit UTF-8 so the worker transport never depends on the locale
+        # (astral chars like emoji must survive the Python↔Node round-trip).
+        # Encoded before the future is registered so a serialization failure
+        # can't orphan a pending entry.
+        if line is None:
+            line = (json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
         loop = asyncio.get_running_loop()
         future: asyncio.Future[dict[str, Any]] = loop.create_future()
         self.pending[request_id] = future
 
-        # Explicit UTF-8 so the worker transport never depends on the locale
-        # (astral chars like emoji must survive the Python↔Node round-trip).
-        line = (json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
         assert self.process.stdin is not None  # guaranteed by _spawn_worker
         self.process.stdin.write(line)
         try:
@@ -318,6 +357,8 @@ class SsrWorkerPool:
         *,
         request_pathname: str | None = None,
         csrf_token: str | None = None,
+        serialized_props: str | None = None,
+        resolved_component_path: str | None = None,
     ) -> dict[str, Any]:
         """Send a render request to the next available worker.
 
@@ -330,6 +371,15 @@ class SsrWorkerPool:
         ``globalThis.__PYXLE_CSRF_TOKEN__``. ``<Form>`` reads it at SSR
         time so a no-JS submission can carry a hidden ``_csrf_token``
         field that satisfies the CSRF middleware.
+
+        ``serialized_props`` is the caller's already-JSON-encoded ``props``
+        (same encoding this method would produce). When provided it is spliced
+        straight into the transport line so a large loader payload is encoded
+        exactly once for the whole render, not once to validate and again to
+        send. ``resolved_component_path`` is the caller's already-``resolve()``d
+        component path string, passed to avoid a second ``realpath`` syscall
+        when the renderer resolved it for its cache key. Both are optional; a
+        direct caller may omit them and this method encodes/resolves itself.
 
         Auto-starts the pool on first call if :meth:`start` was not called
         explicitly.  Raises :class:`WorkerPoolError` if no healthy workers
@@ -347,8 +397,9 @@ class SsrWorkerPool:
         request_id = str(uuid.uuid4())
         payload: dict[str, Any] = {
             "id": request_id,
-            "componentPath": str(component_path.resolve()),
-            "props": props,
+            "componentPath": resolved_component_path
+            if resolved_component_path is not None
+            else str(component_path.resolve()),
             "clientRoot": str(self._client_root),
             "projectRoot": str(self._project_root),
         }
@@ -357,10 +408,12 @@ class SsrWorkerPool:
         if csrf_token is not None:
             payload["csrfToken"] = csrf_token
 
+        line = _encode_render_line(payload, props, serialized_props)
+
         worker.in_flight += 1
         try:
             result = await asyncio.wait_for(
-                worker.send(payload), timeout=self._render_timeout
+                worker.send(payload, line=line), timeout=self._render_timeout
             )
         except asyncio.TimeoutError:
             self._workers = [w for w in self._workers if w is not worker]

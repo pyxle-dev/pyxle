@@ -503,6 +503,11 @@ def pool_render_factory(pool: Any) -> _RenderFactory:
     from pyxle.ssr.worker_pool import WorkerPoolError
 
     def factory(component_path: Path) -> _RenderCallable:
+        # ``ComponentRenderer.render`` already resolved this path for its cache
+        # key, so its string form is the resolved path. Pass it through so
+        # ``pool.render`` need not run a second ``realpath`` syscall per render.
+        resolved_component_path = str(component_path)
+
         async def _render(
             props: Dict[str, Any],
             *,
@@ -510,8 +515,12 @@ def pool_render_factory(pool: Any) -> _RenderFactory:
             csrf_token: str | None = None,
         ) -> RenderResult:
             try:
-                # Validate JSON-serializability without a redundant round-trip.
-                json.dumps(props, ensure_ascii=False, separators=(",", ":"))
+                # Serialize props exactly once: this both validates them and is
+                # the exact JSON the worker transport reuses, so a large loader
+                # payload is never encoded twice per render.
+                serialized_props = json.dumps(
+                    props, ensure_ascii=False, separators=(",", ":")
+                )
             except (TypeError, ValueError) as exc:
                 raise ComponentRenderError(
                     f"Unable to serialize props for component '{component_path.name}'"
@@ -523,6 +532,8 @@ def pool_render_factory(pool: Any) -> _RenderFactory:
                     props,
                     request_pathname=request_pathname,
                     csrf_token=csrf_token,
+                    serialized_props=serialized_props,
+                    resolved_component_path=resolved_component_path,
                 )
             except WorkerPoolError as exc:
                 raise ComponentRenderError(str(exc)) from exc
