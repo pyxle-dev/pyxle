@@ -226,6 +226,8 @@ def test_devserver_start_runs_with_stubbed_uvicorn(monkeypatch, tmp_path: Path) 
     monkeypatch.setattr("pyxle.devserver.uvicorn.Server", StubServer)
 
     class StubVite:
+        # A Vite process that started and became ready is running.
+        running = True
         def __init__(self, cfg: DevServerSettings, *, logger: ConsoleLogger, **_: object) -> None:
             self.started = False
             self.ready = False

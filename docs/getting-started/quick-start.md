@@ -2,6 +2,8 @@
 
 Create a working Pyxle app in under 5 minutes.
 
+> **Before you start:** Pyxle needs **Python 3.10+** and **Node.js 20.19+** (for Vite 7 and React 19). Run `python3 --version` and `node --version` to check. On the wrong version, `pip install` or `pyxle dev` fails with a version error — see [Installation → Troubleshooting](installation.md#troubleshooting).
+
 ## 1. Scaffold a new project
 
 ```bash

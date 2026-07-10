@@ -199,7 +199,18 @@ class DevServer:
             if settings.debug and overlay is not None:
                 log_forwarder = _attach_log_forwarding(overlay, loop, logger)
 
-            self._log_ready_summary(logger, settings, route_table, start_time)
+            # Only advertise "ready" if Vite is genuinely still up. On an
+            # unsupported toolchain Vite can pass the readiness probe and then
+            # crash-loop; printing the success banner beside a red Vite fatal is
+            # the worst signal, so surface the failure instead.
+            if vite_process is not None and not vite_process.running:
+                logger.error(
+                    "Vite exited immediately after starting; the dev server is "
+                    "not ready. Check the Vite output above (an unsupported "
+                    "Node.js version is the most common cause)."
+                )
+            else:
+                self._log_ready_summary(logger, settings, route_table, start_time)
             dashboard_task = self._start_dashboard(app, loop)
             try:
                 await server.serve()
