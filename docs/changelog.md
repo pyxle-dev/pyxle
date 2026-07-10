@@ -2,6 +2,10 @@
 
 Release notes for Pyxle. While we're in beta (`0.x`), minor versions may include breaking changes — those are called out explicitly here. To upgrade, run `pip install --upgrade pyxle-framework`.
 
+## Unreleased
+
+- **Security: require Starlette ≥ 1.3.1.** Pyxle was pinned to `starlette>=0.37,<0.38`, holding it on 0.37.2 — which has known advisories including a `Host`-header URL-reconstruction **auth bypass** (PYSEC-2026-161), unbounded form-parsing **DoS** (PYSEC-2026-249, PYSEC-2026-1943), and a Windows `StaticFiles` UNC **SSRF/credential leak** (CVE-2026-48818). The dependency is now `starlette>=1.3.1,<2.0`, which fixes all of them. Pyxle's own API surface is unchanged; upgrade with `pip install --upgrade pyxle-framework`. (Apps that import Starlette internals directly should review the Starlette 1.0 release notes.) A new `pip-audit` CI job guards against dependency regressions going forward.
+
 ## 0.7.0 — 2026-07-09
 
 - **Fix: `error.pyxl` renders even when an ancestor layout has a `@server` loader.** The error boundary is compiled wrapped in its layout chain like any page, but its render received no layout loader data — the layout component crashed on the missing props and the request silently fell back to the built-in error document (in dev *and* production, with no log). Boundary renders now execute ancestor layout loaders exactly like a normal page; a loader that fails during the boundary render no longer masks the boundary (it renders with error-only props and the failure is logged), and a boundary that itself fails now logs the fallback instead of swapping silently. Also: honest scope wording for `pyxle typecheck` (page JSX isn't checked without `checkJs` — planned, see [the typed-Pyxle roadmap](guides/fully-typed-pyxle.md)), the pyxle-auth doc header says 0.4.0, the `useAuth` seed claim matches real SSR behavior, the `username-available` `reason` field is documented, six missing guides join the docs index, and three dead anchors are fixed.
