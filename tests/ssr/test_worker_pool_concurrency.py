@@ -278,19 +278,35 @@ async def test_concurrent_streams_interleave_not_serialize(tmp_path: Path) -> No
             ]
 
         loop = asyncio.get_running_loop()
-        start = loop.time()
+
+        # Warm the bundle so neither timed run below pays the one-time cold
+        # resolution cost, which would otherwise dwarf the ~200ms signal.
+        await drain("warm")
+
+        # Serial baseline: the two 200ms boundaries run back to back.
+        t_serial_start = loop.time()
+        await drain("serial-a")
+        await drain("serial-b")
+        serial = loop.time() - t_serial_start
+
+        # Concurrent: the two boundaries overlap when the worker interleaves.
+        t_conc_start = loop.time()
         results = await asyncio.gather(drain("one"), drain("two"))
-        elapsed = loop.time() - start
+        concurrent = loop.time() - t_conc_start
     finally:
         await pool.stop()
 
     for frames in results:
         assert frames[-1]["type"] == "end"
 
-    # Serial execution would take ~0.4s (two 200ms boundaries back to back);
-    # interleaved it overlaps to well under that. Generous bound to stay robust
-    # on slow CI while still failing on full serialization.
-    assert elapsed < 0.35, f"streams appear serialized (elapsed={elapsed:.3f}s)"
+    # Comparing concurrent to a serial baseline — rather than an absolute
+    # wall-clock bound — keeps this robust under CI load: when the machine is
+    # busy both runs scale up together, but interleaving still overlaps the two
+    # ~200ms boundaries, so the concurrent run saves close to one full boundary.
+    # Full serialization would make the two times roughly equal.
+    assert concurrent < serial - 0.1, (
+        f"streams appear serialized (serial={serial:.3f}s, concurrent={concurrent:.3f}s)"
+    )
 
 
 # A trivial component with a stable marker — no Suspense. Used to stress the

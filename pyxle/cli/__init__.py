@@ -27,6 +27,7 @@ from .init import DEFAULT_IMPORT_ALIAS
 from .init import log_next_steps as _log_next_steps
 from .init import run_init as _run_init
 from .logger import ConsoleLogger, LogFormat, Verbosity
+from .preflight import ToolchainError, check_node
 
 # Lazily loaded devserver components to avoid import cycles during test collection.
 DevServer = None  # type: ignore[assignment]
@@ -186,6 +187,46 @@ def _prompt_text(question: str, *, default: str) -> str:
     return answer.strip() or default
 
 
+def _require_node_toolchain(logger: ConsoleLogger) -> None:
+    """Fail fast when the local Node.js toolchain is missing or below the floor.
+
+    Used by commands that spawn Vite (``dev``/``build``); a below-floor Node
+    otherwise crashes Vite at startup and reads as a broken framework.
+    """
+    try:
+        check_node(required=True)
+    except ToolchainError as exc:
+        logger.error(str(exc))
+        raise typer.Exit(code=1) from exc
+
+
+def _require_production_secret(config: PyxleConfig, logger: ConsoleLogger) -> None:
+    """Refuse to serve in production without ``PYXLE_SECRET_KEY``.
+
+    Only enforced when CSRF is enabled (the default consumer of the signing
+    secret). Without a secret, CSRF tokens fall back to unsigned double-submit
+    and any signed cookie (sessions, unsubscribe links) is forgeable — an
+    insecure production posture that a single startup warning is too easy to
+    miss.
+    """
+    csrf = getattr(config, "csrf", None)
+    csrf_enabled = csrf is not None and getattr(csrf, "enabled", False)
+    if not csrf_enabled:
+        return
+    if os.environ.get("PYXLE_SECRET_KEY"):
+        return
+    logger.error(
+        "PYXLE_SECRET_KEY is not set — refusing to start in production.\n"
+        "  Without it, CSRF tokens are not HMAC-signed and signed cookies "
+        "(sessions, unsubscribe links) are forgeable.\n"
+        "  Set a long random value before serving, e.g.:\n"
+        "    export PYXLE_SECRET_KEY=$(python -c \"import secrets; print(secrets.token_hex(32))\")\n"
+        "  (A missing key is allowed under `pyxle dev`; set `csrf.enabled=false` "
+        "only if you have deliberately disabled CSRF and sign nothing.)"
+    )
+    raise typer.Exit(code=1)
+
+
 @app.command(help="Create a new Pyxle project scaffold.")
 def init(
     name: Optional[str] = typer.Argument(
@@ -202,7 +243,7 @@ def init(
         "default",
         "--template",
         "-t",
-        help="Specify the project template to use (placeholder).",
+        help="Project template to scaffold (currently only 'default').",
     ),
     tailwind: Optional[bool] = typer.Option(
         None,
@@ -304,6 +345,10 @@ def init(
             include_install_hint=False,
             in_place=(project_path == Path(".")),
         )
+
+    # Scaffolding itself needs no Node.js, but `pyxle dev`/`build` do — surface a
+    # below-floor toolchain now (non-fatal) so it isn't discovered as a crash later.
+    check_node(required=False, logger=logger)
 
 
 def _ensure_directory(directory: Path, logger: ConsoleLogger) -> Path:
@@ -536,6 +581,10 @@ def dev(
         logger.error(f"Path '{project_root}' is not a directory.")
         raise typer.Exit(code=1)
 
+    # Reject a missing/old Node.js toolchain up front so the failure is a clear,
+    # actionable message rather than an opaque Vite crash after "ready".
+    _require_node_toolchain(logger)
+
     try:
         load_env_files(project_root, mode="development")
     except EnvFileError as exc:
@@ -660,6 +709,9 @@ def build(
     if not project_root.is_dir():
         logger.error(f"Path '{project_root}' is not a directory.")
         raise typer.Exit(code=1)
+
+    # The build runs Vite, which requires the supported Node.js floor.
+    _require_node_toolchain(logger)
 
     try:
         load_env_files(project_root, mode="production")
@@ -843,6 +895,12 @@ def serve(
         starlette_host=host,
         starlette_port=port,
     )
+
+    # Refuse to serve in production without a signing secret: CSRF tokens would
+    # not be HMAC-signed and signed cookies (sessions, unsubscribe links) would
+    # be forgeable. A single startup warning is too easy to miss, so fail fast.
+    _require_production_secret(production_config, logger)
+
     resolved_styles = _resolve_global_style_entries(project_root, production_config)
     resolved_scripts = _resolve_global_script_entries(project_root, production_config)
 
@@ -868,6 +926,8 @@ def serve(
     resolved_dist = _resolve_dist_directory(project_root, dist_dir)
 
     if not skip_build:
+        # A fresh build runs Vite and requires the supported Node.js floor.
+        _require_node_toolchain(logger)
         logger.info("Building project before serving")
         runner = _resolve_run_build()
         try:
@@ -877,6 +937,9 @@ def serve(
             raise typer.Exit(code=1) from exc
     else:
         logger.warning("Skipping production build; using existing dist artifacts.")
+        # No Vite here, but SSR still runs React on Node — warn (don't block a
+        # running deploy) if the toolchain is below the supported floor.
+        check_node(required=False, logger=logger)
 
     # Resolve an auto-detect request (--workers 0) to a concrete core count.
     from pyxle.build.production import resolve_server_workers  # noqa: PLC0415
