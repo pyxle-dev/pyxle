@@ -9,7 +9,7 @@ Every rule here exists to keep Pyxle enterprise-grade, stable, and maintainable.
 
 Pyxle is a Python-first full-stack web framework. `.pyxl` files colocate Python server
 logic (`@server` loaders, `@action` mutations) with React/JSX components. The stack is
-Starlette (ASGI), Vite (bundling), React 18 (rendering), and esbuild (SSR transpilation).
+Starlette (ASGI), Vite (bundling), React 19 (rendering), and esbuild (SSR transpilation).
 
 **Key files to read first:**
 - `ROADMAP.md` — current phase, pending tasks, design principles

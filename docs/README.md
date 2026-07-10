@@ -4,6 +4,14 @@ Pyxle is a Python-first full-stack web framework that brings the Next.js develop
 
 **Status:** beta (`0.x`) — see the [changelog](changelog.md) for the current release.
 
+## What's new in 0.7.0
+
+The **hardened run** — a QA and robustness pass across the framework: **React 19 + Vite 7** with an interactive `pyxle init`, concurrent streaming SSR that no longer serializes across requests, dev-server supervision and build-cache safety, correct `error.pyxl` rendering under layout loaders, and ESM-first SSR resolution for CommonJS packages. `0.7.1` follows with a Starlette **security** bump, a production `PYXLE_SECRET_KEY` guard, up-front Node-version checks, and a real testing story (`pyxle.testing`). See the [Changelog](changelog.md).
+
+## What's new in 0.6.0
+
+**Your app, in Markdown.** Every page can be served as clean Markdown — append `.md` to any URL or send `Accept: text/markdown` — with an `/llms.txt` index and discovery headers, so AI assistants and coding agents read your app as text. Off by default; nothing on the page hot path. See [AI accessibility](guides/llms.md).
+
 ## What's new in 0.5.0
 
 The **depth release** — going deep on the production path.

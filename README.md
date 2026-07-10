@@ -127,10 +127,9 @@ from the very first prompt — no priming, no setup.
 
 ## Status
 
-Pyxle is **early (0.4.x) but real.** The framework, SSR, routing, CLI, and editor tooling all work
-today — [pyxle.dev](https://pyxle.dev) itself is built with Pyxle. APIs may still shift before 1.0,
-and a first-class plugin system (auth, database) is in progress. Feedback and contributions are
-very welcome.
+Pyxle is **early (0.7.x) but real.** The framework, SSR, routing, CLI, editor tooling, and the
+official plugins (auth, database, mail) all work today — [pyxle.dev](https://pyxle.dev) itself is
+built with Pyxle. APIs may still shift before 1.0. Feedback and contributions are very welcome.
 
 ## Documentation
 
