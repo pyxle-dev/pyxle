@@ -83,6 +83,7 @@ def build_template_registry(
     registry = TemplateRegistry()
     # Always-present files.
     registry.register(".gitignore", ScaffoldingTemplate(".gitignore"))
+    registry.register("README.md", ScaffoldingTemplate("README.md"))
     registry.register("AGENTS.md", ScaffoldingTemplate("AGENTS.md"))
     registry.register("package.json", ScaffoldingTemplate("package.json"))
     registry.register("requirements.txt", ScaffoldingTemplate("requirements.txt"))
