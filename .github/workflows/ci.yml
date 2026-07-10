@@ -67,7 +67,7 @@ jobs:
       # Node is required: the JSX extractor runs Babel, and the SSR renderer
       # tests shell out to esbuild + React (provisioned into a local cache).
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: "20"
 
