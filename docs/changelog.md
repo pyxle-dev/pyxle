@@ -2,6 +2,10 @@
 
 Release notes for Pyxle. While we're in beta (`0.x`), minor versions may include breaking changes — those are called out explicitly here. To upgrade, run `pip install --upgrade pyxle-framework`.
 
+## Unreleased
+
+- **A real testing story: `pyxle.testing` helpers and a Testing guide.** "How do I test my app?" now has a runnable answer. A `.pyxl` file isn't an importable Python module, so the old advice (`from pages.index import load_home`) raised `ModuleNotFoundError`. New `pyxle.testing.load_loader("pages/index.pyxl")` compiles the page and returns its `@server` loader as a plain `async` function you can call with a fake request; `load_page(...)` returns the whole module so you can reach any `@action` by name. A new [Testing guide](guides/testing.md) covers unit-testing loaders/actions, the keep-logic-in-plain-modules pattern, and end-to-end tests over HTTP (with the CSRF handshake), and the [runtime internals doc](architecture/runtime.md) no longer shows the broken import. A first-class in-process `PyxleTestClient` is called out as the next step on the roadmap.
+
 ## 0.7.0 — 2026-07-09
 
 - **Fix: `error.pyxl` renders even when an ancestor layout has a `@server` loader.** The error boundary is compiled wrapped in its layout chain like any page, but its render received no layout loader data — the layout component crashed on the missing props and the request silently fell back to the built-in error document (in dev *and* production, with no log). Boundary renders now execute ancestor layout loaders exactly like a normal page; a loader that fails during the boundary render no longer masks the boundary (it renders with error-only props and the failure is logged), and a boundary that itself fails now logs the fallback instead of swapping silently. Also: honest scope wording for `pyxle typecheck` (page JSX isn't checked without `checkJs` — planned, see [the typed-Pyxle roadmap](guides/fully-typed-pyxle.md)), the pyxle-auth doc header says 0.4.0, the `useAuth` seed claim matches real SSR behavior, the `username-available` `reason` field is documented, six missing guides join the docs index, and three dead anchors are fixed.
