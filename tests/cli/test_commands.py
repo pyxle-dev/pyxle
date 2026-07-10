@@ -272,6 +272,21 @@ def test_scaffold_agents_md_documents_auto_injected_runtime_names(tmp_path, monk
     assert "import `LoaderError` (`from pyxle.runtime import LoaderError`) before" not in agents
 
 
+def test_scaffold_includes_human_readme(tmp_path, monkeypatch) -> None:
+    """A fresh project gets a human-facing README.md (not only AGENTS.md)."""
+    from pyxle.cli.init import run_init
+
+    monkeypatch.chdir(tmp_path)
+    run_init("demo", force=False, template="default", logger=cli.ConsoleLogger(), log_steps=False)
+
+    readme_path = tmp_path / "demo" / "README.md"
+    assert readme_path.exists()
+    readme = readme_path.read_text(encoding="utf-8")
+    assert "# demo" in readme  # project name interpolated
+    assert "pyxle dev" in readme
+    assert "Node.js 20.19+" in readme
+
+
 def test_in_virtualenv_detects_environments(monkeypatch) -> None:
     monkeypatch.delenv("VIRTUAL_ENV", raising=False)
     monkeypatch.delenv("CONDA_PREFIX", raising=False)
