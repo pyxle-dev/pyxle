@@ -99,8 +99,8 @@ JavaScript; in return you get the whole React ecosystem with none of the two-rep
 
 **[Full framework comparison &rarr;](https://pyxle.dev/docs/guides/comparison)** &nbsp; Honest about when to reach for Reflex, Django, NiceGUI, Streamlit, or Next.js + FastAPI *instead*.
 
-**Fast, and benchmarked in the open.** Pyxle is **faster than Next.js at dynamic SSR** &mdash; 1.7&ndash;2.1&times; on heavy pages &mdash; and matches FastAPI on raw API throughput, giving you both in one framework.
-&rarr; **[See the benchmarks](https://pyxle.dev/benchmarks)** &mdash; full data, honest caveats, reproducible harness.
+**Fast, and benchmarked in the open.** Pyxle is **faster than Next.js at dynamic SSR** &mdash; 2.3&ndash;4.3&times; on equivalent pages &mdash; and **faster than FastAPI** on raw API throughput, giving you both in one framework.
+&rarr; **[See the benchmarks](https://pyxle.dev/benchmarks)** &mdash; full data with framework versions, honest caveats, and a reproducible harness.
 
 **Built for AI coding agents.** Shipping a feature on a Next.js + FastAPI stack means holding two
 languages, two type systems, an API contract, and a CORS config in your head &mdash; and your agent's

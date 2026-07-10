@@ -206,13 +206,26 @@ def HEAD(data):
 
 ## Security headers
 
-In production, configure your reverse proxy (Nginx, Caddy, etc.) to add security headers:
+Pyxle **automatically sets** a baseline of security headers on every response, in both dev and production — you don't need to add these at your proxy:
 
 ```
 X-Content-Type-Options: nosniff
-X-Frame-Options: DENY
+X-Frame-Options: SAMEORIGIN
 Referrer-Policy: strict-origin-when-cross-origin
-Content-Security-Policy: default-src 'self'
+```
+
+`X-Frame-Options: SAMEORIGIN` allows your own pages to frame each other (e.g. a preview iframe) while blocking third-party framing. If you need stricter framing, set `DENY` at your reverse proxy — a proxy header overrides the app's.
+
+Two headers are **not** set for you, because a safe value depends on your app:
+
+- **`Content-Security-Policy`** — a good policy is app-specific (which script/style/img/connect sources you allow), and a wrong one silently breaks your pages. Add it at your reverse proxy once you've settled your sources. A strict starting point is `default-src 'self'`.
+- **`Strict-Transport-Security` (HSTS)** — belongs at the TLS-terminating layer (your proxy or CDN), since it only makes sense once you're serving HTTPS. Example: `Strict-Transport-Security: max-age=31536000; includeSubDomains`.
+
+Example Nginx addition for the two headers Pyxle leaves to you:
+
+```
+add_header Content-Security-Policy "default-src 'self'" always;
+add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
 ```
 
 ## Rate limiting
@@ -236,6 +249,10 @@ A client may burst up to `requests` and then sustains `requests / window` per se
 - Variables without the `PYXLE_PUBLIC_` prefix are **server-only** and never appear in client bundles
 - Loader and action return values are serialised to JSON and sent to the client -- never include secrets in return values
 - Use `.env.local` for secrets and add it to `.gitignore`
+
+## Reporting a vulnerability
+
+Found a security issue in Pyxle itself? **Please report it privately — don't open a public issue.** Use a [GitHub private advisory](https://github.com/pyxle-dev/pyxle/security/advisories/new) or email **security@pyxle.dev**. You'll get an acknowledgement within 72 hours. See [SECURITY.md](https://github.com/pyxle-dev/pyxle/blob/main/SECURITY.md) for the full policy and scope.
 
 ## Next steps
 
