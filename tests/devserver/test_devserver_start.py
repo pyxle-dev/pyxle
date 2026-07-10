@@ -79,6 +79,8 @@ async def test_devserver_start_configures_uvicorn_and_watcher(anyio_backend, mon
     )
 
     class StubVite:
+        # A Vite process that started and became ready is running.
+        running = True
         def __init__(self, cfg: DevServerSettings, *, logger: ConsoleLogger, **_: Any) -> None:
             self.settings = cfg
             self.logger = logger
@@ -224,6 +226,8 @@ async def test_devserver_start_builds_routes_and_creates_app(anyio_backend, monk
     )
 
     class StubVite:
+        # A Vite process that started and became ready is running.
+        running = True
         def __init__(self, cfg: DevServerSettings, *, logger: ConsoleLogger, **_: Any) -> None:
             self.started = False
             self.ready = False
@@ -321,6 +325,8 @@ async def test_devserver_retries_vite_port(monkeypatch, tmp_path: Path) -> None:
     )
 
     class StubVite:
+        # A Vite process that started and became ready is running.
+        running = True
         def __init__(self, cfg: DevServerSettings, *, logger: ConsoleLogger, **_: Any) -> None:
             self.settings = cfg
             self.started = False
@@ -687,6 +693,8 @@ async def test_devserver_starts_tailwind_when_configured(monkeypatch, tmp_path: 
     )
 
     class StubVite:
+        # A Vite process that started and became ready is running.
+        running = True
         def __init__(self, *a: Any, **kw: Any) -> None:
             pass
 
@@ -786,6 +794,8 @@ async def test_devserver_skips_tailwind_when_disabled(monkeypatch, tmp_path: Pat
     )
 
     class StubVite:
+        # A Vite process that started and became ready is running.
+        running = True
         def __init__(self, *a: Any, **kw: Any) -> None:
             pass
 
@@ -891,6 +901,8 @@ async def test_devserver_skips_tailwind_when_postcss_config_present(monkeypatch,
     )
 
     class StubVite:
+        # A Vite process that started and became ready is running.
+        running = True
         def __init__(self, *a: Any, **kw: Any) -> None:
             pass
 
@@ -990,3 +1002,84 @@ async def test_notify_rebuild_error_ignores_success_and_missing_overlay() -> Non
     )
     # No overlay connected: still reports failure handled (True), never raises.
     assert _notify_rebuild_error(None, loop, failed) is True
+
+
+async def test_devserver_skips_ready_banner_when_vite_not_running(
+    anyio_backend, monkeypatch, tmp_path: Path
+) -> None:
+    """If Vite dies right after the readiness probe, don't advertise "ready"."""
+    settings = DevServerSettings.from_project_root(tmp_path)
+    capture = LogCapture()
+    logger = ConsoleLogger(secho=capture)
+
+    monkeypatch.setattr(
+        "pyxle.devserver.build_once",
+        lambda cfg, *, force_rebuild=False: BuildSummary(
+            compiled_pages=[], copied_api_modules=[], removed=[]
+        ),
+    )
+    monkeypatch.setattr(
+        "pyxle.devserver.build_metadata_registry",
+        lambda cfg: MetadataRegistry(pages=[], apis=[]),
+    )
+    monkeypatch.setattr(
+        "pyxle.devserver.build_route_table",
+        lambda registry: RouteTable(pages=[], apis=[]),
+    )
+    dummy_app = SimpleNamespace(state=SimpleNamespace())
+    monkeypatch.setattr(
+        "pyxle.devserver.create_starlette_app", lambda cfg, routes, **_: dummy_app
+    )
+    monkeypatch.setattr(
+        "pyxle.devserver.write_client_bootstrap_files", lambda cfg: None
+    )
+
+    class DeadVite:
+        # Passed the readiness probe, then exited (e.g. unsupported Node.js).
+        running = False
+
+        def __init__(self, cfg: DevServerSettings, *, logger: ConsoleLogger, **_: Any) -> None:
+            pass
+
+        async def start(self) -> None:
+            pass
+
+        async def wait_until_ready(self) -> None:
+            pass
+
+        async def stop(self) -> None:
+            pass
+
+    monkeypatch.setattr("pyxle.devserver.ViteProcess", DeadVite)
+
+    class StubWatcher:
+        def __init__(self, cfg: DevServerSettings, *, logger: ConsoleLogger, **_: Any) -> None:
+            pass
+
+        def start(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr("pyxle.devserver.ProjectWatcher", StubWatcher)
+
+    class StubConfig:
+        def __init__(self, app: object, **kwargs: Any) -> None:
+            pass
+
+    class StubServer:
+        def __init__(self, config: StubConfig) -> None:
+            self.should_exit = False
+
+        async def serve(self) -> None:
+            pass
+
+    monkeypatch.setattr("pyxle.devserver.uvicorn.Config", StubConfig)
+    monkeypatch.setattr("pyxle.devserver.uvicorn.Server", StubServer)
+
+    server = DevServer(settings=settings, logger=logger)
+    await server.start()
+
+    assert not any("dev server ready" in m for m in capture.messages)
+    assert any("not ready" in m for m in capture.messages)

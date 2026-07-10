@@ -374,28 +374,28 @@ participate. Source: `devserver/middleware.py`,
 
 ## What if I want to test my loader?
 
-Because `@server` doesn't wrap the function, testing is trivial:
+Because `@server` doesn't wrap the function, the loader is a plain
+async function — so testing it is a direct call. A `.pyxl` file isn't
+an importable Python module, though (it carries a JSX component and
+compiles into a build directory), so you can't `import` the loader
+directly. `pyxle.testing` compiles the page and hands you the function:
 
 ```python
 # tests/test_pages.py
 import asyncio
-from pages.index import load_home  # The compiled file
-
-class FakeRequest:
-    pass
+from types import SimpleNamespace
+from pyxle.testing import load_loader
 
 def test_load_home():
-    result = asyncio.run(load_home(FakeRequest()))
+    load_home = load_loader("pages/index.pyxl")
+    result = asyncio.run(load_home(SimpleNamespace()))
     assert result["hello"] == "world"
 ```
 
-You don't need a test client, you don't need a fake Starlette app,
-you don't need to mock the request context. The loader is a plain
-async function — call it.
-
-In practice, you probably want to use Starlette's `TestClient` for
-end-to-end tests, but you don't *have* to. Unit-testing individual
-loaders is straightforward because they're just functions.
+No test client, no fake Starlette app, no mocked request context — for
+a loader that only reads its `request`, a `SimpleNamespace` stand-in is
+enough. For `@action` handlers and end-to-end patterns, see the
+[Testing guide](../guides/testing.md).
 
 ---
 

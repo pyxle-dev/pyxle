@@ -54,6 +54,46 @@ The `pyxle` package includes:
 
 Node.js dependencies (React 19, Vite 7, and — if you opt in — Tailwind CSS v4) are installed per-project via `npm install` -- they are **not** global.
 
+## Troubleshooting
+
+Two common failures come from an out-of-date toolchain. Both are fixed by upgrading — Pyxle needs **Python 3.10+** and **Node.js 20.19+**.
+
+### `pip install` says "No matching distribution found for pyxle-framework"
+
+```
+ERROR: Could not find a version that satisfies the requirement pyxle-framework (from versions: none)
+ERROR: No matching distribution found for pyxle-framework
+```
+
+Your `pip` is running on **Python older than 3.10** (the stock `python3` on macOS is 3.9). Pyxle ships no wheels for end-of-life Pythons, so pip reports "none available." Check your version, then install with a supported interpreter:
+
+```bash
+python3 --version          # must be 3.10 or later
+```
+
+Install a supported Python (via [python.org](https://www.python.org/downloads/), `pyenv`, or Homebrew's `python@3.12`) and create the virtual environment with **that** interpreter:
+
+```bash
+python3.12 -m venv venv && source venv/bin/activate
+pip install pyxle-framework
+```
+
+### `pyxle dev` / `pyxle build` stops with a Node.js version error
+
+If `node --version` is **below v20.19**, Pyxle stops with a clear message before starting Vite:
+
+```
+Node.js 20.19+ is required, but 20.16.0 is installed.
+```
+
+Vite 7 — which Pyxle uses to build and serve your React code — requires Node.js 20.19 or newer; older 20.x releases crash at startup. Upgrade Node and re-run:
+
+```bash
+node --version             # must be v20.19 or later
+nvm install 20             # if you use nvm
+# or download the latest LTS from https://nodejs.org
+```
+
 ## Next steps
 
 Create your first project: [Quick Start](quick-start.md)
