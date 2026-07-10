@@ -4,6 +4,7 @@ Release notes for Pyxle. While we're in beta (`0.x`), minor versions may include
 
 ## Unreleased
 
+- **Fix: `pyxle init` scaffolds an installable `requirements.txt` again.** The template pinned `starlette>=0.37,<0.38` — the exact range 0.7.1's security bump moved off — so a fresh project's `requirements.txt` was unsatisfiable against the `pyxle-framework>=0.7.1` line beside it (which requires `starlette>=1.3.1`), and `pip install -r requirements.txt` failed to resolve. The scaffold now pins `starlette>=1.3.1,<2.0`, matching the framework.
 - **Config: a boolean port is now rejected instead of silently binding port 1.** Because `bool` is a subclass of `int` in Python, `{"starlette": {"port": true}}` slipped past the port validator and bound port `1` (or `0`). `_validate_port` now rejects booleans with a clear `ConfigError`, matching every other integer setting in the config.
 
 ## 0.7.1 — 2026-07-10
