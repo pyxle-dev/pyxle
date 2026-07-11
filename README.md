@@ -50,7 +50,7 @@ export default function Users({ data }) {
     const remove = useAction('remove');               // calls the @action above — no fetch, no route
 
     async function onRemove(id) {
-        const res = await remove({ id });             // framework wraps the return as { ok, ...data }
+        const res = await remove({ id });             // framework wraps the return as { ok, ...yourReturn }
         if (res.ok) setUsers(res.users);              // the server stays the source of truth
     }
 

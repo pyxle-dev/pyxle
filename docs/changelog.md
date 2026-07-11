@@ -2,6 +2,10 @@
 
 Release notes for Pyxle. While we're in beta (`0.x`), minor versions may include breaking changes — those are called out explicitly here. To upgrade, run `pip install --upgrade pyxle-framework`.
 
+## Unreleased
+
+- **Docs: the client-side shape of an `@action`'s result is now spelled out — no more `res.data` confusion.** An action's awaited result is the flat `{ ok, ...yourReturn }`: your returned fields sit directly on it (`res.title`), and a *successful* result has no `.data`. Because `useAction` *separately* exposes a `.data` property (the last successful return), it was easy — for a person or an AI coding agent — to write `res.data.title`, which is `undefined` on success and silently no-ops inside `if (res.ok)`, so a mutation looked like it did nothing until the page reloaded. The scaffolded `AGENTS.md`, the [Server Actions guide](core-concepts/server-actions.md), and the [client API reference](reference/client-api.md) now state the contract explicitly and warn against `res.data.x`, and the README drops an ambiguous `...data` spread. No behavior change — the shipped TypeScript types already modelled this correctly.
+
 ## 0.7.2 — 2026-07-11
 
 - **Fix: `pyxle init` scaffolds an installable `requirements.txt` again.** The template pinned `starlette>=0.37,<0.38` — the exact range 0.7.1's security bump moved off — so a fresh project's `requirements.txt` was unsatisfiable against the `pyxle-framework>=0.7.1` line beside it (which requires `starlette>=1.3.1`), and `pip install -r requirements.txt` failed to resolve. The scaffold now pins `starlette>=1.3.1,<2.0`, matching the framework.
