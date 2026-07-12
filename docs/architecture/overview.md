@@ -171,10 +171,11 @@ point. Everything that follows lives inside it.
 ## Stage 2 — Run the loader
 
 Pyxle imports the compiled server module
-(`.pyxle-build/server/pages/index.py`). In dev mode, before importing, it
-purges any cached version from `sys.modules` so changes you've made to
-the `.pyxl` file are reflected immediately. (In production, modules are
-imported once at startup.)
+(`.pyxle-build/server/pages/index.py`). The module is imported once and
+reused across requests — in production and, since it's reused between
+rebuilds, in dev too — so a rebuild re-imports it and your `.pyxl` edits
+are reflected immediately. (Reuse means module-level state persists across
+requests; see [Server-side rendering](ssr.md).)
 
 Once imported, Pyxle finds the function tagged `__pyxle_loader__ = True`
 — that's `load_home` — and calls it with the Starlette `Request`:

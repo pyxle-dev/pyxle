@@ -132,10 +132,16 @@ def test_dev_route_refresh_reconciles_loader_rename(tmp_path: Path) -> None:
     with TestClient(app) as client:
         assert "from load_home" in client.get("/").text
 
-        # Rename the loader + rebuild. BEFORE the refresh, the frozen route
-        # still calls ``load_home`` → the page errors.
+        # Rename the loader + rebuild. `build_once` alone doesn't invalidate the
+        # imported module (that's the watcher's job); simulate the rebuild's
+        # reload-generation bump so the module re-imports with the new name.
+        from pyxle.ssr import module_cache
+
         _write(index, _page_with_loader("load"))
         build_once(settings)
+        module_cache.mark_rebuild()
+        # BEFORE the refresh, the frozen route still calls ``load_home`` (now
+        # gone from the re-imported module) → the page errors.
         assert client.get("/").status_code >= 500
 
         # The live route refresh reconciles it with no restart.

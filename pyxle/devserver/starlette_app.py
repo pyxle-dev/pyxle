@@ -41,6 +41,7 @@ from pyxle.ssr import (
     build_page_navigation_response,
     build_page_response,
 )
+from pyxle.ssr.module_cache import GENERATION_ATTRIBUTE, current_generation
 from pyxle.ssr.renderer import pool_render_factory
 from pyxle.ssr.view import (
     REVALIDATE_HEADER,
@@ -580,14 +581,19 @@ def _import_module(
     (e.g. ``from db import ...``) resolve without manual ``sys.path`` hacks.
 
     When *debug* is ``False`` (production), a previously imported module is
-    returned from ``sys.modules`` without re-execution.  When *debug* is
-    ``True``, the module is always re-imported from disk so that code changes
-    take effect immediately.
+    returned from ``sys.modules`` without re-execution. When *debug* is ``True``
+    (development), the module is likewise reused across requests — so its
+    module-level globals persist exactly like production — and is re-imported
+    from disk only after a rebuild advances the reload generation, so code
+    changes take effect on the next request. See :mod:`pyxle.ssr.module_cache`.
     """
 
-    if module_key in sys.modules:
+    cached = sys.modules.get(module_key)
+    if cached is not None:
         if not debug:
-            return sys.modules[module_key]
+            return cached
+        if getattr(cached, GENERATION_ATTRIBUTE, None) == current_generation():
+            return cached
         del sys.modules[module_key]
         importlib.invalidate_caches()
 
@@ -618,6 +624,8 @@ def _import_module(
         sys.modules.pop(module_key, None)
         raise ApiRouteError(f"Failed to import API module {module_key}: {exc}") from exc
 
+    if debug:
+        setattr(module, GENERATION_ATTRIBUTE, current_generation())
     return module
 
 

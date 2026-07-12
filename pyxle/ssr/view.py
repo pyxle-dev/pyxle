@@ -23,6 +23,7 @@ from pyxle.devserver.overlay import OverlayManager
 from pyxle.devserver.routes import PageRoute
 from pyxle.devserver.settings import DevServerSettings
 
+from .module_cache import GENERATION_ATTRIBUTE, current_generation
 from .renderer import (
     BrowserGlobalRenderError,
     CjsDependencyRenderError,
@@ -286,8 +287,6 @@ async def build_page_response(
     error_boundaries: ErrorBoundaryRegistry | None = None,
     suppress_per_user: bool = False,
 ) -> Response:
-    if settings.debug:
-        _purge_page_modules(settings.pages_dir)
     loader_breadcrumb = _initial_loader_breadcrumb(page)
 
     try:
@@ -399,8 +398,6 @@ async def run_page_loader(
     value. Returns the loader's data dict; a page with no loader returns ``{}``.
     Propagates loader exceptions.
     """
-    if settings.debug:
-        _purge_page_modules(settings.pages_dir)
     payload, _status, _revalidate, _module = await _execute_loader(
         page, request, module=None, debug=settings.debug
     )
@@ -506,8 +503,6 @@ async def build_streaming_page_response(
     ``stream_render`` is the worker pool's ``render_stream`` async generator
     callable. ``renderer`` is still used for the error-boundary fallback render.
     """
-    if settings.debug:
-        _purge_page_modules(settings.pages_dir)
     loader_breadcrumb = _initial_loader_breadcrumb(page)
 
     try:
@@ -625,8 +620,6 @@ async def build_page_navigation_response(
 ) -> JSONResponse:
     from pyxle.runtime import LoaderError
 
-    if settings.debug:
-        _purge_page_modules(settings.pages_dir)
     loader_breadcrumb = _initial_loader_breadcrumb(page)
 
     try:
@@ -779,9 +772,6 @@ async def build_not_found_response(
     boundary_page = error_boundaries.find_not_found_boundary(route_path)
     if boundary_page is None:
         return None
-
-    if settings.debug:
-        _purge_page_modules(settings.pages_dir)
 
     try:
         artifacts = await _create_page_artifacts(
@@ -1365,9 +1355,16 @@ def _ensure_app_root_importable(module_path: Path) -> None:
 def _import_server_module(
     module_key: str, module_path: Path, *, debug: bool = False,
 ):
-    if module_key in sys.modules:
+    cached = sys.modules.get(module_key)
+    if cached is not None:
         if not debug:
-            return sys.modules[module_key]
+            return cached
+        # Dev: reuse the imported module across requests — so module-level
+        # globals persist exactly like `pyxle serve` — until a rebuild advances
+        # the reload generation, at which point re-import from disk so edits take
+        # effect. See pyxle.ssr.module_cache.
+        if getattr(cached, GENERATION_ATTRIBUTE, None) == current_generation():
+            return cached
         del sys.modules[module_key]
 
     _ensure_app_root_importable(module_path)
@@ -1379,33 +1376,9 @@ def _import_server_module(
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_key] = module
     spec.loader.exec_module(module)
+    if debug:
+        setattr(module, GENERATION_ATTRIBUTE, current_generation())
     return module
-
-
-def _purge_page_modules(pages_dir: Path) -> None:
-    try:
-        root = pages_dir.resolve()
-    except FileNotFoundError:
-        return
-    removed: list[str] = []
-    for name, module in list(sys.modules.items()):
-        module_file = getattr(module, "__file__", None)
-        if not module_file:
-            continue
-        try:
-            module_path = Path(module_file).resolve()
-        except (OSError, ValueError):
-            continue
-        try:
-            module_path.relative_to(root)
-        except ValueError:
-            continue
-        removed.append(name)
-    if not removed:
-        return
-    importlib.invalidate_caches()
-    for name in removed:
-        sys.modules.pop(name, None)
 
 
 def _evaluate_head_callable(

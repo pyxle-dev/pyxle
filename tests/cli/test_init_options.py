@@ -250,6 +250,27 @@ def test_cli_init_dot_into_current_directory(monkeypatch) -> None:
         assert (Path(fs) / "pages" / "index.pyxl").exists()
 
 
+def test_cli_init_without_argument_fails(monkeypatch) -> None:
+    """A bare `pyxle init` must require an explicit target, not silently
+    scaffold into the current directory. The error names both `.` and a name,
+    and fails *before* any prompt so the user isn't walked through questions
+    only to hit an error."""
+    monkeypatch.setattr(cli, "_stdin_is_interactive", lambda: True)
+
+    def _boom(*_a, **_k):  # pragma: no cover - must never be reached
+        raise AssertionError("bare `pyxle init` must fail before prompting")
+
+    monkeypatch.setattr(cli, "_prompt_yes_no", _boom)
+
+    with runner.isolated_filesystem() as fs:
+        result = runner.invoke(app, ["init"], catch_exceptions=False)
+        assert result.exit_code == 1, result.stdout
+        assert "Missing target directory" in result.stdout
+        assert "pyxle init ." in result.stdout
+        # Nothing was scaffolded into the current directory.
+        assert not (Path(fs) / "pages").exists()
+
+
 # --------------------------------------------------------------------------- #
 # Prompt seams (questionary-backed)                                            #
 # --------------------------------------------------------------------------- #

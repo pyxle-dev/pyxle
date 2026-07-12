@@ -22,6 +22,7 @@ from watchdog.events import (
 from watchdog.observers import Observer
 
 from pyxle.cli.logger import ConsoleLogger
+from pyxle.ssr.module_cache import mark_rebuild
 
 from .builder import BuildSummary, build_once
 from .settings import DevServerSettings
@@ -515,6 +516,16 @@ class ProjectWatcher:
             return
 
         elapsed = time.perf_counter() - start
+        # Invalidate any changed .py helper modules, then — on a material change —
+        # advance the dev module-reload generation. Both happen BEFORE the route
+        # rebuild (in the emit listener) and the next request, so page/action
+        # modules re-import fresh (globals reset, edits take effect). Between
+        # rebuilds the generation is stable and those modules are reused, so
+        # module-level globals persist across requests exactly like
+        # `pyxle serve`. See pyxle.ssr.module_cache.
+        purged = _invalidate_python_modules(paths, self._settings.project_root)
+        if summary.any_changes() or purged:
+            mark_rebuild()
         stats = WatcherStatistics(
             elapsed_seconds=elapsed,
             summary=summary,
@@ -523,7 +534,6 @@ class ProjectWatcher:
         )
         self._latest_stats = stats
         self._emit_rebuild(stats)
-        _invalidate_python_modules(paths, self._settings.project_root)
 
         if summary.any_changes():
             # Curated one-liner: what rebuilt and how long it took. The full
@@ -585,7 +595,14 @@ class ProjectWatcher:
         )
 
 
-def _invalidate_python_modules(paths: Sequence[Path], project_root: Path) -> None:
+def _invalidate_python_modules(paths: Sequence[Path], project_root: Path) -> set[str]:
+    """Drop changed ``.py`` helper modules (and their package parents) from
+    ``sys.modules`` so the next import re-reads them from disk.
+
+    Returns the set of module names that were considered for the changed paths
+    (whether or not each was actually cached), so the caller can tell a helper
+    edit apart from a no-op event when deciding to advance the reload generation.
+    """
     purged: set[str] = set()
     for path in paths:
         if path.suffix != ".py":
@@ -599,6 +616,7 @@ def _invalidate_python_modules(paths: Sequence[Path], project_root: Path) -> Non
             if target in sys.modules:
                 del sys.modules[target]
             purged.add(target)
+    return purged
 
 
 def _module_name_from_path(path: Path, project_root: Path) -> str | None:

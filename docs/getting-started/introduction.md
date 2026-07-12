@@ -31,7 +31,7 @@ The loader's return value *is* the component's `data` prop. There's no `fetch`, 
 
 - **No API plumbing.** A `@server` loader feeds props straight into your component; an `@action` is an endpoint you call with `useAction` instead of hand-writing `fetch` + a route.
 - **Real React.** `npm install` any React library and use it directly — Pyxle renders genuine React 19 with server-side rendering and hydration, not a Python wrapper around a component library.
-- **Convention over configuration.** File-based routing, automatic SSR, and zero config for the common cases. Run `pyxle init` and you're shipping.
+- **Convention over configuration.** File-based routing, automatic SSR, and zero config for the common cases. Run `pyxle init my-app` and you're shipping.
 - **Batteries includable.** Official plugins for [database](../plugins/pyxle-db.md), [auth](../plugins/pyxle-auth.md), and [email](../plugins/pyxle-mail.md), plus hooks for middleware, edge caching, and your own integrations.
 - **AI-first DX.** Predictable patterns, strong types, and clear errors make Pyxle one of the easiest frameworks for an AI coding agent to ship a whole feature in a single pass. See [Pyxle for AI coding agents](../guides/for-ai-agents.md).
 

@@ -231,7 +231,7 @@ def _require_production_secret(config: PyxleConfig, logger: ConsoleLogger) -> No
 def init(
     name: Optional[str] = typer.Argument(
         None,
-        help="Project directory to create. Use '.' (or omit) to scaffold into the current directory.",
+        help="Project directory to create — a name like 'my-app', or '.' for the current directory.",
     ),
     force: bool = typer.Option(
         False,
@@ -276,6 +276,19 @@ def init(
     """Entry-point for the ``pyxle init`` command."""
 
     logger = get_logger()
+
+    # Require an explicit target. A bare `pyxle init` used to scaffold into the
+    # current directory silently — surprising, since it looks like an incomplete
+    # command. Fail fast (before the prompts) with a message that names both
+    # forms. `.` and a project name still work exactly as before.
+    if name is None:
+        logger.error(
+            "Missing target directory.\n"
+            "  Pass a name to create a new project (e.g. `pyxle init my-app`),\n"
+            "  or `.` to scaffold into the current directory (e.g. `pyxle init .`)."
+        )
+        raise typer.Exit(code=1)
+
     interactive = (not yes) and _stdin_is_interactive()
 
     # 1. Tailwind CSS.
@@ -317,7 +330,7 @@ def init(
 
     try:
         project_path = _run_init(
-            name if name is not None else ".",
+            name,
             force,
             template,
             logger,

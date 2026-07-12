@@ -1026,6 +1026,18 @@ async def test_build_page_response_refreshes_shared_python_modules(settings: Dev
             encoding="utf-8",
         )
 
+        # Simulate the watcher's rebuild on save: invalidate the changed helper
+        # module and advance the reload generation. The next request then
+        # re-imports the page — re-running its `from pages.components import ...`
+        # against the fresh helper — exactly as `pyxle dev` does. Without a
+        # rebuild the page (and its imported helper) stay cached, so module-level
+        # state persists across requests like production.
+        from pyxle.devserver.watcher import _invalidate_python_modules
+        from pyxle.ssr import module_cache
+
+        _invalidate_python_modules([shared_module], Path(project_root))
+        module_cache.mark_rebuild()
+
         await build_page_response(
             request=request,
             settings=settings,
@@ -1364,13 +1376,6 @@ def test_evaluate_head_callable_async_raises(tmp_path: Path) -> None:
         _evaluate_head_callable(page, async_head, {"key": "val"})
 
 
-def test_purge_page_modules_handles_missing_dir(tmp_path: Path) -> None:
-    """_purge_page_modules exits gracefully for non-existent directories."""
-    from pyxle.ssr.view import _purge_page_modules
-
-    _purge_page_modules(tmp_path / "nonexistent")
-
-
 @pytest.mark.anyio
 async def test_runtime_head_overrides_static_dynamic_title(
     settings: DevServerSettings, tmp_path: Path,
@@ -1457,23 +1462,35 @@ def test_import_server_module_caches_in_production(tmp_path: Path) -> None:
     sys.modules.pop(key, None)
 
 
-def test_import_server_module_reimports_in_debug(tmp_path: Path) -> None:
-    """In dev mode (debug=True), the module is re-executed every time."""
+def test_import_server_module_persists_globals_until_rebuild(tmp_path: Path) -> None:
+    """In dev (debug=True), the module is reused across calls so module-level
+    globals persist across requests exactly like production, and is re-imported
+    only after a rebuild advances the reload generation."""
+    from pyxle.ssr import module_cache
     from pyxle.ssr.view import _import_server_module
 
     mod_path = tmp_path / "test_debug.py"
     mod_path.write_text("COUNTER = 0\n", encoding="utf-8")
     key = "pyxle._test_debug_module"
 
-    first = _import_server_module(key, mod_path, debug=True)
-    assert first.COUNTER == 0
-    first.COUNTER = 42
+    try:
+        first = _import_server_module(key, mod_path, debug=True)
+        assert first.COUNTER == 0
+        first.COUNTER = 42
 
-    second = _import_server_module(key, mod_path, debug=True)
-    assert second is not first
-    assert second.COUNTER == 0  # Reset — module was re-executed
+        # No rebuild between requests: same module, globals persist.
+        second = _import_server_module(key, mod_path, debug=True)
+        assert second is first
+        assert second.COUNTER == 42
 
-    sys.modules.pop(key, None)
+        # A rebuild advances the generation → the next import re-executes the
+        # module body from disk, resetting module-level globals.
+        module_cache.mark_rebuild()
+        third = _import_server_module(key, mod_path, debug=True)
+        assert third is not first
+        assert third.COUNTER == 0
+    finally:
+        sys.modules.pop(key, None)
 
 
 @pytest.mark.anyio
@@ -1895,8 +1912,7 @@ async def test_build_not_found_response_renders_boundary_document(
     settings: DevServerSettings, tmp_path: Path
 ) -> None:
     """A matching not-found boundary is rendered into a 404 document. Exercises
-    the debug module purge and the document-rendering success path of
-    build_not_found_response."""
+    the debug-mode document-rendering success path of build_not_found_response."""
     from pyxle.devserver.error_pages import ErrorBoundaryRegistry
     from pyxle.ssr.view import build_not_found_response
 
@@ -1905,7 +1921,6 @@ async def test_build_not_found_response_renders_boundary_document(
 
     renderer = StubRenderer()
     renderer.responses.append(RenderResult(html="<h1>Page not found</h1>"))
-    # debug=True drives the _purge_page_modules branch inside build_not_found_response.
     request = Request({"type": "http", "method": "GET", "path": "/missing", "query_string": b"", "headers": []})
 
     response = await build_not_found_response(
@@ -1969,12 +1984,11 @@ async def test_build_page_navigation_response_success_without_overlay(
     settings: DevServerSettings, tmp_path: Path
 ) -> None:
     """The navigation success path skips overlay notification when overlay is
-    None and still returns the JSON payload. Exercises the production-mode
-    purge skip and the ``overlay is None`` branch of the success path."""
+    None and still returns the JSON payload. Exercises the production-mode path
+    and the ``overlay is None`` branch of the success path."""
     renderer = StubRenderer()
     renderer.responses.append(RenderResult(html="<main>nav</main>"))
 
-    # debug=False skips the _purge_page_modules call at the top of the function.
     prod_settings = replace(settings, debug=False)
     page = _page_route(tmp_path, loader_name=None)
     request = Request({"type": "http", "http_version": "1.1", "method": "GET", "path": "/", "root_path": "", "headers": []})
@@ -2440,44 +2454,6 @@ def test_import_server_module_raises_when_spec_unavailable(tmp_path: Path) -> No
         _import_server_module("pyxle._test_no_spec", bad_path)
 
     assert "pyxle._test_no_spec" not in sys.modules
-
-
-def test_purge_page_modules_swallows_resolve_filenotfound() -> None:
-    """If resolving the pages directory raises FileNotFoundError (e.g. the
-    working directory was removed), the purge exits cleanly. Exercises the
-    ``except FileNotFoundError`` guard at the top of _purge_page_modules."""
-    from pyxle.ssr.view import _purge_page_modules
-
-    class ResolveRaises:
-        def resolve(self):
-            raise FileNotFoundError("pages dir is gone")
-
-    # Should not raise.
-    _purge_page_modules(ResolveRaises())  # type: ignore[arg-type]
-
-
-def test_purge_page_modules_skips_modules_with_unresolvable_file(tmp_path: Path) -> None:
-    """A loaded module whose ``__file__`` cannot be resolved (it contains a NUL
-    byte, raising ValueError) is skipped without aborting the purge. Exercises
-    the ``except (OSError, ValueError)`` guard inside the purge loop."""
-    from types import ModuleType
-
-    from pyxle.ssr.view import _purge_page_modules
-
-    pages_dir = tmp_path / "pages"
-    pages_dir.mkdir()
-
-    poisoned = ModuleType("pyxle._test_poisoned_file")
-    poisoned.__file__ = "/tmp/bad\x00name.py"
-    sys.modules["pyxle._test_poisoned_file"] = poisoned
-
-    try:
-        # The poisoned module must not crash the purge; it is simply skipped
-        # (left in sys.modules because its path could not be compared).
-        _purge_page_modules(pages_dir)
-        assert "pyxle._test_poisoned_file" in sys.modules
-    finally:
-        sys.modules.pop("pyxle._test_poisoned_file", None)
 
 
 @pytest.mark.anyio
