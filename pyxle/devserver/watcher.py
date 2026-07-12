@@ -10,7 +10,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, List, Sequence
 
-from watchdog.events import FileSystemEvent, FileSystemEventHandler
+from watchdog.events import (
+    EVENT_TYPE_CLOSED,
+    EVENT_TYPE_CREATED,
+    EVENT_TYPE_DELETED,
+    EVENT_TYPE_MODIFIED,
+    EVENT_TYPE_MOVED,
+    FileSystemEvent,
+    FileSystemEventHandler,
+)
 from watchdog.observers import Observer
 
 from pyxle.cli.logger import ConsoleLogger
@@ -33,6 +41,28 @@ _GENERATED_DIR_NAMES = frozenset({".pyxle-build", "__pycache__"})
 #: rebuild imports user Python, so ``.pyc`` bytecode is written back into a
 #: watched tree, and a watched extra directory may hold a runtime SQLite file.
 _GENERATED_SUFFIXES = frozenset({".pyc", ".db", ".db-wal", ".db-shm"})
+
+#: Watchdog event types that represent a genuine change to a watched file — a
+#: create, edit, delete, rename, or the close of a *writable* handle. Read-only
+#: events (``opened`` from ``IN_OPEN``, and any future read-close variant) are
+#: deliberately excluded. A rebuild *reads* every source file to hash and
+#: compile it, and on Linux those reads emit file open/close inotify events that
+#: watchdog surfaces as ``FileOpenedEvent``. Reacting to them would let the
+#: rebuild's own reads re-trigger the rebuild — a self-sustaining hot-reload loop
+#: that never settles. macOS FSEvents never surfaces reads, which is why the loop
+#: only appeared on Linux. Whitelisting genuine-change types (rather than
+#: blacklisting known read types) keeps any read-only event a future watchdog
+#: introduces excluded by default. ``closed`` (``IN_CLOSE_WRITE``) fires only
+#: when a writable handle is closed, so it is a real edit signal, never a read.
+_CHANGE_EVENT_TYPES = frozenset(
+    {
+        EVENT_TYPE_CREATED,
+        EVENT_TYPE_MODIFIED,
+        EVENT_TYPE_DELETED,
+        EVENT_TYPE_MOVED,
+        EVENT_TYPE_CLOSED,
+    }
+)
 
 
 def _is_generated_output(path: Path) -> bool:
@@ -147,6 +177,11 @@ class _ProjectEventHandler(FileSystemEventHandler):
     def on_any_event(self, event: FileSystemEvent) -> None:
         if event.is_directory:
             return
+        if event.event_type not in _CHANGE_EVENT_TYPES:
+            # A read-only event — e.g. the rebuild opening a source file to hash
+            # it — must never schedule another rebuild. Reacting to reads is the
+            # Linux hot-reload loop: the rebuild's own reads would retrigger it.
+            return
         dest = getattr(event, "dest_path", "")
         target_path = Path(dest) if dest else Path(event.src_path)
         if self._ignore is not None and self._ignore(target_path):
@@ -165,6 +200,11 @@ class _SingleFileEventHandler(FileSystemEventHandler):
 
     def on_any_event(self, event: FileSystemEvent) -> None:
         if event.is_directory:
+            return
+        if event.event_type not in _CHANGE_EVENT_TYPES:
+            # Ignore read-only events so merely reading pyxle.config.json never
+            # emits a spurious "restart pyxle dev" warning (see the loop note on
+            # ``_CHANGE_EVENT_TYPES``).
             return
         candidates = [event.src_path]
         dest = getattr(event, "dest_path", "")

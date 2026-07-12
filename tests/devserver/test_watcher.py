@@ -197,6 +197,30 @@ def test_single_file_handler_fires_only_for_target(tmp_path: Path) -> None:
     assert fired == []
 
 
+def test_single_file_handler_ignores_read_only_events(tmp_path: Path) -> None:
+    """Merely reading pyxle.config.json must not emit a 'restart' warning.
+
+    Like the rebuild handler, the config watcher only reacts to genuine changes
+    — a read (``FileOpenedEvent``) is ignored so nothing prompts a restart when
+    a process just opens the file.
+    """
+    from watchdog.events import FileModifiedEvent, FileOpenedEvent
+
+    from pyxle.devserver.watcher import _SingleFileEventHandler
+
+    target = tmp_path / "pyxle.config.json"
+    target.write_text("{}", encoding="utf-8")
+
+    fired: list[bool] = []
+    handler = _SingleFileEventHandler(target.resolve(), lambda: fired.append(True))
+
+    handler.on_any_event(FileOpenedEvent(str(target)))
+    assert fired == []
+
+    handler.on_any_event(FileModifiedEvent(str(target)))
+    assert fired == [True]
+
+
 def test_project_watcher_watches_global_styles(tmp_path: Path) -> None:
     root = tmp_path / "project"
     (root / "pages").mkdir(parents=True)
@@ -591,6 +615,7 @@ def test_project_event_handler_prefers_dest_path(project: DevServerSettings) -> 
 
     class DummyEvent:
         is_directory = False
+        event_type = "moved"
         src_path = "ignored"
         dest_path = str(project.pages_dir / "moved.pyxl")
 
@@ -606,6 +631,7 @@ def test_project_event_handler_uses_src_when_dest_empty(project: DevServerSettin
 
     class DummyEvent:
         is_directory = False
+        event_type = "modified"
         src_path = str(project.pages_dir / "index.pyxl")
         dest_path = ""
 
@@ -625,11 +651,13 @@ def test_project_event_handler_skips_ignored_paths(project: DevServerSettings) -
 
     class Ignored:
         is_directory = False
+        event_type = "modified"
         src_path = str(tailwind_output)
         dest_path = ""
 
     class Kept:
         is_directory = False
+        event_type = "modified"
         src_path = str(project.pages_dir / "index.pyxl")
         dest_path = ""
 
@@ -637,6 +665,61 @@ def test_project_event_handler_skips_ignored_paths(project: DevServerSettings) -
     handler.on_any_event(Kept())
 
     assert captured == [Path(Kept.src_path)]
+
+
+def test_project_event_handler_ignores_read_only_events(project: DevServerSettings) -> None:
+    """A read of a watched source must not schedule a rebuild.
+
+    This is the Linux hot-reload loop: ``build_once`` opens every source file to
+    hash and compile it, and on Linux inotify surfaces those reads as
+    ``FileOpenedEvent``. If the handler treated them as edits, the rebuild's own
+    reads would re-trigger it forever. macOS FSEvents never surfaces reads, which
+    is why the loop only ever appeared on Linux. Only genuine-change events pass.
+    """
+    from watchdog.events import FileModifiedEvent, FileOpenedEvent
+
+    captured: List[Path] = []
+    handler = _ProjectEventHandler(lambda path: captured.append(path))
+    source = str(project.pages_dir / "index.pyxl")
+
+    handler.on_any_event(FileOpenedEvent(source))
+    assert captured == []  # a read is ignored — reacting would loop
+
+    handler.on_any_event(FileModifiedEvent(source))
+    assert captured == [Path(source)]  # a genuine edit still triggers
+
+
+def test_project_event_handler_reacts_to_every_change_event(
+    project: DevServerSettings,
+) -> None:
+    """Every genuine-change event type schedules a rebuild: create, modify,
+    delete, a writable-close, and a rename all represent real edits."""
+    from watchdog.events import (
+        FileClosedEvent,
+        FileCreatedEvent,
+        FileDeletedEvent,
+        FileModifiedEvent,
+        FileMovedEvent,
+    )
+
+    source = project.pages_dir / "index.pyxl"
+    moved = project.pages_dir / "renamed.pyxl"
+
+    for event in (
+        FileCreatedEvent(str(source)),
+        FileModifiedEvent(str(source)),
+        FileDeletedEvent(str(source)),
+        FileClosedEvent(str(source)),
+    ):
+        captured: List[Path] = []
+        handler = _ProjectEventHandler(lambda path, sink=captured: sink.append(path))
+        handler.on_any_event(event)
+        assert captured == [source], event.event_type
+
+    captured = []
+    handler = _ProjectEventHandler(lambda path: captured.append(path))
+    handler.on_any_event(FileMovedEvent(str(source), str(moved)))
+    assert captured == [moved]
 
 
 def test_is_generated_output_ignores_build_artefacts(tmp_path: Path) -> None:
