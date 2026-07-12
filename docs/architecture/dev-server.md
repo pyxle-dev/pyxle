@@ -276,6 +276,15 @@ adds extra glob patterns on top of these built-ins — it can add ignores
 but never clear them. The watcher does not watch `node_modules/` or
 `dist/`.
 
+The watcher also reacts only to genuine **change** events — create,
+modify, delete, rename, and writable-close — and ignores read-only file
+open/close events. This matters on Linux: a rebuild *reads* every source
+file to hash and recompile it, and those reads surface through `inotify`
+as open/close events. Treating a read as an edit would let the rebuild's
+own reads re-trigger it in an endless loop; filtering to real changes
+prevents that. (macOS `FSEvents` never reports reads, so the loop only
+ever appeared on Linux.)
+
 ### `public/` is served live, not rebuilt
 
 Changes under `public/` **do not** rebuild or reload the page — matching
