@@ -18,7 +18,7 @@ The `pyxle` CLI manages Pyxle projects from scaffolding to production.
 Create a new Pyxle project.
 
 ```bash
-pyxle init [name] [options]
+pyxle init <name> [options]
 ```
 
 `pyxle init` is **interactive**: when stdin is a terminal and no flag pins the
@@ -30,7 +30,7 @@ defaults below.
 
 | Argument / Flag | Default | Description |
 |----------------|---------|-------------|
-| `name` | `.` | Project directory to create. Use `.` (or omit) to scaffold into the current directory and derive the name from it. |
+| `name` | *(required)* | Project directory to create. A name like `my-app` creates a new directory; `.` scaffolds into the current directory (deriving the name from it). Running `pyxle init` with no argument is an error. |
 | `--force` / `-f` | `false` | Overwrite an existing directory (or scaffold into a non-empty current directory). |
 | `--template` / `-t` | `default` | Project template. Only `"default"` is supported today (other values error). |
 | `--tailwind` / `--no-tailwind` | prompt → off | Set up Tailwind CSS v4 (wired into Vite). |
