@@ -244,14 +244,22 @@ imported version of the compiled `.py` is stale. Python's import
 system caches modules in `sys.modules` — re-importing the same module
 key returns the cached version.
 
-The watcher purges the cached module from `sys.modules` after every
-rebuild, so the next request that needs it triggers a fresh import.
-Source: `devserver/watcher.py:286`.
+So that module-level globals persist across requests exactly like
+`pyxle serve`, the dev server imports a page/action module once and
+reuses it, re-importing only after a rebuild. A rebuild advances a
+process-wide *reload generation* (`ssr/module_cache.py`); each imported
+module is stamped with the generation it was built against, and the
+importer re-imports from disk when the generation has advanced. Changed
+`.py` helper modules are additionally dropped from `sys.modules`
+(`_invalidate_python_modules`), so a re-imported page picks up an edited
+helper too.
 
-This is why Python edits show up immediately without restarting the
-dev server. The hot-reload story is: write file → watcher fires →
-incremental build → module cache purged → next request reads the
-new code.
+This is why Python edits show up immediately without restarting the dev
+server. The hot-reload story is: write file → watcher fires → incremental
+build → reload generation advances → next request re-imports the new code
+(module-level state resets, as it would on any restart). Between rebuilds
+the module is reused, so a module-level counter or cache persists across
+requests — but only per process (see [SSR → module reuse](ssr.md)).
 
 ### What's watched
 

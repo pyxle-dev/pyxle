@@ -167,6 +167,39 @@ For API routes there is a second option: a plain `def endpoint(request)` is
 dispatched through Starlette's threadpool automatically. See
 [Sync endpoints and blocking calls](../guides/api-routes.md#sync-endpoints-and-blocking-calls).
 
+## Loaders should be stateless
+
+A loader runs on every request and should behave as a pure read: fetch what the
+page needs and return it. Avoid keeping mutable state in a **module-level
+global** — a counter, an in-memory cache, an accumulating list:
+
+```python
+count = 0  # module-level state — avoid
+
+@server
+async def load_home(request):
+    global count
+    count += 1              # not what you want in production
+    return {"count": count}
+```
+
+Module-level globals persist across requests for the life of a process — in
+`pyxle serve`, and (because the module is imported once and reused) in
+`pyxle dev` too. But that state is **per process**, never shared or durable:
+
+- Under `pyxle serve --workers N` each worker has its own copy, so `count`
+  above is really N independent counters — a client sees whichever worker
+  handled its request.
+- Nothing survives a restart, a deploy, or — in dev — a hot-reload edit, which
+  re-imports the module and resets its globals.
+
+For state that must be shared across requests or workers, or that must survive
+a restart, use an explicit store: a database (see the
+[`pyxle-db`](../guides/api-routes.md) plugin), a cache such as Redis, or a
+per-worker resource like a `threading.local()` connection (above). Keep
+per-request state inside the loader, and mutate persistent state through an
+[`@action`](server-actions.md).
+
 ## Pages without loaders
 
 If a page has no `@server` function, `data` is an empty object:

@@ -695,26 +695,34 @@ def test_import_module_caches_when_not_debug(tmp_path: Path) -> None:
     sys.modules.pop(key, None)
 
 
-def test_import_module_reimports_when_debug(tmp_path: Path) -> None:
-    """In dev mode (debug=True), _import_module always re-executes the module."""
+def test_import_module_persists_globals_until_rebuild(tmp_path: Path) -> None:
+    """In dev (debug=True), _import_module reuses the module across calls so
+    module-level globals persist across requests exactly like production, and
+    re-executes only after a rebuild advances the reload generation."""
     from pyxle.devserver.starlette_app import _import_module
+    from pyxle.ssr import module_cache
 
     mod_path = tmp_path / "test_debug_reload.py"
     mod_path.write_text("COUNTER = 0\n", encoding="utf-8")
     key = "pyxle._test_debug_reload"
 
-    first = _import_module(key, mod_path, debug=True)
-    assert first.COUNTER == 0
+    try:
+        first = _import_module(key, mod_path, debug=True)
+        assert first.COUNTER == 0
+        first.COUNTER = 42
 
-    # Mutate state that would persist if the module were cached
-    first.COUNTER = 42
+        # No rebuild between requests: same module, mutated global persists.
+        second = _import_module(key, mod_path, debug=True)
+        assert second is first
+        assert second.COUNTER == 42
 
-    # In debug mode, the module must be re-imported (fresh exec), resetting state
-    second = _import_module(key, mod_path, debug=True)
-    assert second is not first
-    assert second.COUNTER == 0  # Reset — module was re-executed
-
-    sys.modules.pop(key, None)
+        # A rebuild advances the generation → the module re-executes, resetting.
+        module_cache.mark_rebuild()
+        third = _import_module(key, mod_path, debug=True)
+        assert third is not first
+        assert third.COUNTER == 0
+    finally:
+        sys.modules.pop(key, None)
 
 
 # ---------------------------------------------------------------------------

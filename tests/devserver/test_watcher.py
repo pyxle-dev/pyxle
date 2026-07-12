@@ -508,6 +508,67 @@ def test_rebuild_logs_no_changes_when_summary_empty(
     assert any("no material changes" in message for message in messages)
 
 
+def test_material_rebuild_advances_module_generation(
+    project: DevServerSettings, timer_factory: Tuple[Callable[[float, Callable[[], None]], ManualTimerHandle], List[ManualTimerHandle]]
+) -> None:
+    """A rebuild with material changes advances the dev module-reload generation
+    so cached page/action modules re-import fresh on the next request."""
+    from pyxle.ssr import module_cache
+
+    factory, handles = timer_factory
+    watcher = ProjectWatcher(
+        project,
+        timer_factory=factory,
+        build_function=lambda settings, **_: BuildSummary(compiled_pages=["index.pyxl"]),
+    )
+
+    before = module_cache.current_generation()
+    watcher.notify_paths([project.pages_dir / "index.pyxl"])
+    handles[-1].trigger()
+    assert module_cache.current_generation() == before + 1
+
+
+def test_changed_python_helper_advances_module_generation(
+    project: DevServerSettings, timer_factory: Tuple[Callable[[float, Callable[[], None]], ManualTimerHandle], List[ManualTimerHandle]]
+) -> None:
+    """Even with an empty build summary, invalidating a changed ``.py`` helper
+    advances the generation — so a cached page that imports it re-imports and
+    picks the edit up on the next request."""
+    from pyxle.ssr import module_cache
+
+    factory, handles = timer_factory
+    watcher = ProjectWatcher(
+        project,
+        timer_factory=factory,
+        build_function=lambda settings, **_: BuildSummary(),
+    )
+
+    before = module_cache.current_generation()
+    watcher.notify_paths([project.pages_dir / "helpers.py"])
+    handles[-1].trigger()
+    assert module_cache.current_generation() == before + 1
+
+
+def test_noop_rebuild_does_not_advance_module_generation(
+    project: DevServerSettings, timer_factory: Tuple[Callable[[float, Callable[[], None]], ManualTimerHandle], List[ManualTimerHandle]]
+) -> None:
+    """A no-op event (nothing recompiled, no ``.py`` module invalidated) leaves
+    the generation unchanged, so module-level globals persist across requests."""
+    from pyxle.ssr import module_cache
+
+    factory, handles = timer_factory
+    watcher = ProjectWatcher(
+        project,
+        timer_factory=factory,
+        build_function=lambda settings, **_: BuildSummary(),
+    )
+
+    before = module_cache.current_generation()
+    watcher.notify_paths([project.public_dir / "favicon.ico"])
+    handles[-1].trigger()
+    assert module_cache.current_generation() == before
+
+
 def test_rebuild_reports_filesystem_error(
     project: DevServerSettings, timer_factory: Tuple[Callable[[float, Callable[[], None]], ManualTimerHandle], List[ManualTimerHandle]]
 ) -> None:

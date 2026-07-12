@@ -90,28 +90,38 @@ sys.modules[page.module_key] = module
 spec.loader.exec_module(module)
 ```
 
-In **dev mode**, before importing, Pyxle purges any cached version of
-this module from `sys.modules`:
+In **dev mode**, the module is likewise imported once and reused across
+requests — so its module-level globals persist exactly like production.
+A rebuild advances a process-wide *reload generation*; the importer
+stamps each module with the generation it was built against and
+re-imports from disk once the generation advances:
 
 ```python
-if settings.debug:
-    _purge_page_modules(settings.pages_dir)
+if getattr(cached, GENERATION_ATTRIBUTE, None) == current_generation():
+    return cached  # reuse between rebuilds — globals persist
 ```
 
 This is the hot-reload mechanism. When you save a `.pyxl` file:
 
-1. The watcher rebuilds the artifacts.
-2. The `.py` file on disk has new content.
-3. The next request purges the old cached module.
-4. Python's import machinery reads the new file from disk.
-5. The new code runs.
+1. The watcher rebuilds the artifacts and advances the reload generation.
+2. The next request sees the module's stamp is stale and re-imports it.
+3. Python re-reads the new `.py` from disk, re-running its body (module
+   globals reset) and its `import` statements (so an edited helper module
+   is picked up too).
+4. The new code runs.
 
-In **production mode** (`pyxle serve`), modules are imported once at
-startup and never re-imported. This avoids the per-request import
-overhead and is consistent with the immutable nature of a deployed
-build.
+In **production mode** (`pyxle serve`), the reload generation never
+advances, so modules are imported once at startup and reused for the life
+of the process — the same reuse as dev between rebuilds.
 
-Source: `ssr/view.py:614-660`.
+Because the module is reused between rebuilds, module-level mutable state
+(a counter, an in-process cache) behaves the same in dev and serve. It is,
+however, **per-process** — under `serve --workers N` each worker has its
+own copy, and nothing survives a restart or an edit. Use a database or
+cache for state that must be shared or durable; see the
+[data-loading guide](../core-concepts/data-loading.md#loaders-should-be-stateless).
+
+Source: `ssr/view.py` (`_import_server_module`) and `ssr/module_cache.py`.
 
 ---
 
