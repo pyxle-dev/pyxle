@@ -330,7 +330,18 @@ class ProjectWatcher:
                 continue
             if not resolved.exists():
                 continue
-            if resolved == pages_root or resolved == public_root:
+            # public/ is served live and index-only — never rebuild-watched. A
+            # global stylesheet under public/ (e.g. the standalone Tailwind CLI
+            # regenerating public/styles/tailwind.css) would otherwise put a
+            # public/ subtree on the rebuild watch; the rebuild lets the CSS be
+            # re-emitted, whose write retriggers the rebuild — a self-sustaining
+            # reload loop. Match the dev.watch guard above (``is_relative_to``,
+            # not ``==``) and skip it; the stylesheet still syncs on each rebuild.
+            if (
+                resolved == pages_root
+                or resolved == public_root
+                or resolved.is_relative_to(public_root)
+            ):
                 continue
             if resolved in watched_extras:
                 continue
@@ -343,7 +354,14 @@ class ProjectWatcher:
                 continue
             if not resolved.exists():
                 continue
-            if resolved == pages_root or resolved == public_root:
+            # public/ is served live and index-only — never rebuild-watched; a
+            # global script under public/ would reintroduce the reload loop the
+            # same way a global stylesheet does (see the stylesheet loop above).
+            if (
+                resolved == pages_root
+                or resolved == public_root
+                or resolved.is_relative_to(public_root)
+            ):
                 continue
             if resolved in watched_extras:
                 continue
