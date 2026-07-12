@@ -104,6 +104,11 @@ export default function ProfilePage({ data }) {
 | `fields` | `Record<string, string[]> \| null` | Per-field validation errors from the last failed submit (a `422`), or `null`. Cleared when a new request starts |
 | `data` | `object \| null` | Last successful response data |
 
+The value you `await` is the **flat** result — `{ ok: true, ...yourReturn }` on success — so read
+returned fields directly off it (`result.title`), **not** under `result.data`. A successful result
+has no `.data`. The `data` property in the table above is the *hook's* convenience copy of that same
+payload, for reading it outside the call site — don't confuse the two.
+
 Options:
 
 | Option | Type | Description |

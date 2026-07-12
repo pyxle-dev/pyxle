@@ -257,6 +257,87 @@ def test_project_watcher_watches_global_scripts(tmp_path: Path) -> None:
     assert script_dir.resolve() in scheduled
 
 
+def test_global_stylesheet_under_public_is_not_rebuild_watched(tmp_path: Path) -> None:
+    """A global stylesheet living under public/ (e.g. the Tailwind CLI output at
+    public/styles/tailwind.css) must NOT put a public/ subtree on the rebuild
+    watch. public/ is served live and index-only; rebuild-watching a public/
+    subdirectory reintroduces the self-sustaining hot-reload loop (the rebuild
+    lets Tailwind re-emit the CSS, whose write retriggers the rebuild)."""
+    root = tmp_path / "project"
+    (root / "pages").mkdir(parents=True)
+    style_dir = root / "public" / "styles"
+    style_dir.mkdir(parents=True)
+    (style_dir / "tailwind.css").write_text("body { color: teal; }\n", encoding="utf-8")
+
+    settings = DevServerSettings.from_project_root(
+        root,
+        global_stylesheets=("public/styles/tailwind.css",),
+    )
+
+    observer = DummyObserver()
+    watcher = ProjectWatcher(
+        settings,
+        logger=make_logger()[0],
+        observer_factory=lambda: observer,
+        timer_factory=lambda delay, callback: ManualTimerHandle(callback),
+        build_function=lambda *_: BuildSummary(),
+    )
+    watcher.start()
+
+    from pyxle.devserver.watcher import _ProjectEventHandler, _PublicAssetEventHandler
+
+    rebuild_watched = {
+        Path(path).resolve()
+        for handler, path, _ in observer.scheduled
+        if isinstance(handler, _ProjectEventHandler)
+    }
+    index_watched = {
+        Path(path).resolve()
+        for handler, path, _ in observer.scheduled
+        if isinstance(handler, _PublicAssetEventHandler)
+    }
+    # The public/ subtree is never rebuild-watched...
+    assert style_dir.resolve() not in rebuild_watched
+    assert settings.public_dir.resolve() not in rebuild_watched
+    # ...but public/ itself keeps its index-only watch.
+    assert settings.public_dir.resolve() in index_watched
+
+
+def test_global_script_under_public_is_not_rebuild_watched(tmp_path: Path) -> None:
+    """A global script living under public/ must NOT be rebuild-watched either —
+    same self-sustaining reload loop as a public/ global stylesheet."""
+    root = tmp_path / "project"
+    (root / "pages").mkdir(parents=True)
+    script_dir = root / "public" / "js"
+    script_dir.mkdir(parents=True)
+    (script_dir / "app.js").write_text("console.log('hi');\n", encoding="utf-8")
+
+    settings = DevServerSettings.from_project_root(
+        root,
+        global_scripts=("public/js/app.js",),
+    )
+
+    observer = DummyObserver()
+    watcher = ProjectWatcher(
+        settings,
+        logger=make_logger()[0],
+        observer_factory=lambda: observer,
+        timer_factory=lambda delay, callback: ManualTimerHandle(callback),
+        build_function=lambda *_: BuildSummary(),
+    )
+    watcher.start()
+
+    from pyxle.devserver.watcher import _ProjectEventHandler
+
+    rebuild_watched = {
+        Path(path).resolve()
+        for handler, path, _ in observer.scheduled
+        if isinstance(handler, _ProjectEventHandler)
+    }
+    assert script_dir.resolve() not in rebuild_watched
+    assert settings.public_dir.resolve() not in rebuild_watched
+
+
 def test_project_watcher_stop_without_start(project: DevServerSettings) -> None:
     logger, _ = make_logger()
 

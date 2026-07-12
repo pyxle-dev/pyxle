@@ -244,6 +244,11 @@ const result = await actionFn(payload);
 // result.*: response data fields  (when ok)
 ```
 
+The `.data` row in the properties table above is the **hook's** convenience copy of the last
+successful result, for reading outside the call. The value you `await` is the flat result itself —
+read returned fields directly off it (`result.title`), **not** under `result.data`. A successful
+result has no `.data`.
+
 **Behaviour:**
 - New calls abort previous in-flight requests
 - State resets on each new call

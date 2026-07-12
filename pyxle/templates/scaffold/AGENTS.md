@@ -15,8 +15,9 @@ frameworks — most mistakes come from not understanding the one-file Python+Rea
    performs a mutation. Both decorators are **available without importing them.**
 3. The client calls an `@action` with **`useAction('name')`, not `fetch()`.** There is no API
    route to write — the `@action` *is* the endpoint.
-4. `@server`/`@action` return a **plain dict.** On the client, an action's result arrives
-   **wrapped** as `{ ok: true, ...yourDict }` (or `{ ok: false, error }`). Always check `res.ok`.
+4. `@server`/`@action` return a **plain dict.** On the client, `const res = await myAction(...)`
+   gives you `{ ok: true, ...yourDict }` (or `{ ok: false, error }`) — your fields sit **directly
+   on `res`** (`res.users`), **not** under `res.data`. Always check `res.ok`.
 5. Raise a handled error with `raise LoaderError(...)` (in a loader) or `raise ActionError(...)`
    (in an action) — **no import needed.** Like the decorators, these runtime classes
    (`LoaderError`, `ActionError`, `ValidationActionError`, `invalidate_routes`) are auto-injected.
@@ -116,10 +117,16 @@ async def create_post(request):
 Call it from React — **never `fetch`**:
 
 ```jsx
-const create = useAction('create_post');           // returns a callable + .pending/.error/.data
+const create = useAction('create_post');           // a callable, plus create.pending / .error / .fields
 const res = await create({ title });               // arg becomes request.json() on the server
-if (res.ok) { /* use res.id, res.title */ } else { /* show res.error */ }
+if (res.ok) { /* fields are top-level: res.id, res.title — never res.data.id */ }
+else        { /* show res.error */ }
 ```
+
+The value you `await` **is** the flat `{ ok, ...yourReturn }` object — read `res.title`, never
+`res.data.title` (a successful result has no `.data`). The hook *also* exposes `create.data`: the
+**same** fields from the last successful call, handy for rendering away from the call site. Both
+reach your data, but the value you `await` is never nested under `.data`.
 
 Or use the `<Form>` helper for form submissions:
 
@@ -161,7 +168,7 @@ for durable/cross-worker jobs, hand off to Celery/ARQ/Dramatiq (see the Backgrou
 
 ## The client toolkit — `import { … } from 'pyxle/client'`
 
-- `useAction(name)` — bind to an `@action`; returns a callable with `.pending`, `.error`, `.fields`, `.data`.
+- `useAction(name)` — bind to an `@action`; returns a callable with `.pending`, `.error`, `.fields`, and `.data` (the last successful return's fields). The value you `await` is the flat `{ ok, ...return }` — read fields off it directly (`res.x`), not off `res.data`.
 - `<Form action="name" onSuccess onError>` — submit named inputs to an `@action`.
 - `<Head>` — set per-page `<title>`/`<meta>`/`<link>` (deduped + merged with layouts).
 - `<Link href="/path">` — client-side navigation; `navigate('/path')` to do it imperatively.
@@ -229,6 +236,10 @@ pyxle install  # (re)install Python + Node deps
 - **DO** keep one `export default function` per page (the component). Name the loader anything.
 - **DO** return JSON-safe dicts from `@server`/`@action`. **DON'T** add your own `ok` key to an
   action's return — the framework adds it.
+- **DON'T** read an awaited action result as `res.data.x`. A successful result is the flat
+  `{ ok, ...yourReturn }`, so the field is `res.x` — your returned data is never nested under
+  `.data`. (`.data` is the hook property `useAction(...).data`; on an awaited result it shows up
+  only on a *failure*, as the optional error payload — never your returned fields.)
 - **DON'T** call your own actions with `fetch` or write a route for them — use `useAction`/`<Form>`.
 - **DON'T** put emoji or other non-BMP characters in **server-rendered** JSX text — SSR can fail
   to encode them. Use them only in client-only paths, or stick to plain text.
