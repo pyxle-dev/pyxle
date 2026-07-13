@@ -1,0 +1,4 @@
+{
+    "title": "Config Parsing: Integer fields like `maxAge` and `port` incorrectly accept boolean values",
+    "body": "In `pyxle/config.py`, several configuration parsers such as `_parse_cors_block`, `_parse_network_block`, and `_parse_rate_limit_block` rely on `isinstance(value, int)` to validate integer fields like `maxAge`, `port`, `window`, and `requests`.\n\nBecause `bool` is a subclass of `int` in Python, this causes configurations such as `\"maxAge\": true` to pass validation, where they should be rejected as invalid types.\n\nTo resolve this, explicit checks for `not isinstance(value, bool)` should be added alongside the `isinstance(value, int)` checks."
+}

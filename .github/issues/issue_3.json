@@ -1,0 +1,4 @@
+{
+    "title": "SSR: `escape_inline_json` raises AttributeError on non-string inputs",
+    "body": "In `pyxle/ssr/_escape.py`, the `escape_inline_json` utility expects a string input and directly calls `.replace()` on it. If a non-string value (like an integer or a boolean) is passed, this results in an `AttributeError`, causing the server-side rendering to crash.\n\nFor example, `escape_inline_json` is used in `_escape_style_contents` inside `pyxle/ssr/template.py` which can receive unexpected types. Explicit type validation or coercing the value to a string first would make this utility safer."
+}
