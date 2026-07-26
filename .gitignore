@@ -68,3 +68,7 @@ CORE_FINDINGS.md
 *.db
 *.db-wal
 *.db-shm
+
+# macOS AppleDouble metadata files
+._*
+.DS_Store
