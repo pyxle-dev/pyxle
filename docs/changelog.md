@@ -11,6 +11,8 @@ Release notes for Pyxle. While we're in beta (`0.x`), minor versions may include
 - **`pyxle dev --inspect` for attach-style debugging.** Hosts a debugpy server bound to `127.0.0.1` so any DAP client — or a remote VS Code — can attach to a running dev server. The server writes `.pyxle-build/dev-server.json` (ports, debugpy endpoint) for editor tooling and removes it on shutdown. [Debugging .pyxl files](guides/debugging-pyxl.md).
 - **Dev tracebacks now point at `.pyxl` sources.** A loader/action error names your `.pyxl` file and line instead of the compiled module under `.pyxle-build/`. [Debugging](guides/debugging.md).
 - **Breaking: `/__pyxle` is now a reserved URL namespace.** The dev server's Vite asset proxy never forwards paths under it, so an app route under `/__pyxle` no longer resolves in `pyxle dev` (it still serves in production, where the namespace is unused). Move any such route before upgrading. [Pyxle Studio](guides/studio.md#the-reserved-__pyxle-namespace).
+- **Fixed on Windows: `NODE_PATH` is built with the platform delimiter.** A project that already set `NODE_PATH` got a `:`-joined value, which Node cannot parse on Windows, so neither entry resolved.
+- **Fixed on Windows: rebuild notifications report POSIX paths.** The dev server's rebuild event carried host separators, so Studio and the error overlay showed `pages\index.pyxl`.
 
 ## 0.7.5
 
