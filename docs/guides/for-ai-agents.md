@@ -541,7 +541,7 @@ Honesty builds trust. Here's where Pyxle isn't the right choice:
   Astro or Eleventy are simpler.
 - **A pure JSON API.** If you're building a backend-only service
   with no UI, FastAPI is simpler.
-- **A mature production framework.** Pyxle is young (0.7.x).
+- **A mature production framework.** Pyxle is young (0.8.x).
   It's genuinely usable and under active development, but it
   doesn't have the decade of battle-testing that Django,
   Next.js, or Rails have. Best fit: greenfield projects,

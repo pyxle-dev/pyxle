@@ -97,6 +97,9 @@ pyxle dev [directory] [options]
 | `--print-config` / `--no-print-config` | `false` | Print merged configuration before starting |
 | `--tailwind` / `--no-tailwind` | `true` | Auto-start the **legacy** standalone Tailwind v3 CLI watcher when a hand-written `tailwind.config.*` is present. Tailwind **v4** projects (the scaffold default when you opt into Tailwind) run through the `@tailwindcss/vite` plugin and ignore this flag. |
 | `--dashboard` / `--no-dashboard` | `false` | Periodically print a live [observability](../guides/observability.md#dev-dashboard) panel (request/SSR metrics) to the terminal |
+| `--inspect` / `--no-inspect` | `false` | Host a debugpy debug server (bound to `127.0.0.1`) so VS Code or any DAP client can set breakpoints directly in `.pyxl` files — see [Debugging .pyxl files](../guides/debugging-pyxl.md). debugpy ships with the framework. |
+| `--inspect-port` | `5678` | Port for the debug server (with `--inspect`). Falls back to an ephemeral port when busy; the actual endpoint is recorded in `.pyxle-build/dev-server.json`. |
+| `--inspect-wait` / `--no-inspect-wait` | `false` | With `--inspect`: wait for a debugger to attach before starting the server — for breakpoints in code that runs during boot. |
 | `--verbose` / `-v` | `false` | Restore full output: the raw Vite log firehose, debug-level internals, and `DEBUG` server logs in the browser console. Equivalent to the global `pyxle -v dev`. |
 
 **Examples:**
@@ -136,6 +139,40 @@ without leaving the browser. By default only `INFO` and above from your own
 loggers are forwarded; `--verbose` additionally forwards `DEBUG` records and the
 framework's own internal loggers. This is strictly a development feature — it
 never runs under `pyxle serve` and never appears in the production bundle.
+
+## `pyxle studio`
+
+Run the dev server and open the [Pyxle Studio](../guides/studio.md) dashboard.
+
+```bash
+pyxle studio [directory] [options]
+```
+
+`pyxle studio` runs the same development server as `pyxle dev` — Studio is part of it, served at `/__pyxle/studio` — and opens your browser on the dashboard once the server is ready. Debug mode is forced on (Studio is dev-only), and the dashboard is enabled for this run even when the config sets `"studio": false`.
+
+| Argument / Flag | Default | Description |
+|----------------|---------|-------------|
+| `directory` | `.` | Project directory |
+| `--host` | `127.0.0.1` | Starlette server bind address |
+| `--port` | `8000` | Starlette server port |
+| `--vite-host` | `127.0.0.1` | Vite dev server bind address |
+| `--vite-port` | `5173` | Vite dev server port |
+| `--ssr-workers` | `1` | Number of persistent SSR worker processes (`0` = per-request subprocess mode) |
+| `--config` | -- | Path to `pyxle.config.json` |
+| `--tailwind` / `--no-tailwind` | `true` | Auto-start the legacy Tailwind v3 watcher when a hand-written `tailwind.config.*` is present (same behavior as `pyxle dev`) |
+| `--open` / `--no-open` | `true` | Open the Studio dashboard in the system browser once the server is ready |
+| `--inspect` / `--no-inspect` | `false` | Host a debugpy debug server for `.pyxl` breakpoint debugging — see [Debugging .pyxl files](../guides/debugging-pyxl.md) |
+| `--inspect-port` | `5678` | Port for the debug server (with `--inspect`; falls back to an ephemeral port when busy) |
+| `--verbose` / `-v` | `false` | Restore full output (raw Vite logs, debug internals). Equivalent to `pyxle -v studio`. |
+
+**Examples:**
+
+```bash
+pyxle studio                     # dev server + dashboard in the browser
+pyxle studio --no-open           # dashboard enabled, but don't launch a browser
+pyxle studio --inspect           # dashboard + debugger in one command
+pyxle studio ./my-app --port 3000
+```
 
 ## `pyxle build`
 
