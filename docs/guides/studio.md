@@ -92,7 +92,7 @@ The `/__pyxle` URL prefix is reserved for framework endpoints — Studio lives u
 
 ## See also
 
-- [Debugging `.pyxl` files](debugging-pyxl.md) — breakpoints in `.pyxl` source; `pyxle studio --inspect` combines both tools
+- [Debugging](debugging.md) — breakpoints in `.pyxl` source; `pyxle studio --inspect` combines both tools
 - [Observability](observability.md) — the metrics registry Studio reads, and production-grade exporters
 - [CLI reference → `pyxle studio`](../reference/cli.md#pyxle-studio) — every flag
 - [Configuration reference → Studio](../reference/configuration.md#studio) — the config block
