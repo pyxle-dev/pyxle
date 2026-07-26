@@ -1,4 +1,0 @@
-{
-    "title": "CSRF: `_tokens_match` crashes when receiving non-string tokens",
-    "body": "In `pyxle/devserver/csrf.py`, the `_tokens_match` function uses `hmac.compare_digest(cookie_token, submitted_token)`. If a submitted token is passed as a non-string type (such as an integer from JSON parsing), `hmac.compare_digest` raises a `TypeError` (e.g., `unsupported operand type(s) for str and int`). This crashes the request handling and results in a 500 error instead of a graceful CSRF failure (403).\n\nTo prevent potential denial of service via malformed JSON bodies, `_tokens_match` should explicitly check that both `cookie_token` and `submitted_token` are strings before passing them to `hmac.compare_digest`."
-}
