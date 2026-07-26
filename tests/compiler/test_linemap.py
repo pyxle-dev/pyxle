@@ -13,13 +13,13 @@ from textwrap import dedent
 
 import pytest
 
-import pyxle.compiler.linemap as linemap
 from pyxle.compiler.linemap import (
     LINE_MAP_DUNDER,
     SOURCE_DUNDER,
     PyxlDebugInfo,
     PyxlSourceFileLoader,
     _SpanMapper,
+    _split_lines,
     build_line_map,
     compress_to_spans,
     extract_debug_info,
@@ -35,22 +35,22 @@ from pyxle.compiler.linemap import (
 
 def test_split_lines_drops_trailing_empty_line() -> None:
     # A final newline must not produce a phantom trailing "" line.
-    assert linemap._split_lines("a\nb\n") == ["a", "b"]
+    assert _split_lines("a\nb\n") == ["a", "b"]
     # …but a file with no trailing newline keeps its last line.
-    assert linemap._split_lines("a\nb") == ["a", "b"]
+    assert _split_lines("a\nb") == ["a", "b"]
     # Interior blank lines are preserved; only the single trailing "" is dropped.
-    assert linemap._split_lines("a\n\nb\n") == ["a", "", "b"]
+    assert _split_lines("a\n\nb\n") == ["a", "", "b"]
 
 
 def test_split_lines_empty_string_has_no_lines() -> None:
-    assert linemap._split_lines("") == []
+    assert _split_lines("") == []
 
 
 def test_split_lines_ignores_form_feed_and_vertical_tab() -> None:
     # Unlike str.splitlines, a form-feed / vertical-tab inside a line is an
     # ordinary in-line character — the parser splits on "\n" only.
-    assert linemap._split_lines("a\x0cb\nc") == ["a\x0cb", "c"]
-    assert linemap._split_lines("a\x0bb\nc") == ["a\x0bb", "c"]
+    assert _split_lines("a\x0cb\nc") == ["a\x0cb", "c"]
+    assert _split_lines("a\x0bb\nc") == ["a\x0bb", "c"]
     # str.splitlines would have split the form-feed into two entries — the very
     # desync _split_lines exists to avoid.
     assert "a\x0cb".splitlines() == ["a", "b"]
@@ -487,7 +487,7 @@ def test_remap_code_tolerates_node_without_end_lineno(
                 del node.end_lineno
         return tree
 
-    monkeypatch.setattr(linemap.ast, "parse", parse_without_end_lineno)
+    monkeypatch.setattr(ast, "parse", parse_without_end_lineno)
     code = remap_code(module_text, module_path)
     assert code is not None
     assert code.co_filename == str(pyxl_path.resolve())

@@ -18,7 +18,7 @@ from starlette.testclient import TestClient
 import pyxle
 from pyxle.cli.logger import ConsoleLogger
 from pyxle.config import CacheConfig, CsrfConfig, StudioConfig
-from pyxle.devserver import DevServer, _notify_studio_rebuild
+from pyxle.devserver import DevServer, _notify_studio_rebuild, _rebuild_app_routes
 from pyxle.devserver.builder import BuildSummary, build_once
 from pyxle.devserver.registry import load_metadata_registry
 from pyxle.devserver.routes import build_route_table
@@ -306,9 +306,7 @@ def table(project: DevServerSettings):
 
 
 def _make_app(settings: DevServerSettings, table, monkeypatch):
-    monkeypatch.setattr(
-        "pyxle.devserver.starlette_app.ComponentRenderer", lambda: object()
-    )
+    monkeypatch.setattr("pyxle.devserver.starlette_app.ComponentRenderer", object)
 
     async def fake_build_page_response(
         *, request, settings, page, renderer, overlay=None, **_kw
@@ -1490,8 +1488,6 @@ async def test_notify_studio_rebuild_closes_coroutine_on_dead_loop(monkeypatch) 
 def test_hot_route_refresh_threads_the_studio_manager(
     app, project, monkeypatch
 ) -> None:
-    import pyxle.devserver as devserver_pkg
-
     manager = app.state.pyxle_studio
     assert isinstance(manager, StudioManager)
 
@@ -1504,7 +1500,7 @@ def test_hot_route_refresh_threads_the_studio_manager(
     monkeypatch.setattr(
         "pyxle.devserver.starlette_app._build_app_routes", spy_build_app_routes
     )
-    devserver_pkg._rebuild_app_routes(app, project)
+    _rebuild_app_routes(app, project)
     assert captured["studio"] is manager
 
 

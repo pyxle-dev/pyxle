@@ -357,6 +357,8 @@ class DevServer:
                 ):
                     return
             except (OSError, ValueError):
+                # Unreadable or not valid JSON — there is no pid to compare, so
+                # nothing can be stranded by removing it. Fall through to unlink.
                 pass
             path.unlink(missing_ok=True)
         except OSError:  # pragma: no cover - best-effort cleanup
