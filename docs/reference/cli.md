@@ -97,7 +97,7 @@ pyxle dev [directory] [options]
 | `--print-config` / `--no-print-config` | `false` | Print merged configuration before starting |
 | `--tailwind` / `--no-tailwind` | `true` | Auto-start the **legacy** standalone Tailwind v3 CLI watcher when a hand-written `tailwind.config.*` is present. Tailwind **v4** projects (the scaffold default when you opt into Tailwind) run through the `@tailwindcss/vite` plugin and ignore this flag. |
 | `--dashboard` / `--no-dashboard` | `false` | Periodically print a live [observability](../guides/observability.md#dev-dashboard) panel (request/SSR metrics) to the terminal |
-| `--inspect` / `--no-inspect` | `false` | Host a debugpy debug server (bound to `127.0.0.1`) so VS Code or any DAP client can set breakpoints directly in `.pyxl` files — see [Debugging .pyxl files](../guides/debugging-pyxl.md). debugpy ships with the framework. |
+| `--inspect` / `--no-inspect` | `false` | Host a debugpy debug server (bound to `127.0.0.1`) so VS Code or any DAP client can set breakpoints directly in `.pyxl` files — see [Debugging](../guides/debugging.md). debugpy ships with the framework. |
 | `--inspect-port` | `5678` | Port for the debug server (with `--inspect`). Falls back to an ephemeral port when busy; the actual endpoint is recorded in `.pyxle-build/dev-server.json`. |
 | `--inspect-wait` / `--no-inspect-wait` | `false` | With `--inspect`: wait for a debugger to attach before starting the server — for breakpoints in code that runs during boot. |
 | `--verbose` / `-v` | `false` | Restore full output: the raw Vite log firehose, debug-level internals, and `DEBUG` server logs in the browser console. Equivalent to the global `pyxle -v dev`. |
@@ -161,7 +161,7 @@ pyxle studio [directory] [options]
 | `--config` | -- | Path to `pyxle.config.json` |
 | `--tailwind` / `--no-tailwind` | `true` | Auto-start the legacy Tailwind v3 watcher when a hand-written `tailwind.config.*` is present (same behavior as `pyxle dev`) |
 | `--open` / `--no-open` | `true` | Open the Studio dashboard in the system browser once the server is ready |
-| `--inspect` / `--no-inspect` | `false` | Host a debugpy debug server for `.pyxl` breakpoint debugging — see [Debugging .pyxl files](../guides/debugging-pyxl.md) |
+| `--inspect` / `--no-inspect` | `false` | Host a debugpy debug server for `.pyxl` breakpoint debugging — see [Debugging](../guides/debugging.md) |
 | `--inspect-port` | `5678` | Port for the debug server (with `--inspect`; falls back to an ephemeral port when busy) |
 | `--verbose` / `-v` | `false` | Restore full output (raw Vite logs, debug internals). Equivalent to `pyxle -v studio`. |
 

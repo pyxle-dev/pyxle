@@ -134,7 +134,7 @@ which earlier framework versions don't provide. Python-side breakpoints
 also require the Python extension (`ms-python.python`); the debugger
 offers to install it if it's missing.
 
-Full walkthrough: [Debugging .pyxl files](debugging-pyxl.md).
+Full walkthrough: [Debugging .pyxl files](debugging.md).
 
 ### Open Studio
 
