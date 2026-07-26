@@ -84,3 +84,57 @@ jobs:
       - name: Run test suite (with coverage gate)
         run: pytest
         working-directory: pyxle
+
+  test-windows:
+    name: Test (Windows, cross-platform surface)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout pyxle
+        uses: actions/checkout@v7
+        with:
+          path: pyxle
+
+      - name: Checkout pyxle-langkit (sibling, for the JSX extractor)
+        uses: actions/checkout@v7
+        with:
+          repository: pyxle-dev/pyxle-langkit
+          path: pyxle-langkit
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+
+      - name: Install JSX extractor deps (Babel)
+        run: npm install
+        working-directory: pyxle-langkit
+
+      - name: Install dev dependencies
+        run: pip install -e ".[dev]"
+        working-directory: pyxle
+
+      # Exercise the code with genuine OS-specific behaviour on Windows —
+      # signal-death exit codes, os.path.relpath across drives, atomic
+      # os.replace under lock contention, POSIX/Windows path handling in the
+      # line-map footer + source-map sidecar, the discovery file, and Studio.
+      # (A full-suite Windows matrix is a good follow-up; this pins the paths
+      # this feature is most likely to break on Windows.)
+      - name: Run cross-platform test surface
+        run: >
+          pytest --no-cov
+          tests/compiler/test_linemap.py
+          tests/compiler/test_writers.py
+          tests/devserver/test_debug_import.py
+          tests/devserver/test_vite.py
+          tests/devserver/test_studio.py
+          tests/devserver/test_devserver_start.py
+          tests/devserver/test_proxy.py
+          tests/build/test_pipeline.py
+          tests/cli/test_commands.py
+          tests/test_main.py
+        working-directory: pyxle

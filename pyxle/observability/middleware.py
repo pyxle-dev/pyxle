@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 import time
 import uuid
-from typing import Any, Awaitable, Callable, MutableMapping
+from typing import Any, Awaitable, Callable, MutableMapping, Sequence
 
 Scope = MutableMapping[str, Any]
 Message = MutableMapping[str, Any]
@@ -93,6 +93,8 @@ class RequestIdMiddleware:
         timing: bool = True,
         metrics: Any = None,
         access_log: bool = False,
+        observer: Callable[[MutableMapping[str, Any]], None] | None = None,
+        exclude_path_prefixes: Sequence[str] = (),
     ) -> None:
         self.app = app
         self.emit_request_id = emit_request_id
@@ -105,6 +107,16 @@ class RequestIdMiddleware:
         self.metrics = metrics
         # Emit one structured access-log line per request when enabled.
         self.access_log = access_log
+        # Optional per-request sink, called on the event loop at response start
+        # with {method, path, status, duration_ms, request_id, route}. Used by
+        # Pyxle Studio's live request feed; a raising observer is swallowed so
+        # instrumentation can never fail a request.
+        self.observer = observer
+        # Requests whose path starts with one of these prefixes are excluded
+        # from metrics, the access log, and the observer — but still get a
+        # correlation id. Keeps internal dashboards (Studio polling its own
+        # endpoints) from polluting the numbers they display.
+        self._exclude_prefixes = tuple(exclude_path_prefixes)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope.get("type") != "http":
@@ -127,8 +139,15 @@ class RequestIdMiddleware:
         bind_request_id(request_id)
 
         # Measure when timing is on, or when a registry/access log needs it.
-        measure = self.timing or self.metrics is not None or self.access_log
+        measure = (
+            self.timing
+            or self.metrics is not None
+            or self.access_log
+            or self.observer is not None
+        )
         start = time.perf_counter() if measure else 0.0
+        path = scope.get("path", "")
+        excluded = any(path.startswith(prefix) for prefix in self._exclude_prefixes)
 
         async def send_wrapper(message: Message) -> None:
             if message["type"] == "http.response.start":
@@ -136,9 +155,9 @@ class RequestIdMiddleware:
                 status = int(message.get("status", 0))
                 if self.timing:
                     pyxle_state[_DURATION_FIELD] = elapsed_ms
-                if self.metrics is not None:
+                if self.metrics is not None and not excluded:
                     self.metrics.observe_request(status, elapsed_ms)
-                if self.access_log:
+                if self.access_log and not excluded:
                     from pyxle.observability.logging import log_access  # noqa: PLC0415
 
                     log_access(
@@ -147,6 +166,20 @@ class RequestIdMiddleware:
                         status=status,
                         duration_ms=elapsed_ms,
                     )
+                if self.observer is not None and not excluded:
+                    try:
+                        self.observer(
+                            {
+                                "method": scope.get("method", ""),
+                                "path": path,
+                                "status": status,
+                                "duration_ms": elapsed_ms,
+                                "request_id": request_id,
+                                "route": pyxle_state.get("route"),
+                            }
+                        )
+                    except Exception:  # noqa: BLE001 — observers never fail a request
+                        pass
                 if request_id is not None:
                     headers = message.setdefault("headers", [])
                     # Drop any upstream copy of the header, then append ours so

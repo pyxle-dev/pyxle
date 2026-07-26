@@ -2,6 +2,18 @@
 
 Release notes for Pyxle. While we're in beta (`0.x`), minor versions may include breaking changes — those are called out explicitly. To upgrade, run `pip install --upgrade pyxle-framework`.
 
+## 0.8.0
+
+- **Pyxle Studio — a dashboard built into `pyxle dev`.** Served at `/__pyxle/studio`: every route with its loader, actions, cache posture, and boundaries; an interactive tester (loaders run in-process, actions go through their real endpoint — CSRF, validation, and auth hooks included); a live request feed; latency metrics; the effective config (secrets redacted); and in-browser `pyxle check`. Dev-only by construction, with a `Host`-header allowlist. [Pyxle Studio](guides/studio.md).
+- **New `pyxle studio` command.** Runs the dev server and opens the browser on the dashboard, enabling it for that run even when the config opts out. [CLI](reference/cli.md#pyxle-studio).
+- **Breakpoint debugging directly in `.pyxl` files.** Set a breakpoint on a line inside a `@server` loader *and* on a line inside the JSX below it — both bind. Compiled server modules are remapped to their `.pyxl` sources, so the Python debugger binds natively; dev source maps chain through Vite so the React half binds in the browser. debugpy ships with the framework — nothing extra to install. [Debugging .pyxl files](guides/debugging-pyxl.md).
+- **One-key debugging from VS Code.** Pyxle Language Tools 0.3.0 contributes a `pyxle` debug type: press F5 to run your dev server under the debugger — one clean session with a real Stop button that tears the whole server down — and open your app. A separate "Debug Pyxle app (React browser)" configuration debugs the React side in a standalone browser session. Plus a "Pyxle: Open Studio" command. [Debugging .pyxl files](guides/debugging-pyxl.md#quick-start-vs-code).
+- **`pyxle dev --inspect` for attach-style debugging.** Hosts a debugpy server bound to `127.0.0.1` so any DAP client — or a remote VS Code — can attach to a running dev server. The server writes `.pyxle-build/dev-server.json` (ports, debugpy endpoint) for editor tooling and removes it on shutdown. [Debugging .pyxl files](guides/debugging-pyxl.md).
+- **Dev tracebacks now point at `.pyxl` sources.** A loader/action error names your `.pyxl` file and line instead of the compiled module under `.pyxle-build/`. [Debugging](guides/debugging.md).
+- **Breaking: `/__pyxle` is now a reserved URL namespace.** The dev server's Vite asset proxy never forwards paths under it, so an app route under `/__pyxle` no longer resolves in `pyxle dev` (it still serves in production, where the namespace is unused). Move any such route before upgrading. [Pyxle Studio](guides/studio.md#the-reserved-__pyxle-namespace).
+- **Fixed on Windows: `NODE_PATH` is built with the platform delimiter.** A project that already set `NODE_PATH` got a `:`-joined value, which Node cannot parse on Windows, so neither entry resolved.
+- **Fixed on Windows: rebuild notifications report POSIX paths.** The dev server's rebuild event carried host separators, so Studio and the error overlay showed `pages\index.pyxl`.
+
 ## 0.7.5
 
 - **`pyxle dev` now persists module-level state across requests, like `pyxle serve`.** A `@server`/`@action` module is imported once and reused between rebuilds, so a module-level counter or in-memory cache no longer resets on every refresh in dev. Saving a file still re-imports it (resetting globals and applying your edits). State stays per-process — use a database or cache for anything shared or durable ([Loaders should be stateless](core-concepts/data-loading.md#loaders-should-be-stateless)).

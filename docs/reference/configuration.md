@@ -69,6 +69,10 @@ Pyxle is configured via `pyxle.config.json` in the project root. All fields are 
     "enabled": false,
     "autoConvert": false
   },
+  "studio": {
+    "enabled": true,
+    "allowedHosts": []
+  },
   "dev": {
     "watch": [],
     "ignore": []
@@ -351,6 +355,27 @@ Serve a clean **markdown** rendition of every page — at its URL with `.md` app
 **Where the markdown comes from** is *not* config — it lives in your project, resolved in this order (first hit wins): a co-located `<page>.md` file → a `to_markdown` handler in the page's server module → a `to_markdown` in the nearest ancestor `llms.py` (covers a route subtree; `pages/llms.py` is app-wide) → `autoConvert` (if on) → otherwise the `.md` URL redirects to the page. A root `pages/llms.py` may also define `wrap_markdown(ctx, markdown)` to frame every `.md` response with a header/footer. Likewise `/llms.txt` comes from a static `public/llms.txt`, else a `llms_txt` function in the root `pages/llms.py`, else a generated index. See the [guide](../guides/llms.md).
 
 > **Deploying handlers.** Co-located `.md` files and `llms.py` handlers are part of your source, so they must be present alongside `pages/` when you `pyxle serve`. (A page's own `to_markdown`, compiled into the build, works regardless.)
+
+## Studio
+
+[Pyxle Studio](../guides/studio.md) — the web dashboard `pyxle dev` serves at `/__pyxle/studio` (routes, an interactive loader/action tester, a live request feed, metrics, config, and `pyxle check` diagnostics). **On by default in development.** Studio is dev-only by construction: the code path that serves it only exists in the debug-mode dev server, so `pyxle serve` never exposes it regardless of this setting.
+
+```json
+{
+  "studio": {
+    "enabled": true,
+    "allowedHosts": ["my-machine.local"]
+  }
+}
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `studio` | `object` \| `boolean` | `{}` | Studio settings. `false` disables the dashboard; `true` (or omitting the block) enables it. |
+| `studio.enabled` | `boolean` | `true` | Serve the dashboard at `/__pyxle/studio` under `pyxle dev`. The [`pyxle studio`](cli.md#pyxle-studio) command enables it for that run even when this is `false`. |
+| `studio.allowedHosts` | `string[]` | `[]` | Extra hostnames accepted by Studio's `Host`-header allowlist (the DNS-rebinding guard). Loopback names and the configured server host are always allowed; add an entry when reaching the dev server through another name (a LAN IP, a `*.local` alias). |
+
+Shorthand to disable: `"studio": false`. See the [Studio guide](../guides/studio.md) for the panels and the full security model.
 
 ## Development
 

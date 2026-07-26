@@ -67,6 +67,10 @@ class DevServerSettings:
     # AI accessibility (LlmsConfig): per-page ``.md`` + ``/llms.txt``. None /
     # disabled = feature off.
     llms: Any = None
+    # Pyxle Studio (StudioConfig): the dev-only web dashboard at
+    # ``/__pyxle/studio``. None = framework default (enabled in debug mode);
+    # only ever served when ``debug`` is true.
+    studio: Any = None
     # Plugin entries from pyxle.config.json::plugins — raw payload
     # (strings or dicts), resolved to PluginSpec/PyxlePlugin instances
     # by the starlette app at startup. Empty tuple = no plugins.
@@ -102,6 +106,7 @@ class DevServerSettings:
         rate_limit: Any = None,
         observability: Any = None,
         llms: Any = None,
+        studio: Any = None,
         plugins: Sequence[Any] | None = None,
     ) -> "DevServerSettings":
         """Create settings derived from a project root directory."""
@@ -179,6 +184,7 @@ class DevServerSettings:
             rate_limit=rate_limit,
             observability=observability,
             llms=llms,
+            studio=studio,
             plugins=tuple(plugins) if plugins else (),
         )
 

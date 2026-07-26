@@ -26,7 +26,7 @@ Those frameworks let you build the UI in pure Python; Pyxle has you write real R
 
 ### Is Pyxle production-ready?
 
-Pyxle is in **beta** (the `0.7.x` series). The core features are implemented and tested (2,500+ tests, with a 95% coverage gate enforced in CI), but the API may change before 1.0. Use it for new projects and experiments, but be prepared for breaking changes.
+Pyxle is in **beta** (the `0.8.x` series). The core features are implemented and tested (2,500+ tests, with a 95% coverage gate enforced in CI), but the API may change before 1.0. Use it for new projects and experiments, but be prepared for breaking changes.
 
 ### What Python version do I need?
 

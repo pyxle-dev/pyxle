@@ -22,6 +22,10 @@ _ASSET_SUFFIXES: tuple[str, ...] = (
     ".map",
 )
 _HOT_MODULE_PREFIXES: tuple[str, ...] = ("/@vite", "/@react-refresh")
+# Framework-internal namespaces (Pyxle Studio, the overlay WebSocket) serve
+# their own assets from the wheel; their ``.js``/``.css`` URLs must never be
+# forwarded to the user's Vite instance, which knows nothing about them.
+_RESERVED_INTERNAL_PREFIXES: tuple[str, ...] = ("/__pyxle",)
 _HOP_BY_HOP_HEADERS: frozenset[str] = frozenset(
     {
         "connection",
@@ -65,6 +69,8 @@ class ViteProxy:
             return False
 
         path = request.url.path
+        if path.startswith(_RESERVED_INTERNAL_PREFIXES):
+            return False
         if any(path.startswith(prefix) for prefix in self._asset_prefixes):
             return True
 

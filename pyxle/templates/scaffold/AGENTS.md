@@ -226,10 +226,13 @@ with the alias, e.g. `import { cn } from '@/lib/utils'`.
 
 ```bash
 pyxle dev      # dev server + hot reload at http://localhost:8000  (use this to verify changes)
+pyxle studio   # same dev server + the Studio dashboard (routes, loader/action tester, live requests)
 pyxle build    # production build -> dist/
 pyxle serve    # serve the production build
 pyxle install  # (re)install Python + Node deps
 ```
+
+`pyxle dev --inspect` adds a debugger port — breakpoints bind directly in `.pyxl` files.
 
 ## Rules — DO / DON'T
 

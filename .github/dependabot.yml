@@ -9,6 +9,14 @@ updates:
       python-dependencies:
         patterns:
           - "*"
+    # typer and click are pinned narrowly on purpose: the CLI tests use
+    # CliRunner.isolated_filesystem, which a newer Typer (and Click 8.2)
+    # dropped. A grouped bump that raises those ceilings breaks the suite, so
+    # these two are excluded here — bump them deliberately, together with the
+    # test-helper migration they require. See the note in pyproject.toml.
+    ignore:
+      - dependency-name: "typer"
+      - dependency-name: "click"
 
   - package-ecosystem: "github-actions"
     directory: "/"

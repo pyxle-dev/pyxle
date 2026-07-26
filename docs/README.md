@@ -4,6 +4,10 @@ Pyxle is a Python-first full-stack web framework that brings the Next.js develop
 
 **Status:** beta (`0.x`) — see the [changelog](changelog.md) for the current release.
 
+## What's new in 0.8.0
+
+The **inside view** — **Pyxle Studio**, a dashboard built into `pyxle dev` at `/__pyxle/studio`: every route with its loader and actions, an interactive tester that runs them with real inputs, a live request feed, latency metrics, the effective config, and in-browser `pyxle check`. Plus **breakpoint debugging inside a single `.pyxl` file** — a Python loader breakpoint *and* a React component breakpoint in the same file — from VS Code's **F5** or `pyxle dev --inspect` for any DAP client. A new `pyxle studio` command opens the dashboard, dev tracebacks now name your `.pyxl` file and line instead of the compiled module, and `/__pyxle` becomes a reserved URL namespace. See [Pyxle Studio](guides/studio.md) and [Debugging .pyxl files](guides/debugging-pyxl.md).
+
 ## What's new in 0.7.0
 
 The **hardened run** — a QA and robustness pass across the framework: **React 19 + Vite 7** with an interactive `pyxle init`, concurrent streaming SSR that no longer serializes across requests, dev-server supervision and build-cache safety, correct `error.pyxl` rendering under layout loaders, and ESM-first SSR resolution for CommonJS packages. `0.7.1` follows with a Starlette **security** bump, a production `PYXLE_SECRET_KEY` guard, up-front Node-version checks, and a real testing story (`pyxle.testing`). See the [Changelog](changelog.md).
@@ -84,6 +88,8 @@ Practical guides for common tasks.
 - [Deployment](guides/deployment.md) -- `pyxle build`, `pyxle serve`, and hosting in production
 - [AI accessibility (llms.txt & .md)](guides/llms.md) -- Serve every page as Markdown for AI agents: .md URLs, llms.txt, and conversion hooks
 - [Editor setup](guides/editor-setup.md) -- VS Code extension, the Pyxle language server, and CI linting
+- [Pyxle Studio](guides/studio.md) -- The dev dashboard: routes, an interactive loader/action tester, live requests, metrics, config, and checks
+- [Debugging .pyxl files](guides/debugging-pyxl.md) -- Breakpoints directly in .pyxl source with VS Code F5, `pyxle dev --inspect`, or any DAP client
 - [Background Tasks](guides/background-tasks.md) -- request.state.background and the in-process task queue
 - [Build Optimization](guides/build-optimization.md) -- pyxle build --analyze, modulepreload hints, and the <Image> component
 - [Migrating from Flask/Django](guides/migration-from-flask-django.md) -- Route, template, and ORM equivalents in Pyxle

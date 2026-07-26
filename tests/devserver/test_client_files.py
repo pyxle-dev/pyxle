@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
 from dataclasses import replace
 from pathlib import Path
+
+import pytest
 
 from pyxle.devserver.client_files import (
     CLIENT_ENTRY_FILENAME,
@@ -358,15 +362,20 @@ def test_vite_config_injects_tailwind_plugin_only_when_present(tmp_path: Path) -
     settings = create_project(tmp_path)
     root = settings.project_root
 
-    # No @tailwindcss/vite in package.json -> plugin absent.
+    # No @tailwindcss/vite in package.json -> plugin absent. The pyxl
+    # source-map plugin is always first in the chain.
     assert "@tailwindcss/vite" not in _render_vite_config(settings)
-    assert "plugins: [react()]" in _render_vite_config(settings)
+    assert (
+        "plugins: [pyxlSourcemaps(), react()]" in _render_vite_config(settings)
+    )
 
     # Declaring the dependency turns the plugin on.
     _write_package_json(root, tailwind=True)
     tailwind_config = _render_vite_config(settings)
     assert "import tailwindcss from '@tailwindcss/vite';" in tailwind_config
-    assert "plugins: [react(), tailwindcss()]" in tailwind_config
+    assert (
+        "plugins: [pyxlSourcemaps(), react(), tailwindcss()]" in tailwind_config
+    )
 
 
 def test_vite_config_injects_jsconfig_import_alias(tmp_path: Path) -> None:
@@ -1086,6 +1095,181 @@ def test_write_client_bootstrap_files_generates_use_websocket(tmp_path: Path) ->
 
     barrel = (settings.client_build_dir / "pyxle" / "client.js").read_text(encoding="utf-8")
     assert "useWebSocket" in barrel
+
+
+def test_vite_config_embeds_pyxl_sourcemap_plugin(tmp_path: Path) -> None:
+    """The generated Vite config carries the inline ``.pyxl`` source-map plugin
+    that lets browser devtools and js-debug display and bind ``.pyxl`` files."""
+    from pyxle.compiler.writers import CLIENT_SOURCEMAP_SIDECAR
+    from pyxle.devserver.client_files import PYXL_SOURCEMAP_PLUGIN_JS
+
+    settings = create_project(tmp_path)
+    config = _render_vite_config(settings)
+
+    # The whole plugin body is embedded verbatim.
+    assert PYXL_SOURCEMAP_PLUGIN_JS in config
+    assert "function pyxlSourcemaps()" in config
+    # Dev-server only, and ahead of every other transform.
+    assert "apply: 'serve'" in config
+    assert "enforce: 'pre'" in config
+    # It reads the compiler's sidecar — the two sides must agree on the name.
+    assert f"const PYXL_SIDECAR = '{CLIENT_SOURCEMAP_SIDECAR}';" in config
+    # file:// sources (Vite passes them through verbatim) that resolve to the
+    # real on-disk .pyxl so js-debug binds breakpoints there.
+    assert "pathToFileURL(pyxlPath).href" in config
+    # The map carries the .pyxl bytes as sourcesContent. It doesn't change where
+    # breakpoints bind (js-debug prefers the on-disk file), but it is the correct
+    # remote-dev fallback and — critically — stops Vite's dev server from trying
+    # to read the file:// URL as a path to backfill content, which would log
+    # "points to missing source files" for every page.
+    assert "sourcesContent: [content]" in config
+    assert "pyxlSource = fs.readFileSync(pyxlPath, 'utf8');" in config
+    # This map is fetched by the browser, so sourcesContent keeps ONLY the mapped
+    # JSX lines and blanks everything else — order-independent, so an @action
+    # written below the component is redacted too. Line count is preserved so the
+    # mappings stay aligned.
+    assert "const mappedLines = new Set();" in config
+    assert "if (!mappedLines.has(i + 1)) srcLines[i] = '';" in config
+    # The plugin's runtime imports are part of the config prelude.
+    assert "import fs from 'node:fs';" in config
+    assert "import { pathToFileURL } from 'node:url';" in config
+
+
+@pytest.mark.skipif(
+    shutil.which("node") is None,
+    reason="Node.js is required to validate the generated Vite config syntax",
+)
+def test_vite_config_is_valid_javascript(tmp_path: Path) -> None:
+    """The generated ``vite.config.js`` — including the embedded ``.pyxl``
+    source-map plugin — must be syntactically valid JavaScript.
+
+    Substring assertions cannot catch a Python-level escaping mistake that emits
+    a broken JS literal — e.g. a bare ``\\n`` inside the triple-quoted plugin
+    string decoding to a real newline mid-literal, which crashes Vite at startup
+    with ``Unterminated string literal`` before the dev server can serve a page.
+    ``node --check`` parses the whole module and is the durable guard for that
+    class of bug. Written to ``.mjs`` so it is checked as ESM (the config uses
+    ``import``) on every Node version."""
+    settings = create_project(tmp_path)
+    config_path = tmp_path / "vite.config.mjs"
+    config_path.write_text(_render_vite_config(settings), encoding="utf-8")
+
+    result = subprocess.run(
+        ["node", "--check", str(config_path)],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.skipif(
+    shutil.which("node") is None,
+    reason="Node.js is required to execute the source-map plugin",
+)
+def test_pyxl_sourcemap_plugin_redacts_server_python(tmp_path: Path) -> None:
+    """Running the embedded plugin's ``load()`` keeps ONLY the mapped JSX lines in
+    ``sourcesContent`` and blanks every other line, so the browser-fetched dev
+    source map never leaks ``@server``/``@action`` Python — including when a Python
+    segment sits *below* the component, which ``.pyxl`` explicitly allows. Line
+    count is preserved so the ``mappings`` stay aligned."""
+    from pyxle.devserver.client_files import PYXL_SOURCEMAP_PLUGIN_JS
+
+    client_root = tmp_path / "client"
+    (client_root / "pages").mkdir(parents=True)
+    (tmp_path / "pages").mkdir()
+
+    # Interleaved .pyxl: @server Python (secret on line 3), JSX on lines 6-8, then
+    # an @action with a second secret BELOW the component on lines 10-12. Blanking
+    # a leading region would miss the lower half entirely — the mapped-lines
+    # whitelist must catch both.
+    pyxl = tmp_path / "pages" / "demo.pyxl"
+    pyxl.write_text(
+        "@server\n"
+        "async def load(request):\n"
+        '    SECRET = "sk-live-super-secret"\n'
+        "    return {}\n"
+        "\n"
+        "<div>hello</div>\n"
+        "<span>world</span>\n"
+        "export default Page\n"
+        "\n"
+        "@action\n"
+        "async def like(request):\n"
+        '    TOKEN = "tok-live-below-secret"\n',
+        encoding="utf-8",
+    )
+    jsx = client_root / "pages" / "demo.jsx"
+    jsx.write_text(
+        "export default function Page() { return null; }\n", encoding="utf-8"
+    )
+    # Sidecar maps generated jsx line i -> .pyxl line; the JSX is lines 6-8 only.
+    (client_root / "pyxl-sourcemaps.json").write_text(
+        json.dumps(
+            {
+                "pages/demo.jsx": {
+                    "pyxl": "../pages/demo.pyxl",
+                    "lines": [None, None, None, None, None, 6, 7, 8],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    harness = tmp_path / "run.mjs"
+    harness.write_text(
+        "import fs from 'node:fs';\n"
+        "import path from 'node:path';\n"
+        "import { pathToFileURL } from 'node:url';\n"
+        + PYXL_SOURCEMAP_PLUGIN_JS
+        + "\n"
+        "const plugin = pyxlSourcemaps();\n"
+        f"plugin.configResolved({{ root: {json.dumps(str(client_root))} }});\n"
+        f"const out = plugin.load({json.dumps(str(jsx))});\n"
+        "process.stdout.write(JSON.stringify(out.map.sourcesContent[0]));\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        ["node", str(harness)], capture_output=True, text=True
+    )
+    assert result.returncode == 0, result.stderr
+    served = json.loads(result.stdout)
+
+    original = pyxl.read_text(encoding="utf-8")
+    served_lines = served.split("\n")
+    # Line count preserved so the source map's line mappings stay aligned.
+    assert len(served_lines) == len(original.split("\n"))
+    # Python ABOVE the component (lines 1-5) blanked.
+    assert served_lines[:5] == ["", "", "", "", ""]
+    # Python BELOW the component (lines 9-12) blanked too — the regression that
+    # a leading-region blank would miss, leaking an @action verbatim.
+    assert served_lines[8:12] == ["", "", "", ""]
+    # Neither secret, nor any Python at all, leaves the box.
+    assert "sk-live-super-secret" not in served
+    assert "tok-live-below-secret" not in served
+    assert "def load" not in served
+    assert "def like" not in served
+    assert "@action" not in served
+    assert "@server" not in served
+    # JSX (lines 6-8) preserved verbatim — it's client code anyway.
+    assert served_lines[5] == "<div>hello</div>"
+    assert served_lines[6] == "<span>world</span>"
+    assert served_lines[7] == "export default Page"
+
+
+def test_vite_config_sourcemap_plugin_registered_first(tmp_path: Path) -> None:
+    """``pyxlSourcemaps()`` opens the plugin chain so its ``load()`` supplies
+    the source map before React's transform sees the module — with and without
+    Tailwind."""
+    settings = create_project(tmp_path)
+    assert (
+        "plugins: [pyxlSourcemaps(), react()]," in _render_vite_config(settings)
+    )
+
+    _write_package_json(settings.project_root, tailwind=True)
+    assert (
+        "plugins: [pyxlSourcemaps(), react(), tailwindcss()],"
+        in _render_vite_config(settings)
+    )
 
 
 def test_navigation_scrolls_to_hash_after_cross_page_commit(tmp_path: Path) -> None:

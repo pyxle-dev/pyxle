@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List
@@ -1083,3 +1086,458 @@ async def test_devserver_skips_ready_banner_when_vite_not_running(
 
     assert not any("dev server ready" in m for m in capture.messages)
     assert any("not ready" in m for m in capture.messages)
+
+
+# ---------------------------------------------------------------------------
+# dev-server.json — the editor-tooling discovery file
+# ---------------------------------------------------------------------------
+
+
+def _read_discovery(settings: DevServerSettings) -> Dict[str, Any]:
+    return json.loads(
+        (settings.build_root / "dev-server.json").read_text(encoding="utf-8")
+    )
+
+
+def test_write_discovery_file_payload(tmp_path: Path) -> None:
+    import pyxle
+
+    settings = DevServerSettings.from_project_root(tmp_path)
+    server = DevServer(
+        settings=settings,
+        logger=ConsoleLogger(secho=LogCapture()),
+        inspect_endpoint=("127.0.0.1", 5679),
+    )
+
+    server._write_discovery_file(settings)
+
+    payload = _read_discovery(settings)
+    assert payload["pid"] == os.getpid()
+    assert payload["version"] == pyxle.__version__
+    assert payload["startedAt"] > 0
+    assert payload["projectRoot"] == str(settings.project_root)
+    assert payload["server"] == {
+        "host": settings.starlette_host,
+        "port": settings.starlette_port,
+    }
+    assert payload["vite"] == {"host": settings.vite_host, "port": settings.vite_port}
+    assert payload["url"] == f"http://127.0.0.1:{settings.starlette_port}"
+    # Debug default + no studio config block = Studio enabled.
+    assert payload["studio"] == (
+        f"http://127.0.0.1:{settings.starlette_port}/__pyxle/studio"
+    )
+    assert payload["debugpy"] == {"host": "127.0.0.1", "port": 5679}
+    # Written atomically — the temp file never survives a successful write.
+    assert not (settings.build_root / "dev-server.json.tmp").exists()
+
+
+def test_write_discovery_file_normalises_bind_all_host(tmp_path: Path) -> None:
+    settings = DevServerSettings.from_project_root(tmp_path, starlette_host="0.0.0.0")
+    server = DevServer(settings=settings, logger=ConsoleLogger(secho=LogCapture()))
+
+    server._write_discovery_file(settings)
+
+    payload = _read_discovery(settings)
+    # The raw bind host is preserved for information…
+    assert payload["server"]["host"] == "0.0.0.0"
+    # …but URLs are browser-connectable.
+    assert payload["url"] == f"http://127.0.0.1:{settings.starlette_port}"
+    assert payload["studio"].startswith("http://127.0.0.1:")
+
+
+def test_write_discovery_file_studio_none_when_unavailable(tmp_path: Path) -> None:
+    logger = ConsoleLogger(secho=LogCapture())
+
+    # Studio explicitly disabled in the config block.
+    disabled = DevServerSettings.from_project_root(
+        tmp_path / "a", studio=SimpleNamespace(enabled=False)
+    )
+    DevServer(settings=disabled, logger=logger)._write_discovery_file(disabled)
+    assert _read_discovery(disabled)["studio"] is None
+
+    # Studio is dev-only: no debug, no dashboard URL.
+    production_like = DevServerSettings.from_project_root(tmp_path / "b", debug=False)
+    DevServer(settings=production_like, logger=logger)._write_discovery_file(
+        production_like
+    )
+    assert _read_discovery(production_like)["studio"] is None
+
+
+def test_write_discovery_file_debugpy_none_without_endpoint(tmp_path: Path) -> None:
+    settings = DevServerSettings.from_project_root(tmp_path)
+    server = DevServer(settings=settings, logger=ConsoleLogger(secho=LogCapture()))
+
+    server._write_discovery_file(settings)
+
+    assert _read_discovery(settings)["debugpy"] is None
+
+
+def test_write_discovery_file_swallows_oserror(monkeypatch, tmp_path: Path) -> None:
+    """A failed discovery write must never take down the dev server."""
+    settings = DevServerSettings.from_project_root(tmp_path)
+    capture = LogCapture()
+    logger = ConsoleLogger(secho=capture)
+    logger.set_verbosity(Verbosity.VERBOSE)
+    server = DevServer(settings=settings, logger=logger)
+
+    def broken_write_text(self: Path, *args: Any, **kwargs: Any) -> int:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(Path, "write_text", broken_write_text)
+
+    server._write_discovery_file(settings)  # must not raise
+
+    assert not (settings.build_root / "dev-server.json").exists()
+    assert any("Could not write dev-server.json" in m for m in capture.messages)
+
+
+def test_remove_discovery_file(tmp_path: Path) -> None:
+    settings = DevServerSettings.from_project_root(tmp_path)
+    server = DevServer(settings=settings, logger=ConsoleLogger(secho=LogCapture()))
+    target = settings.build_root / "dev-server.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("{}", encoding="utf-8")
+
+    server._remove_discovery_file(settings)
+    assert not target.exists()
+
+    # Removing an already-absent file is a no-op, not an error.
+    server._remove_discovery_file(settings)
+    assert not target.exists()
+
+
+def test_remove_discovery_file_keeps_another_process_file(tmp_path: Path) -> None:
+    """A second ``pyxle dev`` may have overwritten the file with its own pid;
+    this process must NOT delete it and strand the still-running instance."""
+    settings = DevServerSettings.from_project_root(tmp_path)
+    server = DevServer(settings=settings, logger=ConsoleLogger(secho=LogCapture()))
+    target = settings.build_root / "dev-server.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    # A foreign pid that is not ours (and is virtually never live in CI).
+    foreign_pid = os.getpid() + 987654
+    target.write_text(json.dumps({"pid": foreign_pid}), encoding="utf-8")
+
+    server._remove_discovery_file(settings)
+    assert target.exists()
+
+    # Our own pid (or no pid) is removable.
+    target.write_text(json.dumps({"pid": os.getpid()}), encoding="utf-8")
+    server._remove_discovery_file(settings)
+    assert not target.exists()
+
+
+@pytest.mark.parametrize("payload", ["null", "42", "[]", '"x"', "{ not json", ""])
+def test_remove_discovery_file_tolerates_non_object_json(
+    tmp_path: Path, payload: str
+) -> None:
+    """A corrupt/hand-edited discovery file (valid non-object JSON, or malformed)
+    must fall through to unlink, never raise — otherwise the exception escapes the
+    shutdown ``finally`` and leaks the Vite subprocess."""
+    settings = DevServerSettings.from_project_root(tmp_path)
+    server = DevServer(settings=settings, logger=ConsoleLogger(secho=LogCapture()))
+    target = settings.build_root / "dev-server.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(payload, encoding="utf-8")
+
+    server._remove_discovery_file(settings)  # must not raise
+    assert not target.exists()
+
+
+async def test_devserver_start_manages_discovery_file_lifecycle(
+    anyio_backend, monkeypatch, tmp_path: Path
+) -> None:
+    """``start()`` writes the discovery file after the initial build,
+    re-asserts it on every rebuild (a build pass may rmtree the build root),
+    and removes it on shutdown."""
+    settings = DevServerSettings.from_project_root(tmp_path)
+    logger = ConsoleLogger(secho=LogCapture())
+    observed: Dict[str, Any] = {}
+    watcher_instances: List[Any] = []
+
+    monkeypatch.setattr(
+        "pyxle.devserver.build_once",
+        lambda cfg, *, force_rebuild=False: BuildSummary(
+            compiled_pages=[], copied_api_modules=[], removed=[]
+        ),
+    )
+    monkeypatch.setattr(
+        "pyxle.devserver.build_metadata_registry",
+        lambda cfg: MetadataRegistry(pages=[], apis=[]),
+    )
+    monkeypatch.setattr(
+        "pyxle.devserver.build_route_table",
+        lambda registry: RouteTable(pages=[], apis=[]),
+    )
+    monkeypatch.setattr("pyxle.devserver.write_client_bootstrap_files", lambda cfg: None)
+
+    class DummyApp:
+        def __init__(self) -> None:
+            self.state = SimpleNamespace()
+
+    dummy_app = DummyApp()
+    monkeypatch.setattr(
+        "pyxle.devserver.create_starlette_app",
+        lambda cfg, routes, **_: dummy_app,
+    )
+
+    class StubVite:
+        running = True
+
+        def __init__(self, cfg: DevServerSettings, *, logger: ConsoleLogger, **_: Any) -> None:
+            pass
+
+        async def start(self) -> None:
+            pass
+
+        async def wait_until_ready(self) -> None:
+            pass
+
+        async def stop(self) -> None:
+            pass
+
+    monkeypatch.setattr("pyxle.devserver.ViteProcess", StubVite)
+
+    class StubWatcher:
+        def __init__(self, cfg: DevServerSettings, *, logger: ConsoleLogger, **kwargs: Any) -> None:
+            self.on_rebuild = kwargs.get("on_rebuild")
+            watcher_instances.append(self)
+
+        def start(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr("pyxle.devserver.ProjectWatcher", StubWatcher)
+
+    class StubConfig:
+        def __init__(self, app: object, **kwargs: Any) -> None:
+            pass
+
+    class StubServer:
+        def __init__(self, config: StubConfig) -> None:
+            self.should_exit = False
+
+        async def serve(self) -> None:
+            target = settings.build_root / "dev-server.json"
+            observed["written_during_serve"] = target.exists()
+            observed["payload"] = json.loads(target.read_text(encoding="utf-8"))
+
+            # A rebuild pass can rmtree the build root; the rebuild hook must
+            # re-assert the discovery file even for a failed build.
+            target.unlink()
+            stats = WatcherStatistics(
+                elapsed_seconds=0.01,
+                summary=None,
+                error=RuntimeError("mid-edit syntax error"),
+                changed_paths=[],
+            )
+            watcher_instances[0].on_rebuild(stats)
+            observed["rewritten_after_rebuild"] = target.exists()
+
+    monkeypatch.setattr("pyxle.devserver.uvicorn.Config", StubConfig)
+    monkeypatch.setattr("pyxle.devserver.uvicorn.Server", StubServer)
+
+    server = DevServer(
+        settings=settings, logger=logger, inspect_endpoint=("127.0.0.1", 5680)
+    )
+    await server.start()
+
+    assert observed["written_during_serve"] is True
+    assert observed["payload"]["debugpy"] == {"host": "127.0.0.1", "port": 5680}
+    assert observed["rewritten_after_rebuild"] is True
+    # Gone after shutdown — stale coordinates must not linger for editors.
+    assert not (settings.build_root / "dev-server.json").exists()
+
+
+async def test_devserver_start_inspect_wait_blocks_after_discovery_file(
+    anyio_backend, monkeypatch, tmp_path: Path
+) -> None:
+    """With ``inspect_wait`` set, ``start()`` calls ``debugpy.wait_for_client``
+    only AFTER the discovery file is written — an editor needs the endpoint on
+    disk before it can attach, and boot-time breakpoints must still bind."""
+    settings = DevServerSettings.from_project_root(tmp_path)
+    logger = ConsoleLogger(secho=LogCapture())
+    observed: Dict[str, Any] = {}
+
+    monkeypatch.setattr(
+        "pyxle.devserver.build_once",
+        lambda cfg, *, force_rebuild=False: BuildSummary(
+            compiled_pages=[], copied_api_modules=[], removed=[]
+        ),
+    )
+    monkeypatch.setattr(
+        "pyxle.devserver.build_metadata_registry",
+        lambda cfg: MetadataRegistry(pages=[], apis=[]),
+    )
+    monkeypatch.setattr(
+        "pyxle.devserver.build_route_table",
+        lambda registry: RouteTable(pages=[], apis=[]),
+    )
+    monkeypatch.setattr("pyxle.devserver.write_client_bootstrap_files", lambda cfg: None)
+
+    class DummyApp:
+        def __init__(self) -> None:
+            self.state = SimpleNamespace()
+
+    monkeypatch.setattr(
+        "pyxle.devserver.create_starlette_app",
+        lambda cfg, routes, **_: DummyApp(),
+    )
+
+    class StubVite:
+        running = True
+
+        def __init__(self, cfg: DevServerSettings, *, logger: ConsoleLogger, **_: Any) -> None:
+            pass
+
+        async def start(self) -> None:
+            pass
+
+        async def wait_until_ready(self) -> None:
+            pass
+
+        async def stop(self) -> None:
+            pass
+
+    monkeypatch.setattr("pyxle.devserver.ViteProcess", StubVite)
+
+    class StubWatcher:
+        def __init__(self, cfg: DevServerSettings, *, logger: ConsoleLogger, **kwargs: Any) -> None:
+            pass
+
+        def start(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr("pyxle.devserver.ProjectWatcher", StubWatcher)
+
+    class StubConfig:
+        def __init__(self, app: object, **kwargs: Any) -> None:
+            pass
+
+    class StubServer:
+        def __init__(self, config: StubConfig) -> None:
+            self.should_exit = False
+
+        async def serve(self) -> None:
+            observed["served"] = True
+
+    monkeypatch.setattr("pyxle.devserver.uvicorn.Config", StubConfig)
+    monkeypatch.setattr("pyxle.devserver.uvicorn.Server", StubServer)
+
+    class FakeDebugpy:
+        def __init__(self) -> None:
+            self.wait_calls = 0
+
+        def wait_for_client(self) -> None:
+            self.wait_calls += 1
+            # The discovery file must already exist so an editor can read the
+            # endpoint and attach before this blocks.
+            observed["discovery_present_at_wait"] = (
+                settings.build_root / "dev-server.json"
+            ).exists()
+            observed["served_before_wait"] = observed.get("served", False)
+
+    fake_debugpy = FakeDebugpy()
+    monkeypatch.setitem(sys.modules, "debugpy", fake_debugpy)
+
+    server = DevServer(
+        settings=settings,
+        logger=logger,
+        inspect_wait=True,
+        inspect_endpoint=("127.0.0.1", 5681),
+    )
+    await server.start()
+
+    assert fake_debugpy.wait_calls == 1
+    assert observed["discovery_present_at_wait"] is True
+    # The wait runs before the uvicorn server starts serving.
+    assert observed["served_before_wait"] is False
+    assert observed.get("served") is True
+
+
+async def test_devserver_start_no_inspect_wait_never_blocks(
+    anyio_backend, monkeypatch, tmp_path: Path
+) -> None:
+    """Without ``inspect_wait`` (or with an endpoint but the flag off), the
+    server never imports debugpy or blocks for an attach."""
+    settings = DevServerSettings.from_project_root(tmp_path)
+    logger = ConsoleLogger(secho=LogCapture())
+
+    monkeypatch.setattr(
+        "pyxle.devserver.build_once",
+        lambda cfg, *, force_rebuild=False: BuildSummary(
+            compiled_pages=[], copied_api_modules=[], removed=[]
+        ),
+    )
+    monkeypatch.setattr(
+        "pyxle.devserver.build_metadata_registry",
+        lambda cfg: MetadataRegistry(pages=[], apis=[]),
+    )
+    monkeypatch.setattr(
+        "pyxle.devserver.build_route_table",
+        lambda registry: RouteTable(pages=[], apis=[]),
+    )
+    monkeypatch.setattr("pyxle.devserver.write_client_bootstrap_files", lambda cfg: None)
+    monkeypatch.setattr(
+        "pyxle.devserver.create_starlette_app",
+        lambda cfg, routes, **_: SimpleNamespace(state=SimpleNamespace()),
+    )
+
+    class StubVite:
+        running = True
+
+        def __init__(self, cfg: DevServerSettings, *, logger: ConsoleLogger, **_: Any) -> None:
+            pass
+
+        async def start(self) -> None:
+            pass
+
+        async def wait_until_ready(self) -> None:
+            pass
+
+        async def stop(self) -> None:
+            pass
+
+    monkeypatch.setattr("pyxle.devserver.ViteProcess", StubVite)
+
+    class StubWatcher:
+        def __init__(self, cfg: DevServerSettings, *, logger: ConsoleLogger, **kwargs: Any) -> None:
+            pass
+
+        def start(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr("pyxle.devserver.ProjectWatcher", StubWatcher)
+
+    class StubConfig:
+        def __init__(self, app: object, **kwargs: Any) -> None:
+            pass
+
+    class StubServer:
+        def __init__(self, config: StubConfig) -> None:
+            self.should_exit = False
+
+        async def serve(self) -> None:
+            pass
+
+    monkeypatch.setattr("pyxle.devserver.uvicorn.Config", StubConfig)
+    monkeypatch.setattr("pyxle.devserver.uvicorn.Server", StubServer)
+
+    class ExplodingDebugpy:
+        def wait_for_client(self) -> None:  # pragma: no cover - must never run
+            raise AssertionError("wait_for_client must not be called")
+
+    monkeypatch.setitem(sys.modules, "debugpy", ExplodingDebugpy())
+
+    # inspect_wait defaults False even though an endpoint is advertised.
+    server = DevServer(
+        settings=settings, logger=logger, inspect_endpoint=("127.0.0.1", 5682)
+    )
+    await server.start()  # must complete without touching debugpy

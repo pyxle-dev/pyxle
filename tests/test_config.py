@@ -599,3 +599,80 @@ def test_apply_env_overrides_multiple(monkeypatch) -> None:
     assert result.starlette_host == "0.0.0.0"
     assert result.starlette_port == 4000
     assert result.debug is False
+
+
+# ---------------------------------------------------------------------------
+# studio block (Pyxle Studio, the dev-only dashboard)
+# ---------------------------------------------------------------------------
+
+
+def test_load_config_studio_defaults_to_enabled(tmp_path: Path) -> None:
+    from pyxle.config import StudioConfig
+
+    # No block at all -> framework default: enabled, no extra hosts.
+    assert load_config(tmp_path).studio == StudioConfig()
+    # An empty object keeps the defaults too.
+    write_config(tmp_path, {"studio": {}})
+    assert load_config(tmp_path).studio == StudioConfig(enabled=True, allowed_hosts=())
+
+
+@pytest.mark.parametrize("shorthand,expected", [(False, False), (True, True)])
+def test_load_config_studio_boolean_shorthand(
+    tmp_path: Path, shorthand: bool, expected: bool
+) -> None:
+    write_config(tmp_path, {"studio": shorthand})
+    config = load_config(tmp_path)
+    assert config.studio.enabled is expected
+    assert config.studio.allowed_hosts == ()
+
+
+def test_load_config_studio_object_form(tmp_path: Path) -> None:
+    write_config(
+        tmp_path,
+        {"studio": {"enabled": False, "allowedHosts": [" MyBox.Local ", "lan.example"]}},
+    )
+    config = load_config(tmp_path)
+    assert config.studio.enabled is False
+    # Entries are trimmed and lowercased so Host-header matching is exact.
+    assert config.studio.allowed_hosts == ("mybox.local", "lan.example")
+
+
+def test_load_config_studio_rejects_unknown_keys(tmp_path: Path) -> None:
+    config_path = write_config(tmp_path, {"studio": {"allowHosts": ["x"]}})
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(tmp_path)
+
+    message = str(excinfo.value)
+    assert "studio" in message
+    assert "allowHosts" in message
+    assert str(config_path) in message
+
+
+@pytest.mark.parametrize(
+    "payload,fragment",
+    [
+        ("yes", "expected an object or boolean"),
+        ({"enabled": "yes"}, "studio.enabled"),
+        ({"allowedHosts": "mybox.local"}, "studio.allowedHosts"),
+        ({"allowedHosts": [""]}, "studio.allowedHosts' entry"),
+        ({"allowedHosts": [42]}, "studio.allowedHosts' entry"),
+    ],
+)
+def test_load_config_studio_rejects_bad_types(
+    tmp_path: Path, payload: object, fragment: str
+) -> None:
+    config_path = write_config(tmp_path, {"studio": payload})
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(tmp_path)
+
+    message = str(excinfo.value)
+    assert fragment in message
+    assert str(config_path) in message
+
+
+def test_studio_config_flows_into_devserver_kwargs(tmp_path: Path) -> None:
+    write_config(tmp_path, {"studio": {"allowedHosts": ["mybox.local"]}})
+    config = load_config(tmp_path)
+    assert config.to_devserver_kwargs()["studio"] is config.studio

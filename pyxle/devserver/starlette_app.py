@@ -70,6 +70,8 @@ from .route_hooks import (
 from . import llms
 from .routes import ActionRoute, ApiRoute, PageRoute, RouteTable, select_static_pages
 from .settings import DevServerSettings
+from .studio import STUDIO_PATH, StudioManager
+from .studio import is_enabled as _studio_is_enabled
 
 _API_HTTP_METHODS: Sequence[str] = ("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS")
 _NAVIGATION_HEADER = "x-pyxle-navigation"
@@ -607,7 +609,17 @@ def _import_module(
                 sys.path.insert(0, _root)
             break
 
-    spec = importlib.util.spec_from_file_location(module_key, module_path)
+    # Debug mode execs generated page modules as their .pyxl source: the
+    # loader remaps line numbers and co_filename via the debug footer the
+    # compiler embeds, so tracebacks point at .pyxl files and debugger
+    # breakpoints set in .pyxl bind natively. Modules without a footer
+    # (plain API modules, static stubs) import exactly as before.
+    loader = None
+    if debug and module_path.suffix == ".py":
+        from pyxle.compiler.linemap import PyxlSourceFileLoader  # noqa: PLC0415
+
+        loader = PyxlSourceFileLoader(module_key, str(module_path))
+    spec = importlib.util.spec_from_file_location(module_key, module_path, loader=loader)
     if spec is None or spec.loader is None:
         raise ApiRouteError(f"Unable to load API module at {module_path!s}")
 
@@ -1586,6 +1598,7 @@ def _build_app_routes(
     action_route_hooks: Sequence[RouteHookCallable] = (),
     page_cache: PageCache | None = None,
     stream_render: Callable[..., Any] | None = None,
+    studio: "StudioManager | None" = None,
 ) -> tuple[list[Any], ErrorBoundaryRegistry]:
     """Build the ordered Starlette route list for a route table.
 
@@ -1633,6 +1646,15 @@ def _build_app_routes(
             )
         )
         built.append(llms.make_llms_txt_route(routes, settings=settings))
+    # Pyxle Studio (dev-only): the manager exists only in debug mode with the
+    # ``studio`` block enabled. Registered BEFORE the page routes so a user
+    # catch-all page (``/{slug:path}``) can never shadow the dashboard.
+    if studio is not None:
+        from pyxle.devserver.studio.api import build_studio_routes  # noqa: PLC0415
+
+        built.extend(
+            build_studio_routes(settings=settings, routes=routes, manager=studio)
+        )
     built.extend(page_router.routes)
     if overlay is not None:
         built.append(WebSocketRoute("/__pyxle__/overlay", overlay.websocket_endpoint))
@@ -1752,8 +1774,17 @@ def create_starlette_app(
     vite_proxy: ViteProxy | None = None
     proxy_middleware: Middleware | None = None
     static_middleware: Middleware | None = None
+    studio_manager: StudioManager | None = None
 
     if settings.debug:
+        # Pyxle Studio: dev-only dashboard, on by default, opt-out via the
+        # ``studio`` config block. Never constructed outside debug mode, so
+        # production assembly is structurally incapable of serving it.
+        _studio_cfg = getattr(settings, "studio", None)
+        if _studio_is_enabled(_studio_cfg):
+            studio_manager = StudioManager(
+                settings=settings, config=_studio_cfg, logger=console_logger
+            )
         vite_proxy = ViteProxy(settings, logger=console_logger)
         overlay_origins: set[str] = {
             f"http://localhost:{settings.starlette_port}",
@@ -2130,8 +2161,15 @@ def create_starlette_app(
         )
     # Add the middleware when anything needs it — request-id/timing, the metrics
     # endpoint (which needs request totals recorded even if the correlation id
-    # and scope timing are off), or the structured access log.
-    if _obs_request_id or _obs_timing or _obs_metrics_ep or _obs_access_log:
+    # and scope timing are off), the structured access log, or Studio's live
+    # request feed (fed by the observer hook below).
+    if (
+        _obs_request_id
+        or _obs_timing
+        or _obs_metrics_ep
+        or _obs_access_log
+        or studio_manager is not None
+    ):
         from pyxle.observability import RequestIdMiddleware  # noqa: PLC0415
 
         middleware_stack.insert(
@@ -2148,6 +2186,14 @@ def create_starlette_app(
                 timing=_obs_timing,
                 metrics=metrics_registry,
                 access_log=_obs_access_log,
+                # Studio's live request feed. Its own namespace is excluded so
+                # the dashboard polling never pollutes the metrics it displays.
+                observer=(
+                    studio_manager.record_request if studio_manager is not None else None
+                ),
+                exclude_path_prefixes=(
+                    (STUDIO_PATH,) if studio_manager is not None else ()
+                ),
             ),
         )
 
@@ -2178,12 +2224,17 @@ def create_starlette_app(
         action_route_hooks=action_route_hooks,
         page_cache=page_cache,
         stream_render=stream_render,
+        studio=studio_manager,
     )
     app.router.routes.extend(app_routes)
 
     app.state.vite_proxy = vite_proxy
     app.state.ssr_renderer = renderer
     app.state.overlay = overlay
+    # Studio's manager lives on app.state (like the overlay) so its state —
+    # the recent-request ring buffer and SSE subscribers — survives hot
+    # route-table refreshes, which rebuild routes but never touch app.state.
+    app.state.pyxle_studio = studio_manager
     app.state.error_boundaries = error_boundaries
     # The dev-server hot route-table refresh reuses these to rebuild routes live
     # on a source change (see ``DevServer._handle_rebuild``). Config-derived

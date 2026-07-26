@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import socket
 import time
 from dataclasses import dataclass, field, replace
@@ -67,6 +69,16 @@ class DevServer:
     # metrics) to the terminal. Dev-only convenience; off by default.
     dashboard: bool = False
     dashboard_interval: float = 5.0
+    # When set, open the system browser at this server path once the dev
+    # server is ready (used by ``pyxle studio`` to land on the dashboard).
+    open_browser_path: Optional[str] = None
+    # (host, port) of the in-process debugpy debug server when ``pyxle dev
+    # --inspect`` hosted one; recorded in the discovery file so editors can
+    # attach without configuration.
+    inspect_endpoint: Optional[tuple] = None
+    # ``--inspect-wait``: block until a debugger attaches. Applied AFTER the
+    # discovery file is written so editors can find the endpoint to attach to.
+    inspect_wait: bool = False
 
     async def start(self) -> None:
         """Run the development server until the underlying uvicorn server exits."""
@@ -85,27 +97,61 @@ class DevServer:
 
         write_client_bootstrap_files(settings)
 
-        registry = build_metadata_registry(settings)
-        route_table = build_route_table(registry)
-        logger.debug(
-            f"Discovered {len(route_table.pages)} page route(s) and {len(route_table.apis)} API route(s)"
-        )
+        # Discovery file for editor tooling (the VS Code extension reads it to
+        # attach the debugger and open Studio). Written only after the initial
+        # build: the first build pass may rmtree a stale build root, and the
+        # watcher never observes .pyxle-build, so the file is stable from here.
+        self._write_discovery_file(settings)
 
-        _pool = None
-        if settings.ssr_workers > 0:
-            from pyxle.ssr.worker_pool import SsrWorkerPool  # noqa: PLC0415
+        # Everything from here until the serve try/finally can still fail — most
+        # notably a Ctrl+C during ``--inspect-wait`` below, or app construction —
+        # and that path is *before* the finally that removes the discovery file.
+        # Guard it so an aborted startup never leaves a stale dev-server.json
+        # advertising a server that no longer exists.
+        try:
+            # ``--inspect-wait``: block for a debugger now that the discovery file
+            # exists, so an editor can read the endpoint and attach. Runs before
+            # the event loop starts serving, so boot-time breakpoints still bind.
+            if self.inspect_wait and self.inspect_endpoint is not None:
+                import debugpy  # noqa: PLC0415 - only reached when --inspect set up debugpy
 
-            _pool = SsrWorkerPool(
-                size=settings.ssr_workers,
-                project_root=settings.project_root,
-                client_root=settings.client_build_dir,
+                logger.info("Waiting for a debugger to attach (--inspect-wait)…")
+                debugpy.wait_for_client()
+
+            registry = build_metadata_registry(settings)
+            route_table = build_route_table(registry)
+            logger.debug(
+                f"Discovered {len(route_table.pages)} page route(s) and "
+                f"{len(route_table.apis)} API route(s)"
             )
 
-        app = create_starlette_app(settings, route_table, logger=logger, pool=_pool)
-        overlay = _resolve_overlay(app)
-        loop = asyncio.get_running_loop()
+            _pool = None
+            if settings.ssr_workers > 0:
+                from pyxle.ssr.worker_pool import SsrWorkerPool  # noqa: PLC0415
+
+                _pool = SsrWorkerPool(
+                    size=settings.ssr_workers,
+                    project_root=settings.project_root,
+                    client_root=settings.client_build_dir,
+                )
+
+            app = create_starlette_app(settings, route_table, logger=logger, pool=_pool)
+            overlay = _resolve_overlay(app)
+            loop = asyncio.get_running_loop()
+        except BaseException:
+            self._remove_discovery_file(settings)
+            raise
 
         def _handle_rebuild(stats: WatcherStatistics) -> None:
+            # A build pass can rmtree a corrupt build root (schema mismatch),
+            # taking the discovery file with it — re-assert it after every pass.
+            self._write_discovery_file(settings)
+            # Studio hears about every finished rebuild — success or failure —
+            # before the error early-return below, so its activity feed always
+            # matches what the terminal reported.
+            _notify_studio_rebuild(
+                getattr(app.state, "pyxle_studio", None), loop, stats
+            )
             if _notify_rebuild_error(overlay, loop, stats):
                 return
             _maybe_schedule_reload(overlay, loop, stats)
@@ -211,6 +257,7 @@ class DevServer:
                 )
             else:
                 self._log_ready_summary(logger, settings, route_table, start_time)
+                self._maybe_open_browser(settings)
             dashboard_task = self._start_dashboard(app, loop)
             try:
                 await server.serve()
@@ -227,11 +274,123 @@ class DevServer:
             if watcher is not None:
                 watcher.close()
                 self._watcher = None
+            # Remove the discovery file only AFTER the watcher is closed: a
+            # last-moment rebuild event (an editor flushing a save as the user
+            # Ctrl+C's) would otherwise re-create it right after removal.
+            self._remove_discovery_file(settings)
             if tailwind_process is not None:
                 await tailwind_process.stop()
             if vite_process is not None:
                 await vite_process.stop()
             logger.debug("Dev server stopped")
+
+    def _write_discovery_file(self, settings: DevServerSettings) -> None:
+        """Persist this server's coordinates for editor tooling.
+
+        ``<build_root>/dev-server.json`` describes the running dev server —
+        HTTP/Vite ports, the Studio URL, and the debugpy endpoint when
+        ``--inspect`` hosted one. The VS Code extension reads it to power
+        one-click attach and "Open Studio". Written atomically; never raises
+        (a failed write must not take down the dev server).
+        """
+        import pyxle  # noqa: PLC0415 - version only; avoids import cycles at module load
+
+        from .studio import STUDIO_PATH  # noqa: PLC0415
+        from .studio import is_enabled as _studio_is_enabled  # noqa: PLC0415
+
+        browser_host = settings.starlette_host
+        if browser_host in ("0.0.0.0", "::", ""):
+            browser_host = "127.0.0.1"
+        studio_url: Optional[str] = None
+        if settings.debug and _studio_is_enabled(getattr(settings, "studio", None)):
+            studio_url = (
+                f"http://{browser_host}:{settings.starlette_port}{STUDIO_PATH}"
+            )
+        payload = {
+            "pid": os.getpid(),
+            "version": pyxle.__version__,
+            "startedAt": time.time(),
+            "projectRoot": str(settings.project_root),
+            "server": {"host": settings.starlette_host, "port": settings.starlette_port},
+            "vite": {"host": settings.vite_host, "port": settings.vite_port},
+            "url": f"http://{browser_host}:{settings.starlette_port}",
+            "studio": studio_url,
+            "debugpy": (
+                {"host": self.inspect_endpoint[0], "port": self.inspect_endpoint[1]}
+                if self.inspect_endpoint is not None
+                else None
+            ),
+        }
+        target = settings.build_root / "dev-server.json"
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            tmp = target.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+            # os.replace can raise PermissionError on Windows when the target is
+            # momentarily open by a reader (the editor polling it); retry briefly
+            # before giving up (it is re-written on every rebuild regardless).
+            for attempt in range(5):
+                try:
+                    tmp.replace(target)
+                    break
+                except PermissionError:  # pragma: no cover - Windows-only timing
+                    if attempt == 4:
+                        tmp.unlink(missing_ok=True)
+                        raise
+                    time.sleep(0.05 * (attempt + 1))
+        except OSError as exc:
+            self.logger.debug(f"Could not write dev-server.json: {exc}")
+
+    def _remove_discovery_file(self, settings: DevServerSettings) -> None:
+        path = settings.build_root / "dev-server.json"
+        try:
+            # Only remove the file if it still describes THIS process. A second
+            # `pyxle dev` on the same project may have overwritten it with its own
+            # coordinates; deleting that would strand the still-running instance
+            # (no attach / Open Studio). A missing or unreadable file falls
+            # through to unlink (nothing to strand).
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(data, dict) and data.get("pid") not in (
+                    None,
+                    os.getpid(),
+                ):
+                    return
+            except (OSError, ValueError):
+                # Unreadable or not valid JSON — there is no pid to compare, so
+                # nothing can be stranded by removing it. Fall through to unlink.
+                pass
+            path.unlink(missing_ok=True)
+        except OSError:  # pragma: no cover - best-effort cleanup
+            pass
+
+    def _maybe_open_browser(self, settings: DevServerSettings) -> None:
+        """Open the system browser at ``open_browser_path``, if set.
+
+        Runs on a daemon thread — ``webbrowser.open`` can block for seconds on
+        some platforms and must never stall server startup. A bind-all host is
+        rewritten to a loopback address the browser can actually reach.
+        """
+        path = self.open_browser_path
+        if not path:
+            return
+        host = settings.starlette_host
+        if host in ("0.0.0.0", "::", ""):
+            host = "127.0.0.1"
+        url = f"http://{host}:{settings.starlette_port}{path}"
+        self.logger.info(f"Opening {url}")
+
+        def _open() -> None:
+            import webbrowser  # noqa: PLC0415
+
+            try:
+                webbrowser.open(url)
+            except Exception:  # noqa: BLE001 — a headless box is not an error
+                pass
+
+        import threading  # noqa: PLC0415
+
+        threading.Thread(target=_open, name="pyxle-open-browser", daemon=True).start()
 
     def _start_dashboard(self, app, loop) -> "Optional[asyncio.Task]":
         """Start the terminal observability dashboard task, if enabled."""
@@ -355,6 +514,18 @@ class DevServer:
             f"  Routes:  {len(route_table.pages)} page(s), "
             f"{len(route_table.apis)} API route(s)"
         )
+        # Surface Studio so the dashboard is discoverable — otherwise a flagship
+        # dev feature is invisible unless you already know its URL.
+        from .studio import STUDIO_PATH  # noqa: PLC0415
+        from .studio import is_enabled as _studio_is_enabled  # noqa: PLC0415
+
+        if settings.debug and _studio_is_enabled(getattr(settings, "studio", None)):
+            browser_host = settings.starlette_host
+            if browser_host in ("0.0.0.0", "::", ""):
+                browser_host = "127.0.0.1"
+            logger.info(
+                f"  Studio:  http://{browser_host}:{settings.starlette_port}{STUDIO_PATH}"
+            )
 
     def _ensure_vite_port_available(self, settings: DevServerSettings) -> DevServerSettings:
         host = settings.vite_host
@@ -420,6 +591,7 @@ def _rebuild_app_routes(app, settings: DevServerSettings):
         if len(app.state.pyxle_route_hooks) > 2
         else (),
         stream_render=getattr(app.state, "pyxle_stream_render", None),
+        studio=getattr(app.state, "pyxle_studio", None),
     )
 
 
@@ -470,6 +642,21 @@ def _notify_rebuild_error(overlay, loop, stats: WatcherStatistics) -> bool:
         except RuntimeError:  # loop shutting down — nothing to notify
             pass
     return True
+
+
+def _notify_studio_rebuild(studio, loop, stats: WatcherStatistics) -> None:
+    """Broadcast a finished rebuild to Pyxle Studio's event stream.
+
+    Runs on the watcher thread; the coroutine is marshaled onto the event
+    loop. A shutting-down loop is tolerated (nothing left to notify).
+    """
+    if studio is None:
+        return
+    coroutine = studio.notify_rebuild(stats)
+    try:
+        asyncio.run_coroutine_threadsafe(coroutine, loop)
+    except RuntimeError:  # loop shutting down — nothing to notify
+        coroutine.close()
 
 
 def _maybe_schedule_reload(overlay, loop, stats: WatcherStatistics) -> bool:

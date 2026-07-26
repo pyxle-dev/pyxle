@@ -23,6 +23,14 @@ In production (`debug=false`) error responses are intentionally generic — no
 stack traces or file paths in the body. The full detail goes to the **server
 log** instead. Check your process manager's logs (e.g. `journalctl -u myapp`).
 
+## Breakpoints in .pyxl files
+
+Beyond `pdb`, Pyxle has a full breakpoint-debugging story: `pyxle dev --inspect`
+hosts a debug server so VS Code (or any DAP client) can pause a request at a
+breakpoint set **directly in a `.pyxl` file** — Python loaders/actions on the
+server side, and the React half through the browser. That workflow has its own
+guide: [Debugging `.pyxl` files](debugging-pyxl.md).
+
 ## Debugging a loader or action (the Python side)
 
 `@server` and `@action` functions are plain `async` functions — debug them like
@@ -102,10 +110,12 @@ Reading them demystifies "where did my code go":
 - `.pyxle-build/client/…​` — the **JavaScript** half: your component, ready for
   Vite.
 
-The line numbers in a Python traceback point at the compiled `.py`; the compiler
-preserves your code verbatim below the injected header, so mapping back to your
-`.pyxl` is a small, constant offset. The build directory is disposable —
-delete it and the next `pyxle dev`/`build` regenerates it.
+In development, Python tracebacks already point at your `.pyxl` file and line
+(see [Debugging `.pyxl` files](debugging-pyxl.md)). A traceback from a
+**production build** points at the compiled `.py`; the compiler preserves your
+code verbatim below the injected header, so mapping back to your `.pyxl` is a
+small, constant offset. The build directory is disposable — delete it and the
+next `pyxle dev`/`build` regenerates it.
 
 ## Static checks
 
@@ -130,6 +140,7 @@ Two commands catch problems before you run the page:
 
 ## Next steps
 
+- [Debugging `.pyxl` files](debugging-pyxl.md) — breakpoints in `.pyxl` source with VS Code or any DAP client
 - [Error Handling](error-handling.md) — `LoaderError`, error boundaries, 404s
 - [Testing](testing.md) — unit-test loaders and actions
 - [Client Components](client-components.md) — browser-only code and `<ClientOnly>`

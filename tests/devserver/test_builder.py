@@ -116,6 +116,10 @@ def test_build_once_force_rebuild_reprocesses_all_sources(project: DevServerSett
 def test_build_once_handles_page_removal(project: DevServerSettings) -> None:
     build_once(project)
 
+    # The page's .jsx is recorded in the client source-map sidecar.
+    sidecar_path = project.build_root / "client/pyxl-sourcemaps.json"
+    assert "pages/about.jsx" in json.loads(sidecar_path.read_text(encoding="utf-8"))
+
     # Remove the page source to trigger artifact cleanup.
     (project.pages_dir / "about.pyxl").unlink()
 
@@ -125,6 +129,10 @@ def test_build_once_handles_page_removal(project: DevServerSettings) -> None:
     assert not (project.build_root / "client/pages/about.jsx").exists()
     assert not (project.build_root / "server/pages/about.py").exists()
     assert not (project.build_root / "metadata/pages/about.json").exists()
+    # …and the reconcile pass drops its now-stale sidecar entry.
+    assert "pages/about.jsx" not in json.loads(
+        sidecar_path.read_text(encoding="utf-8")
+    )
 
 
 def test_build_once_tracks_client_asset_changes(project: DevServerSettings) -> None:

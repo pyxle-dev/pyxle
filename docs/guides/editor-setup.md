@@ -2,7 +2,8 @@
 
 Pyxle Language Tools brings first-class IDE support to `.pyxl` files — syntax
 highlighting, diagnostics, completions, hover documentation, go-to-definition,
-and formatting. Everything works out of the box with a single install.
+formatting, and breakpoint debugging, plus a **Pyxle: Open Studio** command.
+Everything works out of the box with a single install.
 
 > **Beta release.** The language toolkit is production-usable but still
 > evolving. [Report issues on GitHub.](https://github.com/pyxle-dev/pyxle-langkit/issues)
@@ -118,6 +119,30 @@ Each section is formatted independently, preserving the file structure.
 Enhanced syntax coloring beyond the TextMate grammar — decorators,
 function parameters, built-in calls, and constants get distinct colors
 based on AST analysis.
+
+### Debugging
+
+Set a breakpoint directly in a `.pyxl` file — on a line inside a
+`@server` loader *and* on a line inside the JSX below it — and press
+**F5**. The extension contributes a `pyxle` debug type with two launch
+configurations: one runs your dev server under the Python debugger, the
+other debugs the React half in a standalone browser session.
+
+Debugging ships in extension version **0.3.0** and needs
+**pyxle-framework 0.8.0 or newer** — the launch runs `python -m pyxle`,
+which earlier framework versions don't provide. Python-side breakpoints
+also require the Python extension (`ms-python.python`); the debugger
+offers to install it if it's missing.
+
+Full walkthrough: [Debugging .pyxl files](debugging-pyxl.md).
+
+### Open Studio
+
+The **Pyxle: Open Studio** command (from the command palette) opens the
+running dev server's [Pyxle Studio](studio.md) dashboard — routes, an
+interactive loader/action tester, live requests, metrics, and config. It
+reads the server's discovery file, so it finds the right port without
+asking.
 
 ---
 

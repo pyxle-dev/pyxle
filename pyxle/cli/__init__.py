@@ -551,6 +551,27 @@ def dev(
         help="Periodically print a live observability panel (request/SSR metrics) to the terminal.",
         show_default=True,
     ),
+    inspect: bool = typer.Option(
+        False,
+        "--inspect/--no-inspect",
+        help="Host a debugpy debug server so VS Code (or any DAP client) can attach "
+        "and set breakpoints directly in .pyxl files.",
+        show_default=True,
+    ),
+    inspect_port: int = typer.Option(
+        5678,
+        "--inspect-port",
+        help="Port for the debugpy debug server (with --inspect; falls back to an ephemeral port when busy).",
+        show_default=True,
+        min=0,
+        max=65535,
+    ),
+    inspect_wait: bool = typer.Option(
+        False,
+        "--inspect-wait/--no-inspect-wait",
+        help="With --inspect: wait for a debugger to attach before starting the server.",
+        show_default=True,
+    ),
     verbose: bool = typer.Option(  # noqa: FBT002 - CLI option signature.
         False,
         "--verbose",
@@ -562,6 +583,52 @@ def dev(
 ) -> None:
     """Entry-point for the ``pyxle dev`` command."""
 
+    _dev_impl(
+        directory=directory,
+        host=host,
+        port=port,
+        vite_host=vite_host,
+        vite_port=vite_port,
+        debug=debug,
+        ssr_workers=ssr_workers,
+        config_file=config_file,
+        print_config=print_config,
+        tailwind=tailwind,
+        dashboard=dashboard,
+        verbose=verbose,
+        inspect=inspect,
+        inspect_port=inspect_port,
+        inspect_wait=inspect_wait,
+    )
+
+
+def _dev_impl(
+    *,
+    directory: Path,
+    host: Optional[str],
+    port: Optional[int],
+    vite_host: Optional[str],
+    vite_port: Optional[int],
+    debug: Optional[bool],
+    ssr_workers: Optional[int],
+    config_file: Optional[Path],
+    print_config: bool,
+    tailwind: bool,
+    dashboard: bool,
+    verbose: bool,
+    open_browser_path: Optional[str] = None,
+    force_studio: bool = False,
+    inspect: bool = False,
+    inspect_port: int = 5678,
+    inspect_wait: bool = False,
+) -> None:
+    """Shared implementation behind ``pyxle dev`` and ``pyxle studio``.
+
+    ``pyxle studio`` is ``pyxle dev`` plus a browser opened at the Studio
+    dashboard (``open_browser_path``) and a guarantee that the dashboard is
+    enabled for this run (``force_studio``) even when the config opts out.
+    ``inspect`` hosts a debugpy debug server for .pyxl breakpoint debugging.
+    """
     logger = get_logger()
     # `pyxle dev --verbose` mirrors the global `pyxle -v dev`: both raise the
     # shared ConsoleLogger to VERBOSE, which the dev server, Vite pipe, and
@@ -621,6 +688,16 @@ def dev(
 
     effective_config = file_config.apply_overrides(**overrides)
 
+    if force_studio and not effective_config.studio.enabled:
+        # ``pyxle studio`` explicitly asked for the dashboard — the command
+        # wins over a config opt-out for this run.
+        from dataclasses import replace as _dc_replace  # noqa: PLC0415
+
+        effective_config = _dc_replace(
+            effective_config,
+            studio=_dc_replace(effective_config.studio, enabled=True),
+        )
+
     if print_config:
         pretty = json.dumps(effective_config.to_dict(), indent=2)
         logger.info(f"Effective configuration:\n{pretty}")
@@ -650,7 +727,29 @@ def dev(
         f" with Vite proxy at http://{settings.vite_host}:{settings.vite_port}"
     )
 
-    server = DevServer(settings, logger=logger, tailwind=tailwind, dashboard=dashboard)  # type: ignore[call-arg]
+    # debugpy setup is synchronous (~0.4s, spawns the adapter subprocess) and
+    # must happen before the event loop starts — never inside a coroutine. The
+    # optional wait-for-attach is deferred into the server run so it happens
+    # AFTER the discovery file is written (editors need the endpoint to attach).
+    if inspect_wait and not inspect:
+        logger.warning(
+            "--inspect-wait has no effect without --inspect; the server won't "
+            "wait for a debugger. Add --inspect to host one."
+        )
+
+    inspect_endpoint: Optional[tuple] = None
+    if inspect:
+        inspect_endpoint = _start_debug_server(logger, port=inspect_port)
+
+    server = DevServer(  # type: ignore[call-arg]
+        settings,
+        logger=logger,
+        tailwind=tailwind,
+        dashboard=dashboard,
+        open_browser_path=open_browser_path,
+        inspect_endpoint=inspect_endpoint,
+        inspect_wait=inspect_wait and inspect,
+    )
 
     # Process managers, IDE stop buttons, and plain `kill` send SIGTERM.
     # Route it through the same KeyboardInterrupt path as Ctrl-C so the whole
@@ -667,6 +766,160 @@ def dev(
         raise typer.Exit(code=1) from exc
     finally:
         _restore_sigterm_handler(previous_sigterm)
+
+
+def _start_debug_server(logger, *, port: int) -> tuple:
+    """Host a debugpy debug server in this process and return its endpoint.
+
+    Tries the configured port first and falls back to an ephemeral one when it
+    is busy (the discovery file records the actual endpoint either way, so
+    editor attach flows keep working). Waiting for a client to attach
+    (``--inspect-wait``) happens later, inside the server run, so the discovery
+    file is written first and editors can find the endpoint to attach to.
+    """
+    os.environ.setdefault("PYDEVD_DISABLE_FILE_VALIDATION", "1")
+    try:
+        import debugpy  # noqa: PLC0415 - lazy; only the --inspect path needs it
+    except ImportError as exc:
+        # debugpy ships with the framework, so this only fires on a broken /
+        # partial install. Fail clearly rather than crash later.
+        logger.error(
+            "`--inspect` needs debugpy, which ships with Pyxle but couldn't be "
+            "imported. Reinstall the framework: pip install --force-reinstall pyxle-framework"
+        )
+        raise typer.Exit(code=1) from exc
+
+    # Never inject debugger environment into subprocesses (Vite, SSR workers,
+    # or anything a loader shells out to) — only this server process is
+    # debugged.
+    debugpy.configure(subProcess=False)
+    try:
+        endpoint = debugpy.listen(("127.0.0.1", port))
+    except RuntimeError as exc:
+        logger.warning(
+            f"debugpy could not bind 127.0.0.1:{port} ({exc}); using an ephemeral port"
+        )
+        try:
+            endpoint = debugpy.listen(("127.0.0.1", 0))
+        except RuntimeError as exc2:
+            logger.error(
+                f"Could not start the debug server ({exc2}). "
+                "Run `pyxle dev` without --inspect, or free up loopback listening."
+            )
+            raise typer.Exit(code=1) from exc2
+    logger.info(
+        f"Debugger listening on {endpoint[0]}:{endpoint[1]} — attach from "
+        'VS Code with the "Pyxle" debug configuration.'
+    )
+    return endpoint
+
+
+@app.command(help="Run the dev server and open the Pyxle Studio dashboard.")
+def studio(
+    directory: Path = typer.Argument(
+        Path("."),
+        help="Project root containing pages/ and public/ directories.",
+        show_default=True,
+    ),
+    host: Optional[str] = typer.Option(
+        None,
+        "--host",
+        help="Hostname for the Starlette server (defaults to config or 127.0.0.1).",
+        show_default=False,
+    ),
+    port: Optional[int] = typer.Option(
+        None,
+        "--port",
+        help="Port for the Starlette server (defaults to config or 8000).",
+        show_default=False,
+    ),
+    vite_host: Optional[str] = typer.Option(
+        None,
+        "--vite-host",
+        help="Hostname for the Vite dev server (defaults to config or 127.0.0.1).",
+        show_default=False,
+    ),
+    vite_port: Optional[int] = typer.Option(
+        None,
+        "--vite-port",
+        help="Port for the Vite dev server (defaults to config or 5173).",
+        show_default=False,
+    ),
+    ssr_workers: Optional[int] = typer.Option(
+        None,
+        "--ssr-workers",
+        help="Number of persistent Node.js SSR worker processes (0 = per-request subprocess mode, default: 1).",
+        show_default=False,
+        min=0,
+    ),
+    config_file: Optional[Path] = typer.Option(
+        None,
+        "--config",
+        help="Path to a pyxle.config.json file (defaults to <project>/pyxle.config.json).",
+    ),
+    tailwind: bool = typer.Option(
+        True,
+        "--tailwind/--no-tailwind",
+        help="Automatically run the Tailwind CSS watcher if tailwind.config.* is present.",
+        show_default=True,
+    ),
+    open_browser: bool = typer.Option(
+        True,
+        "--open/--no-open",
+        help="Open the Studio dashboard in the system browser once the server is ready.",
+        show_default=True,
+    ),
+    inspect: bool = typer.Option(
+        False,
+        "--inspect/--no-inspect",
+        help="Host a debugpy debug server so VS Code (or any DAP client) can attach "
+        "and set breakpoints directly in .pyxl files.",
+        show_default=True,
+    ),
+    inspect_port: int = typer.Option(
+        5678,
+        "--inspect-port",
+        help="Port for the debugpy debug server (with --inspect; falls back to an ephemeral port when busy).",
+        show_default=True,
+        min=0,
+        max=65535,
+    ),
+    verbose: bool = typer.Option(  # noqa: FBT002 - CLI option signature.
+        False,
+        "--verbose",
+        "-v",
+        help="Restore full output: raw Vite logs, debug internals, and DEBUG "
+        "server logs in the browser console. Equivalent to `pyxle -v studio`.",
+        is_flag=True,
+    ),
+) -> None:
+    """Entry-point for the ``pyxle studio`` command.
+
+    Runs the same development server as ``pyxle dev`` — Studio is part of it —
+    and lands the browser on the dashboard. Debug mode is forced on (Studio is
+    dev-only) and the dashboard is enabled for this run even when the config
+    opts out.
+    """
+    from pyxle.devserver.studio import STUDIO_PATH  # noqa: PLC0415
+
+    _dev_impl(
+        directory=directory,
+        host=host,
+        port=port,
+        vite_host=vite_host,
+        vite_port=vite_port,
+        debug=True,
+        ssr_workers=ssr_workers,
+        config_file=config_file,
+        print_config=False,
+        tailwind=tailwind,
+        dashboard=False,
+        verbose=verbose,
+        open_browser_path=STUDIO_PATH if open_browser else None,
+        force_studio=True,
+        inspect=inspect,
+        inspect_port=inspect_port,
+    )
 
 
 @app.command(help="Build production-ready assets for deployment.")

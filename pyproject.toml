@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pyxle-framework"
-version = "0.7.5"
+version = "0.8.0"
 description = "Python-first full-stack framework with an intelligent CLI."
 readme = "README.md"
 authors = [
@@ -61,6 +61,12 @@ dependencies = [
   # Built on prompt_toolkit; imported lazily on the prompt path only, so it
   # never loads on the compile/serve hot path.
   "questionary>=2.0,<3.0",
+  # debugpy powers ``pyxle dev --inspect`` — breakpoint debugging of .pyxl
+  # files from VS Code (or any DAP client). A default dependency because
+  # debugging is core DX that nearly every developer reaches for; imported
+  # lazily on the ``--inspect`` path only, so it never loads on the normal
+  # compile/serve/dev hot path.
+  "debugpy>=1.8,<2.0",
 ]
 
 [project.urls]

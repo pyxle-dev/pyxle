@@ -789,6 +789,85 @@ def test_dev_command_dashboard_flag(monkeypatch) -> None:
         assert captured.get("dashboard") is True
 
 
+def _invoke_studio_command(monkeypatch, argv, config_payload=None) -> dict[str, object]:
+    """Run ``pyxle studio`` against a stub DevServer and return its capture."""
+    with runner.isolated_filesystem():
+        project = Path("demo")
+        (project / "pages").mkdir(parents=True)
+        (project / "public").mkdir(parents=True)
+        if config_payload is not None:
+            (project / "pyxle.config.json").write_text(
+                json.dumps(config_payload), encoding="utf-8"
+            )
+
+        captured: dict[str, object] = {}
+
+        class StubDevServer:
+            def __init__(self, settings, logger, **kwargs):
+                captured["settings"] = settings
+                captured.update(kwargs)
+
+            async def start(self) -> None:  # pragma: no cover - not awaited
+                pass
+
+        from pyxle.devserver import DevServerSettings as _RealSettings
+
+        monkeypatch.setattr("pyxle.cli.DevServerSettings", _RealSettings)
+        monkeypatch.setattr("pyxle.cli.DevServer", StubDevServer)
+        monkeypatch.setattr("pyxle.cli.asyncio.run", lambda coro: coro.close())
+
+        result = runner.invoke(app, argv, catch_exceptions=False)
+        assert result.exit_code == 0, result.stdout
+        return captured
+
+
+def test_studio_command_opens_browser_at_the_dashboard(monkeypatch) -> None:
+    captured = _invoke_studio_command(monkeypatch, ["studio", "demo"])
+    assert captured["open_browser_path"] == "/__pyxle/studio"
+    settings = captured["settings"]
+    assert settings.debug is True  # Studio is dev-only; debug is forced on
+    # Default-on: no config block means the dashboard is enabled.
+    assert settings.studio.enabled is True
+
+
+def test_studio_command_no_open_flag_skips_the_browser(monkeypatch) -> None:
+    captured = _invoke_studio_command(monkeypatch, ["studio", "demo", "--no-open"])
+    assert captured["open_browser_path"] is None
+
+
+def test_studio_command_wins_over_config_opt_out(monkeypatch) -> None:
+    captured = _invoke_studio_command(
+        monkeypatch,
+        ["studio", "demo"],
+        config_payload={
+            "debug": False,
+            "studio": {"enabled": False, "allowedHosts": ["mybox.local"]},
+        },
+    )
+    settings = captured["settings"]
+    # `pyxle studio` explicitly asked for the dashboard: the run is debug with
+    # Studio enabled, but the rest of the studio block is preserved.
+    assert settings.debug is True
+    assert settings.studio.enabled is True
+    assert settings.studio.allowed_hosts == ("mybox.local",)
+
+
+def test_dev_command_respects_studio_config_opt_out(monkeypatch) -> None:
+    # Plain `pyxle dev` never forces the dashboard back on.
+    captured = _invoke_studio_command(
+        monkeypatch, ["dev", "demo"], config_payload={"studio": False}
+    )
+    assert captured["settings"].studio.enabled is False
+    assert captured["open_browser_path"] is None
+
+
+def test_studio_command_requires_existing_directory() -> None:
+    with runner.isolated_filesystem():
+        result = runner.invoke(app, ["studio", "missing"], catch_exceptions=False)
+        assert result.exit_code == 1
+        assert "does not exist" in result.stdout
+
+
 def test_dev_command_respects_config_file(monkeypatch) -> None:
     with runner.isolated_filesystem():
         project = Path("demo")
@@ -3228,3 +3307,228 @@ def test_sigterm_helper_raises_keyboard_interrupt(monkeypatch) -> None:
     restored.clear()
     cli_module._restore_sigterm_handler(None)
     assert restored == {}
+
+
+# ---------------------------------------------------------------------------
+# `pyxle dev --inspect` — the debugpy debug server
+# ---------------------------------------------------------------------------
+
+
+def _invoke_dev_with_inspect(monkeypatch, argv):
+    """Run a dev/studio command with `_start_debug_server` stubbed out.
+
+    Returns ``(debug_server_calls, devserver_kwargs)`` so tests can assert the
+    flag wiring without touching debugpy.
+    """
+    with runner.isolated_filesystem():
+        project = Path("demo")
+        (project / "pages").mkdir(parents=True)
+        (project / "public").mkdir(parents=True)
+
+        debug_server_calls: list[dict[str, object]] = []
+        devserver_kwargs: dict[str, object] = {}
+
+        def fake_start_debug_server(logger, *, port):
+            debug_server_calls.append({"port": port})
+            return ("127.0.0.1", port)
+
+        class StubDevServer:
+            def __init__(self, settings, logger, **kwargs):
+                devserver_kwargs.update(kwargs)
+
+            async def start(self) -> None:  # pragma: no cover - not awaited
+                pass
+
+        from pyxle.devserver import DevServerSettings as _RealSettings
+
+        monkeypatch.setattr("pyxle.cli.DevServerSettings", _RealSettings)
+        monkeypatch.setattr("pyxle.cli.DevServer", StubDevServer)
+        monkeypatch.setattr("pyxle.cli._start_debug_server", fake_start_debug_server)
+        monkeypatch.setattr("pyxle.cli.asyncio.run", lambda coro: coro.close())
+
+        result = runner.invoke(app, argv, catch_exceptions=False)
+        assert result.exit_code == 0, result.stdout
+        return debug_server_calls, devserver_kwargs
+
+
+def test_dev_command_inspect_flag_hosts_debug_server(monkeypatch) -> None:
+    calls, kwargs = _invoke_dev_with_inspect(monkeypatch, ["dev", "demo", "--inspect"])
+    # _start_debug_server no longer waits — it just hosts and returns the endpoint.
+    assert calls == [{"port": 5678}]
+    # The endpoint flows into the DevServer so the discovery file can
+    # advertise it to editor tooling.
+    assert kwargs["inspect_endpoint"] == ("127.0.0.1", 5678)
+    # No --inspect-wait: the DevServer must not block for an attach.
+    assert kwargs["inspect_wait"] is False
+
+
+def test_dev_command_inspect_port_flag(monkeypatch) -> None:
+    calls, kwargs = _invoke_dev_with_inspect(
+        monkeypatch,
+        ["dev", "demo", "--inspect", "--inspect-port", "6000"],
+    )
+    assert calls == [{"port": 6000}]
+    assert kwargs["inspect_endpoint"] == ("127.0.0.1", 6000)
+
+
+def test_dev_command_inspect_wait_flows_to_devserver(monkeypatch) -> None:
+    # The wait-for-attach moved out of _start_debug_server into DevServer.start,
+    # so --inspect-wait must surface as an ``inspect_wait=True`` on the DevServer.
+    calls, kwargs = _invoke_dev_with_inspect(
+        monkeypatch, ["dev", "demo", "--inspect", "--inspect-wait"]
+    )
+    assert calls == [{"port": 5678}]
+    assert kwargs["inspect_wait"] is True
+
+
+def test_dev_command_inspect_wait_without_inspect_never_waits(monkeypatch) -> None:
+    # --inspect-wait alone (no --inspect) hosts no debug server and never blocks:
+    # ``inspect_wait and inspect`` collapses to False.
+    calls, kwargs = _invoke_dev_with_inspect(monkeypatch, ["dev", "demo", "--inspect-wait"])
+    assert calls == []
+    assert kwargs["inspect_endpoint"] is None
+    assert kwargs["inspect_wait"] is False
+
+
+def test_dev_command_without_inspect_skips_debug_server(monkeypatch) -> None:
+    calls, kwargs = _invoke_dev_with_inspect(monkeypatch, ["dev", "demo"])
+    assert calls == []
+    assert kwargs["inspect_endpoint"] is None
+
+
+def test_studio_command_supports_inspect(monkeypatch) -> None:
+    calls, kwargs = _invoke_dev_with_inspect(
+        monkeypatch, ["studio", "demo", "--inspect", "--inspect-port", "6001"]
+    )
+    # Studio never waits for an attach — it has no --inspect-wait flag.
+    assert calls == [{"port": 6001}]
+    assert kwargs["inspect_endpoint"] == ("127.0.0.1", 6001)
+    assert kwargs["inspect_wait"] is False
+
+
+def test_studio_command_has_no_inspect_wait_flag() -> None:
+    with runner.isolated_filesystem():
+        project = Path("demo")
+        (project / "pages").mkdir(parents=True)
+        (project / "public").mkdir(parents=True)
+        result = runner.invoke(app, ["studio", "demo", "--inspect-wait"])
+        assert result.exit_code != 0
+
+
+class _FakeDebugpy:
+    """Stand-in for the optional ``debugpy`` dependency.
+
+    CLI tests must never import real debugpy — it spawns an adapter
+    subprocess and binds sockets.
+    """
+
+    def __init__(self, *, fail_ports: tuple[int, ...] = ()) -> None:
+        self.configure_calls: list[dict[str, object]] = []
+        self.listen_calls: list[tuple[str, int]] = []
+        self.wait_calls = 0
+        self._fail_ports = fail_ports
+
+    def configure(self, **kwargs) -> None:
+        self.configure_calls.append(kwargs)
+
+    def listen(self, endpoint: tuple[str, int]) -> tuple[str, int]:
+        self.listen_calls.append(endpoint)
+        host, port = endpoint
+        if port in self._fail_ports:
+            raise RuntimeError("Address already in use")
+        return (host, 49152 if port == 0 else port)
+
+    def wait_for_client(self) -> None:
+        self.wait_calls += 1
+
+
+@pytest.fixture
+def _no_pydevd_env(monkeypatch):
+    """Ensure PYDEVD_DISABLE_FILE_VALIDATION is unset and restored afterwards."""
+    monkeypatch.setenv("PYDEVD_DISABLE_FILE_VALIDATION", "primed-for-restore")
+    monkeypatch.delenv("PYDEVD_DISABLE_FILE_VALIDATION")
+
+
+def _capture_logger():
+    messages: list[str] = []
+
+    def secho(message: str, fg=None, bold: bool = False) -> None:
+        messages.append(message)
+
+    return cli.ConsoleLogger(secho=secho), messages
+
+
+def test_start_debug_server_configures_and_listens(monkeypatch, _no_pydevd_env) -> None:
+    import os
+
+    fake = _FakeDebugpy()
+    monkeypatch.setitem(sys.modules, "debugpy", fake)
+    logger, messages = _capture_logger()
+
+    endpoint = cli._start_debug_server(logger, port=5678)
+
+    assert endpoint == ("127.0.0.1", 5678)
+    # pydevd's noisy file validation is silenced before debugpy loads.
+    assert os.environ["PYDEVD_DISABLE_FILE_VALIDATION"] == "1"
+    # Subprocesses (Vite, SSR workers) must never inherit the debugger.
+    assert fake.configure_calls == [{"subProcess": False}]
+    assert fake.listen_calls == [("127.0.0.1", 5678)]
+    # The wait-for-attach lives in DevServer.start now, never here.
+    assert fake.wait_calls == 0
+    assert any("Debugger listening on 127.0.0.1:5678" in m for m in messages)
+
+
+def test_start_debug_server_respects_existing_pydevd_env(monkeypatch) -> None:
+    import os
+
+    fake = _FakeDebugpy()
+    monkeypatch.setitem(sys.modules, "debugpy", fake)
+    monkeypatch.setenv("PYDEVD_DISABLE_FILE_VALIDATION", "0")
+    logger, _ = _capture_logger()
+
+    cli._start_debug_server(logger, port=5678)
+
+    # setdefault semantics: a user's explicit opt-out is preserved.
+    assert os.environ["PYDEVD_DISABLE_FILE_VALIDATION"] == "0"
+
+
+def test_start_debug_server_falls_back_to_ephemeral_port(
+    monkeypatch, _no_pydevd_env
+) -> None:
+    fake = _FakeDebugpy(fail_ports=(5678,))
+    monkeypatch.setitem(sys.modules, "debugpy", fake)
+    logger, messages = _capture_logger()
+
+    endpoint = cli._start_debug_server(logger, port=5678)
+
+    assert fake.listen_calls == [("127.0.0.1", 5678), ("127.0.0.1", 0)]
+    assert endpoint == ("127.0.0.1", 49152)
+    assert any("ephemeral port" in m for m in messages)
+
+
+def test_start_debug_server_does_not_wait_for_client(monkeypatch, _no_pydevd_env) -> None:
+    # The wait moved into DevServer.start (after the discovery file is written),
+    # so _start_debug_server itself must never call wait_for_client.
+    fake = _FakeDebugpy()
+    monkeypatch.setitem(sys.modules, "debugpy", fake)
+    logger, messages = _capture_logger()
+
+    cli._start_debug_server(logger, port=5678)
+
+    assert fake.wait_calls == 0
+    assert not any("Waiting for a debugger to attach" in m for m in messages)
+
+
+def test_start_debug_server_handles_missing_debugpy(monkeypatch, _no_pydevd_env) -> None:
+    # debugpy ships with the framework, so its absence means a broken install.
+    # sys.modules[name] = None makes `import debugpy` raise ImportError without
+    # touching the real package; the command must fail clearly, not crash later.
+    monkeypatch.setitem(sys.modules, "debugpy", None)
+    logger, messages = _capture_logger()
+
+    with pytest.raises(typer.Exit) as excinfo:
+        cli._start_debug_server(logger, port=5678)
+
+    assert excinfo.value.exit_code == 1
+    # The error points at reinstalling the framework, not an extra.
+    assert any("reinstall" in m.lower() for m in messages)
