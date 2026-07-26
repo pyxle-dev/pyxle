@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Dict
 
 from pyxle.compiler.core import compile_file
+from pyxle.compiler.writers import reconcile_client_sourcemap_sidecar
 
 from .build import (
     BuildMetadata,
@@ -130,6 +131,10 @@ def _build_once_locked(settings: DevServerSettings, *, force_rebuild: bool) -> B
         sources=new_sources,
     )
     save_build_metadata(paths.build_root, updated_metadata)
+
+    # Prune source-map sidecar entries for pages removed this pass so the
+    # client sourcemap manifest mirrors the live set of .jsx modules.
+    reconcile_client_sourcemap_sidecar(paths.client_root)
 
     compose_layout_templates(settings)
     if settings.global_stylesheets:

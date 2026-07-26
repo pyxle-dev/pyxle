@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional, Sequence
 
 DEFAULT_CONFIG_FILENAME = "pyxle.config.json"
 
@@ -222,6 +222,30 @@ class LlmsConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class StudioConfig:
+    """Pyxle Studio: the dev-only web dashboard served by ``pyxle dev``.
+
+    When ``enabled`` (the default), the development server mounts Studio at
+    ``/__pyxle/studio`` — a local dashboard for inspecting routes, loaders,
+    actions, configuration, and live request metrics, with an interactive
+    tester for loaders and actions. Studio is **dev-only by construction**:
+    the code path that serves it only exists when the server runs in debug
+    mode, so ``pyxle serve`` (production) never exposes it regardless of this
+    setting.
+
+    ``allowed_hosts`` extends the ``Host`` header allowlist Studio enforces on
+    its own endpoints. By default only loopback names (``localhost``,
+    ``127.0.0.1``, ``[::1]``) and the configured server host are accepted —
+    this blocks DNS-rebinding attacks against the local dashboard. Add an
+    entry when accessing the dev server through another hostname (e.g. a
+    LAN IP or a ``*.local`` name).
+    """
+
+    enabled: bool = True
+    allowed_hosts: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class DevConfig:
     """Development-server-only settings that shape the file watcher.
 
@@ -274,6 +298,7 @@ class PyxleConfig:
     rate_limit: RateLimitConfig = RateLimitConfig()
     observability: ObservabilityConfig = ObservabilityConfig()
     llms: LlmsConfig = LlmsConfig()
+    studio: StudioConfig = StudioConfig()
     dev: DevConfig = DevConfig()
     # Plugin entries as the raw payload from ``pyxle.config.json`` —
     # either a bare string (``"pyxle-auth"``) or an object
@@ -306,6 +331,7 @@ class PyxleConfig:
             "rate_limit": self.rate_limit,
             "observability": self.observability,
             "llms": self.llms,
+            "studio": self.studio,
             "dev_watch": self.dev.watch,
             "dev_ignore": self.dev.ignore,
             "plugins": self.plugins,
@@ -417,6 +443,7 @@ def _parse_config_dict(data: Dict[str, Any], *, source: Path) -> PyxleConfig:
         "rateLimit",
         "observability",
         "llms",
+        "studio",
         "dev",
         "plugins",
     }
@@ -454,6 +481,7 @@ def _parse_config_dict(data: Dict[str, Any], *, source: Path) -> PyxleConfig:
     rate_limit_config = _parse_rate_limit_block(data.get("rateLimit"), source=source)
     observability_config = _parse_observability_block(data.get("observability"), source=source)
     llms_config = _parse_llms_block(data.get("llms"), source=source)
+    studio_config = _parse_studio_block(data.get("studio"), source=source)
     dev_config = _parse_dev_block(data.get("dev"), source=source)
     plugins = _parse_plugins_block(data.get("plugins"), source=source)
 
@@ -479,6 +507,7 @@ def _parse_config_dict(data: Dict[str, Any], *, source: Path) -> PyxleConfig:
         rate_limit=rate_limit_config,
         observability=observability_config,
         llms=llms_config,
+        studio=studio_config,
         dev=dev_config,
         plugins=plugins,
     )
@@ -631,6 +660,56 @@ def _parse_llms_block(value: Any, *, source: Path) -> LlmsConfig:
         )
 
     return LlmsConfig(enabled=enabled, auto_convert=auto_convert)
+
+
+def _parse_studio_block(value: Any, *, source: Path) -> StudioConfig:
+    """Parse the ``studio`` block — the dev-only web dashboard.
+
+    Accepts a boolean shorthand (``"studio": false`` turns the dashboard off)
+    or an object with ``enabled`` and ``allowedHosts`` keys. When the object
+    form is used, the dashboard stays enabled unless ``enabled: false`` is set
+    explicitly. ``allowedHosts`` entries extend the ``Host`` header allowlist
+    Studio enforces (loopback names and the configured server host are always
+    accepted).
+    """
+    if value is None:
+        return StudioConfig()
+    if isinstance(value, bool):
+        return StudioConfig(enabled=value)
+    if not isinstance(value, Mapping):
+        raise ConfigError(
+            f"Invalid value for 'studio' in '{source}': expected an object or boolean."
+        )
+
+    _reject_unknown_keys(
+        value,
+        allowed={"enabled", "allowedHosts"},
+        block="studio",
+        source=source,
+    )
+
+    enabled = value.get("enabled", True)
+    if not isinstance(enabled, bool):
+        raise ConfigError(
+            f"Invalid 'studio.enabled' in '{source}': expected boolean, "
+            f"got {type(enabled).__name__}."
+        )
+
+    raw_hosts = value.get("allowedHosts", ())
+    if isinstance(raw_hosts, str) or not isinstance(raw_hosts, Sequence):
+        raise ConfigError(
+            f"Invalid 'studio.allowedHosts' in '{source}': expected a list of strings."
+        )
+    hosts: list[str] = []
+    for entry in raw_hosts:
+        if not isinstance(entry, str) or not entry.strip():
+            raise ConfigError(
+                f"Invalid 'studio.allowedHosts' entry in '{source}': "
+                "expected a non-empty string."
+            )
+        hosts.append(entry.strip().lower())
+
+    return StudioConfig(enabled=enabled, allowed_hosts=tuple(hosts))
 
 
 def _parse_styling_block(value: Any, *, source: Path) -> tuple[tuple[str, ...], tuple[str, ...]]:
@@ -1227,6 +1306,7 @@ __all__ = [
     "CorsConfig",
     "CsrfConfig",
     "DevConfig",
+    "StudioConfig",
     "CSRF_COOKIE_NAME_PREFIX",
     "default_csrf_cookie_name",
     "load_config",

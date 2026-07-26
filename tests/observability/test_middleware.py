@@ -252,3 +252,94 @@ def test_request_timing_ms_none_when_value_not_numeric() -> None:
         scope = {"pyxle": {"duration_ms": "fast"}}
 
     assert request_timing_ms(_Req()) is None
+
+
+# ---------------------------------------------------------------------------
+# observer hook + excluded path prefixes (Pyxle Studio's live request feed)
+
+
+async def _routed(request):
+    # Simulate the route-metadata hook: it mutates the same scope namespace the
+    # middleware created, so the observer sees the route at response start.
+    request.scope.setdefault("pyxle", {})["route"] = {
+        "target": "page",
+        "path": request.scope["path"],
+    }
+    return JSONResponse({"ok": True})
+
+
+def _observed_client(observer, **mw_kwargs) -> TestClient:
+    app = Starlette(
+        routes=[
+            Route("/", _routed),
+            Route("/__pyxle/studio/api/requests", _routed),
+        ],
+        middleware=[Middleware(RequestIdMiddleware, observer=observer, **mw_kwargs)],
+    )
+    return TestClient(app)
+
+
+def test_observer_receives_request_event_with_route() -> None:
+    events: list[dict] = []
+    resp = _observed_client(events.append).get("/")
+
+    assert len(events) == 1
+    event = events[0]
+    assert event["method"] == "GET"
+    assert event["path"] == "/"
+    assert event["status"] == 200
+    assert isinstance(event["duration_ms"], float)
+    assert event["duration_ms"] >= 0.0
+    assert event["request_id"] == resp.headers["x-request-id"]
+    assert event["route"] == {"target": "page", "path": "/"}
+
+
+def test_excluded_prefix_skips_metrics_and_observer_but_keeps_request_id() -> None:
+    from pyxle.observability.metrics import MetricsRegistry
+
+    events: list[dict] = []
+    registry = MetricsRegistry()
+    client = _observed_client(
+        events.append,
+        metrics=registry,
+        exclude_path_prefixes=("/__pyxle",),
+    )
+
+    excluded = client.get("/__pyxle/studio/api/requests")
+    assert excluded.status_code == 200
+    assert _HEX32.match(excluded.headers["x-request-id"])  # id still assigned
+    assert events == []
+    assert registry.requests_total == 0
+
+    client.get("/")  # a non-excluded path is observed and counted as before
+    assert registry.requests_total == 1
+    assert [event["path"] for event in events] == ["/"]
+
+
+def test_exclusions_are_opt_in() -> None:
+    from pyxle.observability.metrics import MetricsRegistry
+
+    events: list[dict] = []
+    registry = MetricsRegistry()
+    client = _observed_client(events.append, metrics=registry)
+
+    client.get("/__pyxle/studio/api/requests")
+    assert registry.requests_total == 1
+    assert [event["path"] for event in events] == ["/__pyxle/studio/api/requests"]
+
+
+def test_observer_errors_never_fail_the_request() -> None:
+    def broken_observer(event) -> None:
+        raise RuntimeError("observer exploded")
+
+    resp = _observed_client(broken_observer).get("/")
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True}
+    assert "x-request-id" in resp.headers
+
+
+def test_observer_alone_forces_measurement() -> None:
+    # With timing off and no metrics, an observer still gets a real duration.
+    events: list[dict] = []
+    _observed_client(events.append, timing=False).get("/")
+    assert isinstance(events[0]["duration_ms"], float)

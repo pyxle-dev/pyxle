@@ -462,7 +462,11 @@ def _render_vite_config(settings: DevServerSettings) -> str:
     tailwind_import = (
         "\n            import tailwindcss from '@tailwindcss/vite';" if uses_tailwind else ""
     )
-    plugin_calls = "react(), tailwindcss()" if uses_tailwind else "react()"
+    plugin_calls = (
+        "pyxlSourcemaps(), react(), tailwindcss()"
+        if uses_tailwind
+        else "pyxlSourcemaps(), react()"
+    )
 
     alias_entries: list[str] = []
     for prefix, target in _project_import_aliases(settings.project_root):
@@ -481,7 +485,9 @@ def _render_vite_config(settings: DevServerSettings) -> str:
             f"""
             import {{ defineConfig }} from 'vite';
             import react from '@vitejs/plugin-react';{tailwind_import}
+            import fs from 'node:fs';
             import path from 'node:path';
+            import {{ pathToFileURL }} from 'node:url';
 
             const clientRoot = __dirname;
             const projectRoot = path.resolve(clientRoot, '..', '..');
@@ -505,6 +511,8 @@ def _render_vite_config(settings: DevServerSettings) -> str:
             const vitePort = Number(process.env.PYXLE_VITE_PORT ?? {vite_port});
 
             __PYXLE_CSS_MODULE_HELPER__
+
+            __PYXLE_PYXL_SOURCEMAP_PLUGIN__
 
             export default defineConfig({{
               base,
@@ -551,7 +559,120 @@ def _render_vite_config(settings: DevServerSettings) -> str:
             """
         ).strip()
         + "\n"
-    ).replace("__PYXLE_CSS_MODULE_HELPER__", CSS_MODULE_SCOPED_NAME_JS)
+    ).replace("__PYXLE_CSS_MODULE_HELPER__", CSS_MODULE_SCOPED_NAME_JS).replace(
+        "__PYXLE_PYXL_SOURCEMAP_PLUGIN__", PYXL_SOURCEMAP_PLUGIN_JS
+    )
+
+
+# Inline Vite plugin (dev-server only, ``apply: 'serve'``) that attaches a
+# source map to every generated ``pages/**/*.jsx`` pointing back at its
+# ``.pyxl`` origin. The per-file line maps come from the compiler's
+# ``pyxl-sourcemaps.json`` sidecar in the client root, re-read on every load so
+# hot rebuilds always serve a fresh map.
+#
+# ``sources`` is a ``file://`` URL for the real ``.pyxl`` on disk, and Vite
+# passes it through verbatim — a plain absolute path would instead be rewritten
+# to one relative to the ``.jsx`` (Vite only relativizes ``path.isAbsolute``
+# sources, which a ``file://`` URL is not). VS Code's js-debug resolves that
+# ``file://`` to the on-disk ``.pyxl`` and binds breakpoints there by path (the
+# source gets ``sourceReference: 0`` whenever the path exists) — the file the
+# developer actually edits.
+#
+# ``sourcesContent`` carries the ``.pyxl`` bytes with the ``@server`` half
+# redacted: this map is served over HTTP to the browser, so every line above the
+# first mapped JSX line — the server/action Python, which can hold secrets — is
+# blanked (line count preserved so the ``mappings`` stay aligned). It does NOT
+# affect where breakpoints bind — js-debug prefers the on-disk file and never
+# diffs inline content against disk for map sources — but it earns its keep two
+# ways. (1) It's the correct (client-only) fallback shown when the ``.pyxl``
+# isn't resolvable locally (remote/container/renamed). (2) It stops Vite's dev
+# server from trying to read the ``file://`` URL as a filesystem path to backfill
+# missing content: that read always fails (``file://…`` is not a path) and Vite
+# would log ``Sourcemap for "…" points to missing source files`` for every page
+# on every start. Providing non-null ``sourcesContent`` makes Vite skip the read.
+PYXL_SOURCEMAP_PLUGIN_JS = dedent(
+    """
+    const PYXL_SIDECAR = 'pyxl-sourcemaps.json';
+    const VLQ_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+    function pyxlVlq(value) {
+      let x = value < 0 ? (-value << 1) | 1 : value << 1;
+      let out = '';
+      do { let digit = x & 31; x >>>= 5; if (x > 0) digit |= 32; out += VLQ_CHARS[digit]; } while (x > 0);
+      return out;
+    }
+    // One segment per generated line, column 0 -> (source 0, srcLine, column 0).
+    // lines[i] is the 1-based .pyxl line for 0-based generated line i.
+    function pyxlEncodeMappings(lines) {
+      let previous = 0;
+      const out = [];
+      for (const srcLine of lines) {
+        if (srcLine == null) { out.push(''); continue; }
+        const relative = srcLine - 1 - previous;
+        previous = srcLine - 1;
+        out.push(pyxlVlq(0) + pyxlVlq(0) + pyxlVlq(relative) + pyxlVlq(0));
+      }
+      return out.join(';');
+    }
+    function pyxlSourcemaps() {
+      let root;
+      return {
+        name: 'pyxle:pyxl-sourcemap',
+        enforce: 'pre',
+        apply: 'serve',
+        configResolved(config) { root = config.root; },
+        load(id) {
+          const file = id.split('?', 1)[0];
+          if (!file.endsWith('.jsx')) return null;
+          let sidecar;
+          try {
+            sidecar = JSON.parse(fs.readFileSync(path.join(root, PYXL_SIDECAR), 'utf8'));
+          } catch { return null; }
+          const rel = path.relative(root, file).split(path.sep).join('/');
+          const entry = sidecar[rel];
+          if (!entry) return null;
+          let code;
+          const pyxlPath = path.resolve(root, entry.pyxl);
+          let pyxlSource;
+          try {
+            code = fs.readFileSync(file, 'utf8');
+            pyxlSource = fs.readFileSync(pyxlPath, 'utf8');
+          } catch { return null; }
+          // This source map is fetched by the browser, so its sourcesContent must
+          // not carry the .pyxl's @server/@action Python (which can hold secrets).
+          // Keep ONLY the lines the mappings actually reference — i.e. the client
+          // JSX, which is already public in the bundle — and blank every other
+          // line. Whitelisting the mapped lines (rather than blanking a leading
+          // region) is what makes this order-independent: a .pyxl may interleave
+          // Python and JSX segments in any order, so server code can sit BELOW the
+          // component. Line count is preserved so the mappings stay aligned.
+          const mappedLines = new Set();
+          for (const n of entry.lines || []) {
+            if (Number.isInteger(n) && n > 0) mappedLines.add(n);
+          }
+          let content = pyxlSource;
+          if (mappedLines.size) {
+            const srcLines = pyxlSource.split('\\n');
+            for (let i = 0; i < srcLines.length; i++) {
+              if (!mappedLines.has(i + 1)) srcLines[i] = '';
+            }
+            content = srcLines.join('\\n');
+          }
+          return {
+            code,
+            map: {
+              version: 3,
+              file: rel,
+              sources: [pathToFileURL(pyxlPath).href],
+              sourcesContent: [content],
+              names: [],
+              mappings: pyxlEncodeMappings(entry.lines),
+            },
+          };
+        },
+      };
+    }
+    """
+).strip()
 
 
 # Canonical CSS-Module class-name generator, shared verbatim between the Vite

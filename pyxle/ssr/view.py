@@ -1369,7 +1369,15 @@ def _import_server_module(
 
     _ensure_app_root_importable(module_path)
 
-    spec = importlib.util.spec_from_file_location(module_key, module_path)
+    # Debug mode execs the generated module as its .pyxl source (remapped
+    # co_filename + line numbers via the compiler's embedded debug footer) —
+    # .pyxl tracebacks and native debugger breakpoints. See compiler.linemap.
+    loader = None
+    if debug and module_path.suffix == ".py":
+        from pyxle.compiler.linemap import PyxlSourceFileLoader  # noqa: PLC0415
+
+        loader = PyxlSourceFileLoader(module_key, str(module_path))
+    spec = importlib.util.spec_from_file_location(module_key, module_path, loader=loader)
     if spec is None or spec.loader is None:
         raise LoaderExecutionError(f"Unable to load page module at {module_path!s}")
 

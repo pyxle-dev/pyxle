@@ -322,6 +322,75 @@ async def test_vite_process_restarts_after_crash(settings: DevServerSettings) ->
 	await vite.stop()
 
 
+@pytest.mark.parametrize(
+	"exit_code",
+	[
+		-2,  # POSIX SIGINT (Ctrl-C to the process group)
+		-15,  # POSIX SIGTERM (shutdown)
+		0xC000013A,  # Windows STATUS_CONTROL_C_EXIT (Ctrl-C)
+	],
+)
+async def test_vite_process_does_not_restart_after_signal_death(
+	settings: DevServerSettings,
+	exit_code: int,
+) -> None:
+	"""A signal-killed Vite must never be relaunched — POSIX or Windows.
+
+	Pressing Ctrl-C sends the signal to the whole process group, so Vite dies
+	just as the dev server shuts down. Relaunching there would spawn a fresh
+	Vite that the next Ctrl-C kills again — the unstoppable restart loop
+	reported under ``--inspect``. Only genuine crashes restart. POSIX reports a
+	negative code; Windows uses STATUS_CONTROL_C_EXIT (0xC000013A).
+	"""
+
+	class SignalKilledFactory:
+		def __init__(self) -> None:
+			self.calls = 0
+			self.processes: list[FakeProcess] = []
+
+		async def __call__(self, *cmd: str, **_: Any) -> FakeProcess:
+			process = FakeProcess(
+				stdout_lines=None,
+				stderr_lines=None,
+				exit_code=exit_code,
+				auto_exit=True,
+			)
+			process.start()
+			self.calls += 1
+			self.processes.append(process)
+			return process
+
+	factory = SignalKilledFactory()
+	capture: list[str] = []
+	logger = ConsoleLogger(secho=lambda msg, **_: capture.append(msg))
+
+	async def probe(host: str, port: int) -> bool:
+		return True
+
+	vite = ViteProcess(
+		settings,
+		logger=logger,
+		process_factory=factory,
+		restart_delay=0,
+		readiness_interval=0.01,
+		probe=probe,
+		stop_timeout=0.1,
+	)
+
+	await vite.start()
+
+	# Give any (erroneous) restart task a chance to fire, then assert none did.
+	await asyncio.sleep(0.1)
+
+	assert factory.calls == 1, "signal-killed Vite must not be relaunched"
+	assert vite._restart_task is None
+	assert not any("attempting restart" in msg for msg in capture)
+	# The scary red error line is suppressed for an expected signal death.
+	assert not any("process exited with code" in msg for msg in capture)
+
+	await vite.stop()
+
+
 async def test_vite_process_stop_cancels_pending_restart(settings: DevServerSettings) -> None:
 	class RestartingFactory:
 		def __init__(self) -> None:

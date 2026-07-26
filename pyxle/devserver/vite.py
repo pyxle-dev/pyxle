@@ -17,6 +17,25 @@ from .settings import DevServerSettings
 
 _ViteProbe = Callable[[str, int], Awaitable[bool]]
 
+#: Windows exit code for a process terminated by Ctrl+C / console close
+#: (STATUS_CONTROL_C_EXIT, 0xC000013A). POSIX reports signal deaths as a
+#: negative return code, but Windows uses this positive NTSTATUS value — so the
+#: "was it killed by the shutdown signal?" check must recognise both.
+_WINDOWS_CTRL_C_EXIT = 0xC000013A
+
+
+def _is_signal_death(returncode: int | None) -> bool:
+    """Whether *returncode* indicates the process was killed by a signal.
+
+    POSIX encodes a signal death as ``-signum`` (negative); Windows uses the
+    positive ``STATUS_CONTROL_C_EXIT`` code for a Ctrl+C / console-close. A
+    signal death is almost always the shared Ctrl+C tearing the whole dev-server
+    tree down, so the supervisor must not relaunch on it.
+    """
+    if returncode is None:
+        return False
+    return returncode < 0 or returncode == _WINDOWS_CTRL_C_EXIT
+
 #: Maximum consecutive relaunch attempts after an unexpected Vite exit.
 #: Three attempts (with the exponential backoff below) are enough to ride out
 #: transient causes — e.g. a rebuild burst rewriting generated files while
@@ -382,7 +401,11 @@ class ViteProcess:
 
         returncode = await process.wait()
 
-        if returncode not in (0, None):
+        if _is_signal_death(returncode):
+            # Killed by a signal — expected on Ctrl-C / shutdown, so keep it
+            # quiet rather than printing a scary red error line.
+            self._logger.debug(f"[vite] process terminated by signal ({returncode})")
+        elif returncode not in (0, None):
             self._logger.error(f"[vite] process exited with code {returncode}")
         else:
             self._logger.debug("[vite] process exited")
@@ -390,11 +413,29 @@ class ViteProcess:
         if self._stopping:
             return
 
-        # Any exit the supervisor did not initiate is unexpected — including a
-        # "clean" exit code 0 (Vite exits 0 when, e.g., its config file
-        # vanishes during a config-reload). Without a relaunch the dev server
-        # would keep running with no asset server behind it, which looks like
-        # a dead page in the browser.
+        # A signal death (POSIX ``-signum`` or Windows STATUS_CONTROL_C_EXIT)
+        # is almost always the same Ctrl-C / SIGTERM tearing the whole process
+        # tree down: pressing Ctrl-C delivers the signal to every process in the
+        # foreground group, so Vite dies just before our own shutdown runs.
+        # Relaunching here would fight that shutdown — spawning a fresh Vite that
+        # the next Ctrl-C kills again, an unstoppable restart loop (worse under
+        # ``--inspect``, where debugpy's listener thread widens the race). A
+        # deliberate ``kill`` of Vite is the same story: honour it. So never
+        # relaunch a signal-killed Vite — only genuine crashes (a positive exit
+        # code) or a config-reload exit 0.
+        if _is_signal_death(returncode):
+            self._logger.debug(
+                f"[vite] terminated by signal ({returncode}); not relaunching "
+                "(the dev server is shutting down)"
+            )
+            self._process = None
+            return
+
+        # Any other exit the supervisor did not initiate is unexpected —
+        # including a "clean" exit code 0 (Vite exits 0 when, e.g., its config
+        # file vanishes during a config-reload). Without a relaunch the dev
+        # server would keep running with no asset server behind it, which looks
+        # like a dead page in the browser.
         self._logger.warning("Vite process exited unexpectedly; attempting restart")
         self._process = None
         if self._fatal_error is None and (

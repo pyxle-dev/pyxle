@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="robots" content="noindex" />
+  <title>Pyxle Studio</title>
+  <link rel="stylesheet" href="/__pyxle/studio/assets/studio.css" />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='6' fill='none' stroke='%2334d399' stroke-width='2'/%3E%3Ccircle cx='8' cy='8' r='2' fill='%2334d399'/%3E%3C/svg%3E" />
+</head>
+<body>
+  <div id="app" class="app">
+    <header class="topbar">
+      <div class="brand">
+        <svg class="brand-mark" viewBox="0 0 16 16" aria-hidden="true">
+          <circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" stroke-width="2"></circle>
+          <circle cx="8" cy="8" r="2" fill="currentColor"></circle>
+        </svg>
+        <span class="brand-name">Pyxle <strong>Studio</strong></span>
+        <span class="chip" id="project-chip" hidden></span>
+        <span class="chip chip-dim" id="version-chip" hidden></span>
+      </div>
+      <div class="topbar-right">
+        <a class="site-link" id="site-link" href="/" target="_blank" rel="noopener" title="Open your app in a new tab">
+          <span>Open site</span>
+          <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M6 3H3v10h10v-3"></path>
+            <path d="M9 3h4v4"></path>
+            <path d="M13 3 7 9"></path>
+          </svg>
+        </a>
+        <span class="feed-dot" id="feed-dot" title="Event stream disconnected"></span>
+        <span class="feed-label" id="feed-label">connecting…</span>
+        <label class="editor-pick" title="Editor used for open-in-editor links">
+          <span aria-hidden="true">⌥</span>
+          <select id="editor-select" aria-label="Open-in-editor target">
+            <option value="vscode">VS Code</option>
+            <option value="cursor">Cursor</option>
+            <option value="copy">Copy path</option>
+          </select>
+        </label>
+      </div>
+    </header>
+
+    <nav class="tabs" role="tablist" aria-label="Studio panels">
+      <a href="#/routes"   data-tab="routes"   role="tab">Routes</a>
+      <a href="#/tester"   data-tab="tester"   role="tab">Tester</a>
+      <a href="#/requests" data-tab="requests" role="tab">Requests</a>
+      <a href="#/metrics"  data-tab="metrics"  role="tab">Metrics</a>
+      <a href="#/config"   data-tab="config"   role="tab">Config</a>
+      <a href="#/check"    data-tab="check"    role="tab">Check</a>
+    </nav>
+
+    <main id="panel" class="panel" tabindex="-1">
+      <div class="empty">Loading Studio…</div>
+    </main>
+
+    <div id="toasts" class="toasts" aria-live="polite"></div>
+  </div>
+  <script type="module" src="/__pyxle/studio/assets/studio.js"></script>
+</body>
+</html>

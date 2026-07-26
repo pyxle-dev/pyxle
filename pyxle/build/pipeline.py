@@ -212,9 +212,24 @@ def _prepare_dist(settings: DevServerSettings, dist_dir: Path) -> None:
             shutil.rmtree(public_dest)
         shutil.copytree(settings.public_dir, public_dest)
 
-    # Copy client build output (Vite puts assets in .pyxle-build/client/)
+    # Copy client build output (Vite puts assets in .pyxle-build/client/).
+    # Exclude the dev-only debugger source-map sidecar: it is a development
+    # artifact (consumed by the dev Vite plugin) and must never be served from
+    # a production build — Studio and the debugger are dev-only.
     if settings.client_build_dir.exists():
-        shutil.copytree(settings.client_build_dir, client_dest, dirs_exist_ok=True)
+        from pyxle.compiler.writers import CLIENT_SOURCEMAP_SIDECAR  # noqa: PLC0415
+
+        shutil.copytree(
+            settings.client_build_dir,
+            client_dest,
+            dirs_exist_ok=True,
+            # Exclude the dev-only debugger sidecar AND any leftover atomic-write
+            # temp (`…json.tmp`, stranded if a compile was killed mid-write) — the
+            # bare name is an fnmatch that wouldn't otherwise catch the `.tmp`.
+            ignore=shutil.ignore_patterns(
+                CLIENT_SOURCEMAP_SIDECAR, f"{CLIENT_SOURCEMAP_SIDECAR}.tmp"
+            ),
+        )
 
 
 def _load_vite_manifest(settings: DevServerSettings) -> Dict[str, Any] | None:

@@ -2,8 +2,9 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
-from pyxle.build.pipeline import run_build
+from pyxle.build.pipeline import _prepare_dist, run_build
 from pyxle.cli.logger import ConsoleLogger
+from pyxle.compiler.writers import CLIENT_SOURCEMAP_SIDECAR
 from pyxle.devserver.builder import BuildSummary
 from pyxle.devserver.registry import MetadataRegistry, PageRegistryEntry
 from pyxle.devserver.settings import DevServerSettings
@@ -11,6 +12,26 @@ from pyxle.devserver.settings import DevServerSettings
 
 def silent_logger() -> ConsoleLogger:
     return ConsoleLogger(secho=lambda *args, **kwargs: None)
+
+
+def test_prepare_dist_excludes_dev_only_sourcemap_sidecar(tmp_path: Path) -> None:
+    """The debugger source-map sidecar is a dev-only artifact and must never be
+    copied into the production ``dist/client`` (Studio + debugger are dev-only)."""
+    project = tmp_path / "project"
+    settings = DevServerSettings.from_project_root(project)
+    client = settings.client_build_dir
+    (client / "pages").mkdir(parents=True)
+    # A real client asset alongside the dev-only sidecar.
+    (client / "pages" / "index.jsx").write_text("export default 1;\n", encoding="utf-8")
+    (client / CLIENT_SOURCEMAP_SIDECAR).write_text('{"pages/index.jsx": {}}', encoding="utf-8")
+
+    dist = project / "dist"
+    _prepare_dist(settings, dist)
+
+    # Real client assets are copied…
+    assert (dist / "client" / "pages" / "index.jsx").exists()
+    # …but the dev-only sidecar is not.
+    assert not (dist / "client" / CLIENT_SOURCEMAP_SIDECAR).exists()
 
 
 def _page_entry(tmp_path: Path, **overrides) -> PageRegistryEntry:

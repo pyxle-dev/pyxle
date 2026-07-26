@@ -155,6 +155,20 @@ def test_vite_proxy_should_proxy_patterns(settings: DevServerSettings) -> None:
     assert proxy.should_proxy(make_request("/robots.txt")) is False
 
 
+def test_vite_proxy_never_proxies_framework_internal_paths(
+    settings: DevServerSettings,
+) -> None:
+    """Pyxle-internal namespaces serve their own assets from the wheel; their
+    ``.js``/``.css`` URLs must never be forwarded to the user's Vite instance,
+    even though the asset suffix alone would otherwise match."""
+    proxy = ViteProxy(settings)
+    assert proxy.should_proxy(make_request("/__pyxle/studio/assets/studio.js")) is False
+    assert proxy.should_proxy(make_request("/__pyxle/studio/assets/studio.css")) is False
+    assert proxy.should_proxy(make_request("/__pyxle__/overlay.js")) is False
+    # Ordinary user source files still proxy.
+    assert proxy.should_proxy(make_request("/src/x.js")) is True
+
+
 async def test_vite_proxy_handles_non_proxied_request(settings: DevServerSettings) -> None:
     proxy = ViteProxy(settings)
     response = await proxy.handle(make_request("/robots.txt"))
