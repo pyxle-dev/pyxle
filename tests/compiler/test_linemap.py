@@ -456,15 +456,28 @@ def test_remap_code_clamps_multiline_node_ending_on_unmapped_line(tmp_path: Path
 
 
 def test_loader_survives_adversarial_map_that_inverts_a_node_range(tmp_path: Path) -> None:
-    # Adversarial map: the node's end line maps BELOW its start line, which
-    # the clamp collapses onto one line with inverted columns — ``compile``
-    # rejects that tree. The import loader's fault barrier must absorb it and
-    # fall back to the stock import rather than failing the module.
+    """An adversarial map that sends a node's end line BELOW its start must never
+    fail the import.
+
+    Whether ``compile`` rejects the collapsed, column-inverted tree is a CPython
+    detail that varies by version (3.10 accepts it, later versions reject it), so
+    this asserts the guarantee the loader actually owes: it returns usable code
+    either way — remapped if the compile succeeded, or the stock module through
+    the fault barrier if it didn't — and never propagates the error.
+    """
     body = "x = [\n]\n"
-    module_path, _ = _write_pair(tmp_path, body, ((1, 20, 1), (2, 5, 1)))
+    module_path, pyxl_path = _write_pair(tmp_path, body, ((1, 20, 1), (2, 5, 1)))
     loader = PyxlSourceFileLoader("inverted_mod", str(module_path))
+
     code = loader.get_code("inverted_mod")
-    assert code.co_filename == str(module_path)
+
+    assert code is not None
+    # Either branch is acceptable; a third filename would mean something else ran.
+    assert code.co_filename in {str(module_path), str(pyxl_path.resolve())}
+    # The decisive part: the module still executes.
+    namespace: dict[str, object] = {}
+    exec(code, namespace)  # noqa: S102 - executing the module under test
+    assert namespace["x"] == []
 
 
 def test_remap_code_tolerates_node_without_end_lineno(

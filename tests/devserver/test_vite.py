@@ -432,6 +432,14 @@ async def test_vite_process_stop_cancels_pending_restart(settings: DevServerSett
 			await asyncio.sleep(0.01)
 
 	await asyncio.wait_for(wait_for_restart_task(), timeout=1)
+
+	# The restart task existing does not mean it has reached the probe yet —
+	# scheduling order differs by platform — so wait for the probe itself.
+	async def wait_for_probe() -> None:
+		while not probe_calls:
+			await asyncio.sleep(0.01)
+
+	await asyncio.wait_for(wait_for_probe(), timeout=2)
 	assert probe_calls  # restart attempted readiness probe
 
 	await vite.stop()
@@ -600,7 +608,12 @@ async def test_vite_process_installs_dependencies_when_vite_missing(
 
 	assert commands and commands[0][0] == "vite"
 	assert any(Path(cmd[0]).name == "npm" for cmd in commands)
-	assert any("node_modules/.bin" in cmd[0] and Path(cmd[0]).name == "vite" for cmd in commands)
+	# Path parts, not a hardcoded separator: the launcher builds this with Path
+	# joins, so it is "node_modules\\.bin\\vite.cmd" on Windows.
+	assert any(
+		".bin" in Path(cmd[0]).parts and Path(cmd[0]).stem == "vite"
+		for cmd in commands
+	)
 
 	await vite.stop()
 

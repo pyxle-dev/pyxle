@@ -28,6 +28,7 @@ import itertools
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Set
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -155,7 +156,10 @@ class StudioManager:
         payload: Dict[str, Any] = {
             "ok": stats.error is None,
             "elapsedSeconds": round(stats.elapsed_seconds, 3),
-            "changedPaths": [str(path) for path in stats.changed_paths],
+            # POSIX separators regardless of host OS: this payload is rendered in
+            # a browser, and the rest of the wire format (the source-map sidecar,
+            # the debug footer) is POSIX too.
+            "changedPaths": [Path(path).as_posix() for path in stats.changed_paths],
         }
         if stats.error is not None:
             payload["error"] = str(stats.error)

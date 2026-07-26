@@ -363,7 +363,11 @@ class ViteProcess:
         # even when the Vite config lives in .pyxle-build/client/.
         node_modules = str(self._settings.project_root / "node_modules")
         existing = env.get("NODE_PATH", "")
-        env["NODE_PATH"] = f"{node_modules}:{existing}" if existing else node_modules
+        # os.pathsep, not ":" — NODE_PATH is delimited by ";" on Windows, and a
+        # ":"-joined value there would make Node ignore both entries.
+        env["NODE_PATH"] = (
+            f"{node_modules}{os.pathsep}{existing}" if existing else node_modules
+        )
         return env
 
     def _log_process_output(self, stdout: bytes, stderr: bytes, *, prefix: str) -> None:
