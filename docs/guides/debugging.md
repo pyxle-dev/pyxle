@@ -30,7 +30,9 @@ Two more requirements, both one-time:
 - **pyxle-framework 0.8.0 or newer** in the environment VS Code has selected. The
   debugger relies on line mapping added in 0.8.0 and launches the dev server as
   `python -m pyxle`, which earlier versions don't provide. Upgrade with
-  `pip install --upgrade pyxle-framework`.
+  `pip install --upgrade pyxle-framework`. While a `.pyxl` file is open, a
+  status-bar item shows which interpreter that is — click it (or run **Pyxle:
+  Select Python Interpreter**) to change it.
 - **The Python extension** (`ms-python.python`) for Python-side breakpoints. The
   debugger prompts you if it's missing, and still debugs the React side without it.
 
@@ -357,9 +359,13 @@ before launching and offers a **Select Interpreter** button; you can also run
 **Python: Select Interpreter** from the command palette and pick the environment
 your terminal's `pyxle` command uses (`which pyxle` / `where pyxle` shows it).
 
-**"No module named pyxle.\_\_main\_\_", or the debugger says to upgrade.** The
-selected interpreter has pyxle, but a version older than 0.8.0. Run
-`pip install --upgrade pyxle-framework` in that environment.
+**"No module named pyxle.\_\_main\_\_", or the debugger says the interpreter is
+too old.** The selected interpreter has pyxle, but a version older than 0.8.0.
+Either switch to the environment that has 0.8.0+ (**Select Interpreter** in the
+message, or the status-bar item while a `.pyxl` file is open) or run
+`pip install --upgrade pyxle-framework` in that environment. The check asks what
+the interpreter can actually *do*, not what its package metadata says, so an
+editable install whose recorded version is stale still launches normally.
 
 ---
 

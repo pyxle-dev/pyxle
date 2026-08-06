@@ -2,6 +2,10 @@
 
 Release notes for Pyxle. While we're in beta (`0.x`), minor versions may include breaking changes — those are called out explicitly. To upgrade, run `pip install --upgrade pyxle-framework`.
 
+## Unreleased
+
+- **Docs: the debugging guide covers picking the interpreter from a `.pyxl` file.** Both VS Code debug configurations run the dev server under the interpreter VS Code has selected, so the guide now points at the status-bar item (and the **Pyxle: Select Python Interpreter** command) that Pyxle Language Tools shows while a `.pyxl` file is open, and notes that the pre-launch check tests what the interpreter can run rather than the version its package metadata reports — an editable install with stale dist-info is no longer refused. [Debugging](guides/debugging.md).
+
 ## 0.8.0
 
 - **Pyxle Studio — a dashboard built into `pyxle dev`.** Served at `/__pyxle/studio`: every route with its loader, actions, cache posture, and boundaries; an interactive tester (loaders run in-process, actions go through their real endpoint — CSRF, validation, and auth hooks included); a live request feed; latency metrics; the effective config (secrets redacted); and in-browser `pyxle check`. Dev-only by construction, with a `Host`-header allowlist. [Pyxle Studio](guides/studio.md).
