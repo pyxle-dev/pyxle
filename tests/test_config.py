@@ -676,3 +676,33 @@ def test_studio_config_flows_into_devserver_kwargs(tmp_path: Path) -> None:
     write_config(tmp_path, {"studio": {"allowedHosts": ["mybox.local"]}})
     config = load_config(tmp_path)
     assert config.to_devserver_kwargs()["studio"] is config.studio
+
+
+def test_load_config_parses_app_name(tmp_path: Path) -> None:
+    """`name` is the app's display name — the default <title> for untitled pages."""
+    write_config(tmp_path, {"name": "  Acme Dashboard  "})
+
+    config = load_config(tmp_path)
+
+    assert config.name == "Acme Dashboard"
+    assert config.to_devserver_kwargs()["app_name"] == "Acme Dashboard"
+    assert config.to_dict()["name"] == "Acme Dashboard"
+
+
+def test_load_config_defaults_app_name_to_empty(tmp_path: Path) -> None:
+    """Absent `name` stays empty; the directory-name fallback lives downstream."""
+    write_config(tmp_path, {"middleware": []})
+
+    assert load_config(tmp_path).name == ""
+
+
+@pytest.mark.parametrize("bad", [42, "", "   ", [], {}])
+def test_load_config_rejects_invalid_app_name(tmp_path: Path, bad: object) -> None:
+    """A blank/non-string name is an error, not a silent fallback — it ends up
+    in every visitor's browser tab."""
+    write_config(tmp_path, {"name": bad})
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(tmp_path)
+
+    assert "'name'" in str(excinfo.value)

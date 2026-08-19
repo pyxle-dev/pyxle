@@ -76,9 +76,12 @@ The console prints a short summary — the local URL, the Vite URL, the route co
 ℹ️    Local:   http://127.0.0.1:8000
 ℹ️    Vite:    http://127.0.0.1:5173
 ℹ️    Routes:  1 page(s), 1 API route(s)
+ℹ️    Studio:  http://127.0.0.1:8000/__pyxle/studio
 ```
 
-Open [http://localhost:8000](http://localhost:8000) in your browser. You should see the Pyxle starter page — a centered card showing the framework version, server time, and a link to edit `pages/index.pyxl`.
+The last line is [Pyxle Studio](../guides/studio.md), the dev-only dashboard for your routes, requests, and diagnostics. It appears whenever Studio is enabled (the default in `pyxle dev`).
+
+Open [http://localhost:8000](http://localhost:8000) in your browser. You should see the Pyxle starter page — a centered card showing the framework version, server time, and the file to edit first, `pages/index.pyxl`.
 
 Each edit you save prints one concise `Rebuilt … in X ms` line. Your server-side `logging` output also streams to the **browser** devtools console (prefixed `[pyxle:server]`) so you can follow loaders and actions without switching windows. Need the full picture — raw Vite logs and debug internals? Run `pyxle dev --verbose`. See the [CLI reference](../reference/cli.md#pyxle-dev) for details.
 

@@ -57,6 +57,19 @@ def validate_project_name(value: str) -> str:
     """Validate the project name and return the filesystem-safe slug."""
 
     stripped = value.strip()
+    # A path is not a name. Slugifying one turns every separator into a hyphen,
+    # so `pyxle init apps/my-app` used to create a directory literally called
+    # `apps-my-app` in the current directory — silently, and nowhere near where
+    # the user pointed. Checked before the '.'/'-' rule so `./my-app` and
+    # `../my-app` get this message rather than a misleading one about the
+    # leading character.
+    if stripped not in (".", "..") and ("/" in stripped or "\\" in stripped):
+        raise InvalidProjectName(
+            f"'{value.strip()}' looks like a path, and `pyxle init` takes a name — "
+            "it creates a directory of that name in the current directory. "
+            "Run it from the parent (e.g. `cd apps && pyxle init my-app`), "
+            "or use `pyxle init .` to scaffold into the current directory."
+        )
     if stripped.startswith(".") or stripped.startswith("-"):
         raise InvalidProjectName("Project name cannot start with '.' or '-'.")
 

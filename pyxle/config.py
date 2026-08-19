@@ -277,6 +277,11 @@ class DevConfig:
 class PyxleConfig:
     """Resolved configuration values for a Pyxle project."""
 
+    #: The app's display name. Used as the default ``<title>`` for any page
+    #: where neither the page nor a layout supplies one. Empty → the project
+    #: directory name is used instead (see
+    #: :meth:`pyxle.devserver.settings.DevServerSettings.from_project_root`).
+    name: str = ""
     pages_dir: str = "pages"
     public_dir: str = "public"
     build_dir: str = ".pyxle-build"
@@ -312,6 +317,7 @@ class PyxleConfig:
         """Return keyword arguments for :class:`pyxle.devserver.DevServerSettings`."""
 
         return {
+            "app_name": self.name,
             "pages_dir": self.pages_dir,
             "public_dir": self.public_dir,
             "build_dir": self.build_dir,
@@ -341,6 +347,7 @@ class PyxleConfig:
         """Return a serialisable dictionary of the configuration."""
 
         return {
+            "name": self.name,
             "pagesDir": self.pages_dir,
             "publicDir": self.public_dir,
             "buildDir": self.build_dir,
@@ -427,6 +434,7 @@ def load_config(
 
 def _parse_config_dict(data: Dict[str, Any], *, source: Path) -> PyxleConfig:
     allowed_top_keys = {
+        "name",
         "pagesDir",
         "publicDir",
         "buildDir",
@@ -452,6 +460,7 @@ def _parse_config_dict(data: Dict[str, Any], *, source: Path) -> PyxleConfig:
         formatted = ", ".join(sorted(unknown_keys))
         raise ConfigError(f"Unknown configuration keys in '{source}': {formatted}.")
 
+    name = _parse_app_name(data.get("name"), source=source)
     pages_dir = _validate_directory_value(data.get("pagesDir", "pages"), "pagesDir")
     public_dir = _validate_directory_value(data.get("publicDir", "public"), "publicDir")
     build_dir = _validate_directory_value(data.get("buildDir", ".pyxle-build"), "buildDir")
@@ -486,6 +495,7 @@ def _parse_config_dict(data: Dict[str, Any], *, source: Path) -> PyxleConfig:
     plugins = _parse_plugins_block(data.get("plugins"), source=source)
 
     return PyxleConfig(
+        name=name,
         pages_dir=pages_dir,
         public_dir=public_dir,
         build_dir=build_dir,
@@ -511,6 +521,23 @@ def _parse_config_dict(data: Dict[str, Any], *, source: Path) -> PyxleConfig:
         dev=dev_config,
         plugins=plugins,
     )
+
+
+def _parse_app_name(value: Any, *, source: Path) -> str:
+    """Parse the optional top-level ``name`` — the app's display name.
+
+    Absent → ``""``, which downstream resolves to the project directory name.
+    Present but not a non-empty string → a hard error rather than a silent
+    fallback, because the value ends up in every visitor's browser tab.
+    """
+    if value is None:
+        return ""
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigError(
+            f"Invalid value for 'name' in '{source}': expected a non-empty string "
+            "(the app's display name, used as the default page title)."
+        )
+    return value.strip()
 
 
 def _parse_dev_block(value: Any, *, source: Path) -> DevConfig:
@@ -868,7 +895,10 @@ def _parse_cors_block(value: Any, *, source: Path) -> CorsConfig:
         )
 
     max_age = value.get("maxAge", 600)
-    if not isinstance(max_age, int) or max_age < 0:
+    # ``bool`` is a subclass of ``int`` — reject it explicitly (as every other
+    # integer validator in this module does) so ``true`` cannot bind a 1-second
+    # preflight cache and ``false`` a 0-second one, silently and with no error.
+    if not isinstance(max_age, int) or isinstance(max_age, bool) or max_age < 0:
         raise ConfigError(
             f"Invalid value for 'cors.maxAge' in '{source}': expected non-negative integer."
         )

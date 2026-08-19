@@ -80,3 +80,26 @@ def test_filesystem_writer_handles_text_and_binary(tmp_path: Path) -> None:
     (root / "placeholder.txt").write_text("data", encoding="utf-8")
     writer.ensure_root(force=True)
     assert not (root / "placeholder.txt").exists()
+
+
+def test_validate_project_name_rejects_a_path() -> None:
+    """`pyxle init` takes a name, not a path.
+
+    Slugifying a path turns every separator into a hyphen, so
+    `pyxle init apps/my-app` silently created a directory literally called
+    `apps-my-app` in the current directory — nowhere near where the user
+    pointed, and with no error.
+    """
+    for candidate in (
+        "apps/my-app",
+        "./my-app",
+        "../escape",
+        "/tmp/somewhere/my-app",
+        "apps\\my-app",
+    ):
+        with pytest.raises(InvalidProjectName) as excinfo:
+            validate_project_name(candidate)
+        assert "looks like a path" in str(excinfo.value), candidate
+
+    # A plain name is untouched, and `.` still means "scaffold in place".
+    assert validate_project_name("my-app") == "my-app"

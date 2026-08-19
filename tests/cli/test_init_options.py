@@ -319,3 +319,210 @@ def test_prompt_text_falls_back_to_default_and_aborts(monkeypatch) -> None:
     _fake_questionary(monkeypatch, text=None)
     with pytest.raises(typer.Exit):
         cli._prompt_text("Q?", default="@/*")
+
+
+# --------------------------------------------------------------------------- #
+# Interactive-flow guardrails (found by driving the real prompts on a pty)     #
+# --------------------------------------------------------------------------- #
+
+
+def test_prompt_text_validates_in_place_instead_of_aborting(monkeypatch) -> None:
+    """A bad import alias must be rejected *by the prompt* so the user can fix
+    it, rather than aborting the command and discarding every earlier answer."""
+    captured: dict[str, object] = {}
+
+    class _CapturingText:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def ask(self):
+            return "@/*"
+
+    import sys
+    from types import ModuleType
+
+    fake = ModuleType("questionary")
+    fake.select = lambda *a, **k: _FakeAsk(None)
+    fake.text = lambda *a, **k: _CapturingText(**k)
+    monkeypatch.setitem(sys.modules, "questionary", fake)
+
+    cli._prompt_text("Import alias", default="@/*", validate=cli._validate_alias_input)
+
+    validator = captured["validate"]
+    assert callable(validator)
+    # Valid input passes...
+    assert validator("~/*") is True
+    # ...blank falls back to the default, which is valid...
+    assert validator("   ") is True
+    # ...and an unusable alias returns the message the prompt shows in place.
+    problem = validator("@/*~")
+    assert isinstance(problem, str)
+    assert "Invalid import alias" in problem
+
+
+def test_init_rejects_bad_project_name_before_prompting(tmp_path, monkeypatch) -> None:
+    """A typo'd name must fail before any question is asked."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "_stdin_is_interactive", lambda: True)
+
+    def _boom(*_a, **_k):
+        raise AssertionError("prompted before validating the target")
+
+    monkeypatch.setattr(cli, "_prompt_yes_no", _boom)
+    monkeypatch.setattr(cli, "_prompt_text", _boom)
+
+    result = runner.invoke(app, ["init", ".hidden"], catch_exceptions=False)
+
+    assert result.exit_code == 1
+    assert "cannot start with" in result.stdout
+
+
+def test_init_rejects_existing_directory_before_prompting(tmp_path, monkeypatch) -> None:
+    """An occupied destination must fail before any question is asked —
+    answering three prompts and then losing them is the worst possible order."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "taken").mkdir()
+    monkeypatch.setattr(cli, "_stdin_is_interactive", lambda: True)
+
+    def _boom(*_a, **_k):
+        raise AssertionError("prompted before validating the target")
+
+    monkeypatch.setattr(cli, "_prompt_yes_no", _boom)
+    monkeypatch.setattr(cli, "_prompt_text", _boom)
+
+    result = runner.invoke(app, ["init", "taken"], catch_exceptions=False)
+
+    assert result.exit_code == 1
+    assert "already exists" in result.stdout
+
+
+def test_init_force_still_prompts_for_an_existing_directory(tmp_path, monkeypatch) -> None:
+    """--force means "overwrite it", so the early check must not block it."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "taken").mkdir()
+    monkeypatch.setattr(cli, "_stdin_is_interactive", lambda: True)
+    monkeypatch.setattr(cli, "_prompt_yes_no", lambda *a, **k: False)
+
+    result = runner.invoke(app, ["init", "taken", "--force"], catch_exceptions=False)
+
+    assert result.exit_code == 0
+    assert (tmp_path / "taken" / "pages" / "index.pyxl").is_file()
+
+
+def test_init_wires_alias_validation_into_the_prompt(tmp_path, monkeypatch) -> None:
+    """The alias prompt must be handed a validator — without it, a mistyped
+    alias aborts the whole command instead of being corrected in place."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "_stdin_is_interactive", lambda: True)
+
+    answers = iter([False, True])  # no Tailwind, yes customize alias
+    monkeypatch.setattr(cli, "_prompt_yes_no", lambda *a, **k: next(answers))
+
+    seen: dict[str, object] = {}
+
+    def fake_text(question, *, default, validate=None):
+        seen["validate"] = validate
+        return default
+
+    monkeypatch.setattr(cli, "_prompt_text", fake_text)
+
+    result = runner.invoke(app, ["init", "demo"], catch_exceptions=False)
+
+    assert result.exit_code == 0
+    validator = seen["validate"]
+    assert validator is not None, "alias prompt got no validator"
+    with pytest.raises(ValueError):
+        validator("@/*~")
+
+
+def test_scaffold_writes_app_name_into_config(tmp_path, monkeypatch) -> None:
+    """`pyxle init` records the project name so untitled pages are titled after
+    the app rather than after the framework."""
+    monkeypatch.chdir(tmp_path)
+    run_init("demo", False, "default", ConsoleLogger(), log_steps=False)
+
+    config = json.loads((tmp_path / "demo" / "pyxle.config.json").read_text(encoding="utf-8"))
+    assert config["name"] == "demo"
+
+
+def test_scaffold_config_survives_a_name_with_quotes(tmp_path, monkeypatch) -> None:
+    """The name reaches a JSON file, so it must be JSON-encoded — an unescaped
+    quote would leave every command unable to read the config."""
+    monkeypatch.chdir(tmp_path)
+    run_init('My "Quoted" App', False, "default", ConsoleLogger(), log_steps=False)
+
+    config = json.loads(
+        (tmp_path / "my-quoted-app" / "pyxle.config.json").read_text(encoding="utf-8")
+    )
+    assert config["name"] == 'My "Quoted" App'
+
+
+def test_scaffold_pages_never_interpolate_the_name_into_jsx(tmp_path, monkeypatch) -> None:
+    """A name is arbitrary text; a `.pyxl` template is JSX. Pasting one into the
+    other would make `pyxle init 'a<b'` emit a project that does not compile —
+    the title default reads the (escaped) config value instead."""
+    monkeypatch.chdir(tmp_path)
+    run_init("a<b {x} app", False, "default", ConsoleLogger(), log_steps=False)
+
+    page = (tmp_path / "a-b-x-app" / "pages" / "index.pyxl").read_text(encoding="utf-8")
+    assert "a<b" not in page
+    assert "{x}" not in page
+
+
+def test_prompt_text_without_a_validator_accepts_anything(monkeypatch) -> None:
+    """`_prompt_text` is also used without a validator; that path must not
+    reject input (the validator seam returns "valid" for every value)."""
+    captured: dict[str, object] = {}
+
+    class _CapturingText:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def ask(self):
+            return "whatever"
+
+    import sys
+    from types import ModuleType
+
+    fake = ModuleType("questionary")
+    fake.select = lambda *a, **k: _FakeAsk(None)
+    fake.text = lambda *a, **k: _CapturingText(**k)
+    monkeypatch.setitem(sys.modules, "questionary", fake)
+
+    assert cli._prompt_text("Q?", default="@/*") == "whatever"
+    assert captured["validate"]("literally anything") is True
+
+
+def test_init_in_place_rejects_an_underivable_directory_name(tmp_path, monkeypatch) -> None:
+    """`pyxle init .` derives the project name from the current directory. When
+    that name cannot be made into a valid slug, say so before prompting rather
+    than after."""
+    weird = tmp_path / "..."
+    weird.mkdir()
+    monkeypatch.chdir(weird)
+    monkeypatch.setattr(cli, "_stdin_is_interactive", lambda: True)
+
+    def _boom(*_a, **_k):
+        raise AssertionError("prompted before validating the target")
+
+    monkeypatch.setattr(cli, "_prompt_yes_no", _boom)
+    monkeypatch.setattr(cli, "_prompt_text", _boom)
+
+    result = runner.invoke(app, ["init", "."], catch_exceptions=False)
+
+    assert result.exit_code == 1
+    assert "Cannot derive a valid project name" in result.stdout
+
+
+def test_init_in_place_accepts_a_normal_directory_name(tmp_path, monkeypatch) -> None:
+    """The in-place guard must not block the ordinary `pyxle init .`."""
+    workdir = tmp_path / "my-app"
+    workdir.mkdir()
+    monkeypatch.chdir(workdir)
+    monkeypatch.setattr(cli, "_stdin_is_interactive", lambda: True)
+    monkeypatch.setattr(cli, "_prompt_yes_no", lambda *a, **k: False)
+
+    result = runner.invoke(app, ["init", "."], catch_exceptions=False)
+
+    assert result.exit_code == 0
+    assert (workdir / "pages" / "index.pyxl").is_file()

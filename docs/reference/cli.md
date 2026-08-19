@@ -26,11 +26,12 @@ choice, it walks you through arrow-key selections — Tailwind CSS, shadcn/ui
 (only if Tailwind is enabled), and whether to customize the default import
 alias (`@/*`; the value input appears only if you say yes). When stdin is
 **not** a terminal (CI, pipes), it never prompts — it uses the flags and
-defaults below.
+defaults below. The target is validated *before* the first question, so an
+unusable name or an occupied directory never costs you a set of answers.
 
 | Argument / Flag | Default | Description |
 |----------------|---------|-------------|
-| `name` | *(required)* | Project directory to create. A name like `my-app` creates a new directory; `.` scaffolds into the current directory (deriving the name from it). Running `pyxle init` with no argument is an error. |
+| `name` | *(required)* | Project **name**, not a path. `my-app` creates a `my-app/` directory here; `.` scaffolds into the current directory (deriving the name from it). An argument containing a path separator (`apps/my-app`, `~/code/my-app`) is rejected — `cd` to the parent first. Running `pyxle init` with no argument is an error. |
 | `--force` / `-f` | `false` | Overwrite an existing directory (or scaffold into a non-empty current directory). |
 | `--template` / `-t` | `default` | Project template. Only `"default"` is supported today (other values error). |
 | `--tailwind` / `--no-tailwind` | prompt → off | Set up Tailwind CSS v4 (wired into Vite). |
@@ -75,6 +76,16 @@ pyxle install --break-system-packages   # PEP 668 system Python, no venv
 ```
 
 Outside a virtualenv, `pyxle install` warns about PEP 668 ("externally-managed-environment") and recommends creating a venv first; pass `--break-system-packages` to install anyway.
+
+pip and npm output is captured, not printed — a successful install shows only the step lines and the result:
+
+```
+▶️  Python dependencies — /usr/bin/python -m pip install -r requirements.txt
+▶️  Node dependencies — npm install
+✅ Dependencies installed.
+```
+
+Nothing is hidden that you need. A **failure** replays everything the installer said, verbatim, before the error, and `pyxle -v install` streams its output live.
 
 ## `pyxle dev`
 
@@ -122,8 +133,9 @@ pyxle dev --verbose             # troubleshoot: full Vite + debug output
 6. Watches for file changes and recompiles automatically
 
 **Console output.** By default `pyxle dev` prints a clean, curated console — a
-startup summary (the local URL, the Vite URL, the route count, and the total
-"ready in X ms"), a concise one-line notice per incremental rebuild
+startup summary (the local URL, the Vite URL, the route count, the
+[Studio](../guides/studio.md) URL, and the total "ready in X ms"), a concise
+one-line notice per incremental rebuild
 (`Rebuilt … in X ms`), and any warnings or errors. The raw line-by-line Vite
 firehose and debug-level internals are hidden. Pass `--verbose` (or `-v`, or the
 global `pyxle -v dev`) to restore the full output when troubleshooting. Genuine
@@ -262,6 +274,17 @@ pyxle check [directory] [options]
 | `directory` | `.` | Project directory |
 | `--config` | -- | Path to `pyxle.config.json` |
 
+### Errors vs warnings
+
+Findings are split by whether the code will actually break when it runs.
+
+| Severity | What it covers | Exit code |
+|----------|----------------|-----------|
+| **error** | Syntax errors, Pyxle structural rules, JSX syntax, and semantics that fail at runtime: unresolved references (`undefined name 'x'`), unbound locals, malformed `%`/`.format()` strings, `raise NotImplemented` | `1` |
+| **warning** | Code that runs correctly but wants tidying: unused imports, unused locals and annotations, redefinitions, duplicate dict keys, f-strings with no placeholders, `is` against a literal | `0` |
+
+A semantic rule Pyxle does not recognise — one added by a future pyflakes — is reported as a warning, so upgrading a dependency can never turn into a surprise deploy blocker. This is what lets [the deployment checklist](../guides/deployment.md) gate a release on `pyxle check`: a leftover `import json` will not stop a deploy, an unresolved reference will.
+
 **Example output:**
 
 ```
@@ -269,18 +292,20 @@ pyxle check [directory] [options]
 ✅ All checks passed
 ```
 
-Errors are reported per file as `[section] line N: message`, with the file path on the next line (every file is checked, so one broken file never aborts the scan):
+Findings are reported per file as `[section] line N: message`, with the file path on the next line (every file is checked, so one broken file never aborts the scan). Warnings print first, then errors:
 
 ```
 ℹ️  Checked 12 .pyxl file(s) in my-app/
+  warning: [python] line 3: 'json' imported but unused
+    --> pages/index.pyxl
   error: [python] line 15: @server function must be async
     --> pages/index.pyxl
   error: [jsx] line 8:10: Unterminated JSX contents
     --> pages/settings.pyxl
-❌ Check failed with 2 error(s)
+❌ Check failed with 2 error(s) (1 warning(s))
 ```
 
-Exit code is `0` when clean, `1` when any error is found.
+Exit code is `0` when no error is found (warnings alone do not fail the command), `1` otherwise.
 
 ## `pyxle typecheck`
 
@@ -323,9 +348,18 @@ pyxle routes [directory] [options]
 
   API Routes:
   ▶️  /api/pulse  — pages/api/pulse.py
+
+  Special Files (no URL of their own):
+  ▶️  error boundary — error.pyxl  [covers /]
+  ▶️  404 page — not-found.pyxl  [covers /]
+  ▶️  loading fallback — blog/loading.pyxl  [covers /blog/*]
+
+✅ 4 route(s) found
 ```
 
-Use `--json` for machine-readable output.
+`error.pyxl`, `not-found.pyxl` and `loading.pyxl` are compiled but serve no URL of their own, so they are listed by what they do and by the URL subtree they cover — not under a path you could visit. They are not counted in the route total.
+
+Use `--json` for machine-readable output; it lists page and API routes only. Under `--json` the array is the only thing written to stdout and messages go to stderr, so `pyxle routes --json > routes.json` captures valid JSON or an empty file. The human table above is not data and stays on stdout.
 
 ## `pyxle openapi`
 
@@ -347,8 +381,16 @@ pyxle openapi [directory] [options]
 # Print to stdout
 pyxle openapi
 
+# Redirect or pipe it — stdout carries the document and nothing else
+pyxle openapi > openapi.json
+pyxle openapi | jq '.paths'
+
 # Write a file with custom metadata
 pyxle openapi --out openapi.json --title "Acme API" --api-version 2.0.0
 ```
 
-The schema is derived from runtime introspection of the compiled action modules, so it always matches what the dispatcher actually validates. Requires the `[pydantic]` extra (`pip install "pyxle-framework[pydantic]"`); the command exits with an error if Pydantic isn't installed or a page module can't be imported.
+The document is the only thing written to stdout; progress and errors go to stderr. So a redirect captures valid JSON or an empty file — never a document with a message in it — and a failure is still visible in the terminal. The same applies to [`pyxle routes --json`](#pyxle-routes).
+
+The schema is derived from runtime introspection of the compiled action modules, so it always matches what the dispatcher actually validates.
+
+Pydantic is only needed for the actions that actually declare a model body. A project whose actions take no body — or which has no actions yet — generates its document without the `[pydantic]` extra installed, and an empty `paths` object is the correct answer for a project with no actions. The command exits with an error if an action declares a model body and Pydantic isn't installed (`pip install "pyxle-framework[pydantic]"`; the message names the action and its file), or if a page module can't be imported.

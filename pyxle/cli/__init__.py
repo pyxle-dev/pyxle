@@ -8,8 +8,8 @@ import os
 import signal
 import subprocess
 import sys
-from pathlib import Path
-from typing import Optional
+from pathlib import Path, PurePosixPath
+from typing import Any, Callable, Optional
 
 import typer
 import uvicorn
@@ -114,6 +114,34 @@ def _resolve_run_build():
     return _run_build
 
 
+def _execute_build(
+    settings: Any,
+    *,
+    logger: ConsoleLogger,
+    dist_dir: Optional[Path],
+    force_rebuild: bool,
+) -> Any:
+    """Run the production build, turning a failure into a clean CLI exit.
+
+    ``ClientBuildError`` already carries a fully-formed, actionable message
+    (Node/npm missing, no bundle produced), so it is printed verbatim rather
+    than wrapped — the user needs to read *that*, not a generic prefix.
+    """
+    from pyxle.build.pipeline import ClientBuildError  # noqa: PLC0415 - lazy: build path only
+
+    runner = _resolve_run_build()
+    try:
+        return runner(
+            settings, logger=logger, dist_dir=dist_dir, force_rebuild=force_rebuild
+        )
+    except ClientBuildError as exc:
+        logger.error(str(exc))
+        raise typer.Exit(code=1) from exc
+    except Exception as exc:  # pragma: no cover - unexpected runtime errors
+        logger.error(f"Build failed: {exc}")
+        raise typer.Exit(code=1) from exc
+
+
 def _install_sigterm_keyboard_interrupt(logger: object) -> object:
     """Convert SIGTERM into ``KeyboardInterrupt`` for the dev-server run loop.
 
@@ -177,14 +205,86 @@ def _prompt_yes_no(question: str, *, default: bool = False) -> bool:
     return answer == "Yes"
 
 
-def _prompt_text(question: str, *, default: str) -> str:
-    """Free-text prompt with a pre-filled default, matching the select styling."""
+def _prompt_text(
+    question: str,
+    *,
+    default: str,
+    validate: Optional[Callable[[str], None]] = None,
+) -> str:
+    """Free-text prompt with a pre-filled default, matching the select styling.
+
+    ``validate`` is called with the trimmed input and should raise ``ValueError``
+    with a user-facing message when the value is unusable. The prompt then says
+    so and asks again, in place — the alternative is aborting the command and
+    throwing away every answer the user has already given.
+    """
     import questionary  # noqa: PLC0415 - lazy: interactive prompt path only
 
-    answer = questionary.text(question, default=default, qmark="◆").ask()
+    def _validator(raw: str) -> object:
+        if validate is None:
+            return True
+        value = raw.strip() or default
+        try:
+            validate(value)
+        except ValueError as exc:
+            return str(exc)
+        return True
+
+    answer = questionary.text(
+        question, default=default, qmark="◆", validate=_validator
+    ).ask()
     if answer is None:  # Ctrl-C / EOF
         raise typer.Exit(code=1)
     return answer.strip() or default
+
+
+def _validate_alias_input(value: str) -> None:
+    """Raise ``ValueError`` when *value* is not a usable import alias.
+
+    Adapts :func:`validate_import_alias` to the shape the interactive text
+    prompt wants, so a bad alias is corrected in place instead of aborting.
+    """
+    from .scaffold import InvalidImportAlias, validate_import_alias  # noqa: PLC0415
+
+    try:
+        validate_import_alias(value)
+    except InvalidImportAlias as exc:
+        raise ValueError(str(exc)) from exc
+
+
+def _validate_init_target(name: str, *, force: bool, logger: ConsoleLogger) -> None:
+    """Fail before the prompts when the requested target can't be scaffolded.
+
+    Mirrors the checks the scaffolder makes (a filesystem-safe project name, a
+    free destination). Running them up front costs nothing and means a user is
+    never asked three questions only to be told the directory already exists.
+    ``--force`` is honoured here exactly as the scaffolder honours it.
+    """
+    from .scaffold import InvalidProjectName, validate_project_name  # noqa: PLC0415
+
+    stripped = name.strip()
+    if stripped in ("", "."):
+        # Scaffolding in place: the name comes from the current directory, and
+        # emptiness is the scaffolder's call (it may legitimately be --force'd).
+        try:
+            validate_project_name(Path.cwd().name)
+        except InvalidProjectName as exc:
+            logger.error(
+                f"Cannot derive a valid project name from the current directory "
+                f"'{Path.cwd().name}': {exc}"
+            )
+            raise typer.Exit(code=1) from exc
+        return
+
+    try:
+        slug = validate_project_name(stripped)
+    except InvalidProjectName as exc:
+        logger.error(str(exc))
+        raise typer.Exit(code=1) from exc
+
+    if Path(slug).exists() and not force:
+        logger.error("Target directory already exists. Re-run with --force to overwrite.")
+        raise typer.Exit(code=1)
 
 
 def _require_node_toolchain(logger: ConsoleLogger) -> None:
@@ -291,6 +391,13 @@ def init(
 
     interactive = (not yes) and _stdin_is_interactive()
 
+    # Reject an unusable target BEFORE asking anything. Both checks used to run
+    # inside the scaffolder, after the prompts — so a typo'd name or an occupied
+    # directory made the user answer every question and then threw all the
+    # answers away.
+    if interactive:
+        _validate_init_target(name, force=force, logger=logger)
+
     # 1. Tailwind CSS.
     if tailwind is None:
         if shadcn:
@@ -322,7 +429,11 @@ def init(
         if interactive and _prompt_yes_no(
             f"Customize the default import alias ({DEFAULT_IMPORT_ALIAS})?"
         ):
-            alias_choice = _prompt_text("Import alias", default=DEFAULT_IMPORT_ALIAS)
+            alias_choice = _prompt_text(
+                "Import alias",
+                default=DEFAULT_IMPORT_ALIAS,
+                validate=_validate_alias_input,
+            )
         else:
             alias_choice = DEFAULT_IMPORT_ALIAS
     else:
@@ -386,14 +497,52 @@ def _in_virtualenv() -> bool:
     return sys.prefix != getattr(sys, "base_prefix", sys.prefix)
 
 
+def _echo_tool_output(output: str | None) -> None:
+    """Print an installer's captured output verbatim.
+
+    Used only on failure, where the tool's own words are the whole diagnosis.
+    Emitted through ``typer.echo`` rather than the logger so pip/npm output is
+    reproduced exactly — no emoji prefix, no colour, no re-wrapping.
+    """
+
+    if output and output.strip():
+        typer.echo(output.rstrip())
+
+
 def _run_subprocess(command: list[str], *, cwd: Path, label: str, logger: ConsoleLogger) -> None:
+    """Run an installer, surfacing its output only when it is worth reading.
+
+    pip and npm are chatty on success — a ``Requirement already satisfied``
+    line per transitive dependency, plus pip's own "a new release of pip is
+    available" advert — and none of it says anything about the user's project.
+    A normal run therefore captures the child's output and shows just the step
+    line, matching the rest of the CLI. Two escape hatches keep that from
+    hiding anything real: a **failure** prints everything the tool said,
+    verbatim, before the error line, and ``pyxle -v install`` streams the
+    child's output live for anyone who wants to watch it work.
+    """
+
     logger.step(label, " ".join(command))
+    # Verbose users asked to see everything: let the child inherit our stdio so
+    # its output streams live (and keeps its progress bars/colour).
+    stream_live = logger.verbosity == Verbosity.VERBOSE
+    # stderr is folded into stdout so a replayed failure reads in the order the
+    # tool wrote it, rather than every stdout line followed by every stderr one.
+    capture = None if stream_live else subprocess.PIPE
     try:
-        subprocess.run(command, cwd=cwd, check=True)
+        subprocess.run(
+            command,
+            cwd=cwd,
+            check=True,
+            stdout=capture,
+            stderr=None if stream_live else subprocess.STDOUT,
+            text=True,
+        )
     except FileNotFoundError as exc:
         logger.error(f"{label} failed — command '{command[0]}' was not found.")
         raise typer.Exit(code=1) from exc
     except subprocess.CalledProcessError as exc:
+        _echo_tool_output(exc.stdout)
         logger.error(f"{label} failed with exit code {exc.returncode}.")
         raise typer.Exit(code=1) from exc
 
@@ -1021,18 +1170,12 @@ def build(
     if incremental:
         logger.info("Incremental mode enabled — unchanged sources will be skipped")
 
-    runner = _resolve_run_build()
-
-    try:
-        result = runner(
-            settings,
-            logger=logger,
-            dist_dir=resolved_out_dir,
-            force_rebuild=not incremental,
-        )
-    except Exception as exc:  # pragma: no cover - unexpected runtime errors
-        logger.error(f"Build failed: {exc}")
-        raise typer.Exit(code=1) from exc
+    result = _execute_build(
+        settings,
+        logger=logger,
+        dist_dir=resolved_out_dir,
+        force_rebuild=not incremental,
+    )
 
     summary = result.summary
     logger.success(
@@ -1167,8 +1310,17 @@ def serve(
     # be forgeable. A single startup warning is too easy to miss, so fail fast.
     _require_production_secret(production_config, logger)
 
-    resolved_styles = _resolve_global_style_entries(project_root, production_config)
-    resolved_scripts = _resolve_global_script_entries(project_root, production_config)
+    resolved_dist = _resolve_dist_directory(project_root, dist_dir)
+
+    # Global styles/scripts are read from disk (their contents are inlined into
+    # every rendered document), so they are resolved against the project's own
+    # files when those are deployed and against the copy inside ``dist`` when
+    # they are not — otherwise a dist-only deployment refuses to start on a
+    # stylesheet whose source was never shipped.
+    from pyxle.build.production import (  # noqa: PLC0415 - heavy import deferred to runtime
+        app_source_mirror,
+        resolve_global_assets,
+    )
 
     # `pyxle serve` defaults SSR workers to auto-size (0 -> min(cpu_count, 4) via
     # pyxle.build.production._resolve_pool_size) so production renders stream
@@ -1178,6 +1330,11 @@ def serve(
     serve_extra: dict[str, object] = {"ssr_workers": effective_ssr_workers}
 
     try:
+        resolved_styles, resolved_scripts = resolve_global_assets(
+            project_root,
+            production_config,
+            app_mirror=app_source_mirror(resolved_dist),
+        )
         settings = DevServerSettings.from_project_root(  # type: ignore[union-attr]
             project_root,
             **production_config.to_devserver_kwargs(),
@@ -1189,18 +1346,13 @@ def serve(
         logger.error(str(exc))
         raise typer.Exit(code=1) from exc
 
-    resolved_dist = _resolve_dist_directory(project_root, dist_dir)
-
     if not skip_build:
         # A fresh build runs Vite and requires the supported Node.js floor.
         _require_node_toolchain(logger)
         logger.info("Building project before serving")
-        runner = _resolve_run_build()
-        try:
-            runner(settings, logger=logger, dist_dir=resolved_dist, force_rebuild=True)
-        except Exception as exc:  # pragma: no cover - unexpected runtime errors
-            logger.error(f"Build failed: {exc}")
-            raise typer.Exit(code=1) from exc
+        _execute_build(
+            settings, logger=logger, dist_dir=resolved_dist, force_rebuild=True
+        )
     else:
         logger.warning("Skipping production build; using existing dist artifacts.")
         # No Vite here, but SSR still runs React on Node — warn (don't block a
@@ -1418,7 +1570,12 @@ def check(
     # broken JSX (``<Tag>...<`` unclosed, mismatched braces, etc.) is
     # surfaced here instead of waiting for the build step.
     pyxl_count = 0
-    diagnostics: list[tuple[str, str]] = []  # (file, message) pairs
+    # (file, message, severity) triples. Severity comes from the parser: code
+    # that will break when it runs is an "error" and fails the command; code
+    # that merely wants tidying (an unused import, a dead local) is a
+    # "warning" and is printed without failing. `pyxle check` is the documented
+    # deploy gate — a leftover import must not block a release.
+    diagnostics: list[tuple[str, str, str]] = []
     if pages_dir.is_dir():
         from pyxle.compiler.parser import PyxParser
 
@@ -1443,6 +1600,7 @@ def check(
                         rel_path,
                         f"[python] parser crashed: {type(exc).__name__}: "
                         f"{exc}",
+                        "error",
                     )
                 )
                 continue
@@ -1451,7 +1609,10 @@ def check(
                     message = f"[{diag.section}] line {diag.line}: {diag.message}"
                 else:
                     message = f"[{diag.section}] {diag.message}"
-                diagnostics.append((rel_path, message))
+                diagnostics.append((rel_path, message, diag.severity))
+
+    diagnostic_errors = [entry for entry in diagnostics if entry[2] != "warning"]
+    diagnostic_warnings = [entry for entry in diagnostics if entry[2] == "warning"]
 
     # --- Report ---
     logger.info(f"Checked {pyxl_count} .pyxl file(s) in {project_root.name}/")
@@ -1459,18 +1620,23 @@ def check(
     for warning in warnings:
         logger.warning(warning)
 
-    if diagnostics:
-        for diag_file, diag_msg in diagnostics:
-            logger.diagnostic(diag_msg, file=diag_file, severity="error")
+    for diag_file, diag_msg, _ in diagnostic_warnings:
+        logger.diagnostic(diag_msg, file=diag_file, severity="warning")
 
-    if errors or diagnostics:
+    for diag_file, diag_msg, _ in diagnostic_errors:
+        logger.diagnostic(diag_msg, file=diag_file, severity="error")
+
+    warning_count = len(warnings) + len(diagnostic_warnings)
+    warning_suffix = f" ({warning_count} warning(s))" if warning_count else ""
+
+    if errors or diagnostic_errors:
         for error in errors:
             logger.error(error)
-        total_errors = len(errors) + len(diagnostics)
-        logger.error(f"Check failed with {total_errors} error(s)")
+        total_errors = len(errors) + len(diagnostic_errors)
+        logger.error(f"Check failed with {total_errors} error(s){warning_suffix}")
         raise typer.Exit(code=1)
 
-    logger.success("All checks passed")
+    logger.success(f"All checks passed{warning_suffix}")
 
 
 @app.command(help="Run TypeScript checking on compiled JSX output.")
@@ -1675,6 +1841,11 @@ def routes(
     """Show which routes exist and what features they use."""
 
     logger = get_logger()
+    if output_json:
+        # ``--json`` makes stdout a data channel; keep it clean for the redirect
+        # and send messages to stderr. The human table below is not data, so it
+        # keeps stdout.
+        logger = logger.to_stderr()
     project_root = directory.expanduser().resolve()
 
     global DevServerSettings
@@ -1760,16 +1931,47 @@ def routes(
             source = api.source_relative_path.as_posix()
             logger.step(api.path, detail=source)
 
-    if table.error_boundary_pages:
+    # Special files are compiled but serve no URL. Listing them under their
+    # computed route path (`/error`, `/not-found`, `/loading`) invites the
+    # reader to go and visit an address that will always 404. Label each by what
+    # it *is* and show the scope it covers instead.
+    if table.error_boundary_pages or table.loading_boundary_pages:
         logger.info("")
-        logger.info("  Error Boundaries:")
-        for boundary in table.error_boundary_pages:
+        logger.info("  Special Files (no URL of their own):")
+        for boundary in [*table.error_boundary_pages, *table.loading_boundary_pages]:
             source = boundary.source_relative_path.as_posix()
-            logger.step(boundary.path, detail=source)
+            logger.step(
+                _special_file_label(source),
+                detail=f"{source}  [covers {_boundary_scope(source)}]",
+            )
 
     total = len(table.pages) + len(table.apis)
     logger.info("")
     logger.success(f"{total} route(s) found")
+
+
+def _special_file_label(source_relative_posix: str) -> str:
+    """Describe what a non-routable special file does, for ``pyxle routes``."""
+    from pyxle.devserver.error_pages import is_not_found_page  # noqa: PLC0415
+    from pyxle.devserver.loading_pages import is_loading_file  # noqa: PLC0415
+
+    if is_not_found_page(source_relative_posix):
+        return "404 page"
+    if is_loading_file(source_relative_posix):
+        return "loading fallback"
+    return "error boundary"
+
+
+def _boundary_scope(source_relative_posix: str) -> str:
+    """The URL subtree a special file applies to (``/`` for a root boundary).
+
+    ``PurePosixPath`` because the input is always a POSIX-form project-relative
+    path (``source_relative_path.as_posix()``), regardless of the host OS.
+    """
+    parent = PurePosixPath(source_relative_posix).parent.as_posix()
+    if parent in ("", "."):
+        return "/"
+    return f"/{parent}/*"
 
 
 @app.command(help="Export an OpenAPI 3.1 schema generated from @action request models.")
@@ -1791,7 +1993,10 @@ def openapi(
     ),
 ) -> None:
     """Generate an OpenAPI document from every ``@action``'s Pydantic body model."""
-    logger = get_logger()
+    # stdout carries the document (``pyxle openapi > openapi.json``), so every
+    # message — including the failures below — leaves by stderr. Otherwise a
+    # redirect writes the error into the file it was supposed to produce.
+    logger = get_logger().to_stderr()
     project_root = directory.expanduser().resolve()
 
     global DevServerSettings
