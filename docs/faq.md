@@ -119,7 +119,7 @@ Yes. Loaders are standard async Python functions. Use any async database library
 
 ### What happens if my loader throws an unhandled exception?
 
-If you raise `LoaderError`, the nearest `error.pyxl` is rendered. Other exceptions render a default error page. In dev mode, the error overlay shows the full stack trace.
+The nearest `error.pyxl` is rendered either way. A `LoaderError` carries your own status code and message through to it; any other exception is a `500` whose message the boundary receives in development but not in production, where it is replaced with a generic string and written to the server log instead. In dev mode the error overlay also shows the full stack trace. See [Error Handling](guides/error-handling.md#what-reaches-errorpyxl).
 
 ## Styling
 

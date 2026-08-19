@@ -6,6 +6,7 @@ Pyxle is configured via `pyxle.config.json` in the project root. All fields are 
 
 ```json
 {
+  "name": "my-app",
   "pagesDir": "pages",
   "publicDir": "public",
   "buildDir": ".pyxle-build",
@@ -80,6 +81,12 @@ Pyxle is configured via `pyxle.config.json` in the project root. All fields are 
   "plugins": []
 }
 ```
+
+## App identity
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `name` | `string` | project directory name | Your app's display name. Used as the default `<title>` for a page where neither the page nor any layout sets one. Written by `pyxle init`; must be a non-empty string if present. See [Default title](../guides/head-management.md#default-title). |
 
 ## Directory settings
 

@@ -34,7 +34,7 @@ pytest
 
 # The above command uses pyproject.toml defaults:
 #   --strict-markers --strict-config
-#   --cov=pyxle.cli --cov=pyxle.compiler --cov=pyxle.devserver --cov=pyxle.ssr
+#   --cov=pyxle.build --cov=pyxle.cli --cov=pyxle.compiler --cov=pyxle.devserver --cov=pyxle.ssr
 #   --cov-report=term-missing
 ```
 
