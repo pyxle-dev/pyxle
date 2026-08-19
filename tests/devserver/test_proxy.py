@@ -169,6 +169,17 @@ def test_vite_proxy_never_proxies_framework_internal_paths(
     assert proxy.should_proxy(make_request("/src/x.js")) is True
 
 
+def test_vite_proxy_reserves_whole_segments_not_leading_characters(
+    settings: DevServerSettings,
+) -> None:
+    """The reserved namespaces are ``/__pyxle`` and ``/__pyxle__``, not every
+    URL that happens to begin with those letters. A module whose name merely
+    starts the same way belongs to the app and must still reach Vite."""
+    proxy = ViteProxy(settings)
+    assert proxy.should_proxy(make_request("/__pyxle-widget.js")) is True
+    assert proxy.should_proxy(make_request("/src/__pyxle_helpers.js")) is True
+
+
 async def test_vite_proxy_handles_non_proxied_request(settings: DevServerSettings) -> None:
     proxy = ViteProxy(settings)
     response = await proxy.handle(make_request("/robots.txt"))
@@ -203,3 +214,71 @@ async def test_vite_proxy_close_owns_client(settings: DevServerSettings) -> None
     await proxy.close()
 
     assert client.is_closed is True
+
+
+class TestAnEndpointIsNotAnAsset:
+    """A `.js` URL served by the app must not be handed to Vite.
+
+    An embeddable widget — ``/api/embed.js``, the shape every status page and
+    analytics product ships — is a real endpoint whose URL ends in an asset
+    suffix. Proxied on suffix alone it reaches Vite, which knows nothing about
+    it and answers with the index HTML: the endpoint works in production and
+    silently returns a web page in dev, which is the worst way for it to fail.
+    """
+
+    @staticmethod
+    def _app_with(*paths: str):
+        from starlette.applications import Starlette
+        from starlette.responses import PlainTextResponse
+        from starlette.routing import Route
+
+        from pyxle.devserver.proxy import API_ROUTE_MARKER
+
+        routes = [Route(path, lambda request: PlainTextResponse("")) for path in paths]
+        for route in routes:
+            setattr(route, API_ROUTE_MARKER, True)
+        return Starlette(routes=routes)
+
+    def _request(self, path: str, app):
+        request = make_request(path)
+        request.scope["app"] = app
+        return request
+
+    def test_an_api_route_ending_in_js_wins(self, settings: DevServerSettings) -> None:
+        proxy = ViteProxy(settings)
+        app = self._app_with("/api/embed.js")
+
+        assert proxy.should_proxy(self._request("/api/embed.js", app)) is False
+
+    def test_a_dynamic_api_route_wins_too(self, settings: DevServerSettings) -> None:
+        """The path that prompted this: a per-page widget under a slug."""
+        proxy = ViteProxy(settings)
+        app = self._app_with("/s/{slug}/api/v2/embed.js")
+
+        assert proxy.should_proxy(self._request("/s/acme/api/v2/embed.js", app)) is False
+
+    def test_a_real_asset_still_proxies(self, settings: DevServerSettings) -> None:
+        proxy = ViteProxy(settings)
+        app = self._app_with("/api/embed.js")
+
+        assert proxy.should_proxy(self._request("/src/main.js", app)) is True
+
+    def test_a_page_route_does_not_block_an_asset(self, settings: DevServerSettings) -> None:
+        """Only API routes are consulted. A catch-all *page* — `[[...slug]]` —
+        matches every path there is, and letting it speak here would stop every
+        asset in the project from loading."""
+        from starlette.applications import Starlette
+        from starlette.responses import PlainTextResponse
+        from starlette.routing import Route
+
+        proxy = ViteProxy(settings)
+        app = Starlette(routes=[Route("/{slug:path}", lambda r: PlainTextResponse(""))])
+
+        assert proxy.should_proxy(self._request("/src/main.js", app)) is True
+
+    def test_no_app_in_scope_is_not_a_crash(self, settings: DevServerSettings) -> None:
+        """`should_proxy` is called on the raw request; a scope without an app
+        (tests, an embedding harness) must still get an answer."""
+        proxy = ViteProxy(settings)
+
+        assert proxy.should_proxy(make_request("/src/main.js")) is True

@@ -15,6 +15,7 @@ from starlette.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from pyxle.cli.logger import ConsoleLogger
+from pyxle.devserver.build_errors import BuildFailure
 from pyxle.devserver.builder import build_once
 from pyxle.devserver.registry import load_metadata_registry
 from pyxle.devserver.routes import build_route_table
@@ -101,6 +102,54 @@ def test_build_api_router_registers_function_and_class(project: DevServerSetting
     response = client.get("/api/posts/42")
     assert response.status_code == 200
     assert response.json() == {"id": "42"}
+
+
+def test_private_module_beside_an_endpoint_boots_and_stays_importable(
+    project: DevServerSettings,
+) -> None:
+    """A helper colocated with the endpoints that use it must not be routed.
+
+    An API module that exports no handler is a hard ``ApiRouteError`` at
+    startup, so registering ``pages/api/_shared.py`` as a route stops the app
+    from booting at all. The helper is still an ordinary Python module: the
+    endpoint beside it imports it exactly as any other project module.
+    """
+    write_file(project.pages_dir / "api/__init__.py", "")
+    write_file(project.pages_dir / "api/_shared.py", "GREETING = 'hi'\n")
+    write_file(
+        project.pages_dir / "api/greet.py",
+        "from starlette.responses import JSONResponse\n"
+        "from pages.api._shared import GREETING\n\n"
+        "async def endpoint(request):\n"
+        "    return JSONResponse({'greeting': GREETING})\n",
+    )
+
+    build_once(project)
+    registry = load_metadata_registry(project)
+    table = build_route_table(registry)
+
+    assert {route.path for route in table.apis}.isdisjoint(
+        {"/api/_shared", "/api/__init__"}
+    )
+
+    root = str(project.project_root)
+    added = root not in sys.path
+    if added:
+        sys.path.insert(0, root)
+    try:
+        # No ApiRouteError: the private module is not a route to build.
+        router = build_api_router(table.apis)
+        app = Starlette()
+        app.router.routes.extend(router.routes)
+
+        response = TestClient(app).get("/api/greet")
+        assert response.status_code == 200
+        assert response.json() == {"greeting": "hi"}
+    finally:
+        if added and root in sys.path:
+            sys.path.remove(root)
+        for name in [key for key in sys.modules if key == "pages" or key.startswith("pages.")]:
+            del sys.modules[name]
 
 
 def test_build_api_router_raises_for_invalid_module(project: DevServerSettings) -> None:
@@ -1205,6 +1254,114 @@ def test_static_assets_middleware_unmatched_client_path_falls_through(
     assert resp.text == "FELL-THROUGH"
 
 
+class TestPublicFilesNamedLikeTheClientNamespace:
+    """``/client`` is a namespace, not a set of leading characters.
+
+    ``public/client-logo.svg`` is served at ``/client-logo.svg``. Testing that
+    URL with a bare ``str.startswith("/client")`` mistakes it for a framework
+    bundle, so the public directory is never consulted and the file 404s —
+    silently, and only for the files the in-memory cache does not happen to
+    hold. The comparison has to be on whole path segments.
+    """
+
+    def test_dev_serves_a_public_file_whose_name_starts_with_client(
+        self, tmp_path: Path
+    ) -> None:
+        public_dir = tmp_path / "public"
+        public_dir.mkdir()
+        (public_dir / "client-logo.svg").write_text("<svg/>", encoding="utf-8")
+        (public_dir / "clients.json").write_text('["acme"]', encoding="utf-8")
+        client_dir = tmp_path / "client"
+        client_dir.mkdir()
+
+        client = TestClient(
+            _static_assets_app(public_directory=public_dir, client_directory=client_dir)
+        )
+
+        logo = client.get("/client-logo.svg")
+        assert logo.status_code == 200
+        assert logo.text == "<svg/>"
+
+        clients = client.get("/clients.json")
+        assert clients.status_code == 200
+        assert clients.text == '["acme"]'
+
+    def test_production_serves_one_too_large_to_memory_cache(
+        self, tmp_path: Path
+    ) -> None:
+        """In production the file is usually rescued by accident: small assets
+        are answered from the in-memory cache before the prefix test runs. A
+        file above the per-file cache budget falls through to the disk path and
+        is where the bug actually shows."""
+        public_dir = tmp_path / "public"
+        public_dir.mkdir()
+        (public_dir / "client-hero.png").write_bytes(b"PNGDATA")
+        client_dir = tmp_path / "client"
+        client_dir.mkdir()
+
+        client = TestClient(
+            _cached_static_app(
+                public_directory=public_dir,
+                client_directory=client_dir,
+                cache_max_file_bytes=0,
+            )
+        )
+
+        hero = client.get("/client-hero.png")
+        assert hero.status_code == 200
+        assert hero.content == b"PNGDATA"
+
+    def test_the_client_namespace_still_wins_for_its_own_assets(
+        self, tmp_path: Path
+    ) -> None:
+        """The fix must not open the framework namespace up: a real
+        ``/client/...`` URL is still served from the build output, and a
+        missing one still falls through rather than reaching ``public/``."""
+        public_dir = tmp_path / "public"
+        public_dir.mkdir()
+        (public_dir / "client-logo.svg").write_text("<svg/>", encoding="utf-8")
+        client_dir = tmp_path / "client"
+        client_dir.mkdir()
+        (client_dir / "app.js").write_text("CLIENTJS", encoding="utf-8")
+
+        client = TestClient(
+            _static_assets_app(public_directory=public_dir, client_directory=client_dir)
+        )
+
+        bundle = client.get("/client/app.js")
+        assert bundle.status_code == 200
+        assert bundle.text == "CLIENTJS"
+
+        assert client.get("/client/missing.js").text == "FELL-THROUGH"
+
+
+def test_try_static_strips_only_whole_segments_of_the_prefix(tmp_path: Path) -> None:
+    """The prefix guard is the same segment comparison: ``/client-logo.svg``
+    is not inside ``/client``, so it must not be rewritten to ``-logo.svg``
+    and served out of the client build directory."""
+    import asyncio
+
+    from pyxle.devserver.starlette_app import HttpOnlyStaticFiles, StaticAssetsMiddleware
+
+    client_dir = tmp_path / "client"
+    client_dir.mkdir()
+    (client_dir / "-logo.svg").write_text("WRONG-FILE", encoding="utf-8")
+    static = HttpOnlyStaticFiles(directory=client_dir, check_dir=False)
+
+    scope = {"type": "http", "method": "GET", "path": "/client-logo.svg", "headers": []}
+
+    async def receive() -> dict:
+        return {"type": "http.request"}
+
+    send = AsyncMock()
+
+    result = asyncio.run(
+        StaticAssetsMiddleware._try_static(static, scope, receive, send, prefix="/client")
+    )
+    assert result is False
+    send.assert_not_awaited()
+
+
 def test_try_static_returns_false_on_prefix_mismatch(tmp_path: Path) -> None:
     """Calling _try_static with a prefix the path does not start with is a
     no-op that returns False (defensive guard, line 209)."""
@@ -2115,7 +2272,14 @@ def test_create_starlette_app_csrf_secure_cookie_in_production(
     monkeypatch,
 ) -> None:
     """In production with CSRF enabled and cookie_secure unset, the cookie is
-    forced Secure (lines 881-883)."""
+    forced Secure — **over HTTPS**.
+
+    The flag follows the connection, because a `Secure` cookie is dropped
+    outright by the browser over plain HTTP: applying it there breaks every
+    form with "CSRF token missing" and protects nothing, since a connection
+    with no confidentiality has no cookie confidentiality to lose. See
+    `tests/devserver/test_csrf.py::TestTheSecureFlagFollowsTheConnection`.
+    """
     from pyxle.config import CsrfConfig
 
     monkeypatch.setattr(
@@ -2141,13 +2305,23 @@ def test_create_starlette_app_csrf_secure_cookie_in_production(
         csrf=CsrfConfig(enabled=True, cookie_secure=False),
     )
     app = create_starlette_app(prod_csrf, table)
-    client = TestClient(app, raise_server_exceptions=False)
+    client = TestClient(
+        app, raise_server_exceptions=False, base_url="https://testserver"
+    )
 
     got = client.get("/api/pulse")
     csrf_cookie = next(
         c for c in got.headers.get_list("set-cookie") if c.startswith("pyxle-csrf-")
     )
     assert "Secure" in csrf_cookie
+
+    plain = TestClient(app, raise_server_exceptions=False).get("/api/pulse")
+    over_http = next(
+        c for c in plain.headers.get_list("set-cookie") if c.startswith("pyxle-csrf-")
+    )
+    assert "Secure" not in over_http, (
+        "a Secure cookie over plain HTTP is a cookie the browser throws away"
+    )
 
 
 def test_create_starlette_app_installs_rate_limit_middleware(
@@ -2452,12 +2626,8 @@ def test_not_found_handler_renders_boundary_response(
     assert "Custom 404" in resp.text
 
 
-def test_not_found_handler_falls_back_to_plain_404(
-    project: DevServerSettings,
-    monkeypatch,
-) -> None:
-    """When the not-found boundary renderer returns None, the catch-all handler
-    emits a plain 'Not Found' 404 (lines 1086-1087)."""
+def _app_with_uncovered_not_found(project: DevServerSettings, monkeypatch):
+    """An app whose not-found boundary declines to render this request."""
     monkeypatch.setattr(
         "pyxle.devserver.starlette_app.ComponentRenderer",
         lambda: object(),
@@ -2483,13 +2653,106 @@ def test_not_found_handler_falls_back_to_plain_404(
     build_once(project)
     registry = load_metadata_registry(project)
     table = build_route_table(registry)
+    return create_starlette_app(project, table)
 
-    app = create_starlette_app(project, table)
-    client = TestClient(app)
 
-    resp = client.get("/missing/page")
+def test_not_found_handler_falls_back_to_plain_404(
+    project: DevServerSettings,
+    monkeypatch,
+) -> None:
+    """When the not-found boundary declines, a non-HTML client keeps plain text —
+    a fetch/API caller has no use for a styled document."""
+    client = TestClient(_app_with_uncovered_not_found(project, monkeypatch))
+
+    resp = client.get("/missing/page", headers={"accept": "application/json"})
     assert resp.status_code == 404
     assert resp.text == "Not Found"
+
+
+def test_not_found_handler_falls_back_to_designed_document(
+    project: DevServerSettings,
+    monkeypatch,
+) -> None:
+    """When the not-found boundary declines, a browser gets the designed 404."""
+    client = TestClient(_app_with_uncovered_not_found(project, monkeypatch))
+
+    resp = client.get("/missing/page", headers={"accept": "text/html"})
+    assert resp.status_code == 404
+    assert resp.headers["content-type"].startswith("text/html")
+    assert "<h1>Not found</h1>" in resp.text
+
+
+# ---------------------------------------------------------------------------
+# Default 404 — no not-found.pyxl anywhere in the project
+# ---------------------------------------------------------------------------
+
+
+def test_default_404_serves_designed_document(project: DevServerSettings) -> None:
+    """With no not-found.pyxl at all, a browser still gets a designed page —
+    not Starlette's nine-byte text/plain body — and is told which file
+    replaces it."""
+    build_once(project)
+    table = build_route_table(load_metadata_registry(project))
+    assert not table.error_boundary_pages  # no boundary exists
+
+    client = TestClient(create_starlette_app(project, table))
+    resp = client.get("/definitely/not/a/route", headers={"accept": "text/html"})
+
+    assert resp.status_code == 404
+    assert resp.headers["content-type"].startswith("text/html")
+    assert "<h1>Not found</h1>" in resp.text
+    assert "pages/not-found.pyxl" in resp.text
+
+
+def test_default_404_stays_plain_for_non_html_clients(
+    project: DevServerSettings,
+) -> None:
+    """API consumers keep the plain body they asked for."""
+    build_once(project)
+    table = build_route_table(load_metadata_registry(project))
+
+    client = TestClient(create_starlette_app(project, table))
+    resp = client.get("/definitely/not/a/route", headers={"accept": "application/json"})
+
+    assert resp.status_code == 404
+    assert resp.text == "Not Found"
+
+
+def test_default_404_preserves_an_http_exception_detail(project: DevServerSettings) -> None:
+    """An endpoint raising `HTTPException(404, "…")` must still say what it said.
+
+    Starlette's stock handler echoes `exc.detail`; replacing that handler must
+    not silently flatten every 404 to the generic wording for API callers.
+    """
+    write_file(
+        project.pages_dir / "api/missing.py",
+        "from starlette.exceptions import HTTPException\n\n"
+        "async def endpoint(request):\n"
+        "    raise HTTPException(status_code=404, detail='User not found')\n",
+    )
+    build_once(project)
+    table = build_route_table(load_metadata_registry(project))
+
+    client = TestClient(create_starlette_app(project, table))
+    resp = client.get("/api/missing", headers={"accept": "application/json"})
+
+    assert resp.status_code == 404
+    assert resp.text == "User not found"
+
+
+def test_default_404_omits_dev_hint_in_production(project: DevServerSettings) -> None:
+    """The 'add pages/not-found.pyxl' hint is developer guidance — a visitor to
+    a production site must never see it."""
+    build_once(project)
+    table = build_route_table(load_metadata_registry(project))
+
+    prod = replace(project, debug=False)
+    client = TestClient(create_starlette_app(prod, table))
+    resp = client.get("/definitely/not/a/route", headers={"accept": "text/html"})
+
+    assert resp.status_code == 404
+    assert "<h1>Not found</h1>" in resp.text
+    assert "not-found.pyxl" not in resp.text
 
 
 # ---------------------------------------------------------------------------
@@ -3077,3 +3340,118 @@ def test_build_app_routes_registers_llms_routes_when_enabled(
     paths_off = {getattr(route, "path", None) for route in built_off}
     assert "/index.md" not in paths_off
     assert "/llms.txt" not in paths_off
+
+
+class TestBrokenSourceIsNeverServedAsHealthy:
+    """A route whose source no longer compiles must not answer 200.
+
+    ``pyxle dev`` keeps the previous pass' compiled artifacts, so without this
+    gate the route serves the last version that compiled — a page that looks
+    completely healthy while the file on disk is broken.
+    """
+
+    @staticmethod
+    def _app(project: DevServerSettings, monkeypatch):
+        build_once(project)
+        table = build_route_table(load_metadata_registry(project))
+
+        async def fake_build_page_response(*, request, settings, page, renderer, **_kw):
+            return HTMLResponse(f"<div>healthy {page.path}</div>")
+
+        monkeypatch.setattr(
+            "pyxle.devserver.starlette_app.build_page_response",
+            fake_build_page_response,
+        )
+        return create_starlette_app(project, table)
+
+    def test_broken_page_serves_the_compile_error(
+        self, project: DevServerSettings, monkeypatch
+    ) -> None:
+        app = self._app(project, monkeypatch)
+        app.state.pyxle_build_failures.replace(
+            [
+                BuildFailure(
+                    page_relative_path=Path("index.pyxl"),
+                    display_path="pages/index.pyxl",
+                    message="unexpected indent",
+                    line=7,
+                    column=9,
+                )
+            ]
+        )
+        client = TestClient(app)
+
+        response = client.get("/")
+
+        assert response.status_code == 500
+        assert "healthy" not in response.text
+        assert "Build failed" in response.text
+        assert "pages/index.pyxl:7:9" in response.text
+        assert "unexpected indent" in response.text
+        assert response.headers["cache-control"] == "no-store"
+
+    def test_other_routes_keep_working(
+        self, project: DevServerSettings, monkeypatch
+    ) -> None:
+        """The blast radius of a broken page is exactly that page."""
+        app = self._app(project, monkeypatch)
+        app.state.pyxle_build_failures.replace(
+            [
+                BuildFailure(
+                    page_relative_path=Path("index.pyxl"),
+                    display_path="pages/index.pyxl",
+                    message="unexpected indent",
+                    line=7,
+                    column=9,
+                )
+            ]
+        )
+        client = TestClient(app)
+
+        assert client.get("/").status_code == 500
+        assert client.get("/posts/5").status_code == 200
+        assert client.get("/api/pulse").status_code == 200
+
+    def test_a_clean_build_serves_every_page(
+        self, project: DevServerSettings, monkeypatch
+    ) -> None:
+        app = self._app(project, monkeypatch)
+        client = TestClient(app)
+
+        response = client.get("/")
+
+        assert response.status_code == 200
+        assert "healthy" in response.text
+
+    def test_spa_navigation_gets_the_failure_too(
+        self, project: DevServerSettings, monkeypatch
+    ) -> None:
+        """A client-side navigation must not paint a stale page either."""
+        app = self._app(project, monkeypatch)
+        app.state.pyxle_build_failures.replace(
+            [
+                BuildFailure(
+                    page_relative_path=Path("index.pyxl"),
+                    display_path="pages/index.pyxl",
+                    message="unexpected indent",
+                    line=7,
+                )
+            ]
+        )
+        client = TestClient(app)
+
+        response = client.get("/", headers={"x-pyxle-navigation": "1"})
+
+        assert response.status_code == 500
+        assert "Build failed" in response.text
+
+    def test_production_never_builds_a_failure_registry(
+        self, project: DevServerSettings, monkeypatch
+    ) -> None:
+        build_once(project)
+        table = build_route_table(load_metadata_registry(project))
+        prod = replace(project, debug=False)
+
+        app = create_starlette_app(prod, table, serve_static=False)
+
+        assert app.state.pyxle_build_failures is None

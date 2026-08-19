@@ -198,6 +198,7 @@ class ArtifactWriter:
                 else None
             ),
             cache_revalidate=parse_result.cache_revalidate,
+            standalone=parse_result.standalone,
             uses_suspense=parse_result.uses_suspense,
         )
 

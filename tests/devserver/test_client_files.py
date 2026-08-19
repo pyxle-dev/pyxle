@@ -42,6 +42,150 @@ def create_project(tmp_path: Path) -> DevServerSettings:
     return DevServerSettings.from_project_root(root)
 
 
+def _squash_js(source: str) -> str:
+    """Strip each line's leading indentation so two JS snippets can be compared
+    for identical text regardless of how far each template indents them."""
+
+    return "\n".join(line.strip() for line in source.strip().split("\n"))
+
+
+def _extract_js_function(source: str, name: str) -> str:
+    """Return the text of a top-level ``function <name>(…) {…}`` declaration.
+
+    Brace-matched rather than regex-matched so a nested block or an object
+    literal inside the body cannot end the slice early. Used to assert on — and
+    to execute — one function of a generated module without the rest of it.
+    """
+
+    start = source.index(f"function {name}(")
+    cursor = source.index("{", source.index(")", start))
+    depth = 0
+    while True:
+        character = source[cursor]
+        if character == "{":
+            depth += 1
+        elif character == "}":
+            depth -= 1
+            if depth == 0:
+                return source[start : cursor + 1]
+        cursor += 1
+
+
+def _run_client_runtime_under_node(
+    tmp_path: Path,
+    runtime_index: str,
+    client_entry: str,
+    paths: list[str],
+) -> dict[str, dict[str, bool]]:
+    """Execute the emitted client runtime under node and report what it does.
+
+    For each path the harness records four booleans, one per code path that can
+    start a client-side navigation:
+
+    ``spaNavigated``      the runtime's exported ``navigate()`` reached the router
+    ``prefetched``        the runtime's exported ``prefetch()`` reached the router
+    ``clickIntercepted``  the entry's delegated click listener claimed the anchor
+    ``hoverFetched``      the entry's hover listener issued a prefetch request
+
+    The JavaScript under test is the generated text verbatim. Two adjustments
+    make it loadable by plain node and neither touches a line of logic: the
+    runtime's ``react``/``./slot.jsx`` imports and its re-exports of sibling
+    ``.jsx`` components are replaced with local stubs (node cannot resolve a
+    ``.jsx`` extension), and the entry — a Vite module that boots React on
+    import — contributes only the four functions this exercises.
+    """
+
+    harness = tmp_path / "js-harness"
+    harness.mkdir()
+
+    first_statement = "const prefetchedHrefs = new Set();"
+    assert first_statement in runtime_index, "runtime module preamble changed"
+    body = runtime_index[runtime_index.index(first_statement) :]
+    body = "\n".join(
+        line
+        for line in body.split("\n")
+        if not (line.startswith("export ") and " from './" in line)
+    )
+    (harness / "runtime.mjs").write_text(
+        "const React = {\n"
+        "  forwardRef: (fn) => fn,\n"
+        "  useRef: () => ({ current: null }),\n"
+        "  useEffect: () => {},\n"
+        "  useCallback: (fn) => fn,\n"
+        "  createElement: (...args) => ({ args }),\n"
+        "};\n"
+        "const Slot = null, SlotProvider = null, useSlot = null, useSlots = null;\n"
+        "const mergeSlotLayers = null, normalizeSlots = null;\n" + body,
+        encoding="utf-8",
+    )
+
+    (harness / "entry.mjs").write_text(
+        "const PREFETCH_TRIGGER = 'hover';\n"
+        "globalThis.__hoverFetches = [];\n"
+        "function prefetchNavigation(url) {\n"
+        "  globalThis.__hoverFetches.push(url.pathname);\n"
+        "  return Promise.resolve(true);\n"
+        "}\n\n"
+        + "\n\n".join(
+            _extract_js_function(client_entry, name)
+            for name in ("isApiPath", "normalizeUrl", "shouldHandleClick", "handleLinkHover")
+        )
+        + "\n\nexport { shouldHandleClick, handleLinkHover };\n",
+        encoding="utf-8",
+    )
+
+    (harness / "run.mjs").write_text(
+        "const navigated = [], prefetched = [];\n"
+        "globalThis.window = {\n"
+        "  location: {\n"
+        "    href: 'https://app.test/dashboard',\n"
+        "    origin: 'https://app.test',\n"
+        "    pathname: '/dashboard',\n"
+        "    search: '',\n"
+        "    assign: () => {},\n"
+        "  },\n"
+        "  __PYXLE_ROUTER__: {\n"
+        "    navigate: (href) => { navigated.push(href); return Promise.resolve(true); },\n"
+        "    prefetch: (href) => { prefetched.push(href); return Promise.resolve(true); },\n"
+        "  },\n"
+        "};\n"
+        "globalThis.document = { addEventListener: () => {} };\n"
+        "const runtime = await import('./runtime.mjs');\n"
+        "const entry = await import('./entry.mjs');\n"
+        f"const paths = {json.dumps(paths)};\n"
+        "const out = {};\n"
+        "for (const path of paths) {\n"
+        "  navigated.length = 0; prefetched.length = 0;\n"
+        "  globalThis.__hoverFetches.length = 0;\n"
+        "  await runtime.navigate(path);\n"
+        "  await runtime.prefetch(path);\n"
+        "  const anchor = {\n"
+        "    href: 'https://app.test' + path,\n"
+        "    dataset: {},\n"
+        "    getAttribute: (name) => (name === 'href' ? path : null),\n"
+        "    hasAttribute: () => false,\n"
+        "  };\n"
+        "  const event = { defaultPrevented: false, button: 0, target: { closest: () => anchor } };\n"
+        "  const claimed = entry.shouldHandleClick(event);\n"
+        "  entry.handleLinkHover(event);\n"
+        "  out[path] = {\n"
+        "    spaNavigated: navigated.length > 0,\n"
+        "    prefetched: prefetched.length > 0,\n"
+        "    clickIntercepted: claimed !== null,\n"
+        "    hoverFetched: globalThis.__hoverFetches.length > 0,\n"
+        "  };\n"
+        "}\n"
+        "process.stdout.write(JSON.stringify(out));\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        ["node", str(harness / "run.mjs")], capture_output=True, text=True
+    )
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout)
+
+
 def test_write_client_bootstrap_files_generates_expected_artifacts(tmp_path: Path) -> None:
     settings = create_project(tmp_path)
 
@@ -1288,3 +1432,207 @@ def test_navigation_scrolls_to_hash_after_cross_page_commit(tmp_path: Path) -> N
     assert "scrollToHashWhenReady(url.hash);" in entry
     commit = entry.index("window.scrollTo(0, 0);")
     assert entry.index("scrollToHashWhenReady(url.hash);", commit) > commit
+
+
+class TestRelativeHrefsResolveAgainstTheCurrentPage:
+    """A relative reference is defined against the document's own address.
+
+    `?days=7` means "this page, with a different query"; `../x` means one level
+    up. Both were resolved against `window.location.origin`, which turns them
+    into links to the site root — so a query-only filter or tab control
+    silently navigated home. Reported from a real app: the 7d/30d/90d window
+    selector on a monitor page took the user to the dashboard.
+    """
+
+    @staticmethod
+    def _runtime() -> str:
+        from pyxle.devserver.client_files import _render_client_runtime_index
+
+        return _render_client_runtime_index()
+
+    def test_the_link_component_resolves_against_the_current_url(self):
+        source = self._runtime()
+
+        assert "new URL(candidate, window.location.href)" in source
+        assert "new URL(candidate, window.location.origin)" not in source, (
+            "a query-only href would resolve to the site root"
+        )
+
+    def test_the_cache_key_uses_the_same_base_as_navigation(self, tmp_path):
+        """Otherwise the prefetch cache names a different page than the click
+        loads, and the entry is never evicted."""
+        from pyxle.devserver.client_files import _render_client_entry
+        from pyxle.devserver.settings import DevServerSettings
+
+        root = tmp_path / "project"
+        (root / "pages").mkdir(parents=True)
+        (root / "public").mkdir()
+        source = _render_client_entry(DevServerSettings.from_project_root(root))
+
+        assert "new URL(href, window.location.href)" in source
+        assert "new URL(href, window.location.origin)" not in source
+
+    def test_the_semantics_this_encodes(self):
+        """The rule itself, asserted against the standard library's URL parser
+        so the intent is unambiguous rather than a claim about a string."""
+        from urllib.parse import urljoin
+
+        current = "https://example.test/monitors/mon_123"
+
+        assert urljoin(current, "?window=7") == "https://example.test/monitors/mon_123?window=7"
+        assert urljoin("https://example.test", "?window=7") == "https://example.test?window=7"
+
+
+class TestApiRoutesAreNotNavigablePages:
+    """An `api` directory may sit at any depth under `pages/`, so the client's
+    "is this an API route?" test has to be a segment match, not a `/api/`
+    prefix.
+
+    `pages/s/[slug]/api/v2/export.py` serves `/s/{slug}/api/v2/export`. While
+    the client asked for the literal prefix, a link to that endpoint was
+    treated as an ordinary page: hovering it fired an unsolicited `GET` at the
+    endpoint from a mouse movement, and clicking it was intercepted by the
+    delegated listener, which fed the endpoint's own JSON to the navigation
+    cache — the address bar changed to the endpoint while the page already on
+    screen re-rendered with empty props.
+    """
+
+    @staticmethod
+    def _entry(tmp_path: Path) -> str:
+        return _render_client_entry(create_project(tmp_path))
+
+    def test_one_rule_is_emitted_into_both_client_modules(self, tmp_path: Path) -> None:
+        """The runtime module and the router entry get the same helper text, so
+        the two copies cannot drift from each other or from the server."""
+        from pyxle.devserver.client_files import (
+            IS_API_PATH_JS,
+            _render_client_runtime_index,
+        )
+
+        runtime = _render_client_runtime_index()
+        entry = self._entry(tmp_path)
+
+        for source in (runtime, entry):
+            # Identical text, modulo the indentation each template sits at.
+            assert _squash_js(IS_API_PATH_JS) in _squash_js(source)
+            assert source.count("function isApiPath(") == 1
+            # The prefix test is what the nested endpoints slipped through.
+            assert "startsWith('/api/')" not in source
+
+    def test_the_helper_names_the_server_rule_it_mirrors(self) -> None:
+        """A future change to the server rule has to find its way here, so the
+        helper points at the function that owns the definition."""
+        from pyxle.devserver.client_files import IS_API_PATH_JS
+
+        assert "scanner.py::_in_api_directory" in IS_API_PATH_JS
+
+    def test_the_click_path_is_guarded_too(self, tmp_path: Path) -> None:
+        """`normalizeHref` refusing an endpoint is not enough on its own: the
+        document-level listener that intercepts every anchor click does not go
+        through it, so without its own guard it picks the link back up and
+        preventDefault()s the browser's correct behaviour."""
+        entry = self._entry(tmp_path)
+
+        should_handle = _extract_js_function(entry, "shouldHandleClick")
+        assert "isApiPath(url.pathname)" in should_handle
+
+    def test_the_guard_is_not_in_normalize_url(self, tmp_path: Path) -> None:
+        """`normalizeUrl` is a pure coercion, and `handlePopState` runs every
+        history entry through it — a policy guard there would break back and
+        forward navigation."""
+        entry = self._entry(tmp_path)
+
+        assert "isApiPath" not in _extract_js_function(entry, "normalizeUrl")
+
+    @pytest.mark.skipif(
+        shutil.which("node") is None,
+        reason="Node.js is required to execute the emitted client runtime",
+    )
+    def test_the_emitted_runtime_declines_api_routes(self, tmp_path: Path) -> None:
+        """Run the real emitted JavaScript under node and check what it does.
+
+        Substring assertions cannot show that a link to a nested endpoint is
+        actually refused by every path that can start a navigation, so this
+        drives the emitted module itself: the `pyxle/client` runtime through
+        its own exported `navigate()`/`prefetch()` (both of which go through
+        `normalizeHref`), and the router entry's two delegated listeners.
+        """
+        from pyxle.devserver.client_files import _render_client_runtime_index
+
+        results = _run_client_runtime_under_node(
+            tmp_path,
+            _render_client_runtime_index(),
+            self._entry(tmp_path),
+            [
+                "/api/v2/export",
+                "/s/acme/api/v2/export",
+                "/_admin/api/health",
+                "/deep/nest/api/thing",
+                "/%61pi/v2/export",
+                "/dashboard/reports",
+                "/apiary/keepers",
+                "/rapid/build",
+            ],
+        )
+
+        endpoints = [
+            "/api/v2/export",
+            # The nested cases are the point: the top-level one already worked,
+            # which is exactly why this survived review.
+            "/s/acme/api/v2/export",
+            "/_admin/api/health",
+            "/deep/nest/api/thing",
+            # The server routes on the decoded path, so the client decodes too.
+            "/%61pi/v2/export",
+        ]
+        for path in endpoints:
+            assert results[path] == {
+                "spaNavigated": False,
+                "prefetched": False,
+                "clickIntercepted": False,
+                "hoverFetched": False,
+            }, f"{path} was treated as a page"
+
+        # A segment match, not a substring one: an ordinary page whose path
+        # merely contains the letters "api" still navigates client-side.
+        for path in ("/dashboard/reports", "/apiary/keepers", "/rapid/build"):
+            assert results[path] == {
+                "spaNavigated": True,
+                "prefetched": True,
+                "clickIntercepted": True,
+                "hoverFetched": True,
+            }, f"{path} lost client-side navigation"
+
+    @pytest.mark.skipif(
+        shutil.which("node") is None,
+        reason="Node.js is required to execute the emitted client runtime",
+    )
+    def test_a_page_url_with_an_api_segment_falls_back_to_a_full_load(
+        self, tmp_path: Path
+    ) -> None:
+        """The one case the rule is deliberately too broad for.
+
+        A directory named `api` cannot hold pages, but a *URL* with an `api`
+        segment can still be one: `pages/docs/[...slug].pyxl` serves
+        `/docs/api/config`, and so does any dynamic segment a request fills in
+        with "api". Such a URL is indistinguishable from an endpoint's, and the
+        client resolves the ambiguity towards safety — it is not
+        client-navigated, so it loads the way it would with JavaScript
+        disabled. That costs a page transition; guessing the other way costs an
+        unsolicited request to whatever the URL turns out to address.
+        """
+        from pyxle.devserver.client_files import _render_client_runtime_index
+
+        results = _run_client_runtime_under_node(
+            tmp_path,
+            _render_client_runtime_index(),
+            self._entry(tmp_path),
+            ["/docs/api/config"],
+        )
+
+        page = results["/docs/api/config"]
+        assert page["spaNavigated"] is False
+        assert page["hoverFetched"] is False
+        # Declining the click is what makes the fallback work: the browser
+        # follows the link itself and the page renders from the server.
+        assert page["clickIntercepted"] is False

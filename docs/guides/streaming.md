@@ -180,13 +180,47 @@ compression to keep the streaming benefit.
 Because the document `<head>` is flushed *before* the component renders (that's
 what makes the shell fast), only the **static** head is available to a streamed
 page: the `HEAD` variable (including a `HEAD` callable evaluated from loader
-data) and `<Head>` blocks declared in your JSX or layout.
+data), an ancestor layout's own `HEAD` variable, and `<Head>` blocks declared in
+your JSX or layout.
 
 A `<Head>` element registered *during* render — i.e. returned from a component
 as it renders — arrives too late to reach the already-flushed head and is
 omitted from a streamed page. Put meta tags a streamed page needs in the `HEAD`
 variable, not in a runtime-rendered `<Head>`. This only affects pages that opt
 into streaming; buffered pages merge runtime `<Head>` exactly as before.
+
+### Static means *literal*, not just "declared in JSX"
+
+`<Head>` blocks are read from your source at compile time, before any of it has
+run, so an element that interpolates anything is not static — there is no
+render to fill it in, and the braces are not markup. Those elements are
+[dropped rather than emitted](head-management.md#expressions-are-evaluated-by-the-render),
+because the alternative is a literal `{data.title}` in the browser tab and a
+`href="{faviconUrl}"` the browser requests as a relative URL:
+
+```jsx
+<Head>
+  <title>{data.title}</title>                       {/* dropped on a streamed page */}
+  <meta name="description" content={data.excerpt} />{/* dropped on a streamed page */}
+  <title>Acme Status</title>                        {/* kept — no expression */}
+</Head>
+```
+
+So on a streamed page, a `<Head>` element that interpolates loader data
+contributes **nothing**, and the page falls back to whatever a layout supplies —
+or, failing that, to the [default title](head-management.md#default-title),
+your app's name.
+This is the same limitation as above wearing a different hat: anything a
+streamed page's head genuinely needs from loader data belongs in a `HEAD`
+callable, which runs on the server before the flush.
+
+```python
+def HEAD(data):
+    return [
+        f'<title>{data["title"]}</title>',
+        f'<meta name="description" content="{data["excerpt"]}" />',
+    ]
+```
 
 ## Custom middleware and streaming
 

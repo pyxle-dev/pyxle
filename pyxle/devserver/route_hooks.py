@@ -182,10 +182,19 @@ async def attach_route_metadata(context: RouteContext, request: Request, call_ne
 
 
 async def enforce_allowed_methods(context: RouteContext, request: Request, call_next):
-    """Default API policy returning 405 for disallowed HTTP verbs."""
+    """Default API policy returning 405 for disallowed HTTP verbs.
+
+    ``HEAD`` is allowed wherever ``GET`` is. RFC 9110 defines it as identical
+    to GET without a body, Starlette already routes it to the GET handler, and
+    every link checker, health prober and ``curl -I`` in existence assumes it —
+    so refusing it here made the framework advertise a GET route and answer 405
+    to half the clients that would use it.
+    """
 
     method = request.method.upper()
     allowed = context.allowed_methods or ("GET",)
+    if method == "HEAD" and "GET" in allowed:
+        return await call_next(request)
     if context.target == "api" and method not in allowed:
         detail = {
             "error": "method_not_allowed",

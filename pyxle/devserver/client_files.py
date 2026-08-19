@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from textwrap import dedent
+from textwrap import dedent, indent
 
 from .settings import DevServerSettings
 
@@ -11,6 +11,61 @@ CLIENT_ENTRY_FILENAME = "client-entry.js"
 CLIENT_HTML_FILENAME = "index.html"
 VITE_CONFIG_FILENAME = "vite.config.js"
 TSCONFIG_FILENAME = "tsconfig.json"
+
+# Placeholder replaced by ``IS_API_PATH_JS`` in every generated module that
+# needs the rule. Kept as a placeholder rather than an f-string so the JS
+# templates stay literal (they are full of braces).
+_IS_API_PATH_PLACEHOLDER = "__PYXLE_IS_API_PATH__"
+
+#: The client's copy of the server's API-route rule.
+#:
+#: The server decides in :func:`pyxle.devserver.scanner._in_api_directory`:
+#: a ``.py`` file is an endpoint whenever the URL it maps to contains an
+#: ``api`` segment, at any depth. ``pages/s/[slug]/api/v2/summary.json.py``
+#: serves ``/s/{slug}/api/v2/summary.json``, so testing the literal prefix
+#: ``/api/`` recognises only the top-level endpoints and treats every nested
+#: one as an ordinary page.
+#:
+#: Emitted verbatim into both generated client modules — the ``pyxle/client``
+#: runtime and the router entry — so the two copies cannot drift from each
+#: other, and a future change to the server rule has one place to land.
+IS_API_PATH_JS = dedent(
+    """\
+    // Mirrors pyxle/devserver/scanner.py::_in_api_directory — a URL addresses
+    // an API endpoint when any of its path segments is exactly `api`, at any
+    // depth. Keep the two in step: this is the client half of one rule.
+    //
+    // The path is percent-decoded first because the server matches on the
+    // decoded path, so `/%61pi/x` is the same route to it. A malformed escape
+    // cannot be decoded; the raw path is then the best available answer.
+    function isApiPath(pathname) {
+      let decoded = pathname;
+      try {
+        decoded = decodeURIComponent(pathname);
+      } catch (error) {
+        decoded = pathname;
+      }
+      return decoded.split('/').includes('api');
+    }"""
+)
+
+
+def _inject_api_path_helper(content: str) -> str:
+    """Replace the ``isApiPath`` placeholder with the shared helper.
+
+    The placeholder sits on a line of its own; the helper inherits that line's
+    indentation so the generated module stays readable regardless of how far
+    each template is indented after :func:`~textwrap.dedent`.
+    """
+
+    lines: list[str] = []
+    for line in content.split("\n"):
+        if line.strip() != _IS_API_PATH_PLACEHOLDER:
+            lines.append(line)
+            continue
+        prefix = line[: len(line) - len(line.lstrip())]
+        lines.append(indent(IS_API_PATH_JS, prefix))
+    return "\n".join(lines)
 
 
 def _write_text_if_changed(path: Path, contents: str) -> None:
@@ -85,7 +140,7 @@ def _render_client_index() -> str:
 
 
 def _render_client_runtime_index() -> str:
-    return (
+    module = (
         dedent(
             """
             import React from 'react';
@@ -179,6 +234,8 @@ def _render_client_runtime_index() -> str:
               }
             }
 
+            __PYXLE_IS_API_PATH__
+
             function normalizeHref(candidate) {
               if (candidate == null) {
                 return null;
@@ -189,12 +246,19 @@ def _render_client_runtime_index() -> str:
                 return null;
               }
               try {
-                const url = new URL(candidate, window.location.origin);
+                // Resolved against the current URL, not the origin. A
+                // relative reference is defined against the document's own
+                // address (RFC 3986 §5): `?days=7` means "this page, with a
+                // different query", and `../x` means one level up. Resolving
+                // against the origin turns every one of those into a link to
+                // the site root — so a query-only filter or tab control
+                // silently navigates home, which is exactly what it did.
+                const url = new URL(candidate, window.location.href);
                 if (url.origin !== window.location.origin) {
                   return null;
                 }
                 // API routes and static files are not navigable pages.
-                if (url.pathname.startsWith('/api/') || /[.][a-zA-Z0-9]+$/.test(url.pathname)) {
+                if (isApiPath(url.pathname) || /[.][a-zA-Z0-9]+$/.test(url.pathname)) {
                   return null;
                 }
                 // Same-page hash change — let browser handle scroll.
@@ -389,6 +453,7 @@ def _render_client_runtime_index() -> str:
         ).strip()
         + "\n"
     )
+    return _inject_api_path_helper(module)
 
 
 def _project_uses_tailwind(project_root: Path) -> bool:
@@ -1078,7 +1143,10 @@ def _render_client_entry(settings: DevServerSettings) -> str:
                   return true;
                 }
                 try {
-                  const target = new URL(href, window.location.origin);
+                  // Same base as navigation uses, or the cache key for a
+                  // relative href would name a different page than the one the
+                  // click actually loads.
+                  const target = new URL(href, window.location.href);
                   const key = getCacheKey(target);
                   const removed =
                     navigationCache.delete(key) ||
@@ -1475,6 +1543,14 @@ def _render_client_entry(settings: DevServerSettings) -> str:
               updatePropsTag(props);
             }
 
+            __PYXLE_IS_API_PATH__
+
+            // ``normalizeUrl`` deliberately stays a pure coercion — string or
+            // anchor to URL — with no policy in it. ``handlePopState`` runs
+            // every history entry through it, so a guard here would break
+            // back/forward; the API rule belongs at the two places that decide
+            // to *start* a navigation, ``shouldHandleClick`` and
+            // ``handleLinkHover``.
             function normalizeUrl(target) {
               if (target instanceof URL) {
                 return target;
@@ -1521,6 +1597,18 @@ def _render_client_entry(settings: DevServerSettings) -> str:
               }
               const url = normalizeUrl(anchor.href);
               if (!url || url.origin !== window.location.origin) {
+                return null;
+              }
+              // An API route is not a page. Without this the delegated click
+              // listener intercepts the link, calls preventDefault(), and
+              // hands the endpoint's own JSON to the navigation cache: the
+              // address bar changes to the endpoint while the page that is
+              // already on screen re-renders with empty props. Declining the
+              // click lets the browser follow the link, which is what a link
+              // to an endpoint should do — and is already what a <Link> to one
+              // expects, since normalizeHref() refuses it on the component
+              // side and relies on this listener not picking it back up.
+              if (isApiPath(url.pathname)) {
                 return null;
               }
               const href = anchor.getAttribute('href') || '';
@@ -2067,11 +2155,14 @@ def _render_client_entry(settings: DevServerSettings) -> str:
                 return;
               }
               // Skip API routes and static files — only prefetch page routes.
+              // Prefetching an endpoint issues an unsolicited GET from a mouse
+              // movement, which for a non-idempotent or expensive endpoint is a
+              // real side effect the user never asked for.
               // (The dot is written [.], not backslash-escaped: this JS lives
               // in a non-raw Python string, where a backslash escape here is
               // a SyntaxWarning on every compile and an error in future Python.)
               const p = url.pathname;
-              if (p.startsWith('/api/') || /[.][a-zA-Z0-9]+$/.test(p)) {
+              if (isApiPath(p) || /[.][a-zA-Z0-9]+$/.test(p)) {
                 return;
               }
               prefetchNavigation(url).catch(() => {});
@@ -2511,7 +2602,7 @@ def _render_client_entry(settings: DevServerSettings) -> str:
       style_lines = [f"import '{sheet.import_specifier}';" for sheet in settings.global_stylesheets]
       style_block = "\n".join(style_lines) + "\n"
     content = content.replace("__PYXLE_GLOBAL_STYLE_IMPORTS__\n", style_block, 1)
-    return content
+    return _inject_api_path_helper(content)
 
 
 def _render_tsconfig() -> str:

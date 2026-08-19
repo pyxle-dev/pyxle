@@ -46,11 +46,28 @@ def _iter_page_metadata(metadata_dir: Path) -> Iterable[tuple[Path, Path]]:
 
 
 def _discover_wrappers(relative_dir: Path, settings: DevServerSettings) -> List[WrapperSpec]:
+    """Every layout and template that wraps a page, closest first.
+
+    Stops at a layout declaring ``STANDALONE = True``: that layout is the root
+    of its own chain, so nothing above it applies. The case is a section of a
+    site that is not part of the app around it — a public status page inside an
+    admin console, a print view, an embedded widget — where the alternative is
+    teaching the outer layout to recognise each such section and render
+    nothing, a conditional that grows a branch per child and puts knowledge of
+    every one of them in the parent.
+    """
     client_pages_root = settings.client_build_dir / "pages"
     ancestors = _ancestor_dirs(relative_dir)
     wrappers: List[WrapperSpec] = []
 
     for ancestor in ancestors:
+        # Outermost first, because that is the order they nest in. So a
+        # standalone layout *discards* what has been collected rather than
+        # stopping the walk — everything before it is an ancestor it has
+        # declared it does not want.
+        if _is_standalone(ancestor, settings):
+            wrappers.clear()
+
         for kind, base_name in _LAYOUT_FILENAMES.items():
             candidate = _client_component_path(client_pages_root, ancestor, base_name)
             if candidate.exists():
@@ -61,6 +78,18 @@ def _discover_wrappers(relative_dir: Path, settings: DevServerSettings) -> List[
                 wrappers.append(WrapperSpec(kind=kind, client_path=candidate, relative_path=Path(relative)))
 
     return wrappers
+
+
+def _is_standalone(ancestor: Path, settings: DevServerSettings) -> bool:
+    """Whether the layout in *ancestor* declares itself the root of its chain."""
+    import json
+
+    relative = (ancestor / "layout.json") if ancestor != Path(".") else Path("layout.json")
+    metadata_path = settings.metadata_build_dir / "pages" / relative
+    try:
+        return json.loads(metadata_path.read_text()).get("standalone") is True
+    except (OSError, ValueError):
+        return False
 
 
 def _apply_wrappers(

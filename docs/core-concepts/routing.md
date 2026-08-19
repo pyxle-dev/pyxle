@@ -104,10 +104,15 @@ Python files under `pages/api/` become API endpoints:
 | `pages/api/users.py` | `/api/users` |
 | `pages/api/users/[id].py` | `/api/users/:id` |
 
-API routes must live under the top-level `pages/api/` directory; use
-`pages/api/<nested>/file.py` to nest within the API tree. A `.py` file
-placed elsewhere under `pages/` is ignored — it becomes neither an API
-route nor a page.
+An `api` directory may sit at any depth, so `pages/s/[slug]/api/v2/export.py`
+serves `/s/:slug/api/v2/export`. A `.py` file outside one is ignored — it
+becomes neither an API route nor a page, which is what makes it safe to
+colocate helpers with your pages.
+
+An `api` directory is server ground throughout: it holds endpoints, so a
+`.pyxl` page in one is refused, and the client assets beside them are never
+shipped to the browser. Only directories count — `pages/api.pyxl` is an
+ordinary page.
 
 API routes are standard Python files (not `.pyxl`). See [API Routes](../guides/api-routes.md) for details.
 

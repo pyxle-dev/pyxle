@@ -24,7 +24,7 @@ from starlette.exceptions import HTTPException
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import JSONResponse, PlainTextResponse, Response
+from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
 from starlette.routing import Mount, Route, Router, WebSocketRoute
 from starlette.staticfiles import NotModifiedResponse, StaticFiles
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
@@ -49,6 +49,11 @@ from pyxle.ssr.view import (
     build_streaming_page_response,
 )
 
+from .build_errors import (
+    BuildFailureRegistry,
+    find_build_failure,
+    render_build_failure_document,
+)
 from .error_pages import ErrorBoundaryRegistry, build_error_boundary_registry
 from .middleware import (
     MiddlewareHookError,
@@ -56,7 +61,8 @@ from .middleware import (
     load_custom_middlewares,
 )
 from .overlay import OverlayManager
-from .proxy import ViteProxy
+from .path_utils import url_path_is_under
+from .proxy import API_ROUTE_MARKER, ViteProxy
 from .route_hooks import (
     DEFAULT_ACTION_POLICIES,
     DEFAULT_API_POLICIES,
@@ -229,6 +235,11 @@ class StaticFileIndex:
             self._paths = fresh
 
 
+#: URL namespace the client build output is served under. It is a path
+#: *segment*: ``/client/app.js`` is a bundle, ``/client-logo.svg`` is one of
+#: the app's own public files and has nothing to do with it.
+_CLIENT_URL_PREFIX = "/client"
+
 # Per-file and per-process budgets for the in-memory static cache. Both are
 # enforced once at startup (the production build is immutable, so the cache
 # never grows afterwards — bounded by construction, no runtime eviction).
@@ -393,7 +404,9 @@ class StaticAssetsMiddleware:
         self._public_paths = (
             public_index if public_index is not None else StaticFileIndex(public_directory)
         )
-        self._client_paths = _index_static_files(client_directory, prefix="/client")
+        self._client_paths = _index_static_files(
+            client_directory, prefix=_CLIENT_URL_PREFIX
+        )
 
         self._memory_cache: dict[str, _CachedAsset] = {}
         if cache_in_memory:
@@ -405,7 +418,7 @@ class StaticAssetsMiddleware:
             )
             client_cache, budget = _load_static_memory_cache(
                 client_directory,
-                prefix="/client",
+                prefix=_CLIENT_URL_PREFIX,
                 max_file_bytes=cache_max_file_bytes,
                 budget=budget,
             )
@@ -428,7 +441,11 @@ class StaticAssetsMiddleware:
             await self._send_cached(cached, scope, receive, send, method=method)
             return
 
-        if self._client_static is not None and path.startswith("/client"):
+        # Whole-segment comparison: ``/client-logo.svg`` is a file in the app's
+        # ``public/`` directory, not part of the ``/client`` build namespace.
+        under_client = url_path_is_under(path, _CLIENT_URL_PREFIX)
+
+        if self._client_static is not None and under_client:
             # O(1) membership check first: only touch the filesystem for a path
             # that is actually a known static asset, so dynamic requests that
             # merely share the path space don't pay a stat + caught 404.
@@ -437,12 +454,12 @@ class StaticAssetsMiddleware:
                 scope,
                 receive,
                 send,
-                prefix="/client",
+                prefix=_CLIENT_URL_PREFIX,
                 debug=self._debug,
             ):
                 return
 
-        if self._public_static is not None and not path.startswith("/client"):
+        if self._public_static is not None and not under_client:
             if path in self._public_paths and await self._try_static(
                 self._public_static, scope, receive, send, debug=self._debug
             ):
@@ -492,7 +509,10 @@ class StaticAssetsMiddleware:
         selected_scope = scope
         original_path = scope.get("path", "")
         if prefix:
-            if not original_path.startswith(prefix):
+            # Only a whole-segment match is inside the namespace: stripping
+            # "/client" off "/client-logo.svg" would ask the client build for
+            # "-logo.svg", a file that has nothing to do with the request.
+            if not url_path_is_under(original_path, prefix):
                 return False
             stripped = original_path[len(prefix) :] or "/"
             candidate = dict(scope)
@@ -505,7 +525,7 @@ class StaticAssetsMiddleware:
         # Vite hashed assets (e.g. /client/dist/assets/index-a1b2c3d4.js)
         # are immutable and can be cached forever; see _static_cache_control.
         cache_control = _static_cache_control(
-            original_path, is_client=prefix == "/client", debug=debug
+            original_path, is_client=prefix == _CLIENT_URL_PREFIX, debug=debug
         )
 
         async def _send_with_cache_headers(message):
@@ -570,6 +590,12 @@ def build_api_router(
             # hooks that need to run for WS upgrades should do so in the
             # WS handler body.
             router.routes.append(WebSocketRoute(route.path, ws_handler))
+
+    # Tag them, so the dev-server Vite proxy can tell an endpoint that happens
+    # to end in `.js` from an actual client asset. Set here rather than derived
+    # there, because "what is an API route" is this function's answer to give.
+    for built in router.routes:
+        setattr(built, API_ROUTE_MARKER, True)
 
     return router
 
@@ -1203,6 +1229,39 @@ async def _maybe_markdown_response(
     return response
 
 
+def _build_failure_response(
+    request: Request, route: PageRoute, *, settings: DevServerSettings
+) -> HTMLResponse | None:
+    """The compile error to serve instead of rendering *route*, if any.
+
+    ``pyxle dev`` keeps the previous pass' compiled artifacts when a rebuild
+    fails, so without this check the route would answer ``200`` with the last
+    version of the page that compiled — a healthy-looking page for a file that
+    does not build. Returning the failure instead is what makes the browser
+    agree with the terminal.
+
+    Returns ``None`` for every page whose own source and layout chain compiled,
+    which is every page in production (no registry is ever created there) and
+    every page in dev while the build is clean.
+    """
+    registry = getattr(request.app.state, "pyxle_build_failures", None)
+    failure = find_build_failure(registry, route, url_path=request.url.path)
+    if failure is None:
+        return None
+    return HTMLResponse(
+        # The URL as requested, not the route pattern: it is what the developer
+        # typed, and when the failure was matched *by* URL the pattern belongs
+        # to a different (working) page entirely.
+        render_build_failure_document(
+            failure, settings=settings, route_path=request.url.path
+        ),
+        status_code=500,
+        # The page is a snapshot of a broken build; caching it would outlive
+        # the fix. Nothing may store it — not the browser, not a proxy.
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 def _make_page_handler(
     route: PageRoute,
     *,
@@ -1217,6 +1276,9 @@ def _make_page_handler(
     llms_on = llms.is_enabled(llms_cfg)
 
     async def handler(request: Request):  # pragma: no cover - thin wrapper
+        stale = _build_failure_response(request, route, settings=settings)
+        if stale is not None:
+            return stale
         wants_navigation_payload = request.headers.get(_NAVIGATION_HEADER) == "1"
         if wants_navigation_payload:
             response = await build_page_navigation_response(
@@ -1372,7 +1434,7 @@ async def _dispatch_action(
         get_cached_body_model,
         validate_body,
     )
-    from pyxle.runtime import ActionError, ValidationActionError
+    from pyxle.runtime import ActionCookies, ActionError, ValidationActionError
 
     # L-9: reject obviously invalid action names early.
     if not SAFE_IDENTIFIER_RE.match(action_name):
@@ -1438,6 +1500,9 @@ async def _dispatch_action(
     # Expose request.state.background so an action can schedule fire-and-forget
     # work that runs after the response is sent (Starlette BackgroundTasks).
     request.state.background = BackgroundTasks()
+    # …and request.state.cookies, so an action can set one on the response the
+    # dispatcher builds. An action returns a dict and never sees that response.
+    request.state.cookies = ActionCookies()
 
     _action_start = time.perf_counter()
     try:
@@ -1459,7 +1524,22 @@ async def _dispatch_action(
             payload["data"] = exc.data
         if exc.fields:
             payload["fields"] = exc.fields
-        return JSONResponse(payload, status_code=exc.status_code)
+        # A refusal is still the action's own answer, and it may want to record
+        # something on the way out — a failed-attempt counter, a cleared session.
+        error_response = JSONResponse(payload, status_code=exc.status_code)
+        # Work the action scheduled *before* it raised has already been asked
+        # for: ``add_task`` is a statement that ran, like the database write on
+        # the line above it, and a later ``raise`` doesn't undo those either.
+        # Dropping it would make it the one statement in an action silently
+        # reverted by a refusal — and dropping is invisible, where running is
+        # observable. Ordering stays the author's control: schedule before the
+        # checks for work that must happen either way (an audit record, a
+        # failed-attempt counter), after them for work that must not happen on
+        # failure (a welcome email). An *unhandled* exception is different and
+        # is left alone below: the action crashed, so its intent is unknown.
+        if request.state.background.tasks:
+            error_response.background = request.state.background
+        return request.state.cookies.apply(error_response)
     except Exception as exc:
         from pyxle.ssr.view import (  # noqa: PLC0415
             MissingRequestStateError,
@@ -1520,7 +1600,7 @@ async def _dispatch_action(
     # is sent. No-op when the action scheduled nothing.
     if request.state.background.tasks:
         response.background = request.state.background
-    return response
+    return request.state.cookies.apply(response)
 
 
 def _make_action_handler(route: ActionRoute, *, debug: bool = False):
@@ -1942,6 +2022,10 @@ def create_starlette_app(
         set_active_context,
     )
 
+    # Imported here rather than inside the lifespan: startup and shutdown are
+    # separate closures, and both need ``set_active_queue``.
+    from pyxle.tasks import TaskQueue, set_active_queue  # noqa: PLC0415
+
     _plugin_specs = tuple(
         PluginSpec.from_config_entry(entry, source=str(settings.project_root))
         for entry in settings.plugins
@@ -1949,8 +2033,12 @@ def create_starlette_app(
     _plugins = load_plugins(_plugin_specs)
     _plugin_ctx = PluginContext(settings=settings)
 
-    @asynccontextmanager
-    async def lifespan(app: Starlette):  # pragma: no cover - lifecycle orchestration
+    async def _run_startup(app: Starlette):  # pragma: no cover - lifecycle orchestration
+        """Bring every runtime service up, returning the task queue for teardown.
+
+        Kept separate from :func:`lifespan` so a failure here can be reported
+        before it aborts the boot — see the handler in ``lifespan``.
+        """
         # Configure OpenTelemetry tracing once at startup when enabled. Raises
         # if the [observability-otel] extra is missing, so a misconfiguration
         # fails loudly rather than silently dropping traces.
@@ -1981,8 +2069,6 @@ def create_starlette_app(
         set_active_context(_plugin_ctx)
         # Start the in-process background task queue and register it so
         # ``pyxle.tasks.enqueue(...)`` works from any loader/action.
-        from pyxle.tasks import TaskQueue, set_active_queue  # noqa: PLC0415
-
         task_queue = TaskQueue()
         await task_queue.start()
         app.state.pyxle_tasks = task_queue
@@ -2010,6 +2096,23 @@ def create_starlette_app(
         _broker_start = getattr(app.state.pyxle_broker, "start", None)
         if _broker_start is not None:
             await _broker_start()
+        return task_queue
+
+    @asynccontextmanager
+    async def lifespan(app: Starlette):  # pragma: no cover - lifecycle orchestration
+        try:
+            task_queue = await _run_startup(app)
+        except Exception as exc:
+            # The ASGI lifespan is the last thing that can fail on the way up,
+            # and its traceback goes to uvicorn's logger — which under
+            # ``pyxle dev`` is routed to the browser console, i.e. nowhere the
+            # developer is looking when the server never came up at all. Say
+            # what happened on the terminal before letting the boot abort.
+            import traceback as _traceback  # noqa: PLC0415
+
+            console_logger.error(f"Application startup failed: {exc}")
+            console_logger.debug(_traceback.format_exc())
+            raise
         try:
             yield
         finally:
@@ -2202,6 +2305,8 @@ def create_starlette_app(
         middleware=middleware_stack,
         lifespan=lifespan,
     )
+    # Replace Starlette's plain-text 404 with Pyxle's designed status document.
+    app.add_exception_handler(404, _make_default_not_found_handler(settings))
 
     app.state.pyxle_metrics = metrics_registry
     # Shared public static-file index (None when static serving is off). The dev
@@ -2231,6 +2336,12 @@ def create_starlette_app(
     app.state.vite_proxy = vite_proxy
     app.state.ssr_renderer = renderer
     app.state.overlay = overlay
+    # Dev-only: which sources the last build could not compile. Page handlers
+    # consult it so a route whose source is broken answers with the compile
+    # error instead of the previous build's artifacts. Lives on app.state (like
+    # the overlay) so it survives hot route-table refreshes; never created in
+    # production, where a compile error stops the build before the app exists.
+    app.state.pyxle_build_failures = BuildFailureRegistry() if settings.debug else None
     # Studio's manager lives on app.state (like the overlay) so its state —
     # the recent-request ring buffer and SSE subscribers — survives hot
     # route-table refreshes, which rebuild routes but never touch app.state.
@@ -2265,8 +2376,6 @@ def _make_not_found_handler(
 ):
     """Create a catch-all handler that renders the nearest ``not-found.pyxl``."""
 
-    from starlette.responses import HTMLResponse as _HTMLResponse
-
     async def handler(request: Request):  # pragma: no cover - thin wrapper
         response = await build_not_found_response(
             request=request,
@@ -2277,10 +2386,56 @@ def _make_not_found_handler(
         )
         if response is not None:
             return response
-        # No not-found boundary rendered — return a plain 404.
-        return _HTMLResponse("Not Found", status_code=404)
+        # A not-found.pyxl exists somewhere in the tree but none covers this
+        # path — fall back to the framework's designed 404.
+        return _default_not_found_response(request, settings)
 
     handler.__name__ = "pyxle_not_found"
+    return handler
+
+
+def _default_not_found_response(
+    request: Request, settings: DevServerSettings, exc: Exception | None = None
+):
+    """Pyxle's built-in 404 response.
+
+    HTML clients get the designed status document (which, in dev, names
+    ``pages/not-found.pyxl`` as the way to replace it). Everything else — fetch
+    calls, API consumers, curl — keeps exactly what Starlette would have sent,
+    including an ``HTTPException``'s own ``detail`` and headers: an endpoint
+    raising ``HTTPException(404, "User not found")`` must still say so, and a
+    JSON caller has no use for a styled page.
+    """
+    from starlette.responses import HTMLResponse, PlainTextResponse
+
+    from pyxle.ssr.template import render_not_found_document
+
+    detail = getattr(exc, "detail", None) or "Not Found"
+    headers = getattr(exc, "headers", None)
+    if "text/html" not in request.headers.get("accept", ""):
+        return PlainTextResponse(detail, status_code=404, headers=headers)
+    return HTMLResponse(
+        render_not_found_document(debug=settings.debug),
+        status_code=404,
+        headers=headers,
+    )
+
+
+def _make_default_not_found_handler(settings: DevServerSettings):
+    """Exception handler replacing Starlette's stock 404.
+
+    Starlette answers an unmatched route with a nine-byte ``text/plain`` body.
+    That is what a newcomer sees after their first typo'd URL, and it reads as
+    if the server fell over rather than as a page that simply isn't there —
+    especially next to the designed document the 500 path already serves.
+    Registering this handler is what makes the *default* 404 look designed;
+    adding ``pages/not-found.pyxl`` still takes precedence via the catch-all
+    route, which matches before any exception is raised.
+    """
+
+    async def handler(request: Request, exc: Exception):
+        return _default_not_found_response(request, settings, exc)
+
     return handler
 
 
@@ -2379,15 +2534,17 @@ async def _readyz_endpoint(request: Request) -> JSONResponse:
 
 def _make_metrics_endpoint(token: str | None):
     """Build the opt-in Prometheus metrics endpoint, optionally bearer-guarded."""
-    import hmac  # noqa: PLC0415
+    from pyxle.security import constant_time_equals  # noqa: PLC0415
 
     expected = f"Bearer {token}" if token is not None else None
 
     async def _metrics_endpoint(request: Request) -> Response:
         if expected is not None:
             # Constant-time comparison so the token can't be timing-probed.
+            # The header is raw client input decoded as latin-1, so it may hold
+            # non-ASCII characters that ``hmac.compare_digest`` refuses.
             provided = request.headers.get("authorization", "")
-            if not hmac.compare_digest(provided, expected):
+            if not constant_time_equals(provided, expected):
                 return Response("Unauthorized", status_code=401)
         registry = getattr(request.app.state, "pyxle_metrics", None)
         if registry is None:  # pragma: no cover - registry is always set in app

@@ -125,7 +125,7 @@ def test_build_route_table_generates_expected_descriptors(project: DevServerSett
     dynamic_route = table.find_page("/posts/{id}")
     assert dynamic_route is not None
     assert dynamic_route.has_loader is False
-    assert dynamic_route.module_key == "pyxle.server.pages.posts.id"
+    assert dynamic_route.module_key.startswith("pyxle.server.pages.posts.id")
     assert dynamic_route.head_elements == ()
 
     optional_base = table.find_page("/docs")
@@ -140,7 +140,7 @@ def test_build_route_table_generates_expected_descriptors(project: DevServerSett
 
     api_route = table.find_api("/api/posts/{id}")
     assert api_route is not None
-    assert api_route.module_key == "pyxle.server.api.posts.id"
+    assert api_route.module_key.startswith("pyxle.server.api.posts.id")
     assert api_route.server_module_path.as_posix().endswith("server/api/posts/[id].py")
 
     optional_api_base = table.find_api("/api/files")

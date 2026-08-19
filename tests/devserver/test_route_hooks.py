@@ -666,3 +666,31 @@ def test_wrap_with_route_hooks_accepts_partial_without_name():
     assert response.status_code == 200
     assert bytes(response.body) == b"partial-ok"
     assert wrapped.__name__ == "endpoint"
+
+
+def test_head_is_allowed_wherever_get_is():
+    """RFC 9110 defines HEAD as identical to GET without a body, Starlette
+    routes it to the GET handler, and every link checker, health prober and
+    `curl -I` assumes it. Refusing it made the framework advertise a GET route
+    and answer 405 to half the clients that would use it.
+    """
+    context = _make_context(target="api", allowed_methods=("GET", "POST"))
+
+    async def _run():
+        request = _make_request_with(method="HEAD", path="/widgets")
+        return await enforce_allowed_methods(context, request, _sentinel_call_next)
+
+    assert asyncio.run(_run()) is _SENTINEL_RESPONSE
+
+
+def test_head_is_still_refused_where_get_is_not_allowed():
+    """A POST-only endpoint has no GET semantics for HEAD to mirror."""
+    context = _make_context(target="api", allowed_methods=("POST",))
+
+    async def _run():
+        request = _make_request_with(method="HEAD", path="/widgets")
+        return await enforce_allowed_methods(context, request, _sentinel_call_next)
+
+    response = asyncio.run(_run())
+
+    assert response.status_code == 405

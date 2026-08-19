@@ -185,9 +185,15 @@ def test_html_to_markdown_link_without_href():
         ("//cdn.example.com/lib.js", "//cdn.example.com/lib.js"),
         ("mailto:hi@example.com", "mailto:hi@example.com"),
         ("tel:+15550100", "tel:+15550100"),
-        # untouched: API routes
+        # untouched: API routes, at any depth (an `api` directory may sit
+        # anywhere under pages/, so the rule is a segment match, not a prefix)
         ("/api", "/api"),
         ("/api/search?q=x", "/api/search?q=x"),
+        ("/s/acme/api/v2/export", "/s/acme/api/v2/export"),
+        ("/s/acme/api/v2/export?fmt=csv#top", "/s/acme/api/v2/export?fmt=csv#top"),
+        ("/_admin/api/health", "/_admin/api/health"),
+        ("/deep/api", "/deep/api"),
+        ("s/acme/api/v2/export", "s/acme/api/v2/export"),  # relative too
         # untouched: assets and existing .md links
         ("/logo.png", "/logo.png"),
         ("/styles/site.css", "/styles/site.css"),
@@ -202,6 +208,40 @@ def test_html_to_markdown_link_without_href():
 )
 def test_rewrite_internal_href(href, expected):
     assert llms._rewrite_internal_href(href) == expected
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "api/health.py",
+        "api/index.py",
+        "s/[slug]/api/v2/summary.json.py",
+        "_admin/api/health.py",
+        "deep/nest/api/thing.py",
+        "index.pyxl",
+        "s/[slug]/dashboard.pyxl",
+        "apiary/keepers.pyxl",
+        "rapid/build.pyxl",
+    ],
+)
+def test_api_url_rule_matches_the_scanner(relative_path: str) -> None:
+    """``is_api_url_path`` must classify a URL exactly as the scanner classifies
+    the file that serves it.
+
+    The server decides from the source path (``scanner._in_api_directory``); the
+    markdown rewriter and the client runtime decide from the URL. They are one
+    rule expressed twice, so drift between them is what shipped the bug this
+    test guards: an ``api`` directory below the top level made a file an
+    endpoint on the server while every URL-side check still asked for the
+    literal ``/api/`` prefix. Deriving the URL here the same way the router
+    does keeps the two definitions pinned together."""
+    from pyxle.devserver.scanner import _in_api_directory
+    from pyxle.routing.paths import route_path_variants_from_relative
+
+    path = Path(relative_path)
+    url = route_path_variants_from_relative(path).primary
+
+    assert llms.is_api_url_path(url) is _in_api_directory(path), url
 
 
 def test_html_to_markdown_rewrites_links_by_default():

@@ -8,22 +8,30 @@ validation-error response. Actions without a body model get a permissive
 object request body.
 
 The authoritative source is runtime introspection (not compiler metadata), so
-the schema always matches what the dispatcher actually validates. Pydantic is
-the optional ``[pydantic]`` extra; this module imports it lazily and raises
-:class:`PydanticNotInstalledError` if it's absent.
+the schema always matches what the dispatcher actually validates.
+
+Pydantic is the optional ``[pydantic]`` extra, and it is only needed for the
+actions that actually declare a model body: a project whose actions take no
+body — or which has no actions at all — generates its document without it, and
+an empty ``paths`` object is the correct answer for a project with no actions.
+:class:`PydanticNotInstalledError` is raised only when a specific action needs
+a model resolved and Pydantic is absent; it names that action and its file.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 from pyxle.devserver.settings import DevServerSettings
 from pyxle.devserver.validation import (
     PydanticNotInstalledError,
-    _try_import_pydantic,
     resolve_body_model,
 )
+
+if TYPE_CHECKING:  # imported lazily at runtime to avoid a devserver import cycle
+    from pyxle.devserver.routes import ActionRoute
 
 # A reusable schema for the structured validation-error body the dispatcher
 # returns (see pyxle.devserver.validation). Referenced from every validated
@@ -57,10 +65,12 @@ def build_openapi_document(
     title: str = "Pyxle API",
     version: str = "0.1.0",
 ) -> OpenApiResult:
-    """Build the OpenAPI 3.1 document for every ``@action`` in the project."""
-    if _try_import_pydantic() is None:
-        raise PydanticNotInstalledError()
+    """Build the OpenAPI 3.1 document for every ``@action`` in the project.
 
+    Raises :class:`PydanticNotInstalledError` only if an action declares a
+    model-typed body and Pydantic is missing — the document for a project that
+    needs no models is generated either way.
+    """
     # Imported here (not at module top) to avoid a devserver import cycle.
     from pyxle.devserver.registry import load_metadata_registry
     from pyxle.devserver.routes import build_route_table
@@ -89,7 +99,16 @@ def build_openapi_document(
         if action_fn is None or not getattr(action_fn, "__pyxle_action__", False):
             continue
 
-        operation = _build_operation(route, action_fn, schemas)
+        try:
+            operation = _build_operation(route, action_fn, schemas)
+        except PydanticNotInstalledError as exc:
+            # Re-raised with this route's identity: the deeper raise knows only
+            # that *an* action needs a model, and a project-wide walk has to say
+            # which file to edit.
+            raise PydanticNotInstalledError(
+                action=route.action_name,
+                source=_source_label(settings, route),
+            ) from exc
         paths.setdefault(route.path, {})["post"] = operation
 
     document = {
@@ -99,6 +118,23 @@ def build_openapi_document(
         "components": {"schemas": dict(sorted(schemas.items()))},
     }
     return OpenApiResult(document=document, import_errors=import_errors)
+
+
+def _source_label(settings: DevServerSettings, route: ActionRoute) -> str | None:
+    """The route's source file, written the way the user typed it.
+
+    Returns a project-relative path (``pages/signup.pyxl``), the absolute path
+    when the page lives outside the project root, or ``None`` for a route
+    carrying no source — the error then omits the location rather than printing
+    the ``Path(".")`` placeholder.
+    """
+    absolute = route.source_absolute_path
+    if absolute == Path("."):
+        return None
+    try:
+        return absolute.relative_to(settings.project_root).as_posix()
+    except ValueError:
+        return absolute.as_posix()
 
 
 def _operation_id(path: str) -> str:

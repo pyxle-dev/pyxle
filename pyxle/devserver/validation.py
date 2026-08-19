@@ -34,14 +34,29 @@ except ImportError:  # pragma: no cover - 3.9 and earlier
 
 
 class PydanticNotInstalledError(RuntimeError):
-    """An action needs Pydantic to validate its body, but it isn't installed."""
+    """An action needs Pydantic to validate its body, but it isn't installed.
 
-    def __init__(self) -> None:
+    Raised from two places, so the message names the action wherever the caller
+    knows which one it is. The dispatcher (:func:`resolve_body_model`, reached
+    while handling a request for one specific action) raises it bare — "this
+    action" is unambiguous there. Schema generation
+    (:mod:`pyxle.devserver.openapi`) walks every action in the project, so it
+    passes *action* and *source* and the message points at the file to edit.
+    """
+
+    def __init__(self, *, action: str | None = None, source: str | None = None) -> None:
+        if action is None:
+            subject = "This action validates"
+        else:
+            where = f" in {source}" if source else ""
+            subject = f"Action '{action}'{where} validates"
         super().__init__(
-            "This action validates its request body with a Pydantic model, but "
+            f"{subject} its request body with a Pydantic model, but "
             "Pydantic is not installed. Install it with: "
             "pip install 'pyxle-framework[pydantic]'."
         )
+        self.action = action
+        self.source = source
 
 
 @dataclass(frozen=True, slots=True)

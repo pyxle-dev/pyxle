@@ -344,6 +344,22 @@ _BLOCK_TAGS = frozenset(
 )
 
 
+def is_api_url_path(path: str) -> bool:
+    """Return ``True`` when a URL path addresses an API route.
+
+    The server's rule, read off the URL instead of the source file: a path
+    addresses an endpoint when any of its segments is exactly ``api``, at any
+    depth. Mirrors :func:`pyxle.devserver.scanner._in_api_directory`, which
+    decides the same thing from the file's path — ``pages/s/[slug]/api/v2/
+    summary.json.py`` serves ``/s/{slug}/api/v2/summary.json``, so a test on
+    the literal prefix ``/api/`` recognises only the top-level endpoints.
+    Keep this in step with that function, and with ``IS_API_PATH_JS`` in
+    :mod:`pyxle.devserver.client_files`, which is the same rule in JavaScript.
+    """
+
+    return "api" in path.split("/")
+
+
 def _rewrite_internal_href(href: str) -> str:
     """Rewrite an internal page href to its ``.md`` URL; leave everything else.
 
@@ -351,8 +367,9 @@ def _rewrite_internal_href(href: str) -> str:
     ``/about?x=1#y`` → ``/about.md?x=1#y``, ``/`` → ``/index.md`` — keeping
     query strings and fragments intact. Left untouched: URLs with a scheme or
     host (``https://…``, ``mailto:``, ``tel:``, protocol-relative ``//host``),
-    ``/api/`` routes, fragment- or query-only links, and paths whose last
-    segment has a file extension (assets, and links already ending in ``.md``).
+    API routes at any depth (``/api/health``, ``/s/acme/api/v2/export``),
+    fragment- or query-only links, and paths whose last segment has a file
+    extension (assets, and links already ending in ``.md``).
     """
     try:
         parts = urlsplit(href)
@@ -363,7 +380,7 @@ def _rewrite_internal_href(href: str) -> str:
     path = parts.path
     if not path:
         return href
-    if path == "/api" or path.startswith("/api/"):
+    if is_api_url_path(path):
         return href
     last_segment = path.rstrip("/").rsplit("/", 1)[-1]
     if "." in last_segment:
@@ -534,8 +551,8 @@ def html_to_markdown(html: str, *, rewrite_links: bool = True) -> str:
     (``/about`` → ``/about.md``, preserving query strings and fragments) so an
     agent following links stays on the markdown channel; pass
     ``rewrite_links=False`` to keep hrefs verbatim. External URLs,
-    ``mailto:``/``tel:``, ``/api/`` routes, asset paths with file extensions,
-    and links already ending in ``.md`` are never touched.
+    ``mailto:``/``tel:``, API routes at any depth, asset paths with file
+    extensions, and links already ending in ``.md`` are never touched.
 
     Relative (non root-relative) hrefs are rewritten in place, so on a
     directory-index page — whose markdown rendition serves from ``/deep.md``

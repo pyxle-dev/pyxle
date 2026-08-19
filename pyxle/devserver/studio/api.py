@@ -572,7 +572,10 @@ async def _run_loader_endpoint(
         )
 
     from pyxle.runtime import LoaderError  # noqa: PLC0415 - zero-dep module
-    from pyxle.ssr.view import run_page_loader  # noqa: PLC0415 - lazy, avoids cycle
+    from pyxle.ssr.view import (  # noqa: PLC0415 - lazy, avoids cycle
+        LoaderCrashError,
+        run_page_loader,
+    )
 
     concrete_path = _substitute_path_params(path, params)
     synthetic = _synthesize_loader_request(
@@ -605,11 +608,15 @@ async def _run_loader_endpoint(
             status_code=200,
         )
     except Exception as exc:  # noqa: BLE001 — user loader code can raise anything
+        # The page pipeline classifies an exception escaping a loader body as
+        # LoaderCrashError so it can route to error.pyxl; the tester wants the
+        # developer's own exception, so report the cause it wrapped.
+        reported = exc.__cause__ if isinstance(exc, LoaderCrashError) else exc
         return _json(
             {
                 "ok": False,
                 "kind": "exception",
-                "error": _redact_error(f"{type(exc).__name__}: {exc}"),
+                "error": _redact_error(f"{type(reported).__name__}: {reported}"),
                 "durationMs": round((time.perf_counter() - started) * 1000.0, 2),
             },
             status_code=200,

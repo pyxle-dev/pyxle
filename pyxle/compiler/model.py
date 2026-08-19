@@ -81,6 +81,10 @@ class PageMetadata:
     websocket_name: str | None = None
     websocket_line: int | None = None
     cache_revalidate: float | None = None
+    #: A ``layout.pyxl`` that declares ``STANDALONE = True`` is the root of its
+    #: own chain: layouts in ancestor directories do not wrap pages beneath it,
+    #: and their loaders do not run. See the parser for why.
+    standalone: bool = False
     uses_suspense: bool = False
 
     def to_json(self) -> Dict[str, Any]:
@@ -96,6 +100,7 @@ class PageMetadata:
             "scripts": [s.to_json() for s in self.scripts],
             "images": [i.to_json() for i in self.images],
             "head_jsx_blocks": list(self.head_jsx_blocks),
+            "standalone": self.standalone,
             "actions": [a.to_json() for a in self.actions],
             "websocket_name": self.websocket_name,
             "websocket_line": self.websocket_line,

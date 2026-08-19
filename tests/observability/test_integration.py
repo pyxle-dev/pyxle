@@ -144,3 +144,27 @@ def test_metrics_endpoint_bearer_token(tmp_path: Path) -> None:
         "/api/__pyxle/metrics", headers={"Authorization": "Bearer wrong"}
     )
     assert bad.status_code == 401
+
+
+def test_metrics_bearer_token_survives_a_non_ascii_authorization_header(
+    tmp_path: Path,
+) -> None:
+    """An `Authorization` header is raw client bytes, which Starlette decodes
+    as latin-1 — so it can hold characters `hmac.compare_digest` refuses.
+    A bad credential must be a 401, not an unhandled exception, or the guard
+    itself becomes the way in.
+
+    Driven at the ASGI layer because httpx will not put a non-ASCII byte in a
+    header, while h11 (and therefore uvicorn) hands it straight through.
+    """
+    import asyncio
+
+    from pyxle.devserver.starlette_app import _make_metrics_endpoint
+
+    endpoint = _make_metrics_endpoint("s3cret")
+
+    class _Req:
+        headers = {"authorization": "Bearer caf\xe9"}
+
+    response = asyncio.run(endpoint(_Req()))
+    assert response.status_code == 401

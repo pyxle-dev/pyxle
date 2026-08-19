@@ -120,18 +120,117 @@ export default function Broken() { return <div/>; }
     assert "/api/__actions/broken/go" not in result.document["paths"]
 
 
-def test_pydantic_absent_raises(tmp_path: Path, monkeypatch) -> None:
-    from pyxle.devserver import openapi
+def test_pydantic_absent_raises_naming_the_action_and_file(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Pydantic is genuinely required here — the page's action declares a model
+    body — so the command may fail, but the message has to say which action and
+    which file, not just "this action"."""
+    from pyxle.devserver import validation
 
     settings = _project(tmp_path)
-    _write(settings.pages_dir / "signup.pyxl", _SIGNUP_PAGE)
+    _write(settings.pages_dir / "account" / "signup.pyxl", _SIGNUP_PAGE)
     build_once(settings)
 
-    # Patch the name bound in the openapi module so its own fail-fast guard
-    # (not just validation's deeper check) is exercised.
-    monkeypatch.setattr(openapi, "_try_import_pydantic", lambda: None)
-    with pytest.raises(PydanticNotInstalledError):
+    monkeypatch.setattr(validation, "_try_import_pydantic", lambda: None)
+    with pytest.raises(PydanticNotInstalledError) as excinfo:
         build_openapi_document(settings)
+
+    message = str(excinfo.value)
+    assert "Action 'register' in pages/account/signup.pyxl" in message
+    assert "pip install 'pyxle-framework[pydantic]'" in message
+    assert excinfo.value.action == "register"
+    assert excinfo.value.source == "pages/account/signup.pyxl"
+
+
+def test_project_with_no_actions_needs_no_pydantic(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The pristine-scaffold case: a project with no ``@action`` anywhere has
+    nothing to validate, so the document generates without Pydantic and
+    ``paths`` is legitimately empty."""
+    from pyxle.devserver import validation
+
+    settings = _project(tmp_path)
+    # Unique page name: compiled modules are cached in ``sys.modules`` under a
+    # key derived from the page path alone, so a name shared with another test
+    # would hand this one that test's already-imported module.
+    _write(
+        settings.pages_dir / "actionless_home.pyxl",
+        """import React from 'react';
+export default function Home() { return <div/>; }
+""",
+    )
+    build_once(settings)
+
+    monkeypatch.setattr(validation, "_try_import_pydantic", lambda: None)
+    result = build_openapi_document(settings)
+
+    assert result.import_errors == []
+    assert result.document["paths"] == {}
+    assert result.document["openapi"] == "3.1.0"
+
+
+def test_action_without_a_model_needs_no_pydantic(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """An action that takes no body needs nothing from Pydantic, so its
+    operation is emitted with the permissive body even when it's absent."""
+    from pyxle.devserver import validation
+
+    settings = _project(tmp_path)
+    _write(
+        settings.pages_dir / "bodyless_action.pyxl",
+        """from pyxle.runtime import action
+
+@action
+async def ping(request):
+    return {"pong": True}
+
+import React from 'react';
+export default function Plain() { return <div/>; }
+""",
+    )
+    build_once(settings)
+
+    monkeypatch.setattr(validation, "_try_import_pydantic", lambda: None)
+    result = build_openapi_document(settings)
+
+    post = result.document["paths"]["/api/__actions/bodyless_action/ping"]["post"]
+    assert post["requestBody"]["content"]["application/json"]["schema"] == {
+        "type": "object"
+    }
+
+
+def test_source_label_falls_back_for_a_route_without_a_source(
+    tmp_path: Path,
+) -> None:
+    """Directly-constructed routes carry the ``Path(".")`` default; the error
+    omits the location rather than printing the placeholder. A page outside the
+    project root keeps its absolute path."""
+    from pyxle.devserver.openapi import _source_label
+    from pyxle.devserver.routes import ActionRoute
+
+    settings = _project(tmp_path)
+    bare = ActionRoute(
+        path="/api/__actions/x/go",
+        page_path="/x",
+        action_name="go",
+        server_module_path=Path("x.py"),
+        module_key="x",
+    )
+    assert _source_label(settings, bare) is None
+
+    outside = tmp_path / "elsewhere" / "page.pyxl"
+    external = ActionRoute(
+        path="/api/__actions/x/go",
+        page_path="/x",
+        action_name="go",
+        server_module_path=Path("x.py"),
+        module_key="x",
+        source_absolute_path=outside,
+    )
+    assert _source_label(settings, external) == outside.as_posix()
 
 
 def test_catchall_action_route_is_skipped(tmp_path: Path) -> None:
