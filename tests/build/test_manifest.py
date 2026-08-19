@@ -12,6 +12,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from pyxle.build.pipeline import _build_page_manifest
 from pyxle.devserver.registry import (
     ApiRegistryEntry,
@@ -157,3 +159,45 @@ def test_manifest_emits_api_entries(tmp_path: Path) -> None:
             "module_key": "pyxle.server.pages.api.health",
         },
     }
+
+
+def test_build_time_check_and_load_manifest_share_one_rule(tmp_path: Path) -> None:
+    """``_require_servable_manifest`` must apply *exactly* the rule
+    ``load_manifest`` applies, so "the build succeeded" and "the build is
+    servable" cannot drift apart.
+
+    The leading-slash fallback above is the shape a bundle-less build produces;
+    it is rejected at build time and at serve time, by the same validator.
+    """
+    import json as _json
+
+    from pyxle.build.manifest import load_manifest
+    from pyxle.build.pipeline import ClientBuildError, _require_servable_manifest
+
+    settings, project = _project(tmp_path)
+    registry = MetadataRegistry(pages=[_make_page("/", project=project)], apis=[])
+    unservable = _build_page_manifest(settings, registry, vite_manifest=None)
+
+    manifest_path = tmp_path / "page-manifest.json"
+
+    # Build time: refuses, naming the offending entry.
+    with pytest.raises(ClientBuildError) as excinfo:
+        _require_servable_manifest(unservable, manifest_path)
+    assert "/pages/index.jsx" in str(excinfo.value)
+
+    # Serve time: the same payload is rejected by load_manifest.
+    manifest_path.write_text(_json.dumps(unservable), encoding="utf-8")
+    with pytest.raises(ValueError, match="unsafe path"):
+        load_manifest(manifest_path)
+
+    # And a real (Vite-built) manifest passes both gates.
+    servable = _build_page_manifest(
+        settings,
+        registry,
+        vite_manifest={"pages/index.jsx": {"file": "assets/index-DEADBEEF.js"}},
+    )
+    _require_servable_manifest(servable, manifest_path)
+    manifest_path.write_text(_json.dumps(servable), encoding="utf-8")
+    assert load_manifest(manifest_path)["/"]["client"]["file"] == (
+        "dist/assets/index-DEADBEEF.js"
+    )

@@ -10,10 +10,29 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict
 
+from pyxle.build.manifest import validate_asset_paths
+from pyxle.devserver.build import CACHE_METADATA_FILENAME
 from pyxle.devserver.builder import BuildSummary, build_once
 from pyxle.devserver.registry import MetadataRegistry, build_metadata_registry
 from pyxle.devserver.settings import DevServerSettings
 from pyxle.devserver.tailwind import detect_postcss_config
+
+
+class ClientBuildError(RuntimeError):
+    """Raised when the browser bundle cannot be produced.
+
+    Carries a fully-formed, multi-line message the CLI prints verbatim: the
+    build stops here precisely so the user learns what is missing *now*, rather
+    than at deploy time from ``pyxle serve``.
+    """
+
+
+#: Shared tail for every :class:`ClientBuildError` message — states the
+#: consequence (an unservable ``dist/``) in the same terms the user will meet it.
+_UNSERVABLE_CONSEQUENCE = (
+    "  Pyxle bundles your pages with Vite; without that bundle dist/ holds no browser\n"
+    "  JavaScript and `pyxle serve` refuses to start on it."
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,8 +63,13 @@ def run_build(
     Steps:
     1. Compile all .pyxl pages and copy API modules into .pyxle-build
     2. Run ``npm run build`` (Vite + Tailwind) to produce hashed client bundles
-    3. Copy server modules, metadata, public assets, and client bundles to dist/
-    4. Generate a page-manifest.json mapping routes to their assets
+    3. Build the page manifest and verify ``pyxle serve`` would accept it
+    4. Copy server modules, metadata, public assets, and client bundles to dist/
+
+    Raises :class:`ClientBuildError` when the browser bundle cannot be produced.
+    The manifest is built and checked *before* ``dist/`` is touched, so a build
+    that cannot succeed leaves the previous deployment intact rather than
+    replacing it with an unservable one.
     """
     resolved_dist = dist_dir or (settings.project_root / "dist")
     resolved_dist = resolved_dist.resolve()
@@ -58,13 +82,14 @@ def run_build(
 
     vite_manifest = _load_vite_manifest(settings)
 
+    registry = build_metadata_registry(settings)
+    page_manifest = _build_page_manifest(settings, registry, vite_manifest=vite_manifest)
+    page_manifest_path = resolved_dist / "page-manifest.json"
+    _require_servable_manifest(page_manifest, page_manifest_path)
+
     _log(logger, "info", f"Assembling production artifacts in {resolved_dist}")
     _prepare_dist(settings, resolved_dist)
 
-    registry = build_metadata_registry(settings)
-    page_manifest = _build_page_manifest(settings, registry, vite_manifest=vite_manifest)
-
-    page_manifest_path = resolved_dist / "page-manifest.json"
     page_manifest_path.write_text(
         json.dumps(page_manifest, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
@@ -113,8 +138,12 @@ def _package_json_has_script(project_root: Path, script: str) -> bool:
 def _run_npm_build(project_root: Path, logger: Any, *, settings: DevServerSettings) -> None:
     package_json = project_root / "package.json"
     if not package_json.exists():
-        _log(logger, "warning", "No package.json found; skipping npm build")
-        return
+        raise ClientBuildError(
+            f"No package.json in '{project_root}' — cannot build the client bundle.\n"
+            f"{_UNSERVABLE_CONSEQUENCE}\n"
+            "  Restore it (`pyxle init` writes one) and install its dependencies:\n"
+            "    npm install"
+        )
 
     # Step 1: Run the standalone Tailwind CSS build (legacy v3 path) only when
     # the project actually declares a ``build:css`` script *and* has no PostCSS
@@ -158,8 +187,14 @@ def _run_npm_build(project_root: Path, logger: Any, *, settings: DevServerSettin
             env=env,
             start_new_session=True,
         )
-    except FileNotFoundError:
-        _log(logger, "warning", "npx/vite not found; skipping client build")
+    except FileNotFoundError as exc:
+        raise ClientBuildError(
+            "npx was not found on your PATH — cannot build the client bundle.\n"
+            f"{_UNSERVABLE_CONSEQUENCE}\n"
+            "  npx ships with npm: install npm alongside Node.js, then build again.\n"
+            "  (Debian/Ubuntu's `nodejs` package omits npm — `apt install npm`. The\n"
+            "  installers at https://nodejs.org and nvm/fnm include it already.)"
+        ) from exc
     except subprocess.CalledProcessError as exc:
         stderr = exc.stderr.strip() if exc.stderr else ""
         raise RuntimeError(f"Vite build failed (exit {exc.returncode}): {stderr}") from exc
@@ -187,6 +222,60 @@ def _run_npm_script(project_root: Path, script: str, logger: Any, *, required: b
         _log(logger, "warning", f"npm script '{script}' failed; continuing")
 
 
+#: Never mirrored into ``dist/app``: bytecode caches and build output that a
+#: project may have left inside its source tree.
+_APP_SOURCE_IGNORES = shutil.ignore_patterns(
+    "__pycache__", "*.py[cod]", ".pyxle-build", "node_modules"
+)
+
+
+def _mirror_app_sources(settings: DevServerSettings, dist_dir: Path) -> None:
+    """Copy the **source** files a running server reads into ``dist/app``.
+
+    Compiling ``pages/`` produces a route module per page and per endpoint, and
+    nothing else: a private helper beside them (``pages/api/_shared.py``,
+    ``pages/api/__init__.py``, ``pages/api/_internal/…``, or a non-route
+    ``pages/s/[slug]/queries.py``) is deliberately not a route, so it never
+    reaches ``dist/server`` — while the compiled route that imports it does.
+    Serving a tree that has ``dist`` but no ``pages/`` then fails at startup on
+    the first such import and takes *every* route down with it.
+
+    The whole ``pages/`` tree is mirrored rather than a curated list of
+    extensions, because a helper may read files next to itself
+    (``Path(__file__).parent / "seed.json"``), and because the AI-accessibility
+    layer reads ``pages/**/llms.py`` and colocated ``pages/**/*.md`` from the
+    pages directory at request time. Configured global stylesheets/scripts are
+    mirrored too: their contents are read per render and inlined into the head.
+
+    See :func:`pyxle.build.production.app_source_mirror` for the reading side.
+    """
+    # Imported here, not at module scope: ``production`` pulls in the whole
+    # serve stack (Starlette app, SSR), which a build has no use for.
+    from pyxle.build.production import DIST_APP_DIRNAME  # noqa: PLC0415
+
+    app_dest = dist_dir / DIST_APP_DIRNAME
+    if app_dest.exists():
+        shutil.rmtree(app_dest)
+
+    pages_dir = settings.pages_dir
+    if pages_dir.is_dir():
+        try:
+            relative_pages = pages_dir.relative_to(settings.project_root)
+        except ValueError:
+            # A ``pagesDir`` outside the project root is not importable as a
+            # package in development either, so there is nothing to mirror.
+            relative_pages = None
+        if relative_pages is not None:
+            shutil.copytree(pages_dir, app_dest / relative_pages, ignore=_APP_SOURCE_IGNORES)
+
+    for asset in (*settings.global_stylesheets, *settings.global_scripts):
+        if not asset.source_path.is_file():
+            continue
+        destination = app_dest / asset.relative_path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(asset.source_path, destination)
+
+
 def _prepare_dist(settings: DevServerSettings, dist_dir: Path) -> None:
     server_dest = dist_dir / "server"
     metadata_dest = dist_dir / "metadata"
@@ -205,6 +294,21 @@ def _prepare_dist(settings: DevServerSettings, dist_dir: Path) -> None:
     # Copy metadata
     if settings.metadata_build_dir.exists():
         shutil.copytree(settings.metadata_build_dir, metadata_dest, dirs_exist_ok=True)
+
+    # Copy the build-cache index (``meta.json``). It lists every compiled source
+    # and its kind, which is what the production server iterates to rebuild its
+    # route registry — so ``dist`` is only self-contained with it. Without this
+    # copy ``pyxle serve`` has to fall back to reading the intermediate
+    # ``.pyxle-build`` directory, and a deployment that ships only ``dist``
+    # (Docker, CI artifact) has no routes at all.
+    build_cache_index = settings.build_root / CACHE_METADATA_FILENAME
+    if build_cache_index.is_file():
+        shutil.copy2(build_cache_index, dist_dir / CACHE_METADATA_FILENAME)
+
+    # Mirror the source files the server reads at runtime (colocated helpers,
+    # llms handlers, inlined global styles) — the other half of "dist is a
+    # complete deployment".
+    _mirror_app_sources(settings, dist_dir)
 
     # Copy public assets
     if settings.public_dir.exists():
@@ -416,6 +520,28 @@ def _build_page_manifest(
         }
 
     return manifest
+
+
+def _require_servable_manifest(page_manifest: Dict[str, Any], manifest_path: Path) -> None:
+    """Refuse to publish a ``dist/`` that ``pyxle serve`` would reject.
+
+    A page whose entry is absent from the Vite manifest keeps its dev-server
+    asset path (``/routes/index.jsx``) as ``client.file``, and
+    :func:`~pyxle.build.manifest.load_manifest` rejects a leading slash as an
+    unsafe path. Applying the *serve-time* rule here — before anything is
+    written — is what makes "the build succeeded" and "the build is servable"
+    the same statement, whatever the reason a bundle went missing.
+    """
+    try:
+        validate_asset_paths(page_manifest, manifest_path)
+    except ValueError as exc:
+        raise ClientBuildError(
+            "The client build produced no browser bundle for at least one page — "
+            "refusing to write dist/.\n"
+            f"{_UNSERVABLE_CONSEQUENCE}\n"
+            f"  Rejected entry: {exc}\n"
+            "  Run `npm install` in the project root, then build again."
+        ) from exc
 
 
 def _copy_client_manifest(settings: DevServerSettings, dist_dir: Path) -> Path | None:

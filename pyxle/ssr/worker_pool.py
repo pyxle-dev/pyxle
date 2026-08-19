@@ -20,6 +20,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from pyxle.ssr.paths import resolve_component_path
+
 logger = logging.getLogger(__name__)
 
 _WORKER_STOP_TIMEOUT = 5.0  # seconds to wait for graceful shutdown
@@ -254,10 +256,17 @@ class SsrWorkerPool:
         client_root: Path,
         node_executable: str | None = None,
         render_timeout: float = 30.0,
+        vite_owns_css: bool = False,
     ) -> None:
         self._size = max(1, size)
         self._project_root = project_root
         self._client_root = client_root
+        # A manifest-backed render links every stylesheet Vite compiled for the
+        # page, so inlining the same CSS into a <style> block ships it twice.
+        # Constant for the life of the process — a build either has a page
+        # manifest or it does not — which is what keeps the worker's bundle
+        # cache (keyed on component path alone) correct.
+        self._vite_owns_css = vite_owns_css
         self._node_executable = node_executable
         self._render_timeout = render_timeout
         self._workers: list[_WorkerState] = []
@@ -269,6 +278,16 @@ class SsrWorkerPool:
     def size(self) -> int:
         """Configured pool size."""
         return self._size
+
+    @property
+    def client_root(self) -> Path:
+        """Directory holding the generated client modules.
+
+        Also where the compiler's ``.jsx`` → ``.pyxl`` sourcemap sidecar lives,
+        which is how a build error gets reported against the file the author
+        wrote. See :mod:`pyxle.ssr.source_locations`.
+        """
+        return self._client_root
 
     @property
     def alive_count(self) -> int:
@@ -347,10 +366,14 @@ class SsrWorkerPool:
         request_id = str(uuid.uuid4())
         payload: dict[str, Any] = {
             "id": request_id,
-            "componentPath": str(component_path.resolve()),
+            # Memoised: per-render, and usually already canonical because
+            # ComponentRenderer resolved it to key its own cache. See
+            # pyxle.ssr.paths.
+            "componentPath": str(resolve_component_path(component_path)),
             "props": props,
             "clientRoot": str(self._client_root),
             "projectRoot": str(self._project_root),
+            "viteOwnsCss": self._vite_owns_css,
         }
         if request_pathname is not None:
             payload["requestPathname"] = request_pathname
@@ -409,10 +432,12 @@ class SsrWorkerPool:
         request_id = str(uuid.uuid4())
         payload: dict[str, Any] = {
             "id": request_id,
-            "componentPath": str(component_path.resolve()),
+            # Memoised — per-render on the streaming path. See pyxle.ssr.paths.
+            "componentPath": str(resolve_component_path(component_path)),
             "props": props,
             "clientRoot": str(self._client_root),
             "projectRoot": str(self._project_root),
+            "viteOwnsCss": self._vite_owns_css,
             "stream": True,
         }
         if request_pathname is not None:
@@ -422,7 +447,7 @@ class SsrWorkerPool:
         if fallback_path is not None:
             # The page is wrapped in <Suspense fallback={<Loading/>}> using this
             # compiled loading.pyxl component.
-            payload["fallbackPath"] = str(fallback_path.resolve())
+            payload["fallbackPath"] = str(resolve_component_path(fallback_path))
 
         worker.in_flight += 1
         try:
@@ -451,7 +476,7 @@ class SsrWorkerPool:
 
         payload_base: dict[str, Any] = {"type": "invalidate"}
         if component_path is not None:
-            payload_base["componentPath"] = str(component_path.resolve())
+            payload_base["componentPath"] = str(resolve_component_path(component_path))
 
         for worker in self._workers:
             if not worker.alive:

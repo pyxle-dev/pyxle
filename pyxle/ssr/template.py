@@ -5,14 +5,33 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from html import escape
-from typing import Any
+from typing import Any, Final
 
 from pyxle.config import default_csrf_cookie_name
 from pyxle.devserver.routes import PageRoute
 from pyxle.devserver.settings import DevServerSettings
 from pyxle.devserver.styles import load_inline_stylesheets
 
+from .jsx_expressions import is_expression_value
 from .renderer import InlineStyleFragment
+
+
+def vite_owns_stylesheets(settings: DevServerSettings) -> bool:
+    """Whether the document links Vite's compiled stylesheets itself.
+
+    A manifest-backed render emits a ``<link rel="stylesheet">`` for every CSS
+    asset Vite compiled for the page, so the SSR worker inlining the same
+    stylesheets into a ``<style>`` block ships every byte twice — and the links
+    are render-blocking, so the inline copy cannot even buy a faster first
+    paint. Dev has no page manifest (Vite injects CSS through the client bundle
+    after hydration), so there the inline copy is the *only* thing that styles
+    the server-rendered paint and must stay.
+
+    One definition, read both by the code that emits the links and by the code
+    that decides whether to inline. Two consumers disagreeing about one fact is
+    how the duplicate shipped in the first place.
+    """
+    return not settings.debug and settings.page_manifest is not None
 
 
 def _browser_vite_origin(settings: DevServerSettings) -> str:
@@ -108,7 +127,7 @@ def build_document_shell(
     if error_boundary is not None
     else "null"
   )
-  head_injections = render_head_markup(head_elements)
+  head_injections = render_head_markup(head_elements, settings.document_title_default)
   # Seed payload for the client navigation cache. Lets the page the user
   # landed on satisfy its own prefetch (the active self-link) from cache
   # instead of re-running the loader, and powers instant back/forward nav.
@@ -137,7 +156,7 @@ def build_document_shell(
   # script (``useAuth`` resolves over the network).
   auth_seed_script = _render_auth_seed_script(auth_seed, nonce_attr)
 
-  if not settings.debug and settings.page_manifest is not None:
+  if vite_owns_stylesheets(settings):
     manifest_entry = settings.page_manifest.get(page.path)
     if not isinstance(manifest_entry, dict):
       raise ManifestLookupError
@@ -361,9 +380,19 @@ def _serialize_props(props: dict[str, Any]) -> str:
     return escape_inline_json(payload)
 
 
-def render_head_markup(elements: tuple[str, ...]) -> str:
-    default_title = "" if _head_contains_title(elements) else "\n    <title>Pyxle</title>"
-    return default_title + _render_custom_head(elements)
+def render_head_markup(elements: tuple[str, ...], default_title: str = "Pyxle") -> str:
+    """Render the merged head elements, inserting *default_title* if none is set.
+
+    ``default_title`` is the app's own name (see
+    ``DevServerSettings.document_title_default``) so an untitled page reads as
+    the developer's product in the browser tab. The ``"Pyxle"`` fallback in the
+    signature only covers callers that have no settings to hand.
+    """
+    if _head_contains_title(elements):
+        title_markup = ""
+    else:
+        title_markup = f"\n    <title>{escape(default_title)}</title>"
+    return title_markup + _render_custom_head(elements)
 
 
 def _render_custom_head(elements: tuple[str, ...]) -> str:
@@ -449,6 +478,13 @@ _ERROR_DOCUMENT_STYLES = """    <style>
         border-radius: 0.5rem;
         color: #fca5a5;
       }
+      .pyxle-hint {
+        margin-top: 1.5rem;
+        padding-top: 1.5rem;
+        border-top: 1px solid rgba(209, 213, 219, 0.2);
+        color: #9ca3af;
+        font-size: 0.9375rem;
+      }
     </style>"""
 
 
@@ -457,6 +493,7 @@ def render_error_document(
     settings: DevServerSettings,
     page: PageRoute,
     error: BaseException,
+    status_code: int = 500,
 ) -> str:
     """Render a fallback HTML document when SSR fails.
 
@@ -478,7 +515,7 @@ def render_error_document(
       error details are written to the server logs by the caller.
     """
     if not settings.debug:
-        return _render_production_error_document()
+        return _render_production_error_document(status_code)
 
     from pyxle.devserver._security import redact_sensitive_patterns
 
@@ -509,29 +546,120 @@ def render_error_document(
 """
 
 
-def _render_production_error_document() -> str:
-    """Generic production error page — leaks no internal state.
+#: What a production fallback says, per status. A loader raising
+#: ``LoaderError(status_code=404)`` is stating a fact about the request, not
+#: reporting a fault — and telling a visitor who followed a stale link that the
+#: *server* failed sends them to complain to the wrong people, or to wait for a
+#: recovery that is never coming.
+#:
+#: Deliberately short of a real 404 page: an application should answer a missing
+#: resource itself, with its own layout and a way onward. This is the floor, not
+#: the intended experience.
+_STATUS_DOCUMENTS: Final[dict[int, tuple[str, str]]] = {
+    400: ("Bad request", "This request could not be understood."),
+    401: ("Sign in required", "This page needs you to be signed in."),
+    402: ("Payment required", "This page needs an active subscription or payment."),
+    403: ("Not available", "You do not have access to this page."),
+    404: ("Not found", "There is nothing at this address."),
+    405: ("Not allowed here", "This address does not accept that kind of request."),
+    408: ("Request timed out", "The request took too long to send. Please try again."),
+    409: ("Already changed", "Something changed before this request arrived. Reload and try again."),
+    410: ("Gone", "This page used to exist and has been removed."),
+    422: ("Could not process", "Some of the details in this request were not accepted."),
+    429: ("Too many requests", "You have made too many requests. Please wait a moment and try again."),
+    451: ("Unavailable for legal reasons", "This page cannot be shown for legal reasons."),
+}
 
-    Used when ``settings.debug`` is False. Intentionally omits the
-    exception type, message, route path, and the dev-mode Vite
-    client tag.
+#: Fallback for a 4xx nobody has written wording for. The point of splitting
+#: this from the 5xx text is that the *class* decides, not the table: a status
+#: missing from the map above is still never described as a server fault, so
+#: adding an entry is a refinement rather than a bug fix nobody remembers to
+#: make. Blaming the server for a 429 tells a rate-limited visitor to wait for a
+#: recovery that is not coming, and sends them to complain to the wrong people.
+_CLIENT_ERROR_DOCUMENT: Final[tuple[str, str]] = (
+    "Request not accepted",
+    "The server did not accept this request.",
+)
+
+#: 5xx, and anything outside 4xx that reaches this path. The server *is* at
+#: fault, and "try again later" is honest advice.
+_SERVER_ERROR_DOCUMENT: Final[tuple[str, str]] = (
+    "Server Error",
+    "The server encountered an error while processing this request. "
+    "Please try again later.",
+)
+
+
+def _status_document(status_code: int) -> tuple[str, str]:
+    """Heading and detail for *status_code*, decided by class then refined.
+
+    Specific wording wins where it exists; otherwise any 4xx is described as a
+    request that was not accepted, and everything else as a server fault.
     """
+    known = _STATUS_DOCUMENTS.get(status_code)
+    if known is not None:
+        return known
+    if 400 <= status_code < 500:
+        return _CLIENT_ERROR_DOCUMENT
+    return _SERVER_ERROR_DOCUMENT
+
+
+def _render_production_error_document(status_code: int = 500, *, hint_html: str = "") -> str:
+    """Generic production fallback — leaks no internal state.
+
+    Used when ``settings.debug`` is False. Intentionally omits the exception
+    type, message, route path, and the dev-mode Vite client tag: an exception
+    message may carry row ids, file paths or credentials (CLAUDE.md rule 18).
+
+    The *status* is not internal state — the client already has it on the status
+    line — so it decides the wording, by class: a 4xx is never described as a
+    server fault, whether or not anyone has written specific wording for it
+    (see :func:`_status_document`). 5xx keeps the opaque server-error text.
+
+    ``hint_html`` appends developer-facing guidance and is only ever passed on
+    a dev-mode path — never from :func:`render_error_document`'s production
+    branch.
+    """
+    heading, detail = _status_document(status_code)
     return f"""<!DOCTYPE html>
 <html lang=\"en\">
   <head>
     <meta charset=\"utf-8\" />
     <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
-    <title>Server Error</title>
+    <title>{heading}</title>
 {_ERROR_DOCUMENT_STYLES}
   </head>
   <body>
     <main class=\"pyxle-error\">
-      <h1>Server Error</h1>
-      <p>The server encountered an error while processing this request. Please try again later.</p>
+      <h1>{heading}</h1>
+      <p>{detail}</p>{hint_html}
     </main>
   </body>
 </html>
 """
+
+
+def render_not_found_document(*, debug: bool) -> str:
+    """Pyxle's default 404 page, used when no ``not-found.pyxl`` answers.
+
+    Reuses the same designed document as every other status fallback rather
+    than Starlette's nine-byte ``text/plain`` body — a bare "Not Found" reads
+    as if the framework fell over, not as if a page is simply missing.
+
+    Under ``pyxle dev`` it also names the file that replaces it. That hint is
+    strictly dev-only: in production the page stays as opaque as the other
+    status documents.
+    """
+    hint_html = ""
+    if debug:
+        hint_html = (
+            '\n      <p class="pyxle-hint">'
+            "Pyxle is serving its built-in 404. Add "
+            "<code>pages/not-found.pyxl</code> to replace it with your own page "
+            "— it is picked up as soon as you save."
+            "</p>"
+        )
+    return _render_production_error_document(404, hint_html=hint_html)
 
 
 def _format_nonce_attr(value: str | None) -> str:
@@ -579,21 +707,42 @@ def _render_inline_styles_markup(styles: tuple[InlineStyleFragment, ...]) -> str
   return "".join(fragments)
 
 
+def _is_unevaluated_script(script_dict: dict) -> bool:
+  """Whether a statically-extracted ``<Script>`` still holds a JSX expression.
+
+  ``<Script>`` declarations are harvested from ``.pyxl`` source at compile time,
+  exactly like ``<Head>`` blocks, so ``<Script src={analyticsUrl} />`` arrives
+  as the literal text ``{analyticsUrl}``. Emitting that produces a `<script>`
+  pointing at a relative URL the browser requests and fails to find — the same
+  failure the head merger drops, in a sibling code path.
+
+  Dropping it loses nothing: the ``<Script>`` component loads the real src when
+  it renders, and it deduplicates by src, so the evaluated load still happens
+  exactly once.
+  """
+  return is_expression_value(script_dict.get("src")) or is_expression_value(
+    script_dict.get("strategy")
+  )
+
+
 def _render_before_interactive_scripts(scripts: tuple[dict, ...], nonce_attr: str) -> str:
   """Render <script> tags for beforeInteractive strategy."""
   if not scripts:
     return ""
-  
+
   fragments: list[str] = []
   for script_dict in scripts:
+    if _is_unevaluated_script(script_dict):
+      continue
+
     strategy = script_dict.get("strategy", "afterInteractive")
     if strategy != "beforeInteractive":
       continue
-    
+
     src = script_dict.get("src")
     if not src:
       continue
-    
+
     escaped_src = escape(src, quote=True)
     attrs: list[str] = [f'src="{escaped_src}"']
     
@@ -622,10 +771,15 @@ def _serialize_scripts_metadata(scripts: tuple[dict, ...]) -> str:
   if not scripts:
     return "[]"
 
-  # Filter out beforeInteractive scripts (already injected in head)
+  # Filter out beforeInteractive scripts (already injected in head), and any
+  # declaration still holding a JSX expression — the bootstrap loader would
+  # inject `<script src="{analyticsUrl}">` into the document from this payload,
+  # producing the same failing request in the browser that the head merger
+  # drops on the server. The <Script> component loads the evaluated src itself.
   client_scripts = [
     s for s in scripts
     if s.get("strategy", "afterInteractive") != "beforeInteractive"
+    and not _is_unevaluated_script(s)
   ]
 
   return escape_inline_json(json.dumps(client_scripts, ensure_ascii=False, separators=(",", ":")))
@@ -637,4 +791,5 @@ __all__ = [
   "render_document",
   "render_error_document",
   "render_head_markup",
+  "render_not_found_document",
 ]

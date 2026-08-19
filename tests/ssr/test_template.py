@@ -8,7 +8,7 @@ import pytest
 from pyxle.devserver.routes import PageRoute
 from pyxle.devserver.settings import DevServerSettings
 from pyxle.ssr.renderer import InlineStyleFragment
-from pyxle.ssr.template import render_document, render_error_document
+from pyxle.ssr.template import render_document, render_error_document, render_head_markup
 
 
 @pytest.fixture
@@ -46,7 +46,8 @@ def test_render_document_injects_expected_scripts(page_route: PageRoute, tmp_pat
     assert "<!DOCTYPE html>" in html
     assert "<div id=\"root\">" in html
     assert "<p>Hello</p>" in html
-    assert "<title>Pyxle</title>" in html
+    # No page/layout title → the app's own name, never the framework's.
+    assert f"<title>{tmp_path.name}</title>" in html
     assert "window.__PYXLE_PAGE_PATH__ = \"/pages/index.jsx\"" in html
     assert "@vite/client" in html
     assert "@react-refresh" in html
@@ -55,6 +56,46 @@ def test_render_document_injects_expected_scripts(page_route: PageRoute, tmp_pat
     assert '"data":{"greeting":"<\\/script>"}' in html
     assert "<\\/script>" in html  # escaped closing tag in props payload
     assert 'nonce="test-nonce"' in html
+
+
+def test_default_title_uses_configured_app_name(page_route: PageRoute, tmp_path: Path) -> None:
+    """`name` in pyxle.config.json is the default <title> for untitled pages."""
+    settings = DevServerSettings.from_project_root(tmp_path, app_name="Acme Dashboard")
+
+    html = render_document(
+        settings=settings,
+        page=page_route,
+        body_html="<p>Hello</p>",
+        props={},
+        script_nonce="n",
+        head_elements=(),
+    )
+
+    assert "<title>Acme Dashboard</title>" in html
+    assert "<title>Pyxle</title>" not in html
+
+
+def test_default_title_falls_back_to_project_directory(tmp_path: Path) -> None:
+    """With no configured name, the project directory names the app."""
+    settings = DevServerSettings.from_project_root(tmp_path)
+
+    assert settings.document_title_default == tmp_path.name
+
+
+def test_default_title_escapes_markup() -> None:
+    """A name is user data on its way into HTML — it must be escaped."""
+    markup = render_head_markup((), '<script>alert("x")</script>')
+
+    assert "<script>" not in markup
+    assert "&lt;script&gt;" in markup
+
+
+def test_page_title_suppresses_the_default() -> None:
+    """A page/layout <title> wins; no default is injected alongside it."""
+    markup = render_head_markup(("<title>My Page</title>",), "Acme Dashboard")
+
+    assert "<title>My Page</title>" in markup
+    assert "Acme Dashboard" not in markup
 
 
 def test_render_document_embeds_nav_seed(page_route: PageRoute, tmp_path: Path) -> None:
@@ -840,3 +881,260 @@ def test_document_error_asset_is_null_without_boundary(
         head_elements=(),
     )
     assert "window.__PYXLE_ERROR_ASSET__ = null" in html
+
+
+# ---------------------------------------------------------------------------
+# render_error_document — the status decides the wording
+# ---------------------------------------------------------------------------
+
+
+def test_production_404_does_not_blame_the_server(
+    page_route: PageRoute, tmp_path: Path
+) -> None:
+    """A loader raising ``LoaderError(status_code=404)`` is stating a fact
+    about the request, not reporting a fault.
+
+    Every sub-500 status used to render the 500 document, so a visitor who
+    followed a stale link was told "Server Error / The server encountered an
+    error while processing this request. Please try again later." — which sends
+    them to complain to the wrong people, or to wait for a recovery that is
+    never coming. Found on a public status page, where the visitor is a
+    customer of the operator rather than the operator.
+    """
+    settings = DevServerSettings.from_project_root(tmp_path, debug=False)
+
+    html = render_error_document(
+        settings=settings, page=page_route,
+        error=RuntimeError("No status page here."), status_code=404,
+    )
+
+    assert "<title>Not found</title>" in html
+    assert "There is nothing at this address." in html
+    assert "Server Error" not in html
+    assert "try again later" not in html
+
+
+def test_production_5xx_keeps_the_opaque_wording(
+    page_route: PageRoute, tmp_path: Path
+) -> None:
+    settings = DevServerSettings.from_project_root(tmp_path, debug=False)
+
+    html = render_error_document(
+        settings=settings, page=page_route,
+        error=RuntimeError("boom"), status_code=500,
+    )
+
+    assert "Server Error" in html
+    assert "try again later" in html
+
+
+def test_production_defaults_to_the_server_error_document(
+    page_route: PageRoute, tmp_path: Path
+) -> None:
+    """No status supplied means 500, and 500 stays opaque — the server really
+    is at fault and "try again later" is honest advice."""
+    settings = DevServerSettings.from_project_root(tmp_path, debug=False)
+
+    assert "Server Error" in render_error_document(
+        settings=settings, page=page_route, error=RuntimeError("x")
+    )
+
+
+@pytest.mark.parametrize("status", [402, 405, 408, 409, 418, 422, 429, 451, 499])
+def test_no_4xx_is_ever_called_a_server_error(
+    page_route: PageRoute, tmp_path: Path, status: int
+) -> None:
+    """The wording is a rule over status classes, not a list of statuses.
+
+    Every status here is a 4xx, and several have no wording of their own — 418
+    and 499 never will. A 4xx says something about the *request*, so none of
+    them may be reported as the server failing: telling a rate-limited visitor
+    the server broke sends them to complain to the wrong people and to wait for
+    a recovery that is not coming. Adding wording for a status is a refinement;
+    it must never be the thing that stops a page lying about whose fault it is.
+    """
+    settings = DevServerSettings.from_project_root(tmp_path, debug=False)
+
+    html = render_error_document(
+        settings=settings, page=page_route, error=RuntimeError("x"),
+        status_code=status,
+    )
+
+    assert "Server Error" not in html
+    assert "try again later" not in html
+
+
+@pytest.mark.parametrize("status", [500, 502, 503, 504, 599])
+def test_every_5xx_keeps_the_server_error_wording(
+    page_route: PageRoute, tmp_path: Path, status: int
+) -> None:
+    """The other half of the rule, including 5xx nobody wrote wording for."""
+    settings = DevServerSettings.from_project_root(tmp_path, debug=False)
+
+    assert "Server Error" in render_error_document(
+        settings=settings, page=page_route, error=RuntimeError("x"),
+        status_code=status,
+    )
+
+
+@pytest.mark.parametrize("status,heading", [
+    (400, "Bad request"),
+    (401, "Sign in required"),
+    (402, "Payment required"),
+    (403, "Not available"),
+    (404, "Not found"),
+    (405, "Not allowed here"),
+    (408, "Request timed out"),
+    (409, "Already changed"),
+    (410, "Gone"),
+    (422, "Could not process"),
+    (429, "Too many requests"),
+    (451, "Unavailable for legal reasons"),
+])
+def test_each_status_has_its_own_wording(
+    page_route: PageRoute, tmp_path: Path, status: int, heading: str
+) -> None:
+    settings = DevServerSettings.from_project_root(tmp_path, debug=False)
+
+    html = render_error_document(
+        settings=settings, page=page_route, error=RuntimeError("x"),
+        status_code=status,
+    )
+
+    assert f"<title>{heading}</title>" in html
+
+
+def test_a_status_document_still_leaks_nothing(
+    page_route: PageRoute, tmp_path: Path
+) -> None:
+    """The wording changed; the rule about internal state did not."""
+    settings = DevServerSettings.from_project_root(tmp_path, debug=False)
+    error = _SecretError("DB row 12345 / api_key=sk_live_abc123")
+
+    html = render_error_document(
+        settings=settings, page=page_route, error=error, status_code=404,
+    )
+
+    assert "_SecretError" not in html
+    assert "sk_live_abc123" not in html
+    assert "DB row 12345" not in html
+    # Not asserted on `page_route.path`: it is "/", which appears in every
+    # closing tag. The dev-mode overlay is where the route is disclosed, and
+    # that path is covered by its own test above.
+    assert "No status page here" not in html
+
+
+# ---------------------------------------------------------------------------
+# <Script> declarations that were never evaluated
+# ---------------------------------------------------------------------------
+#
+# <Script> is harvested from `.pyxl` source at compile time exactly like
+# <Head>, so `<Script src={analyticsUrl} />` reaches the document shell as the
+# literal text `{analyticsUrl}`. It leaves by two doors — a `beforeInteractive`
+# tag written straight into <head>, and the `__PYXLE_SCRIPTS__` payload the
+# bootstrap loader injects from — and both produce a request for a relative URL
+# that does not exist. The <Script> component loads the evaluated src itself.
+
+
+def _script(**overrides) -> dict:
+    script = {
+        "src": "/analytics.js",
+        "strategy": "afterInteractive",
+        "async": False,
+        "defer": False,
+        "module": False,
+        "noModule": False,
+    }
+    script.update(overrides)
+    return script
+
+
+def test_an_unevaluated_before_interactive_script_is_not_written_into_head(
+    page_route: PageRoute, tmp_path: Path
+) -> None:
+    settings = DevServerSettings.from_project_root(tmp_path)
+    page = replace(
+        page_route,
+        scripts=(_script(src="{analyticsUrl}", strategy="beforeInteractive"),),
+    )
+
+    html = render_document(
+        settings=settings,
+        page=page,
+        body_html="<p>Hello</p>",
+        props={},
+        script_nonce="n",
+        head_elements=(),
+    )
+
+    assert "analyticsUrl" not in html
+
+
+def test_an_unevaluated_script_is_not_handed_to_the_bootstrap_loader(
+    page_route: PageRoute, tmp_path: Path
+) -> None:
+    settings = DevServerSettings.from_project_root(tmp_path)
+    page = replace(page_route, scripts=(_script(src="{analyticsUrl}"),))
+
+    html = render_document(
+        settings=settings,
+        page=page,
+        body_html="<p>Hello</p>",
+        props={},
+        script_nonce="n",
+        head_elements=(),
+    )
+
+    assert "window.__PYXLE_SCRIPTS__ = [];" in html
+    assert "analyticsUrl" not in html
+
+
+def test_an_expression_in_any_extracted_prop_drops_the_script(
+    page_route: PageRoute, tmp_path: Path
+) -> None:
+    """`strategy={...}` is unevaluated too — the literal text is neither
+    "beforeInteractive" nor a strategy the client recognises, so the tag would
+    be placed by a value that was never read."""
+    settings = DevServerSettings.from_project_root(tmp_path)
+    page = replace(
+        page_route,
+        scripts=(_script(src="/analytics.js", strategy="{chosenStrategy}"),),
+    )
+
+    html = render_document(
+        settings=settings,
+        page=page,
+        body_html="<p>Hello</p>",
+        props={},
+        script_nonce="n",
+        head_elements=(),
+    )
+
+    assert "chosenStrategy" not in html
+    assert "window.__PYXLE_SCRIPTS__ = [];" in html
+
+
+def test_an_evaluated_script_is_still_emitted_both_ways(
+    page_route: PageRoute, tmp_path: Path
+) -> None:
+    """The filter must not eat working scripts."""
+    settings = DevServerSettings.from_project_root(tmp_path)
+    page = replace(
+        page_route,
+        scripts=(
+            _script(src="/early.js", strategy="beforeInteractive"),
+            _script(src="/later.js"),
+        ),
+    )
+
+    html = render_document(
+        settings=settings,
+        page=page,
+        body_html="<p>Hello</p>",
+        props={},
+        script_nonce="n",
+        head_elements=(),
+    )
+
+    assert '<script src="/early.js"' in html
+    assert '"src":"/later.js"' in html

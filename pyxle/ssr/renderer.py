@@ -12,6 +12,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Tuple, TypeVar
 
+from pyxle.ssr.paths import resolve_component_path
+from pyxle.ssr.source_locations import remap_generated_locations
+
 
 class ComponentRenderError(RuntimeError):
     """Raised when a component cannot be rendered server-side."""
@@ -215,7 +218,9 @@ class ComponentRenderer:
         what makes a no-JS form POST satisfy the CSRF middleware.
         """
 
-        resolved = component_path.resolve()
+        # Memoised: this runs on every render, and a raw ``resolve()`` here is
+        # ~18.7us of on-CPU event-loop stall per call. See pyxle.ssr.paths.
+        resolved = resolve_component_path(component_path)
         cached = self._cache.get(resolved)
 
         if cached is None or cached[0] != self._generation:
@@ -309,7 +314,7 @@ def _default_factory(component_path: Path) -> _RenderCallable:
 
 class _NodeComponentRuntime:
     def __init__(self, component_path: Path) -> None:
-        self._component_path = component_path.resolve()
+        self._component_path = resolve_component_path(component_path)
         self._client_root, self._project_root = _derive_project_paths(self._component_path)
         self._node_executable = _resolve_node_executable()
         self._runtime_script = _resolve_runtime_script()
@@ -525,11 +530,18 @@ def pool_render_factory(pool: Any) -> _RenderFactory:
                     csrf_token=csrf_token,
                 )
             except WorkerPoolError as exc:
-                raise ComponentRenderError(str(exc)) from exc
+                raise ComponentRenderError(
+                    remap_generated_locations(str(exc), pool.client_root)
+                ) from exc
 
             if not result.get("ok"):
                 message = result.get("message") or "SSR worker reported a failure"
-                raise ComponentRenderError(message)
+                # esbuild/Babel name the generated ``.jsx`` module, at a line
+                # number that belongs to it and not to the author's file. Report
+                # the ``.pyxl`` they actually edit.
+                raise ComponentRenderError(
+                    remap_generated_locations(message, pool.client_root)
+                )
 
             html = result.get("html")
             if not isinstance(html, str):

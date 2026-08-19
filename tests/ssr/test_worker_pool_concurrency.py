@@ -350,3 +350,64 @@ async def test_concurrent_cold_resolutions_coalesce(tmp_path: Path) -> None:
     for result in results:
         assert result["ok"] is True, result
         assert "COLD_MARKER" in result["html"]
+
+
+# A component that imports a stylesheet. The CSS import is what registers an
+# inline-style descriptor as a side effect of module evaluation — the thing a
+# hot-reload re-import used to lose.
+_STYLED_COMPONENT = dedent(
+    """
+    import React from 'react';
+    import './styled.css';
+    export default function Page() {
+        return React.createElement('div', { id: 'styled' }, 'STYLED_MARKER');
+    }
+    """
+)
+
+_STYLED_CSS = ".styled-marker { color: rebeccapurple; }\n"
+
+
+@pytest.mark.anyio
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js required for SSR rendering")
+async def test_inline_styles_survive_invalidation_of_an_unchanged_bundle(
+    tmp_path: Path,
+) -> None:
+    """A rebuild that leaves the client bundle identical keeps its stylesheets.
+
+    A component registers its stylesheets while its module is *evaluated*, and
+    Node evaluates a given module URL once per process. Editing only the Python
+    half of a ``.pyxl`` file — its ``@server`` loader — changes nothing in the
+    emitted client bundle, so the post-rebuild re-import is a module-cache hit
+    that skips that registration. Every inline ``<style>`` then vanished from
+    the page until the dev server was restarted, which made the first edit the
+    Quick Start asks for (change the loader's ``message``) silently strip the
+    app's CSS.
+    """
+    project_root, client_root, pages = _real_project(tmp_path)
+    component = pages / "styled.jsx"
+    component.write_text(_STYLED_COMPONENT, encoding="utf-8")
+    (pages / "styled.css").write_text(_STYLED_CSS, encoding="utf-8")
+
+    pool = SsrWorkerPool(size=1, project_root=project_root, client_root=client_root)
+    await pool.start()
+    try:
+        first = await pool.render(component, {})
+        # Same file, recompiled: byte-identical bundle, so the re-import hits
+        # Node's module cache exactly as it does after a loader-only edit.
+        await pool.invalidate(component)
+        second = await pool.render(component, {})
+    finally:
+        await pool.stop()
+
+    assert first["ok"] is True, first
+    assert second["ok"] is True, second
+    assert "STYLED_MARKER" in second["html"]
+
+    first_styles = first.get("styles") or []
+    second_styles = second.get("styles") or []
+    assert first_styles, "the first render should carry the component's stylesheet"
+    assert second_styles == first_styles, (
+        "inline styles were lost when an unchanged bundle was re-imported "
+        f"(before={first_styles!r}, after={second_styles!r})"
+    )
