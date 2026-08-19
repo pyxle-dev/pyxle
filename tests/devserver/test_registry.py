@@ -71,7 +71,8 @@ def test_metadata_registry_includes_pages_and_apis(project: DevServerSettings) -
     dynamic_page = registry.find_page("/posts/{id}")
     assert dynamic_page is not None
     assert dynamic_page.loader_name is None
-    assert dynamic_page.module_key == "pyxle.server.pages.posts.id"
+    # Readable stem plus a digest of "[id]" — see test_module_keys_are_unique_per_source_file.
+    assert dynamic_page.module_key.startswith("pyxle.server.pages.posts.id")
     assert dynamic_page.head_elements == ()
     assert metadata.sources["posts/[id].pyxl"].content_hash == dynamic_page.content_hash
 
@@ -82,7 +83,7 @@ def test_metadata_registry_includes_pages_and_apis(project: DevServerSettings) -
 
     dynamic_api = registry.find_api("/api/posts/{id}")
     assert dynamic_api is not None
-    assert dynamic_api.module_key == "pyxle.server.api.posts.id"
+    assert dynamic_api.module_key.startswith("pyxle.server.api.posts.id")
     assert metadata.sources["api/posts/[id].py"].content_hash == dynamic_api.content_hash
 
     assert registry.find_page("/missing") is None
@@ -153,7 +154,52 @@ def test_module_key_sanitizes_segments() -> None:
         drop_leading="api",
     )
 
-    assert key == "pyxle.server.api._1_2._123_slug_lives._.file_name"
+    prefix = "pyxle.server.api."
+    assert key.startswith(prefix)
+    segments = key[len(prefix) :].split(".")
+    # Each segment keeps its readable, importable stem. A segment the cleaning
+    # altered also carries a digest of the original text, so it cannot collide
+    # with a differently-spelled sibling that cleans to the same name — see
+    # test_module_keys_are_unique_per_source_file.
+    for segment, stem in zip(
+        segments, ["_1_2", "_123_slug_lives", "_", "file_name"], strict=True
+    ):
+        assert segment == stem or segment.startswith(stem + "_"), (segment, stem)
+
+
+def test_module_keys_are_unique_per_source_file() -> None:
+    """Two source files must never share a ``sys.modules`` key.
+
+    Compiled modules are cached under this key and reused without re-checking
+    which file they came from, so a shared key means one page silently serves
+    the other's loader and component at a different URL, with a 200 and nothing
+    in the logs. Every pair below is two legitimate pages that coexist in one
+    project and cleaned to the same name before this was fixed.
+    """
+    from pyxle.devserver import registry as registry_module
+
+    pairs = [
+        ("docs/[slug].pyxl", "docs/[[...slug]].pyxl"),
+        ("(marketing)/pricing.pyxl", "marketing/pricing.pyxl"),
+        ("my-page.pyxl", "my_page.pyxl"),
+        ("users/[id].pyxl", "users/id.pyxl"),
+        ("blog/[...rest].pyxl", "blog/rest.pyxl"),
+        ("api/embed.js.py", "api/embed_js.py"),
+    ]
+    for left, right in pairs:
+        left_key = registry_module._module_key(
+            Path(left), prefix="pyxle.server.pages"
+        )
+        right_key = registry_module._module_key(
+            Path(right), prefix="pyxle.server.pages"
+        )
+        assert left_key != right_key, f"{left} and {right} share {left_key}"
+
+    # Ordinary names are untouched, so the readable keys stay readable.
+    assert (
+        registry_module._module_key(Path("blog/post.pyxl"), prefix="pyxle.server.pages")
+        == "pyxle.server.pages.blog.post"
+    )
 
 
 def test_load_page_metadata_handles_non_dict_payload(tmp_path: Path) -> None:
@@ -265,20 +311,28 @@ def test_load_page_metadata_defaults_websocket_for_old_builds(tmp_path: Path) ->
     assert metadata.websocket_name is None
 
 
-def test_find_layout_head_jsx_blocks_no_layout(project: DevServerSettings) -> None:
-    """Test that empty tuple is returned when no layout exists."""
-    from pyxle.devserver.registry import find_layout_head_jsx_blocks
+def test_find_layout_head_contributions_no_layout(project: DevServerSettings) -> None:
+    """Test that both channels are empty when no layout exists."""
+    from pyxle.devserver.registry import find_layout_head_contributions
 
     build_once(project)
 
     # A page at root with no layout.pyxl
-    blocks = find_layout_head_jsx_blocks(project, Path("index.pyxl"))
-    assert blocks == ()
+    contribution = find_layout_head_contributions(project, Path("index.pyxl"))
+    assert contribution.jsx_blocks == ()
+    assert contribution.head_sources == ()
 
 
-def test_find_layout_head_jsx_blocks_root_layout(project: DevServerSettings) -> None:
-    """Test finding head blocks from root layout.pyxl."""
-    from pyxle.devserver.registry import find_layout_head_jsx_blocks
+def test_find_layout_head_contributions_root_layout(project: DevServerSettings) -> None:
+    """A layout's ``<Head>`` JSX and its Python ``HEAD`` variable come back in
+    separate channels.
+
+    They are different kinds of thing — unevaluated JSX source versus finished
+    HTML — and only the first may be filtered for unevaluated expressions
+    downstream. Returning them in one list is what deleted a layout's JSON-LD
+    from every page under it.
+    """
+    from pyxle.devserver.registry import find_layout_head_contributions
 
     # Write a layout.pyxl at the root
     write_file(
@@ -287,14 +341,24 @@ def test_find_layout_head_jsx_blocks_root_layout(project: DevServerSettings) -> 
     )
 
     build_once(project)
-    blocks = find_layout_head_jsx_blocks(project, Path("index.pyxl"))
-    assert len(blocks) > 0
-    assert any("<title>Layout Title</title>" in block for block in blocks)
+    contribution = find_layout_head_contributions(project, Path("index.pyxl"))
+
+    head_elements = [
+        element
+        for source in contribution.head_sources
+        for element in source.static_elements
+    ]
+
+    assert any("<title>Layout Title</title>" in block for block in contribution.jsx_blocks)
+    assert any("width=device-width" in element for element in head_elements)
+    # ...and neither channel has swallowed the other.
+    assert not any("width=device-width" in block for block in contribution.jsx_blocks)
+    assert not any("Layout Title" in element for element in head_elements)
 
 
-def test_find_layout_head_jsx_blocks_nested_layout(project: DevServerSettings) -> None:
+def test_find_layout_head_contributions_nested_layout(project: DevServerSettings) -> None:
     """Test finding head blocks from nested layout.pyxl."""
-    from pyxle.devserver.registry import find_layout_head_jsx_blocks
+    from pyxle.devserver.registry import find_layout_head_contributions
 
     # Write a nested layout
     write_file(
@@ -303,16 +367,16 @@ def test_find_layout_head_jsx_blocks_nested_layout(project: DevServerSettings) -
     )
 
     build_once(project)
-    
+
     # Page in the posts directory should find the posts layout
-    blocks = find_layout_head_jsx_blocks(project, Path("posts/[id].pyxl"))
+    blocks = find_layout_head_contributions(project, Path("posts/[id].pyxl")).jsx_blocks
     assert len(blocks) > 0
     assert any("posts-section" in block for block in blocks)
 
 
-def test_find_layout_head_jsx_blocks_layout_hierarchy(project: DevServerSettings) -> None:
+def test_find_layout_head_contributions_layout_hierarchy(project: DevServerSettings) -> None:
     """Test that layout hierarchy is respected (parent and nested layouts)."""
-    from pyxle.devserver.registry import find_layout_head_jsx_blocks
+    from pyxle.devserver.registry import find_layout_head_contributions
 
     # Write root layout
     write_file(
@@ -327,9 +391,9 @@ def test_find_layout_head_jsx_blocks_layout_hierarchy(project: DevServerSettings
     )
 
     build_once(project)
-    
+
     # Page in posts directory should find both layouts
-    blocks = find_layout_head_jsx_blocks(project, Path("posts/[id].pyxl"))
+    blocks = find_layout_head_contributions(project, Path("posts/[id].pyxl")).jsx_blocks
     assert len(blocks) >= 2
     # Should have both meta tags
     all_blocks = " ".join(blocks)
@@ -401,3 +465,27 @@ def test_find_layout_loaders_nested_hierarchy(project: DevServerSettings) -> Non
     assert loaders[0].loader_name == "load_posts"
     assert loaders[1].loader_name == "load_root"
 
+
+
+def test_api_route_nested_under_a_dynamic_section(project: DevServerSettings) -> None:
+    """An endpoint beneath a section carries the whole path, dynamic segments
+    and file extension included.
+
+    This is what a per-tenant compatibility API needs — the Statuspage-shaped
+    ``/s/{slug}/api/v2/summary.json`` — and it was unreachable while only a
+    top-level ``pages/api/`` counted.
+    """
+    write_file(
+        project.pages_dir / "s/[slug]/api/v2/summary.json.py",
+        "async def endpoint(request):\n    return None\n",
+    )
+
+    build_once(project)
+    registry = load_metadata_registry(project)
+
+    entry = registry.find_api("/s/{slug}/api/v2/summary.json")
+    assert entry is not None, [api.route_path for api in registry.apis]
+    # Bracket and dot segments have to survive into an importable module name.
+    assert entry.module_key.startswith("pyxle.server.api.s.slug")
+    assert entry.module_key.split(".")[-1].startswith("summary_json")
+    assert entry.server_module_path.exists()

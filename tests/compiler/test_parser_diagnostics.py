@@ -17,7 +17,11 @@ import pytest
 
 from pyxle.compiler.exceptions import CompilationError
 from pyxle.compiler.jsx_parser import JSXParseResult
-from pyxle.compiler.parser import PyxDiagnostic, PyxParser
+from pyxle.compiler.parser import (
+    INJECTED_RUNTIME_NAMES,
+    PyxDiagnostic,
+    PyxParser,
+)
 
 _NODE_AVAILABLE = shutil.which("node") is not None
 
@@ -1143,6 +1147,22 @@ class TestSemanticValidation:
         )
         assert not any(d.section == "python" for d in result.diagnostics)
 
+    def test_injected_runtime_names_are_public(self):
+        # Editor tooling (pyxle-langkit) whitelists this exact set, so it is a
+        # public export of ``pyxle.compiler`` — adding an injected name here
+        # means the compiler must inject it too.
+        from pyxle import compiler
+
+        assert compiler.INJECTED_RUNTIME_NAMES is INJECTED_RUNTIME_NAMES
+        assert INJECTED_RUNTIME_NAMES == {
+            "server",
+            "action",
+            "ActionError",
+            "ValidationActionError",
+            "LoaderError",
+            "invalidate_routes",
+        }
+
     def test_off_by_default(self):
         result = PyxParser().parse_text(
             dedent(
@@ -1219,3 +1239,194 @@ class TestJsxErrorLineMapping:
         result = self._run(monkeypatch, error_line=None)
         jsx = [d for d in result.diagnostics if d.section == "jsx"]
         assert jsx and jsx[0].line == 1
+
+
+class TestSemanticSeverity:
+    """Semantic findings are split into "this will break" and "this is untidy".
+
+    ``pyxle check`` is the documented deploy gate, so only code that fails when
+    it runs may fail the command; hygiene findings are reported as warnings.
+    """
+
+    def _sem(self, text: str):
+        return PyxParser().parse_text(
+            dedent(text).strip("\n"), tolerant=True, validate_semantics=True
+        )
+
+    def _severity_of(self, text: str, needle: str) -> str:
+        matches = [d for d in self._sem(text).diagnostics if needle in d.message]
+        assert matches, f"no diagnostic matched {needle!r}"
+        return matches[0].severity
+
+    def test_unused_import_is_a_warning(self):
+        severity = self._severity_of(
+            """
+            import json
+
+            import React from 'react'
+
+            export default function P() {
+                return <div>ok</div>
+            }
+            """,
+            "'json' imported but unused",
+        )
+        assert severity == "warning"
+
+    def test_undefined_name_is_an_error(self):
+        severity = self._severity_of(
+            """
+            @server
+            async def load(request):
+                return {"x": compute_total(request)}
+
+            import React from 'react'
+
+            export default function P({ data }) {
+                return <div>{data.x}</div>
+            }
+            """,
+            "undefined name 'compute_total'",
+        )
+        assert severity == "error"
+
+    def test_unused_local_is_a_warning(self):
+        severity = self._severity_of(
+            """
+            @server
+            async def load(request):
+                scratch = 1
+                return {"x": 2}
+
+            import React from 'react'
+
+            export default function P() {
+                return <div>ok</div>
+            }
+            """,
+            "'scratch'",
+        )
+        assert severity == "warning"
+
+    def test_syntax_errors_remain_errors(self):
+        """Structural/syntax diagnostics never pass through the pyflakes
+        classifier, so they stay errors."""
+        result = self._sem(
+            """
+            def broken(:
+
+            import React from 'react'
+
+            export default function P() {
+                return <div>ok</div>
+            }
+            """
+        )
+        assert result.diagnostics
+        assert all(d.severity == "error" for d in result.diagnostics)
+
+    def test_unknown_pyflakes_rule_defaults_to_warning(self):
+        """A rule added by a future pyflakes must not become a surprise deploy
+        blocker on a dependency upgrade."""
+        from pyxle.compiler.parser import _pyflakes_severity
+
+        class SomeBrandNewRule:  # noqa: D106 - stand-in for a future message class
+            pass
+
+        assert _pyflakes_severity(SomeBrandNewRule()) == "warning"
+
+    def test_runtime_breaking_rules_are_errors(self):
+        """Spot-check the classification table against pyflakes' real classes."""
+        from pyflakes import messages as pyflakes_messages
+
+        from pyxle.compiler.parser import _pyflakes_severity
+
+        for name in ("UndefinedName", "UndefinedLocal", "RaiseNotImplemented"):
+            instance = object.__new__(getattr(pyflakes_messages, name))
+            assert _pyflakes_severity(instance) == "error", name
+        for name in ("UnusedImport", "UnusedVariable", "RedefinedWhileUnused"):
+            instance = object.__new__(getattr(pyflakes_messages, name))
+            assert _pyflakes_severity(instance) == "warning", name
+
+
+class TestAHeadEntryHoldsOneElement:
+    """A second element in one ``HEAD`` entry never reaches the document.
+
+    The sanitiser rebuilds each entry from its first element and drops the
+    rest — the same pass that discards markup injected after an attribute
+    quote breakout, so it is a security boundary, not a limitation to route
+    around. Where the entry is a literal the author is looking at it right
+    now, so this is the moment to refuse it: a build error beats a rich-results
+    report months later saying the structured data was never there.
+    """
+
+    _TWO_IN_ONE = (
+        'HEAD = ["<title>Page</title><meta name=\\"description\\" content=\\"D\\" />"]\n'
+        "\n"
+        "import React from 'react';\n"
+        "export default function P() { return <div />; }\n"
+    )
+
+    def test_strict_mode_refuses_the_build(self):
+        with pytest.raises(CompilationError) as excinfo:
+            _parse(self._TWO_IN_ONE)
+
+        message = str(excinfo.value)
+        assert "only one element" in message
+        assert "Split it into separate list entries" in message
+        # The dropped markup itself, so the author does not have to guess which
+        # half went missing.
+        assert 'content="D"' in message or "content=\\\"D\\\"" in message
+
+    def test_a_bare_string_head_is_checked_too(self):
+        with pytest.raises(CompilationError):
+            _parse(
+                'HEAD = "<title>Page</title><link rel=\\"icon\\" href=\\"/f.ico\\" />"\n'
+                "\n"
+                "import React from 'react';\n"
+                "export default function P() { return <div />; }\n"
+            )
+
+    def test_tolerant_mode_reports_it_as_an_error_diagnostic(self):
+        """``pyxle check`` and the LSP must show it, positioned, rather than
+        stopping at the first problem in the file."""
+        result = _parse(self._TWO_IN_ONE, tolerant=True)
+
+        matching = [d for d in result.diagnostics if "only one element" in d.message]
+        assert matching, result.diagnostics
+        assert matching[0].severity == "error"
+        assert matching[0].section == "python"
+        assert matching[0].line is not None
+
+    def test_the_documented_fix_compiles(self):
+        """The error tells the author to split the entry. That has to work."""
+        result = _parse(
+            'HEAD = ["<title>Page</title>", "<meta name=\\"description\\" content=\\"D\\" />"]\n'
+            "\n"
+            "import React from 'react';\n"
+            "export default function P() { return <div />; }\n"
+        )
+        assert len(result.head_elements) == 2
+
+    def test_an_inline_script_is_not_mistaken_for_two_elements(self):
+        """Inline code containing ``<`` and markup-shaped text is one element.
+        A false positive here would block a build that was already correct."""
+        result = _parse(
+            'HEAD = [\'<script>if (a < b) { document.write("<p>x</p>") }</script>\']\n'
+            "\n"
+            "import React from 'react';\n"
+            "export default function P() { return <div />; }\n"
+        )
+        assert len(result.head_elements) == 1
+
+    def test_a_computed_head_is_left_to_the_render(self):
+        """A non-literal cannot be judged here — its value is only known at
+        render time, where the check continues as a warning."""
+        result = _parse(
+            "SITE = 'x'\n"
+            "HEAD = [f'<meta name=\"a\" content=\"{SITE}\" /><meta name=\"b\" content=\"c\" />']\n"
+            "\n"
+            "import React from 'react';\n"
+            "export default function P() { return <div />; }\n"
+        )
+        assert result.head_is_dynamic is True

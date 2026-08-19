@@ -10,14 +10,15 @@ import re
 import secrets
 import sys
 import time
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 
+from pyxle.compiler.head_elements import find_discarded_head_content
 from pyxle.devserver.error_pages import ErrorBoundaryRegistry
 from pyxle.devserver.overlay import OverlayManager
 from pyxle.devserver.routes import PageRoute
@@ -42,9 +43,23 @@ from .template import (
     render_head_markup,
 )
 
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    # Imported lazily at runtime (see the call sites): pyxle.devserver.registry
+    # is a heavier module than the SSR request path should pull in eagerly.
+    from pyxle.devserver.registry import LayoutHeadSource
+
 
 class LoaderExecutionError(RuntimeError):
-    """Raised when a page loader returns an unexpected value."""
+    """Raised when a page loader cannot be run or returns an unexpected value.
+
+    The loader-stage failure family. Every page pipeline (buffered, streaming,
+    navigation) recognises it and reports it as a loader failure: the nearest
+    ``error.pyxl`` renders, the status is 500, and the dev overlay's breadcrumbs
+    mark the renderer as blocked by the loader. Raised directly for framework
+    level problems (a missing loader function, an unloadable module, a bad
+    return value or ``revalidate`` hint); see :class:`LoaderCrashError` for a
+    loader whose own body raised.
+    """
 
 
 #: The exact ``AttributeError`` message Starlette's ``State`` raises when
@@ -105,6 +120,35 @@ class MissingRequestStateError(LoaderExecutionError):
         self.attribute = attribute
 
 
+class LoaderCrashError(LoaderExecutionError):
+    """Raised when a ``@server`` loader's own body raises.
+
+    A ``KeyError`` on a missing dict key, a ``TypeError`` on ``None``, a
+    database driver's exception — the most ordinary failures an application
+    has. They are *expected* loader-stage faults, not unexpected framework
+    ones, so they are classified here at the invocation site rather than
+    reaching the render pipeline bare. That is what routes them to the
+    application's ``error.pyxl`` (status 500) instead of Pyxle's fallback
+    document.
+
+    The original exception stays reachable through ``__cause__``, so the dev
+    overlay and the server log still show the real traceback pointing at the
+    line in the ``.pyxl`` file. The message names the loader, the route, and
+    the original exception; it is shown in development and written to the log,
+    while production responses stay sanitized (CLAUDE.md rule 18).
+
+    An author-raised :class:`~pyxle.runtime.LoaderError` is *not* wrapped: it
+    carries a deliberate status code and user-facing message and propagates
+    untouched.
+    """
+
+    def __init__(self, origin: str, cause: BaseException) -> None:
+        detail = str(cause)
+        summary = f"{type(cause).__name__}: {detail}" if detail else type(cause).__name__
+        super().__init__(f"{origin} raised {summary}")
+        self.origin = origin
+
+
 class HeadEvaluationError(RuntimeError):
     """Raised when HEAD cannot be resolved at runtime."""
 
@@ -139,6 +183,7 @@ class _StreamingPrelude:
     component_props: dict[str, Any]
     head_elements: tuple[str, ...]
     layout_head_jsx_blocks: tuple[str, ...]
+    layout_head_variable: tuple[str, ...]
     status_code: int
     revalidate: float | None
     csrf_token: str | None
@@ -219,15 +264,20 @@ def _error_response(
     stage: str,
     error: BaseException,
     status_code: int,
+    already_logged: bool = False,
 ) -> HTMLResponse:
     """Log the failure server-side, then return the sanitized HTML error page.
 
     Centralizes the "log, then render the fallback document" pair so every
     error branch in :func:`build_page_response` behaves consistently and the
-    production response never leaks internals.
+    production response never leaks internals. Pass ``already_logged=True``
+    when the caller has logged the failure itself, so it is recorded once.
     """
-    _log_render_failure(page, stage=stage, error=error, status_code=status_code)
-    fallback = render_error_document(settings=settings, page=page, error=error)
+    if not already_logged:
+        _log_render_failure(page, stage=stage, error=error, status_code=status_code)
+    fallback = render_error_document(
+        settings=settings, page=page, error=error, status_code=status_code
+    )
     return HTMLResponse(fallback, status_code=status_code)
 
 
@@ -396,7 +446,11 @@ async def run_page_loader(
     A lighter-weight counterpart to :func:`render_page_body_html` for callers
     (such as the ``.md`` markdown resolver) that only need the loader's return
     value. Returns the loader's data dict; a page with no loader returns ``{}``.
-    Propagates loader exceptions.
+
+    Propagates loader exceptions with the same classification the page pipeline
+    uses: an author-raised :class:`~pyxle.runtime.LoaderError` untouched, and
+    anything the loader body raised as a :class:`LoaderCrashError` whose
+    ``__cause__`` is the original exception.
     """
     payload, _status, _revalidate, _module = await _execute_loader(
         page, request, module=None, debug=settings.debug
@@ -418,9 +472,18 @@ async def _handle_render_exception(
     """Map a render-pipeline exception to an error-boundary or sanitized page.
 
     Shared by the buffered and streaming page builders so both honour the same
-    error-boundary contract. Known render-stage exceptions try the nearest
-    ``error.pyxl`` first; any unexpected fault returns the sanitized fallback
-    without exposing internals.
+    error-boundary contract. A failure in *application* code — a loader
+    (including a loader whose own body raised: see :class:`LoaderCrashError`),
+    a ``HEAD``, a component — tries the nearest ``error.pyxl`` first.
+
+    Anything else reaching this function is a fault in the framework's own
+    render pipeline, and the ``else`` branch deliberately returns the sanitized
+    fallback **without** consulting the boundary: running more application code
+    to handle a framework fault can compound the failure, and the boundary
+    render depends on the very machinery that just broke. Application faults do
+    not land there — they are classified where they happen (loader exceptions
+    in :func:`_invoke_loader_callable`, render exceptions in the renderer), not
+    inferred from what is left over here.
     """
     from pyxle.runtime import LoaderError
 
@@ -435,7 +498,7 @@ async def _handle_render_exception(
     elif isinstance(exc, ComponentRenderError):
         exc = _enrich_render_error(exc, page)
         stage, status_code = "renderer", 500
-    else:  # pragma: no cover - defensive guardrail for unexpected faults
+    else:
         if overlay is not None:
             await overlay.notify_error(
                 route_path=page.path,
@@ -452,6 +515,11 @@ async def _handle_render_exception(
             error=exc,
             breadcrumbs=_compose_breadcrumbs(loader_breadcrumb, stage=stage, message=str(exc)),
         )
+    # Log *before* the boundary attempt. A production response is deliberately
+    # sanitized, so this log is the only record of what actually failed — and a
+    # successfully rendered error.pyxl must not make the failure disappear from
+    # the server's logs. (Sub-500 statuses stay quiet; see _log_render_failure.)
+    _log_render_failure(page, stage=stage, error=exc, status_code=status_code)
     boundary_response = await _try_error_boundary(
         request=request,
         settings=settings,
@@ -464,7 +532,12 @@ async def _handle_render_exception(
     if boundary_response is not None:
         return boundary_response
     return _error_response(
-        settings=settings, page=page, stage=stage, error=exc, status_code=status_code,
+        settings=settings,
+        page=page,
+        stage=stage,
+        error=exc,
+        status_code=status_code,
+        already_logged=True,
     )
 
 
@@ -523,6 +596,7 @@ async def build_streaming_page_response(
             head_variable=prelude.head_elements,
             head_jsx_blocks=page.head_jsx_blocks,
             layout_head_jsx_blocks=prelude.layout_head_jsx_blocks,
+            layout_head_variable=prelude.layout_head_variable,
             runtime_head_blocks=(),
         )
         script_nonce = secrets.token_urlsafe(24)
@@ -644,11 +718,14 @@ async def build_page_navigation_response(
                 head_variable=prelude.head_elements,
                 head_jsx_blocks=page.head_jsx_blocks,
                 layout_head_jsx_blocks=prelude.layout_head_jsx_blocks,
+                layout_head_variable=prelude.layout_head_variable,
                 runtime_head_blocks=(),
             )
             nav_status_code = prelude.status_code
             nav_component_props = prelude.component_props
-            nav_head_markup = render_head_markup(static_head)
+            nav_head_markup = render_head_markup(
+                static_head, settings.document_title_default
+            )
         else:
             artifacts = await _create_page_artifacts(
                 request=request,
@@ -740,7 +817,10 @@ async def build_page_navigation_response(
             stage="renderer",
             error=_enrich_render_error(exc, page),
         )
-    except Exception as exc:  # pragma: no cover - defensive guardrail
+    except Exception as exc:
+        # The JSON counterpart of _handle_render_exception's else branch: a
+        # fault in the framework's own pipeline, reported as a server-stage
+        # error. Application faults are classified before they get here.
         return await _navigation_error_response(
             request=request,
             settings=settings,
@@ -843,31 +923,71 @@ async def _execute_loader(
 
     _loader_start = time.perf_counter()
     with span("loader"):
-        result = await _invoke_loader_callable(loader, request)
+        result = await _invoke_loader_callable(loader, request, origin=_loader_origin(page))
     _record_render_metric(request, "loader", (time.perf_counter() - _loader_start) * 1000.0)
 
     payload, status_code, revalidate = _normalize_loader_result(result, page)
     return payload, status_code, revalidate, module
 
 
-async def _invoke_loader_callable(loader: Callable[..., Any], request: Request) -> Any:
+def _loader_origin(page: PageRoute) -> str:
+    """Name a page loader for a :class:`LoaderCrashError` message."""
+    return f"Loader {page.loader_name!r} for {page.path}"
+
+
+async def _invoke_loader_callable(
+    loader: Callable[..., Any], request: Request, *, origin: str
+) -> Any:
     """Call a ``@server`` loader (sync or async) and return its result.
 
-    A read of an unset ``request.state`` attribute is translated into
-    :class:`MissingRequestStateError` (guidance instead of a bare
-    ``AttributeError``), chaining the original exception; every other
-    exception propagates untouched.
+    Everything a loader's own body raises is classified here, at the boundary
+    between framework code and application code, so the render pipeline can
+    treat it as what it is — a loader-stage failure — instead of an unexpected
+    framework fault:
+
+    * :class:`~pyxle.runtime.LoaderError` is the author's deliberate signal
+      (status code, user-facing message, ``data``) and propagates untouched.
+    * A read of an unset ``request.state`` attribute becomes
+      :class:`MissingRequestStateError` — guidance instead of a bare
+      ``AttributeError``.
+    * Anything else becomes :class:`LoaderCrashError`, chaining the original
+      through ``__cause__``.
+
+    ``origin`` names the loader in the resulting message (``"Loader 'load_user'
+    for /users/{id}"``). ``BaseException`` is deliberately not caught, so an
+    ``asyncio.CancelledError`` from a client disconnect stays a cancellation
+    rather than becoming an error page.
     """
     try:
         result = loader(request)
         if hasattr(result, "__await__"):
             result = await result
-    except AttributeError as exc:
-        attribute = missing_state_attribute(exc)
-        if attribute is None:
+    except Exception as exc:
+        # Imported on the failure path only: this is the SSR hot path, and a
+        # successful loader must not pay for the framework's error taxonomy.
+        from pyxle.runtime import LoaderError  # noqa: PLC0415 - zero-dep module
+
+        if isinstance(exc, (LoaderError, LoaderExecutionError)):
             raise
-        raise MissingRequestStateError(attribute) from exc
+        attribute = missing_state_attribute(exc)
+        if attribute is not None:
+            raise MissingRequestStateError(attribute) from exc
+        raise LoaderCrashError(origin, exc) from exc
     return result
+
+
+@dataclass(frozen=True, slots=True)
+class _LayoutLoaderResults:
+    """What the layout chain's ``@server`` loaders produced for one request.
+
+    ``merged`` is the flattened view the layout components receive as props (a
+    later layout's key wins, as before). ``per_layout`` keeps each layout's own
+    result under its source path, because a layout's ``HEAD`` callable is
+    handed *its own* data, not the chain's.
+    """
+
+    merged: dict[str, Any] | None = None
+    per_layout: Mapping[Path, Mapping[str, Any]] = field(default_factory=dict)
 
 
 async def _execute_layout_loaders(
@@ -875,34 +995,40 @@ async def _execute_layout_loaders(
     settings: DevServerSettings,
     page: PageRoute,
     request: Request,
-) -> dict[str, Any] | None:
+) -> _LayoutLoaderResults:
     """Execute ``@server`` loaders declared in ancestor layout/template files.
 
-    Returns a dict of loader results (one entry per layout that has a loader),
-    or ``None`` if no layout declares a loader.
+    Returns the merged loader data (``None`` when no layout declares a loader)
+    alongside each layout's own result, keyed by source path.
     """
     from pyxle.devserver.registry import find_layout_loaders
 
     layout_loader_infos = find_layout_loaders(settings, page.source_relative_path)
     if not layout_loader_infos:
-        return None
+        return _LayoutLoaderResults()
 
     layout_data: dict[str, Any] = {}
+    per_layout: dict[Path, Mapping[str, Any]] = {}
     for info in layout_loader_infos:
         module = _import_server_module(info.module_key, info.server_module_path, debug=settings.debug)
         loader_fn = getattr(module, info.loader_name, None)
         if loader_fn is None:
             continue
 
-        result = await _invoke_loader_callable(loader_fn, request)
+        result = await _invoke_loader_callable(
+            loader_fn,
+            request,
+            origin=f"Layout loader {info.loader_name!r} in {info.relative_path.as_posix()}",
+        )
 
         # Layout loaders return a plain dict (no status code).
         if isinstance(result, tuple) and result:
             result = result[0]
         if isinstance(result, Mapping):
             layout_data.update(result)
+            per_layout[info.relative_path] = result
 
-    return layout_data or None
+    return _LayoutLoaderResults(merged=layout_data or None, per_layout=per_layout)
 
 
 def _resolve_head_elements(
@@ -912,20 +1038,58 @@ def _resolve_head_elements(
     *,
     debug: bool = False,
 ) -> tuple[str, ...]:
+    """Resolve a page's ``HEAD`` — literals straight from the compiler, anything
+    else by importing the page module and evaluating it against loader data."""
     if not page.head_is_dynamic:
         return page.head_elements
 
     if module is None:
         module = _import_server_module(page.module_key, page.server_module_path, debug=debug)
 
-    head_value = getattr(module, "HEAD", None)
-    if head_value is None:
+    return _evaluate_head_value(page.path, getattr(module, "HEAD", None), loader_payload)
+
+
+def _resolve_layout_head_elements(
+    sources: Sequence[LayoutHeadSource],
+    layout_payloads: Mapping[Path, Mapping[str, Any]],
+    *,
+    debug: bool = False,
+) -> tuple[str, ...]:
+    """Resolve every layout's ``HEAD`` in the chain, in wrapping order.
+
+    The layout half of :func:`_resolve_head_elements`, and deliberately its
+    twin: a layout's ``HEAD`` supports exactly the forms a page's does. A
+    literal is taken from the compiler's static extraction; anything the
+    compiler could not read — an f-string, a concatenation, ``json.dumps(...)``,
+    a ``def HEAD(data)`` callable — is evaluated by importing the layout module,
+    which is the same module object its ``@server`` loader ran in.
+
+    A callable receives **that layout's own loader data**, mirroring the page
+    contract where a page's callable receives that page's loader data. A layout
+    with no loader gets an empty mapping, so ``data.get(...)`` is the safe
+    idiom there.
+    """
+    if not sources:
         return tuple()
 
-    if callable(head_value):
-        head_value = _evaluate_head_callable(page, head_value, loader_payload)
+    elements: list[str] = []
+    for source in sources:
+        if not source.is_dynamic:
+            elements.extend(source.static_elements)
+            continue
 
-    return _normalize_head_entries(page, head_value)
+        module = _import_server_module(
+            source.module_key, source.server_module_path, debug=debug
+        )
+        elements.extend(
+            _evaluate_head_value(
+                source.relative_path.as_posix(),
+                getattr(module, "HEAD", None),
+                layout_payloads.get(source.relative_path, {}),
+            )
+        )
+
+    return tuple(elements)
 
 
 def _coerce_revalidate(value: Any, page: PageRoute) -> float | None:
@@ -1064,18 +1228,26 @@ async def _create_streaming_prelude(
 
     head_elements = _resolve_head_elements(page, module, loader_props, debug=settings.debug)
 
-    from pyxle.devserver.registry import find_layout_head_jsx_blocks
+    from pyxle.devserver.registry import find_layout_head_contributions
 
-    layout_head_jsx_blocks = find_layout_head_jsx_blocks(settings, page.source_relative_path)
+    layout_head = find_layout_head_contributions(settings, page.source_relative_path)
 
-    # Execute layout loaders (if any layout has a @server decorator)
-    layout_data = await _execute_layout_loaders(
+    # Execute layout loaders (if any layout has a @server decorator) BEFORE
+    # resolving the layout chain's HEAD: a layout's callable HEAD is handed its
+    # own loader's data, so the data has to exist first.
+    layout_results = await _execute_layout_loaders(
         settings=settings,
         page=page,
         request=request,
     )
 
-    component_props = _compose_component_props(loader_props, layout_data)
+    layout_head_variable = _resolve_layout_head_elements(
+        layout_head.head_sources,
+        layout_results.per_layout,
+        debug=settings.debug,
+    )
+
+    component_props = _compose_component_props(loader_props, layout_results.merged)
     # On a publicly-cacheable render, suppress the per-user CSRF token so the
     # shared cached body never carries one user's token (<Form> falls back to
     # the cookie/header JS path).
@@ -1084,7 +1256,8 @@ async def _create_streaming_prelude(
     return _StreamingPrelude(
         component_props=component_props,
         head_elements=head_elements,
-        layout_head_jsx_blocks=layout_head_jsx_blocks,
+        layout_head_jsx_blocks=layout_head.jsx_blocks,
+        layout_head_variable=layout_head_variable,
         status_code=status_code,
         revalidate=revalidate,
         csrf_token=csrf_token,
@@ -1131,10 +1304,11 @@ async def _create_page_artifacts(
         head_variable=prelude.head_elements,
         head_jsx_blocks=page.head_jsx_blocks,
         layout_head_jsx_blocks=prelude.layout_head_jsx_blocks,
+        layout_head_variable=prelude.layout_head_variable,
         runtime_head_blocks=tuple(runtime_head_blocks),
     )
 
-    head_markup = render_head_markup(merged_head_elements)
+    head_markup = render_head_markup(merged_head_elements, settings.document_title_default)
 
     return PageArtifacts(
         component_props=prelude.component_props,
@@ -1195,7 +1369,7 @@ async def _try_error_boundary(
     # mask the boundary itself: fall back to error-only props and let the
     # render proceed with whatever the layout can do without data.
     try:
-        layout_data = await _execute_layout_loaders(
+        layout_results = await _execute_layout_loaders(
             settings=settings, page=boundary_page, request=request
         )
     except Exception as layout_exc:
@@ -1204,11 +1378,11 @@ async def _try_error_boundary(
             boundary_page.source_relative_path.as_posix(),
             layout_exc,
         )
-        layout_data = None
+        layout_results = _LayoutLoaderResults()
 
     boundary_props: dict[str, Any] = {"error": error_context}
-    if layout_data:
-        boundary_props["layoutData"] = layout_data
+    if layout_results.merged:
+        boundary_props["layoutData"] = layout_results.merged
 
     try:
         _boundary_render_start = time.perf_counter()
@@ -1222,7 +1396,13 @@ async def _try_error_boundary(
             request, "render", (time.perf_counter() - _boundary_render_start) * 1000.0
         )
         script_nonce = secrets.token_urlsafe(24)
-        head_elements = boundary_page.head_elements
+        head_elements = _boundary_head_elements(
+            settings=settings,
+            boundary_page=boundary_page,
+            boundary_props=boundary_props,
+            runtime_head_blocks=tuple(render_result.head_elements),
+            layout_payloads=layout_results.per_layout,
+        )
         document = render_document(
             settings=settings,
             page=boundary_page,
@@ -1244,6 +1424,76 @@ async def _try_error_boundary(
             exc_info=True,
         )
         return None
+
+
+def _boundary_head_elements(
+    *,
+    settings: DevServerSettings,
+    boundary_page: PageRoute,
+    boundary_props: Mapping[str, Any],
+    runtime_head_blocks: tuple[str, ...],
+    layout_payloads: Mapping[Path, Mapping[str, Any]],
+) -> tuple[str, ...]:
+    """Build the document head for a page rendered through an error boundary.
+
+    The boundary is an ordinary page wrapped in its ancestor layout chain, so
+    its head is merged from exactly the sources a normal render uses
+    (:func:`_create_page_artifacts`): the layout chain's two channels, the
+    boundary's own ``HEAD`` variable and ``<Head>`` blocks, and the ``<Head>``
+    elements the render just produced. Reading the ``HEAD`` variable alone left
+    the one page a confused visitor is most likely to see without the site's
+    stylesheet, favicon or title — including the boundary's own ``<Head>``.
+
+    An evaluated ``HEAD`` (a callable, or any non-literal) is the one part that
+    can fail here: it receives the error context rather than loader data, a
+    shape it has never run against. That must not cost the visitor the boundary
+    as well, so a failure degrades to the statically extracted elements and is
+    logged rather than raised. The layout chain's ``HEAD`` is resolved under the
+    same rule, with whatever layout loader data survived the failure — a root
+    layout's JSON-LD or critical CSS should still reach the error page, but not
+    at the price of the error page itself.
+    """
+    from pyxle.devserver.registry import find_layout_head_contributions  # noqa: PLC0415
+    from pyxle.ssr.head_merger import merge_head_elements  # noqa: PLC0415
+
+    try:
+        head_variable = _resolve_head_elements(
+            boundary_page, None, boundary_props, debug=settings.debug
+        )
+    except Exception as exc:
+        _logger.warning(
+            "HEAD evaluation failed for error boundary %s: %s",
+            boundary_page.source_relative_path.as_posix(),
+            exc,
+        )
+        head_variable = boundary_page.head_elements
+
+    layout_head = find_layout_head_contributions(
+        settings, boundary_page.source_relative_path
+    )
+    try:
+        layout_head_variable = _resolve_layout_head_elements(
+            layout_head.head_sources, layout_payloads, debug=settings.debug
+        )
+    except Exception as exc:
+        _logger.warning(
+            "Layout HEAD evaluation failed while rendering error boundary %s: %s",
+            boundary_page.source_relative_path.as_posix(),
+            exc,
+        )
+        layout_head_variable = tuple(
+            element
+            for source in layout_head.head_sources
+            for element in source.static_elements
+        )
+
+    return merge_head_elements(
+        head_variable=head_variable,
+        head_jsx_blocks=boundary_page.head_jsx_blocks,
+        layout_head_jsx_blocks=layout_head.jsx_blocks,
+        layout_head_variable=layout_head_variable,
+        runtime_head_blocks=runtime_head_blocks,
+    )
 
 
 def _build_error_context(
@@ -1390,15 +1640,20 @@ def _import_server_module(
 
 
 def _evaluate_head_callable(
-    page: PageRoute,
+    origin: str,
     head_callable: Callable[[Mapping[str, Any]], object],
     loader_payload: Mapping[str, Any],
 ) -> Any:
+    """Call a ``HEAD`` callable with its loader data.
+
+    *origin* names what failed in the error message — a page's route path, or a
+    layout's project-relative source path.
+    """
     try:
         value = head_callable(loader_payload)
     except TypeError as exc:
         raise HeadEvaluationError(
-            f"Callable HEAD for {page.path} must accept exactly one argument (loader data)",
+            f"Callable HEAD for {origin} must accept exactly one argument (loader data)",
         ) from exc
 
     if inspect.isawaitable(value):
@@ -1406,13 +1661,14 @@ def _evaluate_head_callable(
         if hasattr(value, "close"):
             value.close()
         raise HeadEvaluationError(
-            f"Callable HEAD for {page.path} must return synchronously",
+            f"Callable HEAD for {origin} must return synchronously",
         )
 
     return value
 
 
-def _normalize_head_entries(page: PageRoute, value: Any) -> tuple[str, ...]:
+def _normalize_head_entries(origin: str, value: Any) -> tuple[str, ...]:
+    """Coerce an evaluated ``HEAD`` into a tuple of element strings."""
     if value is None:
         return tuple()
 
@@ -1424,17 +1680,83 @@ def _normalize_head_entries(page: PageRoute, value: Any) -> tuple[str, ...]:
         for item in value:
             if not isinstance(item, str):
                 raise HeadEvaluationError(
-                    f"HEAD entries for {page.path} must be strings; got {type(item).__name__}",
+                    f"HEAD entries for {origin} must be strings; got {type(item).__name__}",
                 )
             normalized.append(item)
         return tuple(normalized)
 
     raise HeadEvaluationError(
-        f"HEAD for {page.path} must be a string, list of strings, or callable; got {type(value).__name__}",
+        f"HEAD for {origin} must be a string, list of strings, or callable; got {type(value).__name__}",
     )
 
 
+#: Multi-element ``HEAD`` entries already reported, as ``(origin, dropped)``.
+#: A computed ``HEAD`` is re-evaluated on every render, so warning on the spot
+#: would put one line per request in the log — the noise that gets a warning
+#: filtered out and the bug ignored. Keyed on the dropped content as well as the
+#: file so a *different* mistake in the same file is still heard.
+_reported_discarded_head: set[tuple[str, str]] = set()
+
+#: Bound for the set above (rule 17: no unbounded caches). The key is normally
+#: stable — the dropped element rarely carries request data — so this holds one
+#: entry per genuine mistake. If an app manages to vary it per request, the set
+#: is cleared on overflow rather than grown or frozen: a rare repeat line is
+#: better than either a leak or going silent.
+_DISCARDED_HEAD_REPORT_LIMIT = 256
+
+
+def _warn_discarded_head_content(origin: str, entries: Sequence[str]) -> None:
+    """Report ``HEAD`` entries whose tail the sanitiser will drop.
+
+    This is the render-time half of the check the compiler makes on a literal
+    ``HEAD``. It cannot be an error: the value is only known once the page is
+    rendered, so a second ``<meta>`` appearing for one row of data would take
+    the whole page down for exactly the visitors who reach that row, having
+    passed every test and every other request. Losing a tag must not cost the
+    page — but it must not be silent either.
+    """
+    for entry in entries:
+        discarded = find_discarded_head_content(entry)
+        if discarded is None:
+            continue
+        key = (origin, discarded)
+        if key in _reported_discarded_head:
+            continue
+        if len(_reported_discarded_head) >= _DISCARDED_HEAD_REPORT_LIMIT:
+            _reported_discarded_head.clear()
+        _reported_discarded_head.add(key)
+        _logger.warning(
+            "HEAD entry for %s contains more than one element; only the first "
+            "is kept. Split it into separate list entries. Dropped: %s",
+            origin,
+            discarded if len(discarded) <= 200 else discarded[:197] + "...",
+        )
+
+
+def _evaluate_head_value(
+    origin: str,
+    head_value: Any,
+    loader_payload: Mapping[str, Any],
+) -> tuple[str, ...]:
+    """Resolve a module's ``HEAD`` attribute into finished element strings.
+
+    The single definition of what a ``HEAD`` may be — a string, a list of
+    strings, or a callable taking loader data. Pages and layouts share it so
+    the two can never drift into supporting different forms.
+    """
+    if head_value is None:
+        return tuple()
+
+    if callable(head_value):
+        head_value = _evaluate_head_callable(origin, head_value, loader_payload)
+
+    entries = _normalize_head_entries(origin, head_value)
+    _warn_discarded_head_content(origin, entries)
+    return entries
+
+
 __all__ = [
+    "LoaderCrashError",
     "LoaderExecutionError",
     "MissingRequestStateError",
     "missing_state_attribute",

@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Iterable, Literal, Sequence
 
 from .exceptions import CompilationError
+from .head_elements import find_discarded_head_content
 
 # ---------------------------------------------------------------------------
 # Public dataclasses
@@ -113,6 +114,7 @@ class PyxParseResult:
     actions: tuple[ActionDetails, ...] = ()
     websocket: WebsocketDetails | None = None
     cache_revalidate: float | None = None
+    standalone: bool = False
     uses_suspense: bool = False
     diagnostics: tuple[PyxDiagnostic, ...] = ()
 
@@ -153,19 +155,20 @@ class _DiagnosticCollector:
         *,
         section: Literal["python", "jsx"] = "python",
         column: int | None = None,
+        severity: Literal["error", "warning"] = "error",
     ) -> None:
         if self.tolerant:
             self.diagnostics.append(
                 PyxDiagnostic(
                     section=section,
-                    severity="error",
+                    severity=severity,
                     message=message,
                     line=line,
                     column=column,
                 )
             )
             return
-        raise CompilationError(message, line)
+        raise CompilationError(message, line, column)
 
 
 def _normalize_newlines(text: str) -> list[str]:
@@ -627,6 +630,11 @@ def _detect_broken_python_in_jsx_segments(
                 exc.msg or "invalid syntax",
                 absolute_line,
                 section="python",
+                # ``SyntaxError.offset`` is already 1-indexed within its line
+                # and needs no segment adjustment (segments only shift lines).
+                # Passing it through is what lets the rebuild print a
+                # ``pages/about.pyxl:7:5`` location an editor can jump to.
+                column=exc.offset,
             )
 
 
@@ -931,6 +939,38 @@ def _detect_websocket(
     )
 
 
+def _preview_discarded(discarded: str) -> str:
+    """Shorten dropped markup for an error message without losing its shape."""
+    collapsed = " ".join(discarded.split())
+    if len(collapsed) > 80:
+        collapsed = collapsed[:77] + "..."
+    return collapsed
+
+
+def _check_head_entries(
+    entries: Sequence[str], line: int | None, collector: _DiagnosticCollector
+) -> None:
+    """Refuse a ``HEAD`` entry that holds more than one element.
+
+    Only the first element of an entry survives sanitisation — the pass that
+    also discards markup injected after an attribute quote breakout, so it is a
+    security boundary rather than a limitation to work around. An entry with a
+    second element is therefore content the author wrote and no visitor will
+    ever receive. Caught here, while it is a literal in front of them, rather
+    than months later in a rich-results report.
+    """
+    for entry in entries:
+        discarded = find_discarded_head_content(entry)
+        if discarded is None:
+            continue
+        collector.emit(
+            "A HEAD entry may contain only one element; everything after the "
+            "first is dropped. Split it into separate list entries. "
+            f"Dropped: {_preview_discarded(discarded)}",
+            line,
+        )
+
+
 def _extract_head_literal(
     value: ast.AST, line: int | None, collector: _DiagnosticCollector
 ) -> list[str] | None:
@@ -940,6 +980,7 @@ def _extract_head_literal(
         if literal is None:
             return []
         if isinstance(literal, str):
+            _check_head_entries([literal], line, collector)
             return [literal]
         collector.emit(
             "HEAD must be assigned a string or list of strings", line
@@ -954,6 +995,7 @@ def _extract_head_literal(
             ):
                 return None
             normalized.append(element.value)
+        _check_head_entries(normalized, line, collector)
         return normalized
 
     return None
@@ -1064,6 +1106,48 @@ def _detect_cache_directive(
     return revalidate
 
 
+def _extract_standalone(
+    tree: ast.Module | None,
+    python_line_numbers: Sequence[int],
+    *,
+    collector: _DiagnosticCollector,
+) -> bool:
+    """Extract a module-level ``STANDALONE = True`` directive.
+
+    Only meaningful on a ``layout.pyxl``. It means "this layout is the root of
+    its own chain" — layouts in ancestor directories are not applied to pages
+    beneath it, and neither are their loaders.
+
+    The case it exists for is a section of a site that is not part of the app
+    around it: a public status page inside an admin console, a print view, an
+    embedded widget. Without it the only options are to wrap that section in
+    the app's chrome, or to teach the root layout to recognise the section and
+    render nothing — a conditional that grows a branch per section and puts
+    knowledge of every child in the parent.
+    """
+    if tree is None:
+        return False
+
+    standalone = False
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(
+            isinstance(target, ast.Name) and target.id == "STANDALONE"
+            for target in node.targets
+        ):
+            continue
+        line = _map_lineno(node.lineno, python_line_numbers)
+        value = node.value
+        if isinstance(value, ast.Constant) and isinstance(value.value, bool):
+            standalone = value.value
+        else:
+            collector.emit(
+                "STANDALONE must be True or False, e.g. STANDALONE = True", line
+            )
+    return standalone
+
+
 # ---------------------------------------------------------------------------
 # JSX metadata extraction (Babel-backed)
 # ---------------------------------------------------------------------------
@@ -1081,6 +1165,12 @@ class _JsxMetadata:
     #: syntax in the client block, else ``None``. Surfaced by ``parse_text`` as a
     #: source-located diagnostic once the Python section is confirmed clean.
     ts_violation: tuple[str, int | None] | None = None
+    #: ``(message, jsx_relative_line)`` when Babel could not parse the JSX at
+    #: all, else ``None``. Costs nothing to know: the extractor pass that reads
+    #: ``<Head>``/``<Script>``/``<Image>``/``<Suspense>`` runs on every compile
+    #: and has to parse the section to do it, so a failure here is a judgement
+    #: it has already made and used to return empty metadata.
+    syntax_error: tuple[str, int | None] | None = None
 
 
 # Element names that opt a page into streaming SSR. ``React.Suspense`` is the
@@ -1106,14 +1196,24 @@ def _detect_jsx_metadata(jsx_code: str) -> _JsxMetadata:
     if result.error:
         # TypeScript syntax in the client block is a real, surfaceable user
         # error (Babel accepts it but esbuild later fails opaquely). Carry it
-        # out so ``parse_text`` can emit a source-located diagnostic. Every
-        # other extractor failure (unavailable toolchain, genuine JSX syntax
-        # error already surfaced elsewhere) keeps degrading silently here.
+        # out so ``parse_text`` can emit a source-located diagnostic.
         if result.error_code == "ts_in_client_block":
             return _JsxMetadata(
                 (), (), (), False, ts_violation=(result.error, result.error_line)
             )
-        return _JsxMetadata((), (), (), False)
+        if not result.toolchain_available:
+            # The *checker* failed, not the page. Degrade silently: turning a
+            # missing Node install into a compile error would fail every file
+            # in the project on a machine that has no Node at all.
+            return _JsxMetadata((), (), (), False)
+        # Babel ran and could not parse the section. Carry it out the same way:
+        # the alternative is what shipped before — returning empty metadata, so
+        # the page's <Head>, <Script>, <Image> and <Suspense> were all silently
+        # dropped and the failure only appeared later, from the bundler, against
+        # the generated .jsx.
+        return _JsxMetadata(
+            (), (), (), False, syntax_error=(result.error, result.error_line)
+        )
 
     components = result.components
     scripts = tuple(
@@ -1137,6 +1237,26 @@ def _detect_jsx_metadata(jsx_code: str) -> _JsxMetadata:
         component.name in _SUSPENSE_ELEMENT_NAMES for component in components
     )
     return _JsxMetadata(scripts, images, head_blocks, uses_suspense)
+
+
+def _map_jsx_line(
+    jsx_relative_line: int | None, jsx_line_numbers: Sequence[int]
+) -> int | None:
+    """Translate a line within the extracted JSX section to a ``.pyxl`` line.
+
+    Every JSX-side tool — Babel here, esbuild later — numbers lines from the
+    start of the *section* it was handed, not from the start of the file the
+    developer is editing. Reporting that number unmapped points at the wrong
+    line of the right file. Falls back to the section's first line when there
+    is no line or it is out of range, so a diagnostic never points nowhere.
+    """
+
+    if (
+        jsx_relative_line is not None
+        and 0 <= jsx_relative_line - 1 < len(jsx_line_numbers)
+    ):
+        return jsx_line_numbers[jsx_relative_line - 1]
+    return jsx_line_numbers[0] if jsx_line_numbers else None
 
 
 def _validate_jsx_syntax(
@@ -1178,7 +1298,10 @@ def _validate_jsx_syntax(
 #: ``compiler/writers.py``). pyflakes must treat them as defined so ``@server`` /
 #: ``@action`` / ``raise ActionError(...)`` / ``raise LoaderError(...)`` never
 #: read as undefined even when the user hasn't written an import.
-_INJECTED_RUNTIME_NAMES = frozenset(
+#:
+#: Public so editor tooling (pyxle-langkit) whitelists exactly the same names
+#: the compiler injects, instead of keeping a copy that can drift.
+INJECTED_RUNTIME_NAMES = frozenset(
     {
         "server",
         "action",
@@ -1188,6 +1311,71 @@ _INJECTED_RUNTIME_NAMES = frozenset(
         "invalidate_routes",
     }
 )
+
+
+#: pyflakes message classes that describe code which will **fail when it runs**
+#: — a NameError, an UnboundLocalError, a TypeError from a bad format string, or
+#: a construct CPython rejects outright. These are the only semantic findings
+#: reported as ``severity="error"``.
+#:
+#: Everything pyflakes can report that is *not* listed here is a warning: the
+#: code runs correctly, it is merely untidy (an unused import, a dead local, a
+#: duplicate dict key, an f-string with no placeholders). That split is what
+#: lets ``pyxle check`` gate a deploy on real breakage without a leftover
+#: ``import json`` blocking a release.
+#:
+#: An unrecognised message class — a rule added by a future pyflakes — is
+#: treated as a **warning**, deliberately. A new hygiene rule must never turn
+#: into a surprise deploy blocker on a dependency upgrade; the finding is still
+#: printed, it just doesn't fail the run.
+_PYFLAKES_ERROR_MESSAGES: frozenset[str] = frozenset(
+    {
+        # Unresolved references — NameError / UnboundLocalError at runtime.
+        "UndefinedName",
+        "UndefinedLocal",
+        "UndefinedExport",
+        # Constructs CPython itself rejects (normally caught by ast.parse
+        # first; listed so they stay errors on any path that reaches here).
+        "BreakOutsideLoop",
+        "ContinueOutsideLoop",
+        "ReturnOutsideFunction",
+        "YieldOutsideFunction",
+        "DefaultExceptNotLast",
+        "DuplicateArgument",
+        "FutureFeatureNotDefined",
+        "LateFutureImport",
+        "ImportStarNotPermitted",
+        "TooManyExpressionsInStarredAssignment",
+        "TwoStarredExpressions",
+        "ForwardAnnotationSyntaxError",
+        "DoctestSyntaxError",
+        # Raises the moment the line executes.
+        "RaiseNotImplemented",
+        "InvalidPrintSyntax",
+        "PercentFormatInvalidFormat",
+        "PercentFormatExpectedMapping",
+        "PercentFormatExpectedSequence",
+        "PercentFormatExtraNamedArguments",
+        "PercentFormatMissingArgument",
+        "PercentFormatMixedPositionalAndNamed",
+        "PercentFormatPositionalCountMismatch",
+        "PercentFormatStarRequiresSequence",
+        "PercentFormatUnsupportedFormatCharacter",
+        "StringDotFormatInvalidFormat",
+        "StringDotFormatMissingArgument",
+        "StringDotFormatMixingAutomatic",
+    }
+)
+
+
+def _pyflakes_severity(message: object) -> Literal["error", "warning"]:
+    """Classify one pyflakes message as an error or a warning.
+
+    See :data:`_PYFLAKES_ERROR_MESSAGES` for the rule and its rationale.
+    """
+    if type(message).__name__ in _PYFLAKES_ERROR_MESSAGES:
+        return "error"
+    return "warning"
 
 
 def _validate_python_semantics(
@@ -1216,7 +1404,7 @@ def _validate_python_semantics(
         return
 
     try:
-        checker = Checker(tree, filename="<pyxl>", builtins=_INJECTED_RUNTIME_NAMES)
+        checker = Checker(tree, filename="<pyxl>", builtins=INJECTED_RUNTIME_NAMES)
     except Exception:  # noqa: BLE001 — never let a linter crash the parse
         return
 
@@ -1226,7 +1414,9 @@ def _validate_python_semantics(
         except (TypeError, ValueError):  # pragma: no cover - defensive
             text = str(message.message)
         line = _map_lineno(getattr(message, "lineno", None), python_line_numbers)
-        collector.emit(text, line, section="python")
+        collector.emit(
+            text, line, section="python", severity=_pyflakes_severity(message)
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1244,6 +1434,7 @@ class PyxParser:
         tolerant: bool = False,
         validate_jsx: bool = False,
         validate_semantics: bool = False,
+        report_jsx_syntax: bool = False,
     ) -> PyxParseResult:
         """Parse a ``.pyxl`` file from disk into a :class:`PyxParseResult`.
 
@@ -1271,6 +1462,7 @@ class PyxParser:
             tolerant=tolerant,
             validate_jsx=validate_jsx,
             validate_semantics=validate_semantics,
+            report_jsx_syntax=report_jsx_syntax,
         )
 
     def parse_text(
@@ -1280,8 +1472,15 @@ class PyxParser:
         tolerant: bool = False,
         validate_jsx: bool = False,
         validate_semantics: bool = False,
+        report_jsx_syntax: bool = False,
     ) -> PyxParseResult:
-        """Parse a ``.pyxl`` source string into a :class:`PyxParseResult`."""
+        """Parse a ``.pyxl`` source string into a :class:`PyxParseResult`.
+
+        ``report_jsx_syntax`` turns a JSX section Babel cannot parse into a
+        source-located error instead of silently-empty JSX metadata. It reuses
+        the extractor pass that already runs, so it spawns nothing extra; it is
+        a flag only so the production build path keeps its current behaviour.
+        """
         lines = _normalize_newlines(text)
         collector = _DiagnosticCollector(tolerant=tolerant)
 
@@ -1349,6 +1548,9 @@ class PyxParser:
         cache_revalidate = _detect_cache_directive(
             tree, python_line_numbers, collector=collector
         )
+        standalone = _extract_standalone(
+            tree, python_line_numbers, collector=collector
+        )
 
         # Layer 5: JSX metadata + optional Babel validation.
         jsx_metadata = _detect_jsx_metadata(jsx_code)
@@ -1374,15 +1576,39 @@ class PyxParser:
         # as a type annotation.
         if jsx_metadata.ts_violation is not None and not has_python_errors:
             ts_message, ts_jsx_line = jsx_metadata.ts_violation
-            if (
-                ts_jsx_line is not None
-                and 0 <= ts_jsx_line - 1 < len(jsx_line_numbers)
-            ):
-                mapped_line: int | None = jsx_line_numbers[ts_jsx_line - 1]
-            else:
-                mapped_line = jsx_line_numbers[0] if jsx_line_numbers else None
-            collector.emit(ts_message, mapped_line, section="jsx")
-        if validate_jsx and jsx_code.strip() and not has_python_errors:
+            collector.emit(
+                ts_message,
+                _map_jsx_line(ts_jsx_line, jsx_line_numbers),
+                section="jsx",
+            )
+        # A JSX section Babel could not parse. Reported from the metadata pass
+        # that already parsed it, so this costs no extra Node subprocess — the
+        # spawn happens on every compile regardless, to read <Head>/<Script>/
+        # <Image>/<Suspense>. Opt-in (``report_jsx_syntax``) purely so the
+        # production build path keeps its existing behaviour and cannot be
+        # newly broken by a parser disagreement between Babel and esbuild.
+        reported_jsx_syntax = False
+        if (
+            report_jsx_syntax
+            and jsx_metadata.syntax_error is not None
+            and not has_python_errors
+        ):
+            jsx_message, jsx_error_line = jsx_metadata.syntax_error
+            collector.emit(
+                f"JSX syntax error: {jsx_message}",
+                _map_jsx_line(jsx_error_line, jsx_line_numbers),
+                section="jsx",
+            )
+            reported_jsx_syntax = True
+        if (
+            validate_jsx
+            and jsx_code.strip()
+            and not has_python_errors
+            and not reported_jsx_syntax
+        ):
+            # Skipped when the metadata pass already reported the same failure:
+            # it would spawn Babel a second time to rediscover it and emit a
+            # duplicate diagnostic for one error.
             _validate_jsx_syntax(
                 jsx_code, jsx_line_numbers, collector=collector
             )
@@ -1415,6 +1641,7 @@ class PyxParser:
             actions=actions,
             websocket=websocket,
             cache_revalidate=cache_revalidate,
+            standalone=standalone,
             uses_suspense=jsx_metadata.uses_suspense,
             diagnostics=diagnostics,
         )

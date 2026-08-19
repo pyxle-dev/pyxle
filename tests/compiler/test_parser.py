@@ -565,7 +565,6 @@ def test_parse_preserves_multiline_triple_quoted_python(tmp_path: Path) -> None:
         '''
         HEAD = """
         <title>Example</title>
-        <meta name="description" content="Example" />
         """
 
         @server
@@ -738,10 +737,14 @@ def test_parse_triple_quoted_string_with_indented_content(tmp_path: Path) -> Non
     """Test that indented content inside triple-quoted strings doesn't trigger indentation errors."""
     content = dedent(
         '''
-        HEAD = """
+        HEAD = [
+            """
             <title>Test Page</title>
+            """,
+            """
             <meta name="description" content="Test" />
-        """
+            """,
+        ]
 
         export default function Page() {
             return <div>Test</div>;
@@ -752,13 +755,14 @@ def test_parse_triple_quoted_string_with_indented_content(tmp_path: Path) -> Non
     source = write(tmp_path, "pages/triple_quoted.pyxl", content)
     result = PyxParser().parse(source)
 
-    assert 'HEAD = """' in result.python_code
+    assert '"""' in result.python_code
     assert "<title>Test Page</title>" in result.python_code
     assert '<meta name="description" content="Test" />' in result.python_code
-    # The HEAD content should be extracted with its indentation preserved
-    assert len(result.head_elements) == 1
+    # One element per entry -- two triple-quoted entries, each keeping the
+    # indentation it was written with.
+    assert len(result.head_elements) == 2
     assert "<title>Test Page</title>" in result.head_elements[0]
-    assert '<meta name="description" content="Test" />' in result.head_elements[0]
+    assert '<meta name="description" content="Test" />' in result.head_elements[1]
     assert "export default function Page" in result.jsx_code
 
 
@@ -931,3 +935,198 @@ class TestCacheDirective:
     def test_invalid_revalidate_value_raises(self, literal):
         with pytest.raises(CompilationError, match="revalidate"):
             self._parse('CACHE = {"revalidate": ' + literal + "}")
+
+
+class TestSyntaxErrorPosition:
+    """A syntax error carries where it is, not just what it is.
+
+    The dev server prints ``pages/about.pyxl:7:9: unexpected indent`` — a
+    location a terminal linkifies and an editor can jump to — which it can only
+    do if the parser hands the column up with the line.
+    """
+
+    def test_compilation_error_carries_line_and_column(self) -> None:
+        source = (
+            "@server\n"
+            "async def load(request):\n"
+            "    return {}\n"
+            "        oops = 1\n"
+            "\n"
+            "import React from 'react';\n"
+            "export default function Page() { return <div />; }\n"
+        )
+
+        with pytest.raises(CompilationError) as excinfo:
+            PyxParser().parse_text(source)
+
+        error = excinfo.value
+        assert error.line_number == 4
+        assert error.column is not None and error.column > 0
+        assert "indent" in error.message
+
+    def test_column_defaults_to_none(self) -> None:
+        assert CompilationError("boom").column is None
+
+    def test_str_is_unchanged_by_the_column(self) -> None:
+        """The message stays stable; the location is assembled by the caller."""
+        assert str(CompilationError("boom", 4, 9)) == "Line 4: boom"
+        assert str(CompilationError("boom")) == "boom"
+
+
+BROKEN_JSX_PAGE = """import React from 'react';
+
+export default function Broken() {
+    return (
+        <main>
+            <p>unterminated</p
+        </main>
+    );
+}
+"""
+
+
+class TestJsxSyntaxReporting:
+    """A JSX half Babel cannot parse must not compile silently.
+
+    The extractor pass that reads <Head>/<Script>/<Image>/<Suspense> runs on
+    every compile and has to parse the section to do it. It used to discard a
+    parse failure and return empty metadata, so the compile "succeeded" — the
+    rebuild logged a green tick, the page's <Head> was silently dropped, and
+    the error only appeared later from the bundler, against the *generated*
+    .jsx rather than the .pyxl the developer edits.
+    """
+
+    def test_broken_jsx_is_a_located_compile_error(self) -> None:
+        with pytest.raises(CompilationError) as excinfo:
+            PyxParser().parse_text(BROKEN_JSX_PAGE, report_jsx_syntax=True)
+
+        error = excinfo.value
+        assert "JSX syntax error" in error.message
+        assert error.line_number == 7
+
+    def test_the_line_is_the_pyxl_line_not_the_jsx_section_line(self) -> None:
+        """Every JSX-side tool numbers from the start of the section it was
+        handed; reporting that unmapped points at the wrong line."""
+        source = (
+            "from __future__ import annotations\n"
+            "\n"
+            "\n"
+            "@server\n"
+            "async def load(request):\n"
+            "    return {}\n"
+            "\n"
+            "\n" + BROKEN_JSX_PAGE
+        )
+
+        with pytest.raises(CompilationError) as excinfo:
+            PyxParser().parse_text(source, report_jsx_syntax=True)
+
+        # The failure is on the 7th line of the JSX section, which is line 15
+        # of the file. An unmapped report would have said 7.
+        assert excinfo.value.line_number == 15
+        assert source.splitlines()[14].strip() == "</main>"
+
+    def test_the_production_build_path_is_unchanged(self) -> None:
+        """Off by default, so a Babel/esbuild disagreement cannot newly break
+        a production build that works today."""
+        result = PyxParser().parse_text(BROKEN_JSX_PAGE)
+
+        assert result.head_jsx_blocks == ()
+        assert result.script_declarations == ()
+
+    def test_healthy_jsx_is_unaffected(self) -> None:
+        source = (
+            "import React from 'react';\n"
+            "import { Head } from 'pyxle/client';\n"
+            "\n"
+            "export default function Page() {\n"
+            "    return <main><Head><title>Hi</title></Head></main>;\n"
+            "}\n"
+        )
+
+        result = PyxParser().parse_text(source, report_jsx_syntax=True)
+
+        assert result.head_jsx_blocks and "Hi" in result.head_jsx_blocks[0]
+
+    def test_tolerant_mode_collects_it_as_a_jsx_diagnostic(self) -> None:
+        result = PyxParser().parse_text(
+            BROKEN_JSX_PAGE, tolerant=True, report_jsx_syntax=True
+        )
+
+        jsx = [d for d in result.diagnostics if d.section == "jsx"]
+        assert len(jsx) == 1
+        assert jsx[0].line == 7
+
+    def test_it_is_reported_exactly_once_alongside_validate_jsx(self) -> None:
+        """``validate_jsx`` would otherwise spawn Babel again to rediscover the
+        same failure and emit a duplicate diagnostic for one error."""
+        result = PyxParser().parse_text(
+            BROKEN_JSX_PAGE, tolerant=True, validate_jsx=True, report_jsx_syntax=True
+        )
+
+        jsx = [d for d in result.diagnostics if d.section == "jsx"]
+        assert len(jsx) == 1
+
+    def test_a_broken_python_half_suppresses_it(self) -> None:
+        """Broken Python is absorbed into the JSX section by the walker, so the
+        JSX complaint would be a symptom, not the cause."""
+        source = (
+            "@server\n"
+            "async def load(request):\n"
+            "    return {}\n"
+            "        bad_indent = 1\n"
+            "\n"
+            "import React from 'react';\n"
+            "export default function P() { return <div />; }\n"
+        )
+
+        result = PyxParser().parse_text(
+            source, tolerant=True, report_jsx_syntax=True
+        )
+
+        assert [d.section for d in result.diagnostics] == ["python"]
+
+
+class TestJsxReportingDegradesWithoutTheToolchain:
+    """A missing checker must never be reported as broken user code.
+
+    Without this the first machine without Node — or without the language
+    toolkit installed — fails every single file in the project with a JSX
+    syntax error it invented.
+    """
+
+    MESSAGE = "Node.js not found. Install Node.js >=20.19 to parse JSX components."
+
+    @staticmethod
+    def _stub_extractor(monkeypatch, *, toolchain_available: bool):
+        from pyxle.compiler import jsx_parser
+
+        def fake(*_args, **_kwargs):
+            return jsx_parser.JSXParseResult(
+                components=(),
+                error=TestJsxReportingDegradesWithoutTheToolchain.MESSAGE,
+                error_line=1,
+                toolchain_available=toolchain_available,
+            )
+
+        monkeypatch.setattr(jsx_parser, "parse_jsx_components", fake)
+
+    def test_an_unavailable_checker_never_fails_the_compile(self, monkeypatch) -> None:
+        self._stub_extractor(monkeypatch, toolchain_available=False)
+
+        result = PyxParser().parse_text(BROKEN_JSX_PAGE, report_jsx_syntax=True)
+
+        assert result.diagnostics == ()
+        assert result.head_jsx_blocks == ()
+
+    def test_the_same_message_from_a_working_checker_does_fail(
+        self, monkeypatch
+    ) -> None:
+        """Identical error text, opposite outcome — the flag is what decides,
+        not the wording, so no string matching can drift."""
+        self._stub_extractor(monkeypatch, toolchain_available=True)
+
+        with pytest.raises(CompilationError) as excinfo:
+            PyxParser().parse_text(BROKEN_JSX_PAGE, report_jsx_syntax=True)
+
+        assert self.MESSAGE in excinfo.value.message
