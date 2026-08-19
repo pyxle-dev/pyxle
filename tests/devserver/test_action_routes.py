@@ -1098,6 +1098,80 @@ def test_action_state_background_runs_after_response(tmp_path: Path) -> None:
     assert marker.read_text() == "ran"
 
 
+def test_action_background_survives_an_action_error(tmp_path: Path) -> None:
+    """Work scheduled *before* the action refused still runs.
+
+    ``add_task`` is a statement that executed; a later ``raise ActionError`` no
+    more undoes it than it rolls back a database write on the line above. This
+    is the audit-record case — "record the attempt whether or not it succeeds" —
+    and dropping it would lose it silently, with a 4xx and nothing in the log.
+    Cookies already behave this way on the same path.
+    """
+    marker = tmp_path / "bg_on_error.txt"
+    src = (
+        "from pyxle.runtime import action, ActionError\n\n"
+        "def _write():\n"
+        f"    open({str(marker)!r}, 'w').write('audited')\n\n"
+        "@action\n"
+        "async def go(request):\n"
+        "    request.state.background.add_task(_write)\n"
+        "    raise ActionError('Insufficient funds', status_code=400)\n"
+    )
+    client, url = _action_client(tmp_path, "bgerror", "go", src)
+    assert not marker.exists()
+    response = client.post(url, json={})
+
+    assert response.status_code == 400
+    assert response.json()["ok"] is False
+    assert marker.read_text() == "audited"
+
+
+def test_action_background_not_scheduled_before_the_error_does_not_run(
+    tmp_path: Path,
+) -> None:
+    """The other half of the rule: ordering is the author's control.
+
+    Work scheduled *after* the check never gets scheduled at all — this is the
+    welcome-email case, and it is why the rule needs no opt-out flag.
+    """
+    marker = tmp_path / "bg_after_raise.txt"
+    src = (
+        "from pyxle.runtime import action, ActionError\n\n"
+        "def _write():\n"
+        f"    open({str(marker)!r}, 'w').write('sent')\n\n"
+        "@action\n"
+        "async def go(request):\n"
+        "    raise ActionError('Payment declined', status_code=402)\n"
+        "    request.state.background.add_task(_write)\n"
+    )
+    client, url = _action_client(tmp_path, "bgafter", "go", src)
+    response = client.post(url, json={})
+
+    assert response.status_code == 402
+    assert not marker.exists()
+
+
+def test_action_background_dropped_when_the_action_crashes(tmp_path: Path) -> None:
+    """An unhandled exception is not a refusal — it is a bug, and the action's
+    intent is unknown, so nothing it staged is applied. This matches how cookies
+    already behave on the 500 path and keeps the two consistent."""
+    marker = tmp_path / "bg_on_crash.txt"
+    src = (
+        "from pyxle.runtime import action\n\n"
+        "def _write():\n"
+        f"    open({str(marker)!r}, 'w').write('ran')\n\n"
+        "@action\n"
+        "async def go(request):\n"
+        "    request.state.background.add_task(_write)\n"
+        "    raise RuntimeError('boom')\n"
+    )
+    client, url = _action_client(tmp_path, "bgcrash", "go", src)
+    response = client.post(url, json={})
+
+    assert response.status_code == 500
+    assert not marker.exists()
+
+
 def test_action_background_shorthand_runs_and_is_stripped(tmp_path: Path) -> None:
     marker = tmp_path / "bg_short.txt"
     src = (
@@ -1339,3 +1413,112 @@ def test_action_dispatch_other_attribute_error_flows_through(tmp_path: Path) -> 
     data = response.json()
     assert data["ok"] is False
     assert data["error"] == "boom"
+
+
+class TestAnActionCanSetACookie:
+    """An action returns a dict and never sees the response it becomes.
+
+    Anything that had to set a cookie — a session, a preference, a consent
+    record — therefore had to be rewritten as an API route, splitting a page's
+    own mutations across two places for the sake of one header. The dispatcher
+    hands the action a recorder instead.
+    """
+
+    @staticmethod
+    def _app(tmp_path: Path, body: str, *, page: str, name: str = "choose"):
+        from starlette.applications import Starlette
+
+        # A distinct module per test: imported modules are cached by key, so a
+        # shared one would quietly serve the first test's code to all of them.
+        module_path = _write_module(tmp_path / "server" / "pages" / f"{page}.py", body)
+        route = ActionRoute(
+            path=f"/api/__actions/{page}/{name}",
+            page_path=f"/{page}",
+            action_name=name,
+            server_module_path=module_path,
+            module_key=f"pyxle.server.pages.{page}",
+        )
+        app = Starlette()
+        app.router.routes.extend(build_action_router([route]).routes)
+        return TestClient(app, raise_server_exceptions=False)
+
+    def test_it_lands_on_the_response(self, tmp_path: Path) -> None:
+        client = self._app(tmp_path, page="prefs_set", body="""
+        from pyxle.runtime import action
+
+        @action
+        async def choose(request):
+            request.state.cookies.set(
+                "theme", "dark", max_age=31536000, httponly=True, samesite="lax"
+            )
+            return {"theme": "dark"}
+        """)
+
+        response = client.post("/api/__actions/prefs_set/choose", json={})
+
+        assert response.json() == {"ok": True, "theme": "dark"}
+        header = response.headers["set-cookie"]
+        assert "theme=dark" in header
+        assert "Max-Age=31536000" in header
+        assert "HttpOnly" in header
+        assert "SameSite=lax" in header
+
+    def test_deleting_one_works_the_same_way(self, tmp_path: Path) -> None:
+        client = self._app(tmp_path, page="prefs_delete", body="""
+        from pyxle.runtime import action
+
+        @action
+        async def choose(request):
+            request.state.cookies.delete("session")
+            return {"signedOut": True}
+        """)
+
+        response = client.post("/api/__actions/prefs_delete/choose", json={})
+
+        assert 'session=""' in response.headers["set-cookie"]
+
+    def test_a_refusal_still_carries_it(self, tmp_path: Path) -> None:
+        """A failed attempt is the action's own answer, and may need to record
+        something on the way out — a counter, or a cleared session."""
+        client = self._app(tmp_path, page="prefs_refuse", body="""
+        from pyxle.runtime import action, ActionError
+
+        @action
+        async def choose(request):
+            request.state.cookies.set("attempts", "3")
+            raise ActionError("Wrong password.", status_code=403)
+        """)
+
+        response = client.post("/api/__actions/prefs_refuse/choose", json={})
+
+        assert response.status_code == 403
+        assert "attempts=3" in response.headers["set-cookie"]
+
+    def test_an_action_that_sets_none_gets_no_header(self, tmp_path: Path) -> None:
+        client = self._app(tmp_path, page="prefs_none", body="""
+        from pyxle.runtime import action
+
+        @action
+        async def choose(request):
+            return {"ok": True}
+        """)
+
+        response = client.post("/api/__actions/prefs_none/choose", json={})
+
+        assert "set-cookie" not in response.headers
+
+    def test_two_cookies_both_arrive(self, tmp_path: Path) -> None:
+        client = self._app(tmp_path, page="prefs_two", body="""
+        from pyxle.runtime import action
+
+        @action
+        async def choose(request):
+            request.state.cookies.set("a", "1")
+            request.state.cookies.set("b", "2")
+            return {}
+        """)
+
+        response = client.post("/api/__actions/prefs_two/choose", json={})
+
+        headers = response.headers.get_list("set-cookie")
+        assert [h.split(";")[0] for h in headers] == ["a=1", "b=2"]

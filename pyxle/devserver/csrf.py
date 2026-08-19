@@ -30,6 +30,7 @@ import hashlib
 import hmac
 import logging
 import posixpath
+import re
 import secrets
 from dataclasses import dataclass
 from typing import Any, Sequence
@@ -47,11 +48,17 @@ except ImportError:  # pragma: no cover - legacy python-multipart module name
     from multipart.multipart import MultipartParser, parse_options_header
 
 from pyxle.config import default_csrf_cookie_name
+from pyxle.security import constant_time_equals
 
 _SAFE_METHODS: frozenset[str] = frozenset({"GET", "HEAD", "OPTIONS", "TRACE"})
 _HEADER_NAME = "x-csrf-token"
 _FORM_FIELD = "_csrf_token"
 _TOKEN_LENGTH = 32
+# The exact shape :func:`_generate_token` emits: a URL-safe base64 random
+# value, optionally followed by ``.`` and a 16-character hex HMAC segment.
+# Used to reject values this server could never have minted before one is
+# trusted or written back into a ``Set-Cookie`` header.
+_TOKEN_SHAPE = re.compile(r"[A-Za-z0-9_-]+(?:\.[0-9a-f]{16})?")
 # Cap how much of a urlencoded body we buffer when extracting the CSRF form
 # field. Larger payloads short-circuit and force the caller to send the
 # token via the ``X-CSRF-Token`` header (the JS / fetch path).
@@ -65,6 +72,21 @@ _MAX_BUFFERED_BODY_BYTES = 1 * 1024 * 1024
 _MAX_MULTIPART_SCAN_BYTES = 1 * 1024 * 1024
 
 _logger = logging.getLogger(__name__)
+
+
+def _is_https(scope: Scope) -> bool:
+    """Whether this request reached us over TLS.
+
+    Reads ``X-Forwarded-Proto`` first, because the overwhelmingly common
+    production shape is a TLS-terminating proxy speaking plain HTTP to the app
+    — where the ASGI scheme says ``http`` and the *browser's* connection was
+    HTTPS all along. Falls back to the scheme the server itself sees.
+    """
+    for name, value in scope.get("headers", ()):
+        if name == b"x-forwarded-proto":
+            first = value.decode("latin-1").split(",")[0].strip().lower()
+            return first == "https"
+    return str(scope.get("scheme", "")).lower() in ("https", "wss")
 
 
 class CsrfMiddleware:
@@ -87,7 +109,14 @@ class CsrfMiddleware:
         Name of the request header containing the CSRF token
         (default ``x-csrf-token``).
     cookie_secure:
-        Set the ``Secure`` flag on the cookie. ``True`` in production.
+        Set the ``Secure`` flag on the cookie. ``True`` in production — but a
+        ``Secure`` cookie is *dropped entirely* by the browser over plain
+        HTTP, so it is applied only when the request actually arrived over
+        HTTPS (directly, or via ``X-Forwarded-Proto`` from a TLS-terminating
+        proxy). Marking it unconditionally made every plain-HTTP production
+        server reject its own forms with "CSRF token missing" and no clue
+        why — and it protected nothing, because a connection with no
+        confidentiality has no cookie confidentiality to lose.
     cookie_samesite:
         ``SameSite`` attribute for the cookie (default ``"lax"``).
     exempt_paths:
@@ -237,7 +266,7 @@ class CsrfMiddleware:
                         f"{cookie_name}={token}; Path=/"
                         f"; SameSite={self._cookie_samesite}"
                     )
-                    if self._cookie_secure:
+                    if self._cookie_secure and _is_https(scope):
                         cookie_value += "; Secure"
                     headers.append((b"set-cookie", cookie_value.encode("latin-1")))
                     message = {**message, "headers": headers}
@@ -366,15 +395,29 @@ def _compute_signature(raw: str, secret: str) -> str:
 
 
 def _verify_token_integrity(token: str, secret: str) -> bool:
-    """Check that a token's HMAC signature is valid (when a secret is set).
+    """Check that a token is one this server could have minted.
 
-    Returns ``True`` if the token is structurally valid.  For unsigned tokens
-    (no secret), any non-empty token is considered valid.
+    Two gates:
+
+    1. **Shape** — the value must match the alphabet
+       :func:`_generate_token` emits (URL-safe base64, plus an optional
+       ``.<16 hex>`` signature segment). Anything else cannot be one of our
+       tokens, so rejecting it costs nothing and buys a great deal: the
+       caller *echoes an accepted token straight back into the response's*
+       ``Set-Cookie`` *header*, and a cookie value can smuggle ``;`` and
+       ``=`` through ``http.cookies`` octal escapes (``"x\\073 Domain\\075…"``
+       parses to ``x; Domain=…``). Without this check a request could dictate
+       the attributes of the cookie the server sets on itself.
+    2. **HMAC signature** (only when a secret is configured) — proves the
+       token was minted here rather than chosen by whoever sent the cookie.
+
+    With no secret configured the shape gate is all there is, which is the
+    documented weaker mode the constructor already warns about.
     """
-    if not token:
+    if not token or not _TOKEN_SHAPE.fullmatch(token):
         return False
     if not secret:
-        # No secret → unsigned tokens; any non-empty value is acceptable.
+        # No secret → unsigned tokens; any well-formed value is acceptable.
         return True
     if "." not in token:
         return False
@@ -382,7 +425,7 @@ def _verify_token_integrity(token: str, secret: str) -> bool:
     if not raw or not sig:
         return False
     expected = _compute_signature(raw, secret)
-    return hmac.compare_digest(sig, expected)
+    return constant_time_equals(sig, expected)
 
 
 def _tokens_match(cookie_token: str, submitted_token: str, secret: str) -> bool:
@@ -399,8 +442,10 @@ def _tokens_match(cookie_token: str, submitted_token: str, secret: str) -> bool:
     if not cookie_token or not submitted_token:
         return False
 
-    # Double-submit: submitted value must match cookie value.
-    if not hmac.compare_digest(cookie_token, submitted_token):
+    # Double-submit: submitted value must match cookie value. Both sides are
+    # attacker-controlled strings decoded from the wire, so the comparison
+    # must tolerate any byte (see :func:`constant_time_equals`).
+    if not constant_time_equals(cookie_token, submitted_token):
         return False
 
     # HMAC integrity: verify the cookie token was minted by this server.

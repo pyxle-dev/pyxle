@@ -66,6 +66,26 @@ def _resolve_secret(secret_key: str | None) -> str:
     return secret
 
 
+def constant_time_equals(left: str, right: str) -> bool:
+    """Compare two strings in constant time, for *any* input.
+
+    ``hmac.compare_digest`` is only defined for ASCII-only ``str`` arguments;
+    handed anything else it raises ``TypeError``. Every caller in Pyxle
+    compares a server-minted ASCII secret against a value lifted off the wire
+    — a header (which Starlette decodes as latin-1), a cookie, or a form field
+    — so the untrusted side can hold any byte the client cares to send.
+    Comparing the UTF-8 encodings keeps the comparison constant-time while
+    turning a hostile byte sequence into an ordinary mismatch instead of an
+    unhandled exception.
+
+    Not part of the public API; internal callers import it directly.
+    """
+    return hmac.compare_digest(
+        left.encode("utf-8", "surrogatepass"),
+        right.encode("utf-8", "surrogatepass"),
+    )
+
+
 def _signature(value: str, secret: str, salt: str) -> str:
     """HMAC-SHA256 of *value* under a key derived from *secret* and *salt*.
 
@@ -120,6 +140,6 @@ def verify_cookie(
     if not signature:
         return None
     expected = _signature(value, secret, salt)
-    if hmac.compare_digest(signature, expected):
+    if constant_time_equals(signature, expected):
         return value
     return None

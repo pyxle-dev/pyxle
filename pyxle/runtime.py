@@ -109,6 +109,56 @@ class LoaderError(Exception):
         self.data = data or {}
 
 
+class ActionCookies:
+    """Cookies an ``@action`` asked for, applied to the response it produced.
+
+    An action returns a dict, not a response, so it has nothing to call
+    ``set_cookie`` on — which used to mean anything that had to set one
+    (a session, a preference, a consent record) had to be written as an
+    API route instead, splitting a page's own mutations across two
+    places. The dispatcher exposes this recorder on ``request.state`` and
+    applies it to the response it builds::
+
+        @action
+        async def choose_theme(request, body: "ThemeBody"):
+            request.state.cookies.set(
+                "theme", body.theme, max_age=31536000, samesite="lax"
+            )
+            return {"theme": body.theme}
+
+    The arguments are Starlette's ``Response.set_cookie`` /
+    ``delete_cookie`` arguments, unchanged and unvalidated here — this
+    records the call and replays it, so the framework never becomes a
+    second, staler copy of that signature.
+
+    Cookies are applied to a successful response and to an
+    :class:`ActionError` (both are the action's own answer), and not to
+    an unexpected 500, where the action's intent is unknown.
+    """
+
+    __slots__ = ("_calls",)
+
+    def __init__(self) -> None:
+        self._calls: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
+
+    def set(self, *args: Any, **kwargs: Any) -> None:
+        """Record a ``Response.set_cookie(...)`` call."""
+        self._calls.append(("set_cookie", args, kwargs))
+
+    def delete(self, *args: Any, **kwargs: Any) -> None:
+        """Record a ``Response.delete_cookie(...)`` call."""
+        self._calls.append(("delete_cookie", args, kwargs))
+
+    def __bool__(self) -> bool:
+        return bool(self._calls)
+
+    def apply(self, response: Any) -> Any:
+        """Replay the recorded calls onto *response*."""
+        for method, args, kwargs in self._calls:
+            getattr(response, method)(*args, **kwargs)
+        return response
+
+
 _INVALIDATE_HEADER = "x-pyxle-invalidate"
 
 
@@ -176,6 +226,7 @@ def invalidate_routes(response: Any, *urls: str) -> Any:
 __all__ = [
     "server",
     "action",
+    "ActionCookies",
     "ActionError",
     "ValidationActionError",
     "LoaderError",

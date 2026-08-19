@@ -81,6 +81,88 @@ export default function ErrorPage({ error }) {
 }
 ```
 
+### What reaches `error.pyxl`
+
+Your error page is not only for `LoaderError`. **Any** exception that escapes a
+`@server` loader renders it — a missing dict key, a `None` where an object was
+expected, a database driver's timeout — with `error.statusCode === 500`. You do
+not have to catch and re-raise anything to be covered:
+
+```python
+@server
+async def load_dashboard(request):
+    # Both of these render the nearest error.pyxl.
+    raise LoaderError("Not your workspace", status_code=403)   # status 403
+    return {"id": session["user_id"]}                          # KeyError -> status 500
+```
+
+Reaches `error.pyxl`:
+
+| Failure | Status |
+|---------|--------|
+| `LoaderError` raised by a page loader | its `status_code` |
+| Any other exception from a page loader's body | `500` |
+| Any exception from a `layout.pyxl` loader | `500` |
+| A `request.state.x` read with no plugin or middleware providing it | `500` |
+| A loader Pyxle cannot run, or whose return value it rejects | `500` |
+| A `HEAD` that fails to evaluate | `500` |
+| A component that throws while rendering — on the server, or in the browser | `500` |
+
+Does **not** reach `error.pyxl`:
+
+- **A `.pyxl` file whose module-level Python fails** — a bad import, a
+  `SyntaxError`, an exception at import time. The page is broken before it has
+  a loader to run, and the boundary's own module is loaded the same way, so
+  Pyxle's fallback document is served instead. In `pyxle dev` the overlay shows
+  it; a build catches most of it before you deploy.
+- **A fault in Pyxle's own render pipeline.** Handling a framework fault by
+  running more of your code can compound the failure, so these deliberately
+  serve the fallback document. If you see one, it is a bug — please report it.
+- **`@action` failures.** An action answers the caller with JSON, not a page.
+  Raise `ActionError` and handle it where you called it (`useAction`'s error).
+- **API routes** (`pages/api/**.py`) and **middleware**, neither of which is a
+  page render.
+- **A request matching no route at all** — that is [`not-found.pyxl`](#not-found-pages-not-foundpyxl).
+- **Errors in a browser event handler or an `await`** — see
+  [client-side errors](#client-side-errors).
+
+### What the visitor sees, and what you see
+
+For an author-raised `LoaderError` (or `ActionError`), `error.message` is your
+own copy and reaches the visitor verbatim in every environment — that is the
+point of raising it.
+
+For **any other** exception the message comes from your dependencies or the
+framework and may carry a file path, a row ID, a connection string or a token.
+So it is split:
+
+- **In production**, `error.message` is `"An unexpected error occurred."` and
+  `error.type` is `"ServerError"`. The real exception never reaches the browser
+  (see [Security](security.md)). It **is** written to the server log, once, with
+  its full traceback — that log is your only record, so make sure you collect it.
+- **In development**, `error.message` carries the real detail (with obvious
+  secrets redacted), and the error overlay shows the full traceback pointing at
+  the line in your `.pyxl` file.
+
+Design `error.pyxl` for the production wording. Rendering `{error.message}` is
+fine, but do not build the page around it saying something specific.
+
+### An `error.pyxl` does not run a loader
+
+Unlike `not-found.pyxl`, an error page has **no** `@server` loader: it receives
+only the `error` prop (plus its layouts' data), and a `@server` function
+declared in an `error.pyxl` is never called. Fetching data at the moment the
+page is already failing is how one error becomes two, so the boundary does the
+least work it can.
+
+Everything it does still touch is protected the same way. If a layout loader
+raises while the boundary renders, or the boundary's own `HEAD` fails to
+evaluate, the failure is logged and the boundary renders without that piece
+rather than being lost. If the boundary itself cannot render at all, Pyxle's
+fallback document is served — the boundary is never retried, so a failing error
+page cannot loop. Throughout, the error reported is the *original* one; a
+failure while handling it never replaces it.
+
 ### Error props
 
 The `error` prop contains:
@@ -91,6 +173,38 @@ The `error` prop contains:
 | `statusCode` | `number` | HTTP status code |
 | `type` | `string` | Exception class name |
 | `data` | `object?` | Additional data (if provided via `LoaderError(data=...)`) |
+
+### The error page's head
+
+An `error.pyxl` is an ordinary page: it is wrapped in its ancestor layouts, and
+its document head is merged from the same sources with the same precedence as
+any other page — the layout chain's `<Head>` blocks and `HEAD` variable, the
+boundary's own `HEAD` variable, and its `<Head>` blocks. Your stylesheet,
+favicon and site metadata reach the error page, and a `<title>` in `error.pyxl`
+overrides the layout's:
+
+```jsx
+// pages/error.pyxl
+import { Head } from 'pyxle/client';
+
+export default function ErrorPage({ error }) {
+  return (
+    <main>
+      <Head>
+        <title>Something went wrong</title>
+        <meta name="robots" content="noindex" />
+      </Head>
+      <h1>Something went wrong</h1>
+      <p>{error.message}</p>
+    </main>
+  );
+}
+```
+
+A callable or otherwise computed `HEAD` in an `error.pyxl` receives the error
+context rather than loader data. If it raises, the head falls back to the
+elements Pyxle could extract statically and the boundary still renders — the
+visitor never loses the page over its head.
 
 ### Boundary resolution
 
@@ -110,6 +224,16 @@ It receives an `error` prop with the same keys on both sides (`message`, `status
 This catches *render* faults. An error thrown in an event handler or an `await` (e.g. a failed `fetch`) is not a render error — handle those where they occur (a `try/catch`, or surfacing an `ActionError` from `useAction`).
 
 ## Not-found pages (`not-found.pyxl`)
+
+With no `not-found.pyxl` anywhere in your project, an unmatched URL is answered
+with Pyxle's built-in 404 — the same designed document the other status
+fallbacks use. Under `pyxle dev` it also names the file that replaces it. That
+hint is dev-only; a production visitor sees the page without it. Clients that
+did not ask for HTML (a `fetch` call, an API consumer) get a plain
+`text/plain` body instead.
+
+The built-in page is a floor, not the intended experience: it has none of your
+layout, your navigation, or a way onward. Ship your own.
 
 Create a `not-found.pyxl` file to customise the 404 page:
 
@@ -148,6 +272,37 @@ During development (`pyxle dev`), errors also appear in a browser overlay with:
 - File path and line number
 
 The overlay communicates via WebSocket and updates in real time as you fix errors.
+It also **survives a reload**: the current error is replayed to the page when it
+reconnects, so an error raised while no tab was open — or one you reloaded past —
+still shows.
+
+## A page that will not compile
+
+A syntax error is different from a runtime error: the page never builds, so there
+is nothing to render an error boundary *into*. `pyxle dev` serves the compile
+error at that URL instead — the file, the line and column, the message, and the
+source around it — and reloads the page by itself once the rebuild succeeds.
+
+```
+❌ Rebuild failed: pages/about.pyxl:7:9: unexpected indent
+```
+
+Both halves of the file are checked. A syntax error in the React half is
+reported the same way, against the `.pyxl` line you wrote — not the line of the
+`.jsx` Pyxle generates from it:
+
+```
+❌ Rebuild failed: pages/about.pyxl:16: JSX syntax error: Unexpected token, expected "jsxTagEnd"
+```
+
+Only the routes that depend on the broken file are affected. A broken
+`pages/about.pyxl` takes down `/about`; a broken `pages/blog/layout.pyxl` takes
+down `/blog/*`, because every page there is wrapped in it. Everything else keeps
+rendering and keeps hot-reloading while you fix it.
+
+`error.pyxl` is not involved — it cannot be: it catches exceptions raised while a
+page runs, and a page that does not compile never runs. This is dev-only;
+`pyxle build` refuses to produce a `dist/` from a project that does not compile.
 
 ## Next steps
 

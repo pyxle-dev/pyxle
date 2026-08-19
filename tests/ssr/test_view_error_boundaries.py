@@ -51,6 +51,24 @@ def _stub_request(path: str = "/test"):
     return req
 
 
+def _stub_settings(tmp_path: Path, *, debug: bool = False) -> MagicMock:
+    """A settings double whose head lookup reads a real (empty) build tree.
+
+    The boundary render merges the layout chain's head contributions, which
+    are loaded from ``metadata_build_dir``. A bare ``MagicMock`` answers that
+    path with another mock, so pointing it at a real directory is what makes
+    the double behave like a project that simply has no layouts.
+    """
+    settings = MagicMock()
+    settings.debug = debug
+    settings.vite_host = "127.0.0.1"
+    settings.vite_port = 5173
+    settings.page_manifest = None
+    settings.global_stylesheets = ()
+    settings.metadata_build_dir = tmp_path / "metadata"
+    return settings
+
+
 # ---------------------------------------------------------------------------
 # _build_error_context
 # ---------------------------------------------------------------------------
@@ -177,7 +195,7 @@ class TestTryErrorBoundary:
         )
         assert result is None
 
-    def test_renders_error_boundary_when_found(self):
+    def test_renders_error_boundary_when_found(self, tmp_path: Path):
         mock_renderer = MagicMock()
         mock_render_result = MagicMock()
         mock_render_result.html = "<div>Error Page</div>"
@@ -185,12 +203,7 @@ class TestTryErrorBoundary:
         mock_render_result.head_elements = ()
         mock_renderer.render = AsyncMock(return_value=mock_render_result)
 
-        settings = MagicMock()
-        settings.debug = False
-        settings.vite_host = "127.0.0.1"
-        settings.vite_port = 5173
-        settings.page_manifest = None
-        settings.global_stylesheets = ()
+        settings = _stub_settings(tmp_path)
 
         result = asyncio.run(
             _try_error_boundary(
@@ -206,7 +219,7 @@ class TestTryErrorBoundary:
         assert result is not None
         assert result.status_code == 500
 
-    def test_uses_correct_status_code(self):
+    def test_uses_correct_status_code(self, tmp_path: Path):
         mock_renderer = MagicMock()
         mock_render_result = MagicMock()
         mock_render_result.html = "<div>Not Found</div>"
@@ -214,12 +227,7 @@ class TestTryErrorBoundary:
         mock_render_result.head_elements = ()
         mock_renderer.render = AsyncMock(return_value=mock_render_result)
 
-        settings = MagicMock()
-        settings.debug = False
-        settings.vite_host = "127.0.0.1"
-        settings.vite_port = 5173
-        settings.page_manifest = None
-        settings.global_stylesheets = ()
+        settings = _stub_settings(tmp_path)
 
         result = asyncio.run(
             _try_error_boundary(
@@ -235,7 +243,7 @@ class TestTryErrorBoundary:
         assert result is not None
         assert result.status_code == 404
 
-    def test_boundary_hides_internals_in_prod(self):
+    def test_boundary_hides_internals_in_prod(self, tmp_path: Path):
         # End-to-end: a non-author exception routed through the boundary must
         # hand the error.pyxl component a generic message in production, never
         # the raw internal detail.
@@ -246,12 +254,7 @@ class TestTryErrorBoundary:
         mock_render_result.head_elements = ()
         mock_renderer.render = AsyncMock(return_value=mock_render_result)
 
-        settings = MagicMock()
-        settings.debug = False
-        settings.vite_host = "127.0.0.1"
-        settings.vite_port = 5173
-        settings.page_manifest = None
-        settings.global_stylesheets = ()
+        settings = _stub_settings(tmp_path)
 
         asyncio.run(
             _try_error_boundary(
@@ -268,7 +271,7 @@ class TestTryErrorBoundary:
         assert props["error"]["message"] == "An unexpected error occurred."
         assert "secret" not in props["error"]["message"]
 
-    def test_boundary_shows_internals_in_dev(self):
+    def test_boundary_shows_internals_in_dev(self, tmp_path: Path):
         mock_renderer = MagicMock()
         mock_render_result = MagicMock()
         mock_render_result.html = "<div>Error Page</div>"
@@ -276,12 +279,7 @@ class TestTryErrorBoundary:
         mock_render_result.head_elements = ()
         mock_renderer.render = AsyncMock(return_value=mock_render_result)
 
-        settings = MagicMock()
-        settings.debug = True
-        settings.vite_host = "127.0.0.1"
-        settings.vite_port = 5173
-        settings.page_manifest = None
-        settings.global_stylesheets = ()
+        settings = _stub_settings(tmp_path, debug=True)
 
         asyncio.run(
             _try_error_boundary(

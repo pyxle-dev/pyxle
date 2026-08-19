@@ -157,3 +157,47 @@ class TestEdgeCaseInputs:
         # The same crafted string presented directly, with no real signature,
         # must be rejected — appending plausible hex can't forge a token.
         assert verify_cookie("x." + "a" * 64, _KEY) is None
+
+
+class TestUntrustedInputNeverRaises:
+    """`verify_cookie` is handed cookie values straight from a request, so it
+    has to be total: the documented contract is `None` for any signature or
+    format failure. `hmac.compute_digest` on a non-ASCII `str` raises
+    TypeError instead, which would surface as a 500 on a tampered cookie.
+    """
+
+    def test_non_ascii_signature_segment_returns_none(self):
+        assert verify_cookie("user-42.caf\xe9", _KEY) is None
+
+    def test_replacement_character_signature_returns_none(self):
+        assert verify_cookie("user-42.�" * 2, _KEY) is None
+
+    def test_lone_surrogate_returns_none(self):
+        assert verify_cookie("user-42.\ud800", _KEY) is None
+
+    def test_a_valid_token_still_verifies(self):
+        assert verify_cookie(sign_cookie("user-42", _KEY), _KEY) == "user-42"
+
+
+class TestConstantTimeEquals:
+    def test_equal_ascii(self):
+        from pyxle.security import constant_time_equals
+
+        assert constant_time_equals("abc", "abc") is True
+
+    def test_unequal_ascii(self):
+        from pyxle.security import constant_time_equals
+
+        assert constant_time_equals("abc", "xyz") is False
+
+    def test_non_ascii_compares_instead_of_raising(self):
+        from pyxle.security import constant_time_equals
+
+        assert constant_time_equals("caf\xe9", "caf\xe9") is True
+        assert constant_time_equals("caf\xe9", "cafe") is False
+
+    def test_lone_surrogate_compares_instead_of_raising(self):
+        from pyxle.security import constant_time_equals
+
+        assert constant_time_equals("\ud800", "\ud800") is True
+        assert constant_time_equals("\ud800", "x") is False

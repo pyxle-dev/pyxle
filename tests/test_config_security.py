@@ -151,6 +151,17 @@ class TestCorsConfigParsing:
         with pytest.raises(ConfigError, match="maxAge"):
             load_config(tmp_path, config_path=config_file)
 
+    @pytest.mark.parametrize("literal", [True, False])
+    def test_boolean_max_age_raises(self, tmp_path: Path, literal: bool):
+        """`bool` is a subclass of `int`, so a bare `isinstance(x, int)` lets
+        `"maxAge": true` through and silently binds a 1-second preflight cache
+        (`false` a 0-second one). Every other integer field in the config
+        rejects booleans explicitly; this one must too."""
+        config_file = tmp_path / "pyxle.config.json"
+        config_file.write_text(json.dumps({"cors": {"maxAge": literal}}))
+        with pytest.raises(ConfigError, match="maxAge"):
+            load_config(tmp_path, config_path=config_file)
+
     def test_no_cors_block_returns_defaults(self, tmp_path: Path):
         config_file = tmp_path / "pyxle.config.json"
         config_file.write_text("{}")
