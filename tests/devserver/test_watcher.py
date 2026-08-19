@@ -10,7 +10,8 @@ from typing import Callable, List, Tuple
 import pytest
 
 from pyxle.cli.logger import ConsoleLogger, Verbosity
-from pyxle.devserver.builder import BuildSummary, build_once
+from pyxle.devserver.build_errors import BuildFailure
+from pyxle.devserver.builder import BuildFailed, BuildSummary, build_once
 from pyxle.devserver.settings import DevServerSettings
 from pyxle.devserver.watcher import (
     ProjectWatcher,
@@ -1075,7 +1076,7 @@ def test_format_paths_truncates_and_handles_external(project: DevServerSettings)
         build_function=lambda settings, **_: BuildSummary(),
     )
 
-    external = Path("/tmp/elsewhere.txt")
+    external = Path("/tmp/elsewhere.pyxl")
     paths = [
         project.pages_dir / "file_0.pyxl",
         external,
@@ -1091,6 +1092,33 @@ def test_format_paths_truncates_and_handles_external(project: DevServerSettings)
     remaining = len(paths) - 5
     assert f"+{remaining} more" in output
     assert external.as_posix() in output
+
+
+def test_format_paths_omits_editor_scratch_files(project: DevServerSettings) -> None:
+    """An editor's in-tree temp file must never be named as something rebuilt.
+
+    Several editors save by writing a randomly-named sibling and renaming it
+    into place. The watcher has to react to that event, but reporting
+    ``Rebuilt pages/index.pyxl, pages/sedo1AOsO`` makes it look like Pyxle
+    compiled the scratch file.
+    """
+    logger, _ = make_logger()
+    watcher = ProjectWatcher(
+        project,
+        logger=logger,
+        timer_factory=lambda delay, callback: ManualTimerHandle(callback),
+        build_function=lambda settings, **_: BuildSummary(),
+    )
+
+    output = watcher._format_paths(
+        [
+            project.pages_dir / "index.pyxl",
+            project.pages_dir / "sedo1AOsO",
+            project.pages_dir / ".index.pyxl.swp",
+        ]
+    )
+
+    assert output == "pages/index.pyxl"
 
 
 def test_default_timer_handle_cancel_prevents_callback() -> None:
@@ -1245,3 +1273,343 @@ def test_failed_rebuild_forces_the_next_pass(tmp_path: Path) -> None:
 
     assert calls == [False, True, False]
     assert watcher.latest_statistics is not None and watcher.latest_statistics.error is None
+
+
+def make_build_failure(
+    relative: str = "about.pyxl", *, line: int | None = 7, column: int | None = 9
+) -> BuildFailure:
+    return BuildFailure(
+        page_relative_path=Path(relative),
+        display_path=f"pages/{relative}",
+        message="unexpected indent",
+        line=line,
+        column=column,
+        code_frame="",
+    )
+
+
+def test_compile_failure_is_logged_with_file_line_and_column(
+    project: DevServerSettings,
+    timer_factory: Tuple[Callable[[float, Callable[[], None]], ManualTimerHandle], List[ManualTimerHandle]],
+) -> None:
+    """The terminal must name the file the browser overlay names.
+
+    A bare 'Rebuild failed: Line 7: unexpected indent' tells a developer
+    nothing when the project has more than one page.
+    """
+    factory, handles = timer_factory
+    logger, messages = make_logger()
+
+    def failing_build(settings: DevServerSettings, **_: object) -> BuildSummary:
+        raise BuildFailed([make_build_failure()], BuildSummary())
+
+    watcher = ProjectWatcher(
+        project,
+        logger=logger,
+        timer_factory=factory,
+        build_function=failing_build,
+    )
+
+    watcher.notify_paths([project.pages_dir / "about.pyxl"])
+    handles[-1].trigger()
+
+    assert any(
+        "pages/about.pyxl:7:9: unexpected indent" in message for message in messages
+    )
+    stats = watcher.latest_statistics
+    assert isinstance(stats.error, BuildFailed)
+
+
+def test_every_compile_failure_gets_its_own_line(
+    project: DevServerSettings,
+    timer_factory: Tuple[Callable[[float, Callable[[], None]], ManualTimerHandle], List[ManualTimerHandle]],
+) -> None:
+    factory, handles = timer_factory
+    logger, messages = make_logger()
+
+    def failing_build(settings: DevServerSettings, **_: object) -> BuildSummary:
+        raise BuildFailed(
+            [make_build_failure("about.pyxl"), make_build_failure("blog/index.pyxl")],
+            BuildSummary(),
+        )
+
+    watcher = ProjectWatcher(
+        project,
+        logger=logger,
+        timer_factory=factory,
+        build_function=failing_build,
+    )
+
+    watcher.notify_paths([project.pages_dir / "about.pyxl"])
+    handles[-1].trigger()
+
+    assert any("pages/about.pyxl:7:9" in message for message in messages)
+    assert any("pages/blog/index.pyxl:7:9" in message for message in messages)
+
+
+def test_partial_failure_still_reports_what_rebuilt(
+    project: DevServerSettings,
+    timer_factory: Tuple[Callable[[float, Callable[[], None]], ManualTimerHandle], List[ManualTimerHandle]],
+) -> None:
+    """Silence beside a failure line reads as 'your save did nothing'."""
+    factory, handles = timer_factory
+    logger, messages = make_logger()
+    partial = BuildSummary(compiled_pages=["index.pyxl"])
+
+    def failing_build(settings: DevServerSettings, **_: object) -> BuildSummary:
+        raise BuildFailed([make_build_failure()], partial)
+
+    watcher = ProjectWatcher(
+        project,
+        logger=logger,
+        timer_factory=factory,
+        build_function=failing_build,
+    )
+
+    watcher.notify_paths([project.pages_dir / "index.pyxl"])
+    handles[-1].trigger()
+
+    assert any(message.startswith("✅ Rebuilt pages/index.pyxl in ") for message in messages)
+    assert any("pages/about.pyxl:7:9" in message for message in messages)
+
+
+def test_partial_failure_with_nothing_rebuilt_says_nothing_extra(
+    project: DevServerSettings,
+    timer_factory: Tuple[Callable[[float, Callable[[], None]], ManualTimerHandle], List[ManualTimerHandle]],
+) -> None:
+    factory, handles = timer_factory
+    logger, messages = make_logger()
+
+    def failing_build(settings: DevServerSettings, **_: object) -> BuildSummary:
+        raise BuildFailed([make_build_failure()], BuildSummary())
+
+    watcher = ProjectWatcher(
+        project,
+        logger=logger,
+        timer_factory=factory,
+        build_function=failing_build,
+    )
+
+    watcher.notify_paths([project.pages_dir / "about.pyxl"])
+    handles[-1].trigger()
+
+    assert not any(message.startswith("✅ Rebuilt") for message in messages)
+
+
+def test_partial_failure_carries_the_summary_to_the_listener(
+    project: DevServerSettings,
+    timer_factory: Tuple[Callable[[float, Callable[[], None]], ManualTimerHandle], List[ManualTimerHandle]],
+) -> None:
+    """The dev server needs both halves: what to reload and what to refuse."""
+    factory, handles = timer_factory
+    logger, _ = make_logger()
+    partial = BuildSummary(compiled_pages=["index.pyxl"], failures=[make_build_failure()])
+    observed: List[WatcherStatistics] = []
+
+    def failing_build(settings: DevServerSettings, **_: object) -> BuildSummary:
+        raise BuildFailed(partial.failures, partial)
+
+    watcher = ProjectWatcher(
+        project,
+        logger=logger,
+        timer_factory=factory,
+        build_function=failing_build,
+        on_rebuild=observed.append,
+    )
+
+    watcher.notify_paths([project.pages_dir / "index.pyxl"])
+    handles[-1].trigger()
+
+    assert observed[-1].summary is partial
+    assert observed[-1].summary.failures[0].display_path == "pages/about.pyxl"
+
+
+def test_partial_failure_advances_the_module_reload_generation(
+    project: DevServerSettings,
+    timer_factory: Tuple[Callable[[float, Callable[[], None]], ManualTimerHandle], List[ManualTimerHandle]],
+) -> None:
+    """An edit that compiled must take effect even while another file is broken."""
+    from pyxle.ssr.module_cache import current_generation
+
+    factory, handles = timer_factory
+    logger, _ = make_logger()
+    partial = BuildSummary(compiled_pages=["index.pyxl"])
+
+    def failing_build(settings: DevServerSettings, **_: object) -> BuildSummary:
+        raise BuildFailed([make_build_failure()], partial)
+
+    watcher = ProjectWatcher(
+        project,
+        logger=logger,
+        timer_factory=factory,
+        build_function=failing_build,
+    )
+
+    before = current_generation()
+    watcher.notify_paths([project.pages_dir / "index.pyxl"])
+    handles[-1].trigger()
+
+    assert current_generation() != before
+
+
+def test_partial_failure_says_nothing_when_only_artifacts_were_removed(
+    project: DevServerSettings,
+    timer_factory: Tuple[Callable[[float, Callable[[], None]], ManualTimerHandle], List[ManualTimerHandle]],
+) -> None:
+    """A deletion is a material change but names no file that was rebuilt."""
+    factory, handles = timer_factory
+    logger, messages = make_logger()
+
+    def failing_build(settings: DevServerSettings, **_: object) -> BuildSummary:
+        raise BuildFailed([make_build_failure()], BuildSummary(removed=["gone.pyxl"]))
+
+    watcher = ProjectWatcher(
+        project,
+        logger=logger,
+        timer_factory=factory,
+        build_function=failing_build,
+    )
+
+    watcher.notify_paths([project.pages_dir / "gone.pyxl"])
+    handles[-1].trigger()
+
+    assert not any(message.startswith("✅ Rebuilt") for message in messages)
+
+
+def test_partial_rebuild_line_truncates_a_long_list(
+    project: DevServerSettings,
+    timer_factory: Tuple[Callable[[float, Callable[[], None]], ManualTimerHandle], List[ManualTimerHandle]],
+) -> None:
+    factory, handles = timer_factory
+    logger, messages = make_logger()
+    compiled = [f"page_{index}.pyxl" for index in range(8)]
+
+    def failing_build(settings: DevServerSettings, **_: object) -> BuildSummary:
+        raise BuildFailed(
+            [make_build_failure()], BuildSummary(compiled_pages=list(compiled))
+        )
+
+    watcher = ProjectWatcher(
+        project,
+        logger=logger,
+        timer_factory=factory,
+        build_function=failing_build,
+    )
+
+    watcher.notify_paths([project.pages_dir / "page_0.pyxl"])
+    handles[-1].trigger()
+
+    rebuilt = [m for m in messages if m.startswith("✅ Rebuilt")]
+    assert rebuilt and "pages/page_0.pyxl" in rebuilt[0]
+    assert "+3 more" in rebuilt[0]
+
+
+class TestHelperModuleChanges:
+    """A Python helper beside an endpoint is code the server runs, even though
+    it is not a build artifact.
+
+    ``scan_source_tree`` deliberately ignores underscore modules in an ``api``
+    directory — they serve no URL — so editing one produces a summary with no
+    changes at all. The watcher must still report it and tell the listener,
+    or the endpoint that imports it goes on serving the old values with no
+    output whatsoever.
+    """
+
+    @staticmethod
+    def _watcher(project, factory, logger, helper: Path):
+        return ProjectWatcher(
+            project,
+            logger=logger,
+            timer_factory=factory,
+            build_function=lambda settings, **_: BuildSummary(),
+        )
+
+    def test_helper_edit_is_reported(
+        self,
+        project: DevServerSettings,
+        timer_factory: Tuple[Callable[[float, Callable[[], None]], ManualTimerHandle], List[ManualTimerHandle]],
+    ) -> None:
+        factory, handles = timer_factory
+        logger, messages = make_logger()
+        helper = project.pages_dir / "api" / "_shared.py"
+        watcher = self._watcher(project, factory, logger, helper)
+
+        watcher.notify_paths([helper])
+        handles[-1].trigger()
+
+        assert any(
+            message.startswith("✅ Reloaded pages/api/_shared.py in ") for message in messages
+        )
+
+    def test_helper_edit_reaches_the_listener_as_a_real_change(
+        self,
+        project: DevServerSettings,
+        timer_factory: Tuple[Callable[[float, Callable[[], None]], ManualTimerHandle], List[ManualTimerHandle]],
+    ) -> None:
+        """This is the field the route-table refresh has to gate on."""
+        factory, handles = timer_factory
+        logger, _ = make_logger()
+        observed: List[WatcherStatistics] = []
+        helper = project.pages_dir / "api" / "_shared.py"
+        watcher = ProjectWatcher(
+            project,
+            logger=logger,
+            timer_factory=factory,
+            build_function=lambda settings, **_: BuildSummary(),
+            on_rebuild=observed.append,
+        )
+
+        watcher.notify_paths([helper])
+        handles[-1].trigger()
+
+        assert observed[-1].summary.any_changes() is False
+        assert "pages.api._shared" in observed[-1].purged_modules
+
+    def test_a_change_with_no_python_at_all_stays_quiet(
+        self,
+        project: DevServerSettings,
+        timer_factory: Tuple[Callable[[float, Callable[[], None]], ManualTimerHandle], List[ManualTimerHandle]],
+    ) -> None:
+        factory, handles = timer_factory
+        logger, messages = make_logger()
+        watcher = ProjectWatcher(
+            project,
+            logger=logger,
+            timer_factory=factory,
+            build_function=lambda settings, **_: BuildSummary(),
+        )
+
+        watcher.notify_paths([project.pages_dir / "styles" / "app.css"])
+        handles[-1].trigger()
+
+        assert not any(message.startswith("✅ Reloaded") for message in messages)
+        assert watcher.latest_statistics.purged_modules == ()
+
+    def test_the_pass_outcome_is_reported_before_the_listener_runs(
+        self,
+        project: DevServerSettings,
+        timer_factory: Tuple[Callable[[float, Callable[[], None]], ManualTimerHandle], List[ManualTimerHandle]],
+    ) -> None:
+        """A listener warning must read as a consequence, not a contradiction."""
+        factory, handles = timer_factory
+        logger, messages = make_logger()
+        order: List[str] = []
+
+        def listener(stats: WatcherStatistics) -> None:
+            order.append("listener")
+            logger.warning("route table not refreshed")
+
+        watcher = ProjectWatcher(
+            project,
+            logger=logger,
+            timer_factory=factory,
+            build_function=lambda settings, **_: BuildSummary(compiled_pages=["index.pyxl"]),
+            on_rebuild=listener,
+        )
+
+        watcher.notify_paths([project.pages_dir / "index.pyxl"])
+        handles[-1].trigger()
+
+        rebuilt = next(i for i, m in enumerate(messages) if m.startswith("✅ Rebuilt"))
+        warned = next(i for i, m in enumerate(messages) if "route table" in m)
+        assert rebuilt < warned

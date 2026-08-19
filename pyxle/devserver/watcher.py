@@ -24,7 +24,8 @@ from watchdog.observers import Observer
 from pyxle.cli.logger import ConsoleLogger
 from pyxle.ssr.module_cache import mark_rebuild
 
-from .builder import BuildSummary, build_once
+from .builder import BuildFailed, BuildSummary, build_once
+from .scanner import is_source_file
 from .settings import DevServerSettings
 
 _RebuildCallback = Callable[[Sequence[Path]], None]
@@ -256,6 +257,12 @@ class WatcherStatistics:
     summary: BuildSummary | None
     error: Exception | None
     changed_paths: Sequence[Path]
+    #: Python modules dropped from ``sys.modules`` for this pass. A helper
+    #: module — ``pages/api/_shared.py``, anything under ``dev.watch`` — is not
+    #: a build *artifact*, so a change to one produces a summary with no
+    #: changes at all. It is still a change to code the server runs, and the
+    #: listener needs to know: this is the only field that says so.
+    purged_modules: tuple[str, ...] = ()
 
 
 class ProjectWatcher:
@@ -488,6 +495,36 @@ class ProjectWatcher:
         self._force_next_rebuild = False
         try:
             summary = self._build_function(self._settings, force_rebuild=force_rebuild)
+        except BuildFailed as error:
+            # A compile error names its file, its line and its column, so the
+            # terminal says exactly what the browser overlay says. Anything
+            # less and the only actionable copy is in a tab the developer may
+            # not have open.
+            self._force_next_rebuild = True
+            elapsed = time.perf_counter() - start
+            for failure in error.failures:
+                self._logger.error(f"Rebuild failed: {failure.describe()}")
+            # The pass built every file it could, so the half that succeeded
+            # needs the same module invalidation a clean pass performs — an
+            # edit to a working page must take effect even while another page
+            # is unparseable.
+            purged = _invalidate_python_modules(paths, self._settings.project_root)
+            if error.summary.any_changes() or purged:
+                mark_rebuild()
+            stats = WatcherStatistics(
+                elapsed_seconds=elapsed,
+                summary=error.summary,
+                error=error,
+                changed_paths=paths,
+                purged_modules=tuple(sorted(purged)),
+            )
+            self._latest_stats = stats
+            # What this pass did is reported before the listener runs, so that
+            # anything the listener has to say (a route table it could not
+            # refresh) reads as a consequence rather than as a contradiction.
+            self._log_partial_rebuild(error.summary, elapsed)
+            self._emit_rebuild(stats)
+            return
         except OSError as error:
             self._force_next_rebuild = True
             elapsed = time.perf_counter() - start
@@ -531,9 +568,9 @@ class ProjectWatcher:
             summary=summary,
             error=None,
             changed_paths=paths,
+            purged_modules=tuple(sorted(purged)),
         )
         self._latest_stats = stats
-        self._emit_rebuild(stats)
 
         if summary.any_changes():
             # Curated one-liner: what rebuilt and how long it took. The full
@@ -548,20 +585,77 @@ class ProjectWatcher:
                 f"global scripts: {len(summary.synced_scripts)}, "
                 f"removed: {len(summary.removed)}"
             )
+        elif purged:
+            # A helper module produces no build artifact, so nothing was
+            # "rebuilt" — but the server does now run different code, and
+            # saying nothing is what makes a developer think their editor
+            # didn't write the file.
+            self._logger.success(f"Reloaded {formatted} in {elapsed * 1000:.0f} ms")
         else:
             self._logger.debug(
                 f"Rebuild finished in {elapsed:.2f}s with no material changes (debounced {files_changed} event(s))"
             )
 
+        # Reported first, then acted on: the listener refreshes the route table
+        # and may have to say it could not, which only reads correctly after the
+        # line describing what the pass actually did.
+        self._emit_rebuild(stats)
+
+    def _log_partial_rebuild(self, summary: BuildSummary | None, elapsed: float) -> None:
+        """Report the files that *did* rebuild in a pass that also failed.
+
+        A pass no longer stops at the first broken file, so an edit to a
+        working page still lands while another page is unparseable. Saying so
+        is what tells the developer their save was applied — silence beside a
+        failure line reads as "nothing happened".
+        """
+
+        if summary is None or not summary.any_changes():
+            return
+        built = self._format_source_keys(
+            [
+                *summary.compiled_pages,
+                *summary.copied_api_modules,
+                *summary.copied_client_assets,
+            ]
+        )
+        if not built:
+            return
+        self._logger.success(f"Rebuilt {built} in {elapsed * 1000:.0f} ms")
+
+    def _format_source_keys(self, keys: Sequence[str]) -> str:
+        """Render ``pages/``-relative build keys as project-relative paths."""
+
+        try:
+            prefix = self._settings.pages_dir.relative_to(self._settings.project_root)
+        except ValueError:  # pragma: no cover - pages_dir outside the project
+            prefix = None
+        rendered = [
+            (prefix / key).as_posix() if prefix is not None else key for key in keys[:5]
+        ]
+        remaining = len(keys) - len(rendered)
+        if remaining > 0:
+            rendered.append(f"+{remaining} more")
+        return ", ".join(rendered)
+
     def _format_paths(self, paths: Sequence[Path]) -> str:
+        """Render changed paths for the rebuild log, project-relative.
+
+        Only files the scanner would treat as project source are named. An
+        editor that saves through an in-tree temporary file (``pages/sedo1AOsO``
+        and friends) puts one filesystem event per save in the batch; naming it
+        beside the real file made the log look like Pyxle had compiled junk.
+        """
+
         project_root = self._settings.project_root
         rendered: List[str] = []
-        for path in paths[:5]:
+        candidates = [path for path in paths if is_source_file(path)]
+        for path in candidates[:5]:
             try:
                 rendered.append(path.relative_to(project_root).as_posix())
             except ValueError:
                 rendered.append(path.as_posix())
-        remaining = len(paths) - len(rendered)
+        remaining = len(candidates) - len(rendered)
         if remaining > 0:
             rendered.append(f"+{remaining} more")
         return ", ".join(rendered)

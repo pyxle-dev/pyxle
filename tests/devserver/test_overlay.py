@@ -6,7 +6,7 @@ import pytest
 from starlette.websockets import WebSocketDisconnect
 
 from pyxle.cli.logger import ConsoleLogger
-from pyxle.devserver.overlay import OverlayManager, _format_stacktrace
+from pyxle.devserver.overlay import OverlayEvent, OverlayManager, _format_stacktrace
 
 
 @pytest.fixture
@@ -268,3 +268,98 @@ async def test_notify_error_formats_stack_when_omitted() -> None:
     # traceback derived from the live exception.
     assert "RuntimeError" in message["payload"]["stack"]
     assert "derived stack" in message["payload"]["stack"]
+
+
+class TestErrorSurvivesReload:
+    """An error must outlive the tab that happened to be open when it broke.
+
+    Reloading a page closes the overlay socket and opens a new one. Without
+    replay the new socket is told nothing, so the browser shows a healthy page
+    while the source is still broken — and the developer concludes hot reload
+    is what is broken.
+    """
+
+    @pytest.mark.anyio
+    async def test_error_is_replayed_to_a_client_that_connects_later(self) -> None:
+        manager = OverlayManager(logger=StubLogger())
+        await manager.notify_error(
+            route_path="(rebuild)", error=RuntimeError("pages/about.pyxl:7:9: bad")
+        )
+
+        reconnected = StubWebSocket()
+        await manager.register(reconnected)
+
+        assert len(reconnected.sent) == 1
+        replayed = json.loads(reconnected.sent[0])
+        assert replayed["type"] == "error"
+        assert replayed["payload"]["routePath"] == "(rebuild)"
+        assert "pages/about.pyxl:7:9" in replayed["payload"]["message"]
+
+    @pytest.mark.anyio
+    async def test_nothing_is_replayed_when_the_build_is_healthy(self) -> None:
+        manager = OverlayManager(logger=StubLogger())
+        socket = StubWebSocket()
+
+        await manager.register(socket)
+
+        assert socket.sent == []
+
+    @pytest.mark.anyio
+    async def test_clearing_a_route_stops_it_being_replayed(self) -> None:
+        manager = OverlayManager(logger=StubLogger())
+        await manager.notify_error(route_path="(rebuild)", error=RuntimeError("boom"))
+        await manager.notify_clear(route_path="(rebuild)")
+
+        socket = StubWebSocket()
+        await manager.register(socket)
+
+        assert socket.sent == []
+
+    @pytest.mark.anyio
+    async def test_a_healthy_route_does_not_clear_another_route_error(self) -> None:
+        """Every successful render clears its own route — and only its own."""
+        manager = OverlayManager(logger=StubLogger())
+        await manager.notify_error(route_path="(rebuild)", error=RuntimeError("boom"))
+        await manager.notify_clear(route_path="/")
+
+        socket = StubWebSocket()
+        await manager.register(socket)
+
+        assert len(socket.sent) == 1
+        assert json.loads(socket.sent[0])["payload"]["routePath"] == "(rebuild)"
+
+    @pytest.mark.anyio
+    async def test_the_most_recent_error_is_the_one_replayed(self) -> None:
+        manager = OverlayManager(logger=StubLogger())
+        await manager.notify_error(route_path="/first", error=RuntimeError("older"))
+        await manager.notify_error(route_path="/second", error=RuntimeError("newer"))
+
+        socket = StubWebSocket()
+        await manager.register(socket)
+
+        assert json.loads(socket.sent[0])["payload"]["routePath"] == "/second"
+
+    @pytest.mark.anyio
+    async def test_repeating_an_error_keeps_one_entry_per_route(self) -> None:
+        manager = OverlayManager(logger=StubLogger())
+        await manager.notify_error(route_path="/a", error=RuntimeError("one"))
+        await manager.notify_error(route_path="/b", error=RuntimeError("two"))
+        await manager.notify_error(route_path="/a", error=RuntimeError("three"))
+        await manager.notify_clear(route_path="/a")
+
+        socket = StubWebSocket()
+        await manager.register(socket)
+
+        assert json.loads(socket.sent[0])["payload"]["routePath"] == "/b"
+
+    @pytest.mark.anyio
+    async def test_a_client_that_vanishes_during_replay_is_dropped(self) -> None:
+        manager = OverlayManager(logger=StubLogger())
+        await manager.notify_error(route_path="(rebuild)", error=RuntimeError("boom"))
+
+        socket = StubWebSocket()
+        socket.disconnect_after = 1
+        await manager.register(socket)
+
+        await manager.broadcast(OverlayEvent(type="reload", payload={}))
+        assert len(socket.sent) == 1

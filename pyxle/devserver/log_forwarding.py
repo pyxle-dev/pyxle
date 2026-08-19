@@ -118,6 +118,7 @@ class BrowserConsoleLogHandler(logging.Handler):
         self._window_count = 0
         self._prev_root_level = logging.NOTSET
         self._lowered_root = False
+        self._stderr_fallback: logging.Handler | None = None
         self.setFormatter(logging.Formatter("%(message)s"))
 
     # -- attachment ----------------------------------------------------
@@ -129,6 +130,9 @@ class BrowserConsoleLogHandler(logging.Handler):
         records before they reach any handler. While attached, the level is
         lowered to ``INFO`` (or ``DEBUG`` when verbose) so server logs are
         forwarded. The previous level is restored on :meth:`detach`.
+
+        Attaching also installs a stderr fallback when the root logger has no
+        handlers of its own — see :meth:`_install_stderr_fallback`.
         """
         root = logging.getLogger()
         self._prev_root_level = root.level
@@ -136,12 +140,40 @@ class BrowserConsoleLogHandler(logging.Handler):
         if root.level == logging.NOTSET or root.level > target:
             root.setLevel(target)
             self._lowered_root = True
+        self._install_stderr_fallback(root)
         root.addHandler(self)
+
+    def _install_stderr_fallback(self, root: logging.Logger) -> None:
+        """Keep warnings and errors on the terminal once this handler exists.
+
+        Python routes a record to :data:`logging.lastResort` — WARNING and above,
+        to stderr — only while it finds *no* handler willing to take it. Adding
+        this one ends that fallback for the whole process, which would quietly
+        redirect every library warning and error into a browser console that may
+        not even be open: a plugin whose ``on_startup`` raises would abort the
+        boot without printing anything at all.
+
+        So when nothing else is listening on the root logger, install the
+        equivalent stderr sink ourselves. This restores exactly what Python did
+        before we attached, and adds no output that was not already being
+        printed. It is removed again in :meth:`detach`.
+        """
+        if root.handlers:
+            return
+        fallback = logging.StreamHandler()
+        fallback.setLevel(logging.WARNING)
+        fallback.setFormatter(logging.Formatter("%(message)s"))
+        root.addHandler(fallback)
+        self._stderr_fallback = fallback
 
     def detach(self) -> None:
         """Remove from the root logger and restore its previous level."""
         root = logging.getLogger()
         root.removeHandler(self)
+        if self._stderr_fallback is not None:
+            root.removeHandler(self._stderr_fallback)
+            self._stderr_fallback.close()
+            self._stderr_fallback = None
         if self._lowered_root:
             root.setLevel(self._prev_root_level)
             self._lowered_root = False

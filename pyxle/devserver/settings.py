@@ -75,6 +75,23 @@ class DevServerSettings:
     # (strings or dicts), resolved to PluginSpec/PyxlePlugin instances
     # by the starlette app at startup. Empty tuple = no plugins.
     plugins: tuple[Any, ...] = ()
+    # The app's display name (``name`` in pyxle.config.json). Empty means
+    # "unset" — ``document_title_default`` then falls back to the project
+    # directory name. Read only when a page renders with no <title> from the
+    # page or any layout.
+    app_name: str = ""
+
+    @property
+    def document_title_default(self) -> str:
+        """The ``<title>`` to use when nothing else supplies one.
+
+        Resolution order: the configured ``name``, then the project directory
+        name. Deliberately never the framework's own name — a page with no
+        title should read as the developer's app in the browser tab, not as
+        Pyxle.
+        """
+
+        return self.app_name.strip() or self.project_root.name
 
     @classmethod
     def from_project_root(
@@ -108,6 +125,7 @@ class DevServerSettings:
         llms: Any = None,
         studio: Any = None,
         plugins: Sequence[Any] | None = None,
+        app_name: str = "",
     ) -> "DevServerSettings":
         """Create settings derived from a project root directory."""
 
@@ -186,6 +204,7 @@ class DevServerSettings:
             llms=llms,
             studio=studio,
             plugins=tuple(plugins) if plugins else (),
+            app_name=app_name.strip(),
         )
 
     def to_dict(self) -> Dict[str, Any]:

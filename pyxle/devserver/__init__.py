@@ -13,7 +13,9 @@ from typing import TYPE_CHECKING, Optional
 
 import uvicorn
 
-from .builder import BuildSummary, build_once
+from pyxle.ssr.paths import clear_resolved_paths
+
+from .builder import BuildFailed, BuildSummary, build_once
 from .client_files import write_client_bootstrap_files
 from .registry import build_metadata_registry
 from .routes import RouteTable, build_route_table
@@ -28,6 +30,11 @@ if TYPE_CHECKING:  # pragma: no cover - import cycle guard
 
     from .log_forwarding import BrowserConsoleLogHandler
     from .overlay import OverlayManager
+
+#: How often to re-check ``uvicorn.Server.started`` while waiting to announce
+#: readiness. Small enough that the startup time the banner reports stays
+#: honest, large enough not to spin the loop while Vite and the lifespan work.
+READY_POLL_INTERVAL_S = 0.005
 
 
 def _attach_log_forwarding(
@@ -129,13 +136,20 @@ class DevServer:
             if settings.ssr_workers > 0:
                 from pyxle.ssr.worker_pool import SsrWorkerPool  # noqa: PLC0415
 
+                from pyxle.ssr.template import vite_owns_stylesheets  # noqa: PLC0415
+
                 _pool = SsrWorkerPool(
                     size=settings.ssr_workers,
                     project_root=settings.project_root,
                     client_root=settings.client_build_dir,
+                    vite_owns_css=vite_owns_stylesheets(settings),
                 )
 
             app = create_starlette_app(settings, route_table, logger=logger, pool=_pool)
+            # Seed the gate from the startup build, so a page that was already
+            # broken before the server started is refused from the first
+            # request rather than only after the next save.
+            _record_build_failures(app, summary)
             overlay = _resolve_overlay(app)
             loop = asyncio.get_running_loop()
         except BaseException:
@@ -147,15 +161,21 @@ class DevServer:
             # taking the discovery file with it — re-assert it after every pass.
             self._write_discovery_file(settings)
             # Studio hears about every finished rebuild — success or failure —
-            # before the error early-return below, so its activity feed always
-            # matches what the terminal reported.
+            # so its activity feed always matches what the terminal reported.
             _notify_studio_rebuild(
                 getattr(app.state, "pyxle_studio", None), loop, stats
             )
-            if _notify_rebuild_error(overlay, loop, stats):
-                return
+            # Which sources are broken decides what the server may serve, so it
+            # is recorded before anything else acts on this pass.
+            _record_build_failures(app, stats.summary)
+            # A pass that failed on one file still built every other file, so
+            # the reload goes out either way — an edit to a working page must
+            # land while an unrelated page is unparseable. The error is
+            # broadcast after it, so a client that acts on both ends up showing
+            # the failure rather than a stale all-clear.
             _maybe_schedule_reload(overlay, loop, stats)
-            if stats.summary is None or not stats.summary.any_changes():
+            _notify_rebuild_error(overlay, loop, stats)
+            if not _pass_changed_running_code(stats):
                 return
             # Invalidate SSR bundle caches in the worker pool when files change.
             if _pool is not None:
@@ -175,7 +195,8 @@ class DevServer:
                     new_routes, error_boundaries = _rebuild_app_routes(app, settings)
                 except Exception as exc:
                     logger.warning(
-                        f"Live route refresh failed; restart `pyxle dev` to apply changes: {exc}"
+                        "Route table not refreshed — the previous one is still "
+                        f"serving, so this change has not taken effect: {exc}"
                     )
                 else:
                     loop.call_soon_threadsafe(
@@ -196,6 +217,7 @@ class DevServer:
         vite_process: ViteProcess | None = None
         tailwind_process: TailwindProcess | None = None
         dashboard_task: asyncio.Task | None = None
+        announce_task: asyncio.Task | None = None
         log_forwarder: "BrowserConsoleLogHandler | None" = None
 
         try:
@@ -245,19 +267,17 @@ class DevServer:
             if settings.debug and overlay is not None:
                 log_forwarder = _attach_log_forwarding(overlay, loop, logger)
 
-            # Only advertise "ready" if Vite is genuinely still up. On an
-            # unsupported toolchain Vite can pass the readiness probe and then
-            # crash-loop; printing the success banner beside a red Vite fatal is
-            # the worst signal, so surface the failure instead.
-            if vite_process is not None and not vite_process.running:
-                logger.error(
-                    "Vite exited immediately after starting; the dev server is "
-                    "not ready. Check the Vite output above (an unsupported "
-                    "Node.js version is the most common cause)."
+            # The readiness banner is announced from a side task rather than
+            # here, because everything that can still fail — the ASGI lifespan
+            # (plugin startup, database connections, config validation) and the
+            # socket bind — happens inside ``server.serve()`` below. Announcing
+            # first turns a failed boot into a green "ready" line followed by a
+            # silent exit.
+            announce_task = loop.create_task(
+                self._announce_when_serving(
+                    server, settings, route_table, start_time, vite_process
                 )
-            else:
-                self._log_ready_summary(logger, settings, route_table, start_time)
-                self._maybe_open_browser(settings)
+            )
             dashboard_task = self._start_dashboard(app, loop)
             try:
                 await server.serve()
@@ -269,6 +289,8 @@ class DevServer:
             _set_app_ready_flag(app, False)
             if log_forwarder is not None:
                 log_forwarder.detach()
+            if announce_task is not None:
+                announce_task.cancel()
             if dashboard_task is not None:
                 dashboard_task.cancel()
             if watcher is not None:
@@ -458,8 +480,20 @@ class DevServer:
     # Internal helpers -------------------------------------------------
 
     def _run_initial_build(self, settings: DevServerSettings) -> BuildSummary:
+        """Build the project once before serving.
+
+        A file that does not compile is reported and the server starts anyway:
+        the routes that *do* build stay usable, and the broken one answers with
+        the compile error instead of taking the whole app down. Any other
+        failure (an unreadable build directory, a scanner refusing the project)
+        is fatal, because it says nothing can be served at all.
+        """
         try:
             summary = build_once(settings, force_rebuild=True)
+        except BuildFailed as exc:
+            for failure in exc.failures:
+                self.logger.error(f"Build failed: {failure.describe()}")
+            return exc.summary
         except Exception as exc:
             self.logger.error(f"Initial build failed: {exc}")
             raise
@@ -488,6 +522,45 @@ class DevServer:
             self.logger.debug(f"Initial build completed — {message}")
         else:
             self.logger.debug("Initial build completed with no changes detected")
+
+    async def _announce_when_serving(
+        self,
+        server: uvicorn.Server,
+        settings: DevServerSettings,
+        route_table: RouteTable,
+        start_time: float,
+        vite_process: ViteProcess | None,
+    ) -> None:
+        """Announce readiness once uvicorn is genuinely accepting connections.
+
+        ``uvicorn.Server.started`` flips at the very end of the server's startup
+        sequence — after the ASGI lifespan completed (where plugins start,
+        databases connect and settings are validated) *and* after the listening
+        socket is bound. Waiting for it means a boot that dies in either place
+        prints no success banner at all, instead of the green "ready in 646 ms"
+        that used to precede a silent exit.
+
+        The caller cancels this task when the server stops, so the wait needs no
+        timeout of its own.
+        """
+        while not server.started:
+            if server.should_exit:
+                return
+            await asyncio.sleep(READY_POLL_INTERVAL_S)
+
+        # Vite can pass its readiness probe and then crash-loop on an
+        # unsupported toolchain. A success banner beside a red Vite fatal is the
+        # worst possible signal, so surface the failure instead.
+        if vite_process is not None and not vite_process.running:
+            self.logger.error(
+                "Vite exited immediately after starting; the dev server is "
+                "not ready. Check the Vite output above (an unsupported "
+                "Node.js version is the most common cause)."
+            )
+            return
+
+        self._log_ready_summary(self.logger, settings, route_table, start_time)
+        self._maybe_open_browser(settings)
 
     def _log_ready_summary(
         self,
@@ -602,9 +675,75 @@ def _apply_refreshed_routes(app, new_routes, error_boundaries) -> None:
     """
     app.router.routes[:] = new_routes
     app.state.error_boundaries = error_boundaries
+    # Component paths are canonicalised through a per-process memo, so a
+    # rebuild that moves or re-links build output must drop it alongside the
+    # bundle cache or a stale canonical path would be handed to the worker.
+    clear_resolved_paths()
     renderer = getattr(app.state, "ssr_renderer", None)
     if renderer is not None:
         renderer.clear()
+
+
+def _pass_changed_running_code(stats: WatcherStatistics) -> bool:
+    """Whether this pass changed anything the server actually runs.
+
+    Two different things count, and using only the first is a bug that has hit
+    Pyxle before: a build *artifact* changed (a page recompiled, an API module
+    copied), **or** a Python module was dropped from ``sys.modules``. A helper
+    beside an endpoint — ``pages/api/_shared.py``, anything under ``dev.watch``
+    — is never a build artifact, so editing one produces a summary with no
+    changes whatsoever. Judging by the summary alone, the listener concluded
+    nothing had happened and skipped the route-table refresh, which is what
+    re-imports endpoint modules: the endpoint went on serving the helper's old
+    values with no rebuild line, no error, and nothing to restart. This is the
+    same predicate the watcher already uses to decide whether to advance the
+    module-reload generation; the two must not disagree.
+
+    A pass with no summary at all died before it could describe anything, so
+    there is nothing safe to act on.
+    """
+    if stats.summary is None:
+        return False
+    return bool(stats.summary.any_changes() or stats.purged_modules)
+
+
+def _record_build_failures(app, summary: BuildSummary | None) -> None:
+    """Publish which sources the last pass could not compile.
+
+    The registry is what stops a page whose build failed being served as a
+    healthy ``200`` from the previous pass' artifacts. It is replaced wholesale
+    every pass — including with an empty set after a clean one — so it always
+    describes the build on disk right now and never accumulates stale entries.
+
+    A ``None`` summary means the pass died before it could say anything about
+    individual files; the previous set is left in place rather than being
+    replaced with a claim that nothing is broken.
+    """
+    registry = getattr(getattr(app, "state", None), "pyxle_build_failures", None)
+    if registry is None or summary is None:
+        return
+    registry.replace(summary.failures)
+
+
+def _notify_rebuild_cleared(overlay, loop) -> None:
+    """Retract the sticky rebuild error after a pass that compiled everything.
+
+    Pairs with :func:`_notify_rebuild_error`: without it the overlay would keep
+    replaying a build failure to every newly connected client long after the
+    file was fixed.
+    """
+    if overlay is None:
+        return
+    coroutine = overlay.notify_clear(route_path=_REBUILD_ROUTE_LABEL)
+    try:
+        asyncio.run_coroutine_threadsafe(coroutine, loop)
+    except RuntimeError:  # loop shutting down — nothing to notify
+        coroutine.close()
+
+
+#: Route label the rebuild reports errors under. Not a real route, so it can
+#: never collide with a page's own error state in the overlay's error table.
+_REBUILD_ROUTE_LABEL = "(rebuild)"
 
 
 def _notify_rebuild_error(overlay, loop, stats: WatcherStatistics) -> bool:
@@ -613,27 +752,38 @@ def _notify_rebuild_error(overlay, loop, stats: WatcherStatistics) -> bool:
     The architecture docs promise that a build failure (e.g. a parser error
     saved mid-edit) reaches the WebSocket overlay so the browser shows it
     inline — the watcher thread marshals the notification onto the event
-    loop here. Returns ``True`` when the stats describe a failure (whether
-    or not an overlay is connected), so the caller can stop processing.
+    loop here. The overlay keeps the error until it is retracted, so a client
+    that connects afterwards (a reload, a second tab) is told about it too.
+
+    Returns ``True`` when the stats describe a failure, whether or not an
+    overlay is connected.
     """
     if stats.error is None:
+        _notify_rebuild_cleared(overlay, loop)
         return False
     if overlay is not None:
-        changed = ", ".join(
-            path.as_posix() if isinstance(path, Path) else str(path)
-            for path in stats.changed_paths
-        )
+        if isinstance(stats.error, BuildFailed):
+            # A compile failure already names every file it is about. Listing
+            # the paths that *triggered* the pass beside it points at the file
+            # the developer just saved, which is usually not the broken one.
+            detail = str(stats.error)
+        else:
+            changed = ", ".join(
+                path.as_posix() if isinstance(path, Path) else str(path)
+                for path in stats.changed_paths
+            )
+            detail = f"{stats.error} (changed: {changed or 'unknown'})"
         breadcrumbs = [
             {
                 "label": "Rebuild",
                 "status": "failed",
-                "detail": f"{stats.error} (changed: {changed or 'unknown'})",
+                "detail": detail,
             }
         ]
         try:
             asyncio.run_coroutine_threadsafe(
                 overlay.notify_error(
-                    route_path="(rebuild)",
+                    route_path=_REBUILD_ROUTE_LABEL,
                     error=stats.error,
                     breadcrumbs=breadcrumbs,
                 ),
@@ -660,9 +810,18 @@ def _notify_studio_rebuild(studio, loop, stats: WatcherStatistics) -> None:
 
 
 def _maybe_schedule_reload(overlay, loop, stats: WatcherStatistics) -> bool:
+    """Reload connected clients for whatever this pass actually rebuilt.
+
+    A :class:`~pyxle.devserver.builder.BuildFailed` pass still carries a real
+    summary — it compiled every file except the broken ones — so its successful
+    half is reloaded too. Any other exception means the pass stopped somewhere
+    unknown, and its summary cannot be trusted to describe the build on disk.
+    """
     if overlay is None:
         return False
-    if stats.error is not None or stats.summary is None:
+    if stats.summary is None:
+        return False
+    if stats.error is not None and not isinstance(stats.error, BuildFailed):
         return False
     summary = stats.summary
     changed_paths: list[str] = [

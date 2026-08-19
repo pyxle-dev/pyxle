@@ -25,6 +25,7 @@ when you save a file, and how to read the dev server's source code.
 | `routes.py` (~280) | The `PageRoute` / `ApiRoute` / `ActionRoute` dataclasses |
 | `layouts.py` (~295) | Generates layout-wrapped client modules |
 | `overlay.py` (~105) | WebSocket overlay for error notifications |
+| `build_errors.py` (~280) | Which sources failed to compile, and the page served instead |
 | `error_pages.py` (~140) | Discovers `error.pyxl` and `not-found.pyxl` boundaries |
 | `route_hooks.py` (~225) | Per-route middleware policies |
 | `middleware.py` (~75) | Loads custom user middleware modules |
@@ -98,6 +99,7 @@ When all seven steps are done, the console shows a curated startup summary:
 ℹ️    Local:   http://127.0.0.1:8000
 ℹ️    Vite:    http://127.0.0.1:5173
 ℹ️    Routes:  13 page(s), 1 API route(s)
+ℹ️    Studio:  http://127.0.0.1:8000/__pyxle/studio
 ```
 
 By default the per-line Vite firehose and the internal step-by-step lifecycle
@@ -233,9 +235,77 @@ and a moment later the affected pages reload in the browser.
    window expires.
 
 The dispatch callback runs `build_once()` and then refreshes the
-metadata registry. If the build fails (e.g., a parser error), the
-watcher captures the exception and broadcasts it to the WebSocket
-overlay so the browser can display the error inline.
+metadata registry.
+
+### When a rebuild fails
+
+A build pass does not stop at the first file it cannot compile. It
+builds every other source, records the ones it could not, and raises
+`BuildFailed` carrying both halves — the partial `BuildSummary` and a
+`BuildFailure` per broken file (path, line, column, message, and a code
+frame captured at failure time). Stopping at the first failure used to
+mean that while one page was unparseable, an edit to any file scanned
+after it never reached the browser.
+
+Three things then happen, and they are deliberately independent:
+
+1. **The terminal** prints one line per broken file, located:
+   `Rebuild failed: pages/about.pyxl:7:9: unexpected indent`. Files that
+   *did* rebuild are still reported on their own success line.
+2. **The overlay** receives the failure (route label `(rebuild)`) and
+   keeps it as the current error until it is retracted, so a browser
+   that connects afterwards — which is what a page reload produces — is
+   told about it too.
+3. **The failed set** is published to `app.state.pyxle_build_failures`
+   (a `BuildFailureRegistry`, dev-only). Every page handler consults it
+   before rendering: a route whose own source failed, or whose
+   `layout.pyxl` / `template.pyxl` chain failed, answers `500` with the
+   compile error instead of the artifacts the previous pass left on
+   disk. Without this the route serves the last version that compiled —
+   a page that looks completely healthy while the file is broken.
+
+Scope is exactly the failing source and the pages a broken wrapper
+wraps: a broken `pages/about.pyxl` leaves `/`, `/blog` and every API
+route untouched, and a broken `pages/blog/layout.pyxl` takes down
+`/blog/*` and nothing above it.
+
+**Both halves of a `.pyxl` are checked, for the price of one.** The
+Python half is checked by `ast.parse`. The JSX half is checked by the
+Babel extractor pass that already runs on every compile to read
+`<Head>`, `<Script>`, `<Image>` and `<Suspense>` — it has to parse the
+section to find them, so a parse failure is a judgement it has already
+made. It used to discard that judgement and return empty metadata,
+which is why a JSX typo logged a success line, silently dropped the
+page's `<Head>`, and only surfaced later from the bundler against the
+generated `.jsx`. Reporting it adds no Node subprocess: measured at one
+spawn per compile either way, and it removes the second spawn `pyxle
+check` used to make to rediscover the same error.
+
+Two constraints shape it. The line is mapped from the JSX section back
+to the `.pyxl` (`_map_jsx_line`), because every JSX-side tool numbers
+lines from the start of the section it was handed. And it is gated on
+`settings.debug` (`compile_file(..., report_jsx_syntax=...)`), so
+`pyxle build` and `pyxle serve` keep their existing behaviour and a
+disagreement between Babel and esbuild can never newly break a release
+that builds today. The extractor also distinguishes "this code does not
+parse" from "the checker could not run"
+(`JSXParseResult.toolchain_available`); a missing Node install degrades
+silently, exactly as before, instead of failing every file.
+
+The compile-error page is the same dark document the SSR failure path
+serves (`pyxle/devserver/build_errors.py`), plus the source frame and a
+socket connection that reloads the page when the next rebuild succeeds.
+It is never cached (`Cache-Control: no-store`), and the registry is
+never created outside `debug` mode — `pyxle build` still refuses to
+produce a `dist/` from a project that does not compile.
+
+A source that has *never* compiled has no route of its own, so its URL
+would otherwise be answered by whatever dynamic or catch-all page
+matches it. Each failure records the parameterless URL it would serve,
+and a handler reached at that URL reports the failure rather than
+rendering. A page that has never compiled, is dynamic (`[slug].pyxl`),
+*and* has no route is not covered — with no catch-all in the project
+that URL simply 404s.
 
 ### Module cache invalidation
 
@@ -260,6 +330,26 @@ build → reload generation advances → next request re-imports the new code
 (module-level state resets, as it would on any restart). Between rebuilds
 the module is reused, so a module-level counter or cache persists across
 requests — but only per process (see [SSR → module reuse](ssr.md)).
+
+**A pass can change running code without changing a build artifact.** A
+private helper (`pages/api/_shared.py`, anything under `dev.watch`) is not
+a source the scanner builds — it serves no URL, so nothing compiles or
+copies it — and editing one produces a `BuildSummary` with no changes at
+all. It is still code the server runs, and `WatcherStatistics` says so on
+its own field: `purged_modules`, the modules dropped from `sys.modules`
+this pass. Both the watcher (deciding whether to advance the reload
+generation) and the dev server's rebuild listener (deciding whether to
+refresh the route table) gate on *artifact changes **or** purged modules*,
+and the two must not disagree. When the listener gated on the summary
+alone, a helper edit was read as "nothing happened": the route table was
+never refreshed, so endpoint modules were never re-imported and the
+endpoint served the helper's old values indefinitely — no rebuild line, no
+error, nothing to restart, until an unrelated file was edited.
+
+Refreshing the route table re-imports endpoint modules, so it is also
+where a broken helper surfaces. If the import fails, the routes are not
+swapped: the previous table keeps serving and the terminal says so. The
+next successful change applies the new one — no restart.
 
 ### What's watched
 
@@ -314,7 +404,7 @@ production tree is immutable.)
 
 ## Vite integration
 
-`ViteProcess` (`devserver/vite.py:21`) supervises the Vite dev
+`ViteProcess` (`devserver/vite.py`) supervises the Vite dev
 server subprocess. The Vite process is responsible for:
 
 - Bundling JSX for the browser (with React Refresh / HMR)
@@ -328,20 +418,26 @@ and Vite is the JS expert.
 
 ### Spawning Vite
 
-`ViteProcess` tries several command resolutions to find Vite:
+`ViteProcess` launches plain `vite`, resolved off `PATH`. Only when
+that spawn fails with "no such executable" does it fall back, in
+order:
 
-1. `node_modules/.bin/vite` — local install via npm
-2. `node_modules/vite/bin/vite.js` — local install, called via
-   `node`
-3. `npx vite` — fallback if neither local install exists
+1. `node node_modules/vite/bin/vite.js` — the project's own install,
+   run through the `node` on `PATH`
+2. `node_modules/.bin/vite` (or `vite.cmd` on Windows) — the same
+   install, via its shim
+3. `npm install` — run once, if the project has a `package.json` and
+   the install hasn't already been tried, then 1 and 2 are retried
+4. `npx --yes vite` — last resort
 
-Each candidate is validated with `--version` before being committed
-to. If Vite isn't installed at all, Pyxle automatically runs
-`npm install` to restore dependencies. (This is also why a fresh
-`pyxle init` works on the second `pyxle dev`: the first attempt
-notices the missing dependencies and installs them.)
+Candidates 1 and 2 are picked by checking that the file exists; the
+resolved command is then committed to, and whether it worked is
+decided by the readiness probe below rather than a separate
+`--version` call. Step 3 is why a fresh `pyxle init` works on the
+second `pyxle dev`: the first attempt notices the missing
+dependencies and installs them.
 
-Source: `devserver/vite.py:225`.
+Source: `devserver/vite.py` (`_recover_missing_vite`).
 
 ### Readiness probing
 
@@ -366,7 +462,7 @@ sessions: it keeps Vite running across edits to its config, plugin
 errors, and Node version mismatches without requiring you to
 restart the dev server.
 
-Source: `devserver/vite.py:302`.
+Source: `devserver/vite.py` (`_restart_after_exit`).
 
 ### The proxy
 
@@ -414,12 +510,24 @@ projects) and the correctness is much easier to reason about.
 
 ### Layout head discovery
 
-A layout's `<Head>` JSX block contributes to every page below it.
-At registry-build time, `find_layout_head_jsx_blocks()` walks
-ancestor directories of each page looking for `layout.pyxl` (and
-`template.pyxl`) metadata, collects their `head_jsx_blocks`, and
-attaches the merged list to the page's `PageRoute`. The SSR
-pipeline reads this at request time without re-parsing.
+A layout's `<Head>` JSX block and its Python `HEAD` variable both
+contribute to every page below it. `find_layout_head_contributions()`
+walks ancestor directories of each page looking for `layout.pyxl`
+(and `template.pyxl`) metadata and returns a
+`LayoutHeadContribution` holding the two **in separate channels**:
+
+- `jsx_blocks` — raw JSX source from `<Head>`, which may still hold
+  unevaluated `{expressions}` and is filtered for them when the head
+  is merged.
+- `head_variable` — the layout's `HEAD` list, which is finished HTML
+  and is passed through verbatim (braces in it are content: JSON-LD,
+  a CSS rule).
+
+Keeping them apart is load-bearing, not cosmetic: filtering the
+`HEAD` channel deletes a layout's JSON-LD from every page under it,
+and nothing re-supplies it, because a Python `HEAD` variable is never
+rendered by React. The SSR pipeline reads both at request time
+without re-parsing.
 
 Source: `devserver/registry.py:337`.
 
@@ -441,8 +549,18 @@ Event types:
   evaluation, etc.).
 - `"clear"` — sent when a previously-failing route succeeds. The
   client uses this to dismiss any visible error overlay.
-- `"reload"` — sent after a successful rebuild. The client triggers
-  a soft reload of the current page.
+- `"reload"` — sent after a successful rebuild — including a rebuild
+  that failed on *another* file, for the half that did compile. The
+  client triggers a soft reload of the current page.
+
+An error is not a one-off broadcast: the manager keeps the current
+error for each route (keyed by route path, plus `(rebuild)` for build
+failures) and replays the most recent one to every client that connects
+afterwards. A reload closes the socket that was told about the error and
+opens a new one, so without the replay a reload made the error vanish
+while the fault remained. `"clear"` for a route drops that route's entry
+and only that one, so a healthy render of `/` never silences a build
+failure in `pages/about.pyxl`.
 - `"log"` — a server-side `logging` record forwarded to the browser
   devtools console (dev only). The payload carries the target
   `console` method (`info`/`warn`/`error`/`debug`), the formatted

@@ -18,10 +18,14 @@ from pyxle.devserver import (
     DevServer,
     DevServerSettings,
     _maybe_schedule_reload,
+    _notify_rebuild_cleared,
     _notify_rebuild_error,
+    _pass_changed_running_code,
+    _record_build_failures,
     _set_app_ready_flag,
 )
-from pyxle.devserver.builder import BuildSummary
+from pyxle.devserver.build_errors import BuildFailure, BuildFailureRegistry
+from pyxle.devserver.builder import BuildFailed, BuildSummary
 from pyxle.devserver.registry import MetadataRegistry
 from pyxle.devserver.routes import RouteTable
 from pyxle.devserver.watcher import WatcherStatistics
@@ -40,6 +44,21 @@ class LogCapture:
 
     def __call__(self, message: str, fg: str | None = None, bold: bool = False) -> None:  # pragma: no cover - formatting only
         self.messages.append(message)
+
+
+async def _serve_until_announced(stub_server: Any, turns: int = 10) -> None:
+    """Model uvicorn's startup inside a stubbed ``serve()``.
+
+    Real uvicorn completes the ASGI lifespan, binds its listening socket, sets
+    ``started``, and only then serves for the rest of the session. The dev
+    server announces readiness from a side task watching that flag, so a stub
+    whose ``serve()`` returns instantly would be torn down before the announcer
+    ever ran. Flip the flag and yield to the loop; the announcer needs a single
+    turn, the remainder is slack.
+    """
+    stub_server.started = True
+    for _ in range(turns):
+        await asyncio.sleep(0)
 
 
 async def test_devserver_start_configures_uvicorn_and_watcher(anyio_backend, monkeypatch, tmp_path: Path) -> None:
@@ -128,10 +147,14 @@ async def test_devserver_start_configures_uvicorn_and_watcher(anyio_backend, mon
         def __init__(self, config: StubConfig) -> None:
             server_state["config"] = config
             self.should_exit = False
+            # Real uvicorn flips this at the end of its startup sequence; the
+            # readiness banner waits for it, so a stub must model it.
+            self.started = False
 
         async def serve(self) -> None:
             server_state["served"] = True
             server_state["ready_during_serve"] = getattr(dummy_app.state, "pyxle_ready", None)
+            await _serve_until_announced(self)
 
     monkeypatch.setattr("pyxle.devserver.uvicorn.Config", StubConfig)
     monkeypatch.setattr("pyxle.devserver.uvicorn.Server", StubServer)
@@ -202,6 +225,8 @@ async def test_devserver_start_builds_routes_and_creates_app(anyio_backend, monk
     class StubServer:
         def __init__(self, config: StubConfig) -> None:
             self.config = config
+            self.should_exit = False
+            self.started = False
 
         async def serve(self) -> None:
             served_config["served"] = True
@@ -367,6 +392,9 @@ async def test_devserver_retries_vite_port(monkeypatch, tmp_path: Path) -> None:
     class StubServer:
         def __init__(self, config: StubConfig) -> None:
             self.should_exit = False
+            # Real uvicorn flips this at the end of its startup sequence; the
+            # readiness banner waits for it, so a stub must model it.
+            self.started = False
 
         async def serve(self) -> None:
             return None
@@ -745,6 +773,9 @@ async def test_devserver_starts_tailwind_when_configured(monkeypatch, tmp_path: 
     class StubServer:
         def __init__(self, *a: Any) -> None:
             self.should_exit = False
+            # Real uvicorn flips this at the end of its startup sequence; the
+            # readiness banner waits for it, so a stub must model it.
+            self.started = False
 
         async def serve(self) -> None:
             pass
@@ -844,6 +875,9 @@ async def test_devserver_skips_tailwind_when_disabled(monkeypatch, tmp_path: Pat
     class StubServer:
         def __init__(self, *a: Any) -> None:
             self.should_exit = False
+            # Real uvicorn flips this at the end of its startup sequence; the
+            # readiness banner waits for it, so a stub must model it.
+            self.started = False
 
         async def serve(self) -> None:
             pass
@@ -951,6 +985,9 @@ async def test_devserver_skips_tailwind_when_postcss_config_present(monkeypatch,
     class StubServer:
         def __init__(self, *a: Any) -> None:
             self.should_exit = False
+            # Real uvicorn flips this at the end of its startup sequence; the
+            # readiness banner waits for it, so a stub must model it.
+            self.started = False
 
         async def serve(self) -> None:
             pass
@@ -1074,9 +1111,12 @@ async def test_devserver_skips_ready_banner_when_vite_not_running(
     class StubServer:
         def __init__(self, config: StubConfig) -> None:
             self.should_exit = False
+            # Real uvicorn flips this at the end of its startup sequence; the
+            # readiness banner waits for it, so a stub must model it.
+            self.started = False
 
         async def serve(self) -> None:
-            pass
+            await _serve_until_announced(self)
 
     monkeypatch.setattr("pyxle.devserver.uvicorn.Config", StubConfig)
     monkeypatch.setattr("pyxle.devserver.uvicorn.Server", StubServer)
@@ -1086,6 +1126,113 @@ async def test_devserver_skips_ready_banner_when_vite_not_running(
 
     assert not any("dev server ready" in m for m in capture.messages)
     assert any("not ready" in m for m in capture.messages)
+
+
+async def test_devserver_stays_silent_when_startup_fails(
+    anyio_backend, monkeypatch, tmp_path: Path
+) -> None:
+    """A boot that dies inside ``server.serve()`` must not claim to be ready.
+
+    The ASGI lifespan — where plugins start, databases connect and settings are
+    validated — runs inside ``serve()``, and uvicorn binds its socket only once
+    that succeeds. A plugin whose ``on_startup`` raises therefore aborts the
+    boot *after* the old code had already printed its green banner, which made
+    a dead server look like a healthy one.
+    """
+    settings = DevServerSettings.from_project_root(tmp_path)
+    capture = LogCapture()
+    logger = ConsoleLogger(secho=capture)
+
+    monkeypatch.setattr(
+        "pyxle.devserver.build_once",
+        lambda cfg, *, force_rebuild=False: BuildSummary(
+            compiled_pages=[], copied_api_modules=[], removed=[]
+        ),
+    )
+    monkeypatch.setattr(
+        "pyxle.devserver.build_metadata_registry",
+        lambda cfg: MetadataRegistry(pages=[], apis=[]),
+    )
+    monkeypatch.setattr(
+        "pyxle.devserver.build_route_table",
+        lambda registry: RouteTable(pages=[], apis=[]),
+    )
+    dummy_app = SimpleNamespace(state=SimpleNamespace())
+    monkeypatch.setattr(
+        "pyxle.devserver.create_starlette_app", lambda cfg, routes, **_: dummy_app
+    )
+    monkeypatch.setattr(
+        "pyxle.devserver.write_client_bootstrap_files", lambda cfg: None
+    )
+
+    class HealthyVite:
+        running = True
+
+        def __init__(self, cfg: DevServerSettings, *, logger: ConsoleLogger, **_: Any) -> None:
+            pass
+
+        async def start(self) -> None:
+            pass
+
+        async def wait_until_ready(self) -> None:
+            pass
+
+        async def stop(self) -> None:
+            pass
+
+    monkeypatch.setattr("pyxle.devserver.ViteProcess", HealthyVite)
+
+    class StubWatcher:
+        def __init__(self, cfg: DevServerSettings, *, logger: ConsoleLogger, **_: Any) -> None:
+            pass
+
+        def start(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr("pyxle.devserver.ProjectWatcher", StubWatcher)
+
+    class StubConfig:
+        def __init__(self, app: object, **kwargs: Any) -> None:
+            pass
+
+    class StubServer:
+        def __init__(self, config: StubConfig) -> None:
+            self.should_exit = False
+            self.started = False
+
+        async def serve(self) -> None:
+            # uvicorn exits with STARTUP_FAILURE when the lifespan reports
+            # failure — `started` never flips.
+            for _ in range(10):
+                await asyncio.sleep(0)
+            raise SystemExit(3)
+
+    monkeypatch.setattr("pyxle.devserver.uvicorn.Config", StubConfig)
+    monkeypatch.setattr("pyxle.devserver.uvicorn.Server", StubServer)
+
+    server = DevServer(settings=settings, logger=logger)
+    with pytest.raises(SystemExit):
+        await server.start()
+
+    assert not any("dev server ready" in m for m in capture.messages)
+    assert not any("Local:" in m for m in capture.messages)
+
+
+async def test_announcer_gives_up_when_the_server_stops_first(tmp_path: Path) -> None:
+    """Ctrl+C during startup: nothing ever served, so nothing is announced."""
+    settings = DevServerSettings.from_project_root(tmp_path)
+    capture = LogCapture()
+    dev = DevServer(settings=settings, logger=ConsoleLogger(secho=capture))
+
+    stopping = SimpleNamespace(started=False, should_exit=True)
+    await dev._announce_when_serving(
+        stopping, settings, RouteTable(pages=[], apis=[]), 0.0, None
+    )
+
+    assert capture.messages == []
 
 
 # ---------------------------------------------------------------------------
@@ -1317,6 +1464,9 @@ async def test_devserver_start_manages_discovery_file_lifecycle(
     class StubServer:
         def __init__(self, config: StubConfig) -> None:
             self.should_exit = False
+            # Real uvicorn flips this at the end of its startup sequence; the
+            # readiness banner waits for it, so a stub must model it.
+            self.started = False
 
         async def serve(self) -> None:
             target = settings.build_root / "dev-server.json"
@@ -1421,6 +1571,9 @@ async def test_devserver_start_inspect_wait_blocks_after_discovery_file(
     class StubServer:
         def __init__(self, config: StubConfig) -> None:
             self.should_exit = False
+            # Real uvicorn flips this at the end of its startup sequence; the
+            # readiness banner waits for it, so a stub must model it.
+            self.started = False
 
         async def serve(self) -> None:
             observed["served"] = True
@@ -1523,6 +1676,9 @@ async def test_devserver_start_no_inspect_wait_never_blocks(
     class StubServer:
         def __init__(self, config: StubConfig) -> None:
             self.should_exit = False
+            # Real uvicorn flips this at the end of its startup sequence; the
+            # readiness banner waits for it, so a stub must model it.
+            self.started = False
 
         async def serve(self) -> None:
             pass
@@ -1541,3 +1697,303 @@ async def test_devserver_start_no_inspect_wait_never_blocks(
         settings=settings, logger=logger, inspect_endpoint=("127.0.0.1", 5682)
     )
     await server.start()  # must complete without touching debugpy
+
+
+def _failure(relative: str = "about.pyxl") -> BuildFailure:
+    return BuildFailure(
+        page_relative_path=Path(relative),
+        display_path=f"pages/{relative}",
+        message="unexpected indent",
+        line=7,
+        column=9,
+    )
+
+
+async def test_record_build_failures_publishes_the_broken_set() -> None:
+    registry = BuildFailureRegistry()
+    app = SimpleNamespace(state=SimpleNamespace(pyxle_build_failures=registry))
+
+    _record_build_failures(app, BuildSummary(failures=[_failure()]))
+
+    assert registry.find_for_page(Path("about.pyxl")) is not None
+
+
+async def test_record_build_failures_clears_after_a_clean_pass() -> None:
+    registry = BuildFailureRegistry()
+    registry.replace([_failure()])
+    app = SimpleNamespace(state=SimpleNamespace(pyxle_build_failures=registry))
+
+    _record_build_failures(app, BuildSummary())
+
+    assert registry.failures == ()
+
+
+async def test_record_build_failures_keeps_the_set_when_the_pass_said_nothing() -> None:
+    """A pass that died before reporting files cannot claim nothing is broken."""
+    registry = BuildFailureRegistry()
+    registry.replace([_failure()])
+    app = SimpleNamespace(state=SimpleNamespace(pyxle_build_failures=registry))
+
+    _record_build_failures(app, None)
+
+    assert len(registry.failures) == 1
+
+
+async def test_record_build_failures_tolerates_a_production_app() -> None:
+    """Production never builds a registry; recording must be a no-op there."""
+    app = SimpleNamespace(state=SimpleNamespace(pyxle_build_failures=None))
+
+    _record_build_failures(app, BuildSummary(failures=[_failure()]))
+    _record_build_failures(SimpleNamespace(), BuildSummary())
+
+
+async def test_clean_rebuild_retracts_the_sticky_build_error(monkeypatch) -> None:
+    loop = asyncio.get_running_loop()
+    cleared: list[str] = []
+
+    class StubOverlay:
+        async def notify_clear(self, *, route_path: str) -> None:
+            cleared.append(route_path)
+
+    monkeypatch.setattr(
+        "pyxle.devserver.asyncio.run_coroutine_threadsafe",
+        lambda coro, loop: loop.create_task(coro),
+    )
+    ok = WatcherStatistics(
+        elapsed_seconds=0.01, summary=BuildSummary(), error=None, changed_paths=[]
+    )
+
+    assert _notify_rebuild_error(StubOverlay(), loop, ok) is False
+    await asyncio.sleep(0)
+    assert cleared == ["(rebuild)"]
+
+
+async def test_notify_rebuild_cleared_tolerates_a_closing_loop(monkeypatch) -> None:
+    loop = asyncio.get_running_loop()
+
+    class StubOverlay:
+        async def notify_clear(self, *, route_path: str) -> None:  # pragma: no cover
+            raise AssertionError("should not run")
+
+    def raise_runtime(coro, loop):
+        raise RuntimeError("loop is shutting down")
+
+    monkeypatch.setattr(
+        "pyxle.devserver.asyncio.run_coroutine_threadsafe", raise_runtime
+    )
+
+    _notify_rebuild_cleared(StubOverlay(), loop)
+    _notify_rebuild_cleared(None, loop)
+
+
+async def test_partial_failure_still_reloads_what_compiled(monkeypatch) -> None:
+    """One broken page must not freeze hot reload for every other page."""
+    loop = asyncio.get_running_loop()
+    captured: list[list[str]] = []
+
+    class StubOverlay:
+        async def notify_reload(self, *, changed_paths: list[str]) -> None:
+            captured.append(changed_paths)
+
+    summary = BuildSummary(compiled_pages=["index.pyxl"], failures=[_failure()])
+    stats = WatcherStatistics(
+        elapsed_seconds=0.01,
+        summary=summary,
+        error=BuildFailed(summary.failures, summary),
+        changed_paths=[Path("pages/index.pyxl")],
+    )
+    monkeypatch.setattr(
+        "pyxle.devserver.asyncio.run_coroutine_threadsafe",
+        lambda coro, loop: loop.create_task(coro),
+    )
+
+    assert _maybe_schedule_reload(StubOverlay(), loop, stats) is True
+    await asyncio.sleep(0)
+    assert captured == [["index.pyxl"]]
+
+
+async def test_an_unexpected_build_error_still_suppresses_the_reload() -> None:
+    """Only a compile failure leaves a summary that describes the build on disk."""
+    loop = asyncio.get_running_loop()
+
+    class StubOverlay:
+        async def notify_reload(self, *, changed_paths: list[str]) -> None:  # pragma: no cover
+            raise AssertionError("should not be invoked")
+
+    stats = WatcherStatistics(
+        elapsed_seconds=0.01,
+        summary=BuildSummary(compiled_pages=["index.pyxl"]),
+        error=RuntimeError("scanner exploded"),
+        changed_paths=[],
+    )
+
+    assert _maybe_schedule_reload(StubOverlay(), loop, stats) is False
+
+
+class TestPassChangedRunningCode:
+    """The gate that decides whether the route table is refreshed.
+
+    It has to agree with the watcher's own predicate. When it did not, a
+    helper module edit — no build artifact, so no summary change — was read as
+    "nothing happened": the route table was never refreshed, endpoint modules
+    were never re-imported, and the endpoint served the helper's old values
+    indefinitely with nothing printed and nothing to restart.
+    """
+
+    def test_a_rebuilt_artifact_counts(self) -> None:
+        stats = WatcherStatistics(
+            elapsed_seconds=0.01,
+            summary=BuildSummary(compiled_pages=["index.pyxl"]),
+            error=None,
+            changed_paths=[],
+        )
+
+        assert _pass_changed_running_code(stats) is True
+
+    def test_a_purged_helper_module_counts(self) -> None:
+        stats = WatcherStatistics(
+            elapsed_seconds=0.01,
+            summary=BuildSummary(),
+            error=None,
+            changed_paths=[Path("pages/api/_shared.py")],
+            purged_modules=("pages.api._shared",),
+        )
+
+        assert _pass_changed_running_code(stats) is True
+
+    def test_a_pass_that_changed_nothing_does_not_count(self) -> None:
+        stats = WatcherStatistics(
+            elapsed_seconds=0.01,
+            summary=BuildSummary(),
+            error=None,
+            changed_paths=[Path("pages/styles/app.css")],
+        )
+
+        assert _pass_changed_running_code(stats) is False
+
+    def test_a_pass_with_no_summary_does_not_count(self) -> None:
+        """It died before it could describe anything; nothing is safe to act on."""
+        stats = WatcherStatistics(
+            elapsed_seconds=0.01,
+            summary=None,
+            error=OSError("disk full"),
+            changed_paths=[Path("pages/api/_shared.py")],
+            purged_modules=("pages.api._shared",),
+        )
+
+        assert _pass_changed_running_code(stats) is False
+
+    def test_a_partial_compile_failure_still_counts(self) -> None:
+        summary = BuildSummary(compiled_pages=["index.pyxl"], failures=[_failure()])
+        stats = WatcherStatistics(
+            elapsed_seconds=0.01,
+            summary=summary,
+            error=BuildFailed(summary.failures, summary),
+            changed_paths=[],
+        )
+
+        assert _pass_changed_running_code(stats) is True
+
+
+async def test_compile_failure_breadcrumb_names_the_broken_file_only(monkeypatch) -> None:
+    """The breadcrumb must not point at the file the developer just saved.
+
+    A generic rebuild error is described alongside the paths that triggered the
+    pass, because nothing else identifies it. A compile failure already names
+    every file it is about, and listing the trigger beside it points at the
+    working file that was saved rather than the broken one.
+    """
+    loop = asyncio.get_running_loop()
+    captured: list[dict] = []
+
+    class StubOverlay:
+        async def notify_error(self, *, route_path, error, stack=None, breadcrumbs=None):
+            captured.append({"breadcrumbs": breadcrumbs})
+
+    summary = BuildSummary(compiled_pages=["index.pyxl"], failures=[_failure()])
+    stats = WatcherStatistics(
+        elapsed_seconds=0.01,
+        summary=summary,
+        error=BuildFailed(summary.failures, summary),
+        changed_paths=[Path("pages/index.pyxl")],
+    )
+    monkeypatch.setattr(
+        "pyxle.devserver.asyncio.run_coroutine_threadsafe",
+        lambda coro, loop: loop.create_task(coro),
+    )
+
+    assert _notify_rebuild_error(StubOverlay(), loop, stats) is True
+    await asyncio.sleep(0)
+
+    detail = captured[0]["breadcrumbs"][0]["detail"]
+    assert detail == "pages/about.pyxl:7:9: unexpected indent"
+    assert "changed:" not in detail
+    assert "index.pyxl" not in detail
+
+
+class TestInitialBuildTolerance:
+    """`pyxle dev` must start on a project that has one broken page.
+
+    A file that would not compile used to abort startup, taking every working
+    route down with it. The failure is reported and the server starts; only the
+    routes that depend on the broken file answer with the error.
+    """
+
+    def _server(self, tmp_path: Path):
+        capture = LogCapture()
+        settings = DevServerSettings.from_project_root(tmp_path)
+        logger = ConsoleLogger(secho=capture)
+        return DevServer(settings=settings, logger=logger), settings, capture
+
+    async def test_a_compile_failure_does_not_abort_startup(
+        self, monkeypatch, tmp_path: Path
+    ) -> None:
+        server, settings, capture = self._server(tmp_path)
+        summary = BuildSummary(compiled_pages=["index.pyxl"], failures=[_failure()])
+        monkeypatch.setattr(
+            "pyxle.devserver.build_once",
+            lambda cfg, *, force_rebuild=False: (_ for _ in ()).throw(
+                BuildFailed(summary.failures, summary)
+            ),
+        )
+
+        returned = server._run_initial_build(settings)
+
+        assert returned is summary
+        assert returned.compiled_pages == ["index.pyxl"]
+
+    async def test_the_broken_file_is_named_at_startup(
+        self, monkeypatch, tmp_path: Path
+    ) -> None:
+        server, settings, capture = self._server(tmp_path)
+        summary = BuildSummary(failures=[_failure()])
+        monkeypatch.setattr(
+            "pyxle.devserver.build_once",
+            lambda cfg, *, force_rebuild=False: (_ for _ in ()).throw(
+                BuildFailed(summary.failures, summary)
+            ),
+        )
+
+        server._run_initial_build(settings)
+
+        assert any(
+            "pages/about.pyxl:7:9: unexpected indent" in message
+            for message in capture.messages
+        )
+
+    async def test_a_failure_that_is_not_a_compile_error_is_still_fatal(
+        self, monkeypatch, tmp_path: Path
+    ) -> None:
+        """A build root that cannot be read says nothing can be served at all."""
+        server, settings, capture = self._server(tmp_path)
+        monkeypatch.setattr(
+            "pyxle.devserver.build_once",
+            lambda cfg, *, force_rebuild=False: (_ for _ in ()).throw(
+                OSError("build root is unreadable")
+            ),
+        )
+
+        with pytest.raises(OSError):
+            server._run_initial_build(settings)
+
+        assert any("Initial build failed" in m for m in capture.messages)

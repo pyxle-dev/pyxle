@@ -316,6 +316,68 @@ def test_attach_preserves_already_verbose_root_level(preserve_root_logger) -> No
     assert root.level == logging.DEBUG
 
 
+def test_attach_installs_stderr_fallback_when_root_is_bare(
+    preserve_root_logger, capsys
+) -> None:
+    """Attaching must not silence what Python would otherwise have printed.
+
+    :data:`logging.lastResort` sends WARNING+ to stderr only while a record
+    finds no handler at all. Adding this bridge ends that fallback for the whole
+    process — which is how a plugin whose ``on_startup`` raised could abort a
+    boot while printing nothing to the terminal, its traceback going instead to
+    a browser console that was not even open.
+    """
+    root = preserve_root_logger
+    root.handlers[:] = []  # a bare root logger, as under `pyxle dev`
+    overlay = FakeOverlay()
+    handler = BrowserConsoleLogHandler(overlay, loop=None, scheduler=_sync_scheduler)
+
+    handler.attach()
+    try:
+        assert len(root.handlers) == 2  # the stderr fallback plus the bridge
+        logging.getLogger("uvicorn.error").error("Application startup failed")
+    finally:
+        handler.detach()
+
+    assert "Application startup failed" in capsys.readouterr().err
+    # Framework-internal namespaces stay out of the browser console …
+    assert overlay.calls == []
+    # … and detaching leaves the root logger exactly as it was found.
+    assert root.handlers == []
+
+
+def test_attach_leaves_an_already_configured_root_alone(preserve_root_logger) -> None:
+    """An app that configured its own logging keeps exactly the handlers it set."""
+    root = preserve_root_logger
+    existing = logging.StreamHandler()
+    root.handlers[:] = [existing]
+    handler = BrowserConsoleLogHandler(FakeOverlay(), loop=None, scheduler=_sync_scheduler)
+
+    handler.attach()
+    try:
+        assert root.handlers == [existing, handler]
+    finally:
+        handler.detach()
+    assert root.handlers == [existing]
+
+
+def test_stderr_fallback_ignores_records_below_warning(
+    preserve_root_logger, capsys
+) -> None:
+    """The fallback mirrors ``lastResort`` exactly — it is not a new log sink."""
+    root = preserve_root_logger
+    root.handlers[:] = []
+    handler = BrowserConsoleLogHandler(FakeOverlay(), loop=None, scheduler=_sync_scheduler)
+
+    handler.attach()
+    try:
+        logging.getLogger("uvicorn.error").info("Application startup complete")
+    finally:
+        handler.detach()
+
+    assert capsys.readouterr().err == ""
+
+
 def test_attached_handler_forwards_user_logs(preserve_root_logger) -> None:
     overlay = FakeOverlay()
     handler = BrowserConsoleLogHandler(overlay, loop=None, scheduler=_sync_scheduler)

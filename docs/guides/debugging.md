@@ -115,9 +115,12 @@ In development, Pyxle surfaces errors in three places at once:
 
 - **The browser error overlay** — a full-screen panel with the message, the file
   and line, and a breadcrumb of what the framework was doing (loading, rendering,
-  head evaluation). This is the fastest signal for a broken page.
+  head evaluation). This is the fastest signal for a broken page, and it survives
+  a reload: the current error is replayed when the page reconnects.
 - **The terminal** running `pyxle dev` — the same error, plus the Python
-  traceback for loader/action failures.
+  traceback for loader/action failures. A file that will not compile is reported
+  as `pages/about.pyxl:7:9: unexpected indent`, and that URL serves the compile
+  error rather than the last version that built.
 - **The browser devtools console** — your server-side `logging` output is
   forwarded here during `pyxle dev`, prefixed `[pyxle:server]`, so you can watch
   server logs without leaving the page. `pyxle -v dev` also forwards `DEBUG`
@@ -374,6 +377,7 @@ editable install whose recorded version is stale still launches normally.
 | Symptom | Likely cause | Where to look |
 |---------|--------------|---------------|
 | Blank page, overlay shows a Python traceback | Loader/action raised | `pyxle dev` terminal; set a breakpoint in the loader |
+| Page shows "Build failed" | The `.pyxl` (or a layout wrapping it) has a syntax error | The file, line and column named on the page and in the `pyxle dev` terminal |
 | `window is not defined` | Browser global at render scope | The named `.pyxl`; use `useEffect`/`<ClientOnly>` |
 | `'State' object has no attribute 'db'` | Missing plugin | `plugins` in `pyxle.config.json` |
 | Component data is `undefined` | Loader key ≠ component prop | Compare the loader's return dict to the component's `data` usage |

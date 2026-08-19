@@ -170,6 +170,9 @@ def test_devserver_start_runs_with_stubbed_uvicorn(monkeypatch, tmp_path: Path) 
         async def notify_reload(self, *, changed_paths: list[str]) -> None:
             overlay_calls.append(changed_paths)
 
+        async def notify_clear(self, *, route_path: str) -> None:
+            """A clean rebuild retracts the sticky build-failure overlay."""
+
     sentinel_app = SimpleNamespace(state=SimpleNamespace(overlay=StubOverlay()))
     monkeypatch.setattr(
         "pyxle.devserver.create_starlette_app",
@@ -218,9 +221,16 @@ def test_devserver_start_runs_with_stubbed_uvicorn(monkeypatch, tmp_path: Path) 
     class StubServer:
         def __init__(self, config: StubConfig) -> None:
             self.config = config
+            self.should_exit = False
+            self.started = False
 
         async def serve(self) -> None:
-            return None
+            # Real uvicorn flips `started` at the end of its startup sequence
+            # and then serves; the readiness banner waits for exactly that, so
+            # a stub returning instantly would be torn down before it fired.
+            self.started = True
+            for _ in range(10):
+                await asyncio.sleep(0)
 
     monkeypatch.setattr("pyxle.devserver.uvicorn.Config", StubConfig)
     monkeypatch.setattr("pyxle.devserver.uvicorn.Server", StubServer)
@@ -258,3 +268,184 @@ def test_devserver_start_runs_with_stubbed_uvicorn(monkeypatch, tmp_path: Path) 
     assert any("Pyxle dev server ready" in message for message in capture)
     assert overlay_calls and overlay_calls[0]
     assert overlay_calls[0][0].endswith("pages/index.pyxl")
+
+
+def _run_dev_server_with_stats(
+    monkeypatch, tmp_path: Path, stats: WatcherStatistics, *, build_app_routes=None
+):
+    """Boot ``DevServer.start`` against stubs and feed it one rebuild result.
+
+    Returns ``(refresh_calls, messages)`` — how many times the live route-table
+    refresh ran, and everything the logger was asked to print. The refresh is
+    what re-imports endpoint modules, so "did it run?" is the whole question
+    for a change that produces no build artifact.
+    """
+    settings = DevServerSettings.from_project_root(tmp_path)
+    messages: list[str] = []
+    logger = ConsoleLogger(secho=lambda message, fg=None, bold=False: messages.append(message))
+
+    monkeypatch.setattr(
+        "pyxle.devserver.build_once",
+        lambda cfg, *, force_rebuild=False: BuildSummary(),
+    )
+    monkeypatch.setattr(
+        "pyxle.devserver.build_metadata_registry",
+        lambda cfg: MetadataRegistry(pages=[], apis=[]),
+    )
+    monkeypatch.setattr(
+        "pyxle.devserver.build_route_table",
+        lambda registry: RouteTable(pages=[], apis=[]),
+    )
+
+    refresh_calls: list[object] = []
+
+    def fake_build_app_routes(**kwargs):
+        refresh_calls.append(kwargs)
+        if build_app_routes is not None:
+            return build_app_routes(**kwargs)
+        return [], None
+
+    monkeypatch.setattr(
+        "pyxle.devserver.starlette_app._build_app_routes", fake_build_app_routes
+    )
+
+    class StubOverlay:
+        async def notify_reload(self, *, changed_paths: list[str]) -> None:
+            """Connected browsers are told to reload."""
+
+        async def notify_clear(self, *, route_path: str) -> None:
+            """A clean pass retracts the sticky build-failure overlay."""
+
+    class StubRenderer:
+        def clear(self) -> None:
+            """The SSR bundle cache is dropped when routes are swapped."""
+
+    sentinel_app = SimpleNamespace(
+        state=SimpleNamespace(
+            overlay=StubOverlay(),
+            ssr_renderer=StubRenderer(),
+            pyxle_route_hooks=((), (), ()),
+            pyxle_build_failures=None,
+        ),
+        router=SimpleNamespace(routes=[]),
+    )
+    monkeypatch.setattr(
+        "pyxle.devserver.create_starlette_app",
+        lambda cfg, routes, **_: sentinel_app,
+    )
+
+    class StubWatcher:
+        def __init__(self, cfg, *, logger, on_rebuild, **_: object) -> None:
+            self._on_rebuild = on_rebuild
+
+        def start(self) -> None:
+            self._on_rebuild(stats)
+
+        def close(self) -> None:
+            """Nothing to tear down."""
+
+    monkeypatch.setattr("pyxle.devserver.ProjectWatcher", StubWatcher)
+
+    class StubConfig:
+        def __init__(self, app: object, **kwargs: object) -> None:
+            self.app = app
+
+    class StubServer:
+        def __init__(self, config: StubConfig) -> None:
+            self.should_exit = False
+            self.started = False
+
+        async def serve(self) -> None:
+            self.started = True
+            for _ in range(10):
+                await asyncio.sleep(0)
+
+    monkeypatch.setattr("pyxle.devserver.uvicorn.Config", StubConfig)
+    monkeypatch.setattr("pyxle.devserver.uvicorn.Server", StubServer)
+
+    class StubVite:
+        running = True
+
+        def __init__(self, cfg, *, logger, **_: object) -> None:
+            pass
+
+        async def start(self) -> None:
+            """Vite is already up."""
+
+        async def wait_until_ready(self) -> None:
+            """Vite is already ready."""
+
+        async def stop(self) -> None:
+            """Nothing to stop."""
+
+    monkeypatch.setattr("pyxle.devserver.ViteProcess", StubVite)
+    monkeypatch.setattr(
+        "pyxle.devserver.asyncio.run_coroutine_threadsafe",
+        lambda coro, loop: loop.create_task(coro),
+    )
+
+    asyncio.run(DevServer(settings=settings, logger=logger).start())
+    return refresh_calls, messages
+
+
+def test_helper_module_edit_refreshes_the_route_table(monkeypatch, tmp_path: Path) -> None:
+    """A helper edit must re-import the endpoints that import it.
+
+    ``pages/api/_shared.py`` is not a build artifact — the scanner skips it, so
+    the pass reports no changes at all. The listener used to read that as
+    "nothing happened" and skip the route-table refresh, which is the step that
+    re-imports endpoint modules. The endpoint then served the helper's old
+    values indefinitely, with no rebuild line and nothing to restart.
+    """
+    stats = WatcherStatistics(
+        elapsed_seconds=0.01,
+        summary=BuildSummary(),
+        error=None,
+        changed_paths=[tmp_path / "pages" / "api" / "_shared.py"],
+        purged_modules=("pages.api._shared",),
+    )
+
+    refresh_calls, _ = _run_dev_server_with_stats(monkeypatch, tmp_path, stats)
+
+    assert len(refresh_calls) == 1
+
+
+def test_a_pass_that_changed_nothing_skips_the_route_table_refresh(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """The refresh is not free — a genuinely empty pass must not trigger it."""
+    stats = WatcherStatistics(
+        elapsed_seconds=0.01,
+        summary=BuildSummary(),
+        error=None,
+        changed_paths=[tmp_path / "pages" / "styles" / "app.css"],
+    )
+
+    refresh_calls, _ = _run_dev_server_with_stats(monkeypatch, tmp_path, stats)
+
+    assert refresh_calls == []
+
+
+def test_a_failed_route_refresh_says_what_is_still_serving(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Telling a developer to restart overstates it: the next change recovers."""
+
+    def explode(**kwargs):
+        raise RuntimeError("Failed to import API module: unexpected indent")
+
+    stats = WatcherStatistics(
+        elapsed_seconds=0.01,
+        summary=BuildSummary(compiled_pages=["index.pyxl"]),
+        error=None,
+        changed_paths=[tmp_path / "pages" / "index.pyxl"],
+    )
+
+    _, messages = _run_dev_server_with_stats(
+        monkeypatch, tmp_path, stats, build_app_routes=explode
+    )
+
+    warning = next(m for m in messages if "Route table not refreshed" in m)
+    assert "still serving" in warning
+    assert "unexpected indent" in warning
+    assert "restart" not in warning.lower()

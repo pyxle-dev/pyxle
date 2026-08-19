@@ -240,8 +240,10 @@ def test_ts_syntax_payload_captures_error_code_and_line():
 
 
 def test_generic_jsx_error_has_no_error_code():
-    """A plain Babel parse error carries no structured ``code``/``line`` —
-    only the message — so it keeps degrading the way it always has."""
+    """A plain Babel parse error carries no structured ``code``, only the
+    message (and a ``line`` when Babel reports one). It is still a judgement
+    the extractor made about the source, so ``toolchain_available`` stays
+    True and the compiler may surface it."""
 
     class _FakeProc:
         returncode = 0
@@ -255,3 +257,129 @@ def test_generic_jsx_error_has_no_error_code():
     assert result.error == "Unexpected token"
     assert result.error_code is None
     assert result.error_line is None
+
+
+class TestToolchainAvailability:
+    """Separating "the code is broken" from "the checker is broken".
+
+    The compiler turns extractor errors into compile failures, so it must be
+    able to tell the two apart: a machine with no Node installed would
+    otherwise fail every file in the project with a JSX syntax error.
+    """
+
+    SOURCE = "import React from 'react';\nexport default function P() { return <div />; }"
+
+    def test_missing_node_is_not_the_page_being_broken(self):
+        with patch("pyxle.compiler.jsx_parser.subprocess.run") as mock_run:
+            mock_run.side_effect = FileNotFoundError("node not found")
+            result = parse_jsx_components(self.SOURCE, target_components={"Script"})
+
+        assert result.toolchain_available is False
+
+    def test_timeout_is_not_the_page_being_broken(self):
+        with patch("pyxle.compiler.jsx_parser.subprocess.run") as mock_run:
+            mock_run.side_effect = subprocess.TimeoutExpired(cmd="node", timeout=10)
+            result = parse_jsx_components(self.SOURCE, target_components={"Script"})
+
+        assert result.toolchain_available is False
+
+    def test_missing_babel_deps_is_not_the_page_being_broken(self):
+        class _FakeProc:
+            returncode = 1
+            stdout = ""
+            stderr = "Error [ERR_MODULE_NOT_FOUND]: Cannot find package '@babel/parser'"
+
+        with patch("pyxle.compiler.jsx_parser.subprocess.run") as mock_run:
+            mock_run.return_value = _FakeProc()
+            result = parse_jsx_components(self.SOURCE, target_components={"Script"})
+
+        assert result.toolchain_available is False
+
+    def test_unreadable_output_is_not_the_page_being_broken(self):
+        class _FakeProc:
+            returncode = 0
+            stdout = "not json at all"
+            stderr = ""
+
+        with patch("pyxle.compiler.jsx_parser.subprocess.run") as mock_run:
+            mock_run.return_value = _FakeProc()
+            result = parse_jsx_components(self.SOURCE, target_components={"Script"})
+
+        assert result.toolchain_available is False
+
+    def test_missing_extractor_script_is_not_the_page_being_broken(self):
+        with patch("pyxle.compiler.jsx_parser.Path.exists", return_value=False), patch(
+            "pyxle.compiler.jsx_parser._langkit_js_base", return_value=None
+        ):
+            result = parse_jsx_components(self.SOURCE, target_components={"Script"})
+
+        assert result.toolchain_available is False
+
+    def test_a_real_parse_failure_is_the_page_being_broken(self):
+        class _FakeProc:
+            returncode = 0
+            stdout = json.dumps({"ok": False, "message": "Unexpected token", "line": 3})
+            stderr = ""
+
+        with patch("pyxle.compiler.jsx_parser.subprocess.run") as mock_run:
+            mock_run.return_value = _FakeProc()
+            result = parse_jsx_components("<div", target_components={"Script"})
+
+        assert result.toolchain_available is True
+        assert result.error_line == 3
+
+    def test_a_clean_parse_reports_the_toolchain_available(self):
+        class _FakeProc:
+            returncode = 0
+            stdout = json.dumps({"ok": True, "components": []})
+            stderr = ""
+
+        with patch("pyxle.compiler.jsx_parser.subprocess.run") as mock_run:
+            mock_run.return_value = _FakeProc()
+            result = parse_jsx_components(self.SOURCE, target_components={"Script"})
+
+        assert result.toolchain_available is True
+        assert result.error is None
+
+
+class TestNoVerdictIsNotAFailedPage:
+    """Output that carries no ``ok`` is not a judgement about the source.
+
+    The compiler turns ``ok: false`` into a compile error, so anything that
+    merely *looks* like a negative verdict — empty stdout, a truncated pipe, a
+    payload of the wrong shape — must degrade instead. Otherwise a file whose
+    JSX nothing actually examined is reported as broken.
+    """
+
+    SOURCE = "import React from 'react';\nexport default function P() { return <div />; }"
+
+    def _result(self, stdout: str, stderr: str = ""):
+        class _FakeProc:
+            returncode = 0
+
+        _FakeProc.stdout = stdout
+        _FakeProc.stderr = stderr
+        with patch("pyxle.compiler.jsx_parser.subprocess.run") as mock_run:
+            mock_run.return_value = _FakeProc()
+            return parse_jsx_components(self.SOURCE, target_components={"Script"})
+
+    def test_empty_stdout_degrades(self):
+        result = self._result("")
+
+        assert result.toolchain_available is False
+
+    def test_an_object_without_ok_degrades(self):
+        result = self._result(json.dumps({"components": []}))
+
+        assert result.toolchain_available is False
+
+    def test_a_payload_of_the_wrong_shape_degrades(self):
+        result = self._result(json.dumps([1, 2, 3]))
+
+        assert result.toolchain_available is False
+
+    def test_an_explicit_negative_verdict_is_still_the_page(self):
+        result = self._result(json.dumps({"ok": False, "message": "Unexpected token"}))
+
+        assert result.toolchain_available is True
+        assert result.error == "Unexpected token"
