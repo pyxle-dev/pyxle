@@ -1859,3 +1859,68 @@ class TestAnUnmappableNumberIsLeftAlone:
         assert _remap_message_line_refs(
             message, lambda relative: _exact_source_line(relative, segment_lines)
         ) == message
+
+
+class TestAnUnclosedBracketNamesTheBracket:
+    """An unclosed bracket inside an indented block used to be reported as
+    ``unexpected indent``.
+
+    The split walker stops at the largest prefix that parses, which is the line
+    *before* the bracket's line, and hands the rest over as JSX. Parsing that
+    remainder alone describes the tear (`the fragment starts indented`) rather
+    than the fault (`the bracket two lines up is open`). CPython, given the
+    whole thing, says the useful sentence — so we widen back to the Python this
+    segment was torn from and report that.
+    """
+
+    SOURCE = """
+    from __future__ import annotations
+
+
+    @server
+    async def load(request):
+        body = {"a": 1}
+        step = int(body.get("a", 1)
+        return {"step": step}
+
+
+    import React from "react";
+
+    export default function A() {
+        return <main>hi</main>;
+    }
+    """
+
+    def _python_errors(self):
+        result = _parse(self.SOURCE, tolerant=True)
+        return [d for d in result.diagnostics if d.section == "python"]
+
+    def test_it_names_the_bracket_not_the_indentation(self):
+        errors = self._python_errors()
+        assert errors, "an unclosed bracket must produce a python diagnostic"
+        message = errors[0].message
+        assert "was never closed" in message
+        assert "unexpected indent" not in message
+
+    def test_it_points_at_the_line_holding_the_bracket(self):
+        # File line 7 is ``step = int(body.get("a", 1)``. Line 8 is the
+        # ``return``, which is fine, and line 6 is fine too — an off-by-one
+        # here sends the reader to code that is correct.
+        assert self._python_errors()[0].line == 7
+
+    def test_a_top_level_bracket_is_unaffected(self):
+        # No indented block, so nothing is torn and the narrow path already
+        # produced CPython's message. This guards the widening from becoming a
+        # blanket override.
+        result = _parse(
+            """
+            from __future__ import annotations
+
+            X = int(str(5)
+            Y = 2
+            """,
+            tolerant=True,
+        )
+        errors = [d for d in result.diagnostics if d.section == "python"]
+        assert errors and "was never closed" in errors[0].message
+        assert errors[0].line == 3

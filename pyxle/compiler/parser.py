@@ -674,7 +674,7 @@ def _detect_broken_python_in_jsx_segments(
     # ``_segment_has_content`` filtering upstream guarantees every
     # segment has at least one non-blank line, so the empty-segment
     # defensive branch that earlier revisions had is unreachable.
-    for segment in segments:
+    for index, segment in enumerate(segments):
         if segment.kind != "jsx":
             continue
 
@@ -711,13 +711,21 @@ def _detect_broken_python_in_jsx_segments(
         try:
             ast.parse(segment_text)
         except SyntaxError as exc:
+            base = segment.start
+            if isinstance(exc, IndentationError):
+                # The narrow error is about the tear, not the fault — see
+                # ``_reparse_with_python_context``. Only this class is
+                # overridden: any other message is genuinely about the segment.
+                widened = _reparse_with_python_context(segments, index, lines)
+                if widened is not None:
+                    exc, base = widened
             relative_line = exc.lineno or 1
-            absolute_line = segment.start + relative_line
+            absolute_line = base + relative_line
             # The segment's own lines, in ``.pyxl`` coordinates: it is a
             # contiguous run, so line N of it is file line ``start + N``. A
             # number outside that run is not a line of this segment and gets no
             # answer rather than one extrapolated past its end.
-            segment_lines = range(segment.start + 1, segment.end + 1)
+            segment_lines = range(base + 1, segment.end + 1)
             collector.emit(
                 # ``exc.msg`` is CPython's, written against the isolated
                 # segment: "does not match opening parenthesis '[' on line 3"
@@ -736,6 +744,40 @@ def _detect_broken_python_in_jsx_segments(
                 # ``pages/about.pyxl:7:5`` location an editor can jump to.
                 column=exc.offset,
             )
+
+
+def _reparse_with_python_context(
+    segments: Sequence[_Segment],
+    index: int,
+    lines: Sequence[str],
+) -> tuple[SyntaxError, int] | None:
+    """Re-parse a torn segment together with the Python it was torn from.
+
+    A segment whose first line is *indented* is not a statement anyone wrote at
+    top level — it is the tail of a Python block that ``_find_largest_python_at``
+    could not finish. That walker stops at the largest prefix which parses, so an
+    unclosed bracket makes it stop on the line *before* the bracket's line and
+    hand the remainder over as JSX. Parsing that remainder alone then reports
+    ``unexpected indent``: a true description of the fragment, and a useless one
+    about the file, because the indent is not the mistake — the unclosed bracket
+    two lines up is.
+
+    So widen back over the Python segment this one was torn from and report what
+    CPython says about *that*, which is the text the developer actually wrote.
+    Returns the error and the file line its line numbers are relative to, or
+    ``None`` when there is no preceding Python to widen into or the wider text
+    parses cleanly (in which case the narrow error is still the best available).
+    """
+    previous = segments[index - 1] if index > 0 else None
+    if previous is None or previous.kind == "jsx":
+        return None
+
+    widened = "\n".join(lines[previous.start : segments[index].end])
+    try:
+        ast.parse(widened)
+    except SyntaxError as exc:
+        return exc, previous.start
+    return None
 
 
 def _concat_segments(
