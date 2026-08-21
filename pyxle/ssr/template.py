@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import linecache
 from dataclasses import dataclass
 from html import escape
+from pathlib import Path
 from typing import Any, Final
 
 from pyxle.config import default_csrf_cookie_name
@@ -527,6 +529,25 @@ _ERROR_DOCUMENT_STYLES = """    <style>
         border-radius: 0.5rem;
         color: #fca5a5;
       }
+      .pyxle-origin {
+        margin-top: 1.25rem;
+        padding: 0.875rem 1rem;
+        background: rgba(15, 23, 42, 0.6);
+        border-left: 2px solid #fca5a5;
+        border-radius: 0.25rem;
+        font-family: Menlo, Monaco, Consolas, \"Liberation Mono\", monospace;
+        font-size: 0.875rem;
+        overflow-x: auto;
+      }
+      .pyxle-origin .pyxle-origin-file {
+        color: #9ca3af;
+      }
+      .pyxle-origin .pyxle-origin-src {
+        display: block;
+        margin-top: 0.5rem;
+        color: #f9fafb;
+        white-space: pre;
+      }
       .pyxle-hint {
         margin-top: 1.5rem;
         padding-top: 1.5rem;
@@ -535,6 +556,69 @@ _ERROR_DOCUMENT_STYLES = """    <style>
         font-size: 0.9375rem;
       }
     </style>"""
+
+
+def _origin_in_user_source(
+    error: BaseException,
+    project_root: Path,
+    build_root: Path,
+) -> tuple[str, int, str] | None:
+    """The deepest frame in the developer's own files: ``(path, line, source)``.
+
+    A traceback from a failed render is nearly all framework — ``view.py``
+    calling ``view.py`` calling the import machinery — and the developer can act
+    on exactly one frame in it: the one in a file they wrote. So we take the
+    *deepest* frame under ``project_root`` that is neither inside Pyxle itself
+    nor inside the build directory, which holds generated modules whose paths
+    mean nothing to the reader.
+
+    ``__cause__`` / ``__context__`` are followed because the exception that
+    reaches the renderer is often a wrapper (``LoaderCrashError``) whose own
+    traceback stops at the framework call site, while the frame that names the
+    author's mistake hangs off the exception it wrapped.
+    """
+    pyxle_package = Path(__file__).resolve().parent.parent
+
+    chain: list[BaseException] = []
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        chain.append(current)
+        current = current.__cause__ or current.__context__
+
+    for candidate in chain:
+        deepest: tuple[Path, int] | None = None
+        tb = candidate.__traceback__
+        while tb is not None:
+            try:
+                resolved = Path(tb.tb_frame.f_code.co_filename).resolve()
+            except (OSError, ValueError):
+                tb = tb.tb_next
+                continue
+            if (
+                resolved.is_relative_to(project_root)
+                and not resolved.is_relative_to(pyxle_package)
+                and not resolved.is_relative_to(build_root)
+            ):
+                deepest = (resolved, tb.tb_lineno)
+            tb = tb.tb_next
+        if deepest is not None:
+            path, lineno = deepest
+            # The developer's own line, shown to the developer, on their own
+            # machine, in a document that only exists when debug is on. It is
+            # escaped against injection but deliberately NOT run through
+            # ``redact_sensitive_patterns``: mangling the line is the one
+            # outcome that would defeat the point of printing it, and the
+            # server terminal already prints it unaltered.
+            source = linecache.getline(str(path), lineno).strip()
+            try:
+                shown = path.relative_to(project_root)
+            except ValueError:  # pragma: no cover - guarded by is_relative_to
+                shown = path
+            return str(shown), lineno, source
+
+    return None
 
 
 def render_error_document(
@@ -575,6 +659,29 @@ def render_error_document(
     message = escape(redact_sensitive_patterns(raw_message))
     page_path = escape(page.path)
 
+    # The terminal traceback has always named the file and line the author can
+    # act on; this document threw it away and sent the reader to go and find it,
+    # which is worst for the failure that needs it most — an import error names
+    # a module the developer never typed (``pyxle.server``), reading like a
+    # broken installation rather than a bad import in their own file.
+    origin = _origin_in_user_source(
+        error, settings.project_root, settings.build_root
+    )
+    if origin is None:
+        origin_markup = ""
+    else:
+        origin_path, origin_line, origin_source = origin
+        source_markup = (
+            f'<span class="pyxle-origin-src">{escape(origin_source)}</span>'
+            if origin_source
+            else ""
+        )
+        origin_markup = (
+            '\n      <div class="pyxle-origin">'
+            f'<span class="pyxle-origin-file">{escape(origin_path)}, '
+            f"line {origin_line}</span>{source_markup}</div>"
+        )
+
     return f"""<!DOCTYPE html>
 <html lang=\"en\">
   <head>
@@ -588,8 +695,8 @@ def render_error_document(
     <main class=\"pyxle-error\">
       <h1>Server Render Failed</h1>
       <p>While rendering <code>{page_path}</code>, Pyxle encountered a <strong>{error_type}</strong>.</p>
-      <pre>{message}</pre>
-      <p>Check your loader or component implementation and the server logs for full details.</p>
+      <pre>{message}</pre>{origin_markup}
+      <p>Check your loader or component implementation. The server terminal carries the full traceback.</p>
     </main>
   </body>
 </html>

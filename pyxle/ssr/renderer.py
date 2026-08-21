@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import logging
 import re
 import shutil
 import subprocess
@@ -14,6 +15,8 @@ from typing import Any, Awaitable, Callable, Dict, Tuple, TypeVar
 
 from pyxle.ssr.paths import resolve_component_path
 from pyxle.ssr.source_locations import remap_generated_locations
+
+logger = logging.getLogger(__name__)
 
 
 class ComponentRenderError(RuntimeError):
@@ -423,6 +426,44 @@ def _format_node_error(process: subprocess.CompletedProcess[str]) -> str:
     return "SSR runtime failed to execute"
 
 
+#: Stack frames that belong to React, Node or an installed package rather than
+#: to anything the author wrote. A server render fails *inside* React, so the
+#: first few frames of every such stack are noise — the frame worth naming is
+#: the last one before them.
+_FOREIGN_FRAME_MARKERS: tuple[str, ...] = (
+    "/node_modules/",
+    "\\node_modules\\",
+    "node:internal",
+)
+
+#: ``    at ComponentName (/path/to/file.mjs:68:120)`` — captures the function
+#: name. React calls a page component by its own exported name, so this is the
+#: identifier the author wrote above their JSX.
+_STACK_FRAME_RE = re.compile(r"^\s*at\s+(?:async\s+)?([A-Za-z_$][\w$.]*)\s*\(")
+
+
+def _authored_frame_name(stack: str) -> str | None:
+    """Name the component whose code raised, from a Node stack.
+
+    Full positions are not recoverable here: the SSR bundle is built into a
+    content-hashed module under ``.pyxle-build/.ssr-tmp/`` with no source map,
+    so ``remap_generated_locations`` cannot translate its line numbers back to
+    the ``.pyxl`` (checked, not assumed). The *function* name survives bundling
+    intact, though, and on a page with several components it is the difference
+    between reading one of them and bisecting the file.
+
+    Returns ``None`` when every frame is foreign or none parses — an absent
+    answer beats a confident wrong one.
+    """
+    for line in stack.splitlines():
+        if any(marker in line for marker in _FOREIGN_FRAME_MARKERS):
+            continue
+        match = _STACK_FRAME_RE.match(line)
+        if match:
+            return match.group(1)
+    return None
+
+
 def _derive_project_paths(component_path: Path) -> Tuple[Path, Path]:
     for ancestor in component_path.parents:
         if ancestor.name == "client" and ancestor.parent.name == ".pyxle-build":
@@ -542,11 +583,29 @@ def pool_render_factory(pool: Any) -> _RenderFactory:
                 # number that belongs to it and not to the author's file. Report
                 # the ``.pyxl`` they actually edit — or, for a component the
                 # author wrote and Pyxle only copied, that file at its own line.
-                raise ComponentRenderError(
-                    remap_generated_locations(
-                        message, pool.client_root, pool.pages_root
-                    )
+                message = remap_generated_locations(
+                    message, pool.client_root, pool.pages_root
                 )
+                # A *runtime* failure carries no position in its message at all
+                # — "NoSuchThing is not defined" names a variable and nothing
+                # else — so the remap above has nothing to work on and the
+                # author is told what broke without being told where. The stack
+                # knows; name the component it points at.
+                stack = result.get("stack") or ""
+                if stack:
+                    # Dev-only detail, and the reason the error document can
+                    # honestly say the log has more than it does.
+                    logger.debug(
+                        "SSR component stack for %s:\n%s",
+                        component_path.name,
+                        remap_generated_locations(
+                            stack, pool.client_root, pool.pages_root
+                        ),
+                    )
+                    component = _authored_frame_name(stack)
+                    if component and component not in message:
+                        message = f"{message} (raised while rendering <{component}>)"
+                raise ComponentRenderError(message)
 
             html = result.get("html")
             if not isinstance(html, str):

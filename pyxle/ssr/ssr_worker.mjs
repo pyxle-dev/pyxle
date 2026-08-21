@@ -487,7 +487,7 @@ async function handleRequest(request) {
     const result = await renderRequest(request);
     writeFrame({ id, ok: true, ...result });
   } catch (error) {
-    writeFrame({ id, ok: false, message: String(error.message || error) });
+    writeFrame({ id, ok: false, message: String(error.message || error), stack: String(error.stack || '') });
   }
 }
 

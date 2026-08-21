@@ -1192,3 +1192,148 @@ def test_an_evaluated_script_is_still_emitted_both_ways(
 
     assert '<script src="/early.js"' in html
     assert '"src":"/later.js"' in html
+
+
+# ---------------------------------------------------------------------------
+# render_error_document — naming the file and line the author can act on
+# ---------------------------------------------------------------------------
+
+
+def _raise_from_file(path: Path, source: str) -> BaseException:
+    """Run *source* as if it were *path*, and hand back what it raised.
+
+    ``compile(..., str(path), "exec")`` is what makes this worth doing: the
+    traceback frame carries that filename, so the helper produces the same shape
+    of traceback a compiled ``.pyxl`` produces, and ``linecache`` reads the real
+    file back off disk.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(source, encoding="utf-8")
+    try:
+        exec(compile(source, str(path), "exec"), {"__name__": "pyxle.server.pages.x"})
+    except BaseException as exc:  # noqa: BLE001 - handing the error back is the point
+        return exc
+    raise AssertionError("source was expected to raise")
+
+
+def test_error_document_names_the_authors_file_line_and_source(
+    page_route: PageRoute, tmp_path: Path
+) -> None:
+    """The overlay names the file, the line, and the line's text.
+
+    This is the whole ticket: the terminal traceback always had this and the
+    browser page dropped it, which hurts most for an import error, whose message
+    names ``pyxle.server`` — a module the developer never typed.
+    """
+    page = tmp_path / "pages" / "relimp.pyxl"
+    error = _raise_from_file(page, "from ._shared import GREETING\n")
+    settings = DevServerSettings.from_project_root(tmp_path)  # debug=True
+
+    html = render_error_document(settings=settings, page=page_route, error=error)
+
+    assert "pages/relimp.pyxl, line 1" in html
+    assert "from ._shared import GREETING" in html
+
+
+def test_error_document_origin_is_relative_to_the_project(
+    page_route: PageRoute, tmp_path: Path
+) -> None:
+    """The path shown is project-relative; an absolute path is noise."""
+    page = tmp_path / "pages" / "deep" / "boom.pyxl"
+    error = _raise_from_file(page, "value = undefined_name\n")
+    settings = DevServerSettings.from_project_root(tmp_path)
+
+    html = render_error_document(settings=settings, page=page_route, error=error)
+
+    assert "pages/deep/boom.pyxl, line 1" in html
+    assert str(tmp_path) not in html
+
+
+def test_error_document_follows_the_exception_chain_to_the_authors_frame(
+    page_route: PageRoute, tmp_path: Path
+) -> None:
+    """A wrapper exception must not hide the frame that names the mistake.
+
+    ``LoaderCrashError`` is raised at a framework call site, so its own
+    traceback holds no file the developer wrote; the frame that does hangs off
+    the exception it wrapped.
+    """
+    page = tmp_path / "pages" / "loaderboom.pyxl"
+    inner = _raise_from_file(page, "value = undefined_name_the_dev_typed\n")
+    try:
+        raise RuntimeError("Loader 'load' failed") from inner
+    except RuntimeError as wrapper:
+        error: BaseException = wrapper
+
+    settings = DevServerSettings.from_project_root(tmp_path)
+    html = render_error_document(settings=settings, page=page_route, error=error)
+
+    assert "pages/loaderboom.pyxl, line 1" in html
+    assert "undefined_name_the_dev_typed" in html
+
+
+def test_error_document_ignores_generated_modules_in_the_build_directory(
+    page_route: PageRoute, tmp_path: Path
+) -> None:
+    """A path inside the build directory names an artifact, not the author's
+    file, and pointing at it sends the reader to edit a generated module."""
+    settings = DevServerSettings.from_project_root(tmp_path)
+    generated = settings.build_root / "server" / "pages" / "index.py"
+    error = _raise_from_file(generated, "value = undefined_name\n")
+
+    html = render_error_document(settings=settings, page=page_route, error=error)
+
+    assert '<div class="pyxle-origin">' not in html
+    assert "index.py" not in html
+
+
+def test_error_document_without_any_user_frame_renders_normally(
+    page_route: PageRoute, tmp_path: Path
+) -> None:
+    """A purely internal failure still renders — it simply has no origin to
+    show, and must not gain an empty box or raise while rendering."""
+    settings = DevServerSettings.from_project_root(tmp_path)
+    error = RuntimeError("something internal went wrong")
+
+    html = render_error_document(settings=settings, page=page_route, error=error)
+
+    assert "Server Render Failed" in html
+    assert '<div class="pyxle-origin">' not in html
+
+
+def test_error_document_escapes_the_source_line(
+    page_route: PageRoute, tmp_path: Path
+) -> None:
+    """The author's line is printed, so it is escaped like every other value.
+
+    A ``.pyxl`` file legitimately contains JSX, so a line with ``<script>`` in
+    it is ordinary source, not necessarily an attack — which is exactly why it
+    must never be emitted raw.
+    """
+    page = tmp_path / "pages" / "xss.pyxl"
+    error = _raise_from_file(page, "boom = '<script>alert(1)</script>' + missing\n")
+    settings = DevServerSettings.from_project_root(tmp_path)
+
+    html = render_error_document(settings=settings, page=page_route, error=error)
+
+    assert "<script>alert(1)</script>" not in html
+    assert "&lt;script&gt;" in html
+
+
+def test_error_document_production_never_shows_the_origin(
+    page_route: PageRoute, tmp_path: Path
+) -> None:
+    """Production must not gain a file path, a line number or a line of source.
+
+    The overlay is a dev affordance; leaking the author's source tree to a
+    visitor is precisely what CLAUDE.md rule 18 forbids.
+    """
+    page = tmp_path / "pages" / "relimp.pyxl"
+    error = _raise_from_file(page, "from ._shared import GREETING\n")
+    settings = replace(DevServerSettings.from_project_root(tmp_path), debug=False)
+
+    html = render_error_document(settings=settings, page=page_route, error=error)
+
+    assert "relimp.pyxl" not in html
+    assert "GREETING" not in html
+    assert '<div class="pyxle-origin">' not in html
