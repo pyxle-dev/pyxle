@@ -50,7 +50,9 @@ def _make_project(tmp_path: Path, *, with_manifest: bool = True) -> tuple[Path, 
     (project / "public").mkdir(parents=True)
     dist = project / "dist"
     (dist / "public").mkdir(parents=True)
-    (dist / "client").mkdir(parents=True)
+    # A real build puts Vite's bundle in dist/client/dist; the tree above it is
+    # build input and is deliberately never mounted.
+    (dist / "client" / "dist").mkdir(parents=True)
     if with_manifest:
         (dist / "page-manifest.json").write_text(
             '{"pages": {}, "generated_at": "2024-01-01"}', encoding="utf-8"
@@ -184,9 +186,32 @@ def test_build_production_app_assembles_and_sizes_pool(tmp_path: Path, monkeypat
     assert pool_size == 2
     assert pool_args["size"] == 2
     assert captured["public_static_dir"] == dist / "public"
-    assert captured["client_static_dir"] == dist / "client"
+    # The bundle, not the build-input tree one level up.
+    assert captured["client_static_dir"] == dist / "client" / "dist"
     assert captured["serve_static"] is True
     assert captured["pool"] is not None
+
+
+def test_build_production_app_does_not_mount_the_build_input_tree(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A ``dist/client`` that predates the bundle must not be mounted wholesale.
+
+    ``dist/client/`` is the build input — page JSX, ``vite.config.js``,
+    ``tsconfig.json``. Only ``dist/client/dist/`` is public, and when Vite left
+    nothing there the mount is disabled rather than falling back to the parent.
+    """
+    project, dist = _make_project(tmp_path)
+    (dist / "client" / "vite.config.js").write_text("export default {};", encoding="utf-8")
+    shutil.rmtree(dist / "client" / "dist")
+    settings = build_settings(project, ssr_workers=1)
+    captured: dict = {}
+    _stub_assembly(monkeypatch, captured)
+    monkeypatch.setattr("pyxle.ssr.worker_pool.SsrWorkerPool", lambda **kw: SimpleNamespace())
+
+    build_production_app(settings, dist)
+
+    assert captured["client_static_dir"] is None
 
 
 def test_build_production_app_serve_static_false_disables_mounts(tmp_path: Path, monkeypatch) -> None:
@@ -207,7 +232,7 @@ def test_build_production_app_falls_back_when_dist_assets_missing(tmp_path: Path
     project, dist = _make_project(tmp_path)
     # Remove the built asset dirs to exercise the fallback/None branches.
     (dist / "public").rmdir()
-    (dist / "client").rmdir()
+    shutil.rmtree(dist / "client")
     settings = build_settings(project, ssr_workers=1)
     captured: dict = {}
     _stub_assembly(monkeypatch, captured)

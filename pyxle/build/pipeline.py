@@ -14,7 +14,7 @@ from pyxle.build.manifest import validate_asset_paths
 from pyxle.devserver.build import CACHE_METADATA_FILENAME
 from pyxle.devserver.builder import BuildSummary, build_once
 from pyxle.devserver.registry import MetadataRegistry, build_metadata_registry
-from pyxle.devserver.settings import DevServerSettings
+from pyxle.devserver.settings import CLIENT_BUNDLE_DIR_NAME, DevServerSettings
 from pyxle.devserver.tailwind import detect_postcss_config
 
 
@@ -170,12 +170,12 @@ def _run_npm_build(project_root: Path, logger: Any, *, settings: DevServerSettin
             "ensure sources are compiled before running the build"
         )
 
-    # Set PYXLE_VITE_BASE so Vite generates absolute asset URLs
-    # matching the static mount path.  The client build dir's
-    # Vite output lands in a ``dist/`` sub-directory which is then
-    # served under ``/client/``.
+    # Set PYXLE_VITE_BASE so Vite generates absolute asset URLs matching the
+    # static mount path. The client build dir's Vite output lands in the
+    # CLIENT_BUNDLE_DIR_NAME sub-directory, and that sub-directory — not its
+    # parent — is what `pyxle serve` mounts under ``/client/``.
     env = dict(os.environ)
-    env.setdefault("PYXLE_VITE_BASE", "/client/dist/")
+    env.setdefault("PYXLE_VITE_BASE", f"/client/{CLIENT_BUNDLE_DIR_NAME}/")
 
     try:
         subprocess.run(
@@ -196,8 +196,22 @@ def _run_npm_build(project_root: Path, logger: Any, *, settings: DevServerSettin
             "  installers at https://nodejs.org and nvm/fnm include it already.)"
         ) from exc
     except subprocess.CalledProcessError as exc:
+        # Rollup and esbuild name the module they were handed, which is one of
+        # two very different things. A compiled page — ``pages/about.jsx:8:8`` —
+        # carries line numbers belonging to the JSX section, not the ``.pyxl``;
+        # a component the author wrote was only copied there, so its position is
+        # already theirs. Both go through the same map the SSR error path uses,
+        # so either way the failure names a file the author wrote and a line
+        # they can open. ``pages_dir`` is what tells the two apart.
+        from pyxle.ssr.source_locations import remap_generated_locations  # noqa: PLC0415
+
         stderr = exc.stderr.strip() if exc.stderr else ""
-        raise RuntimeError(f"Vite build failed (exit {exc.returncode}): {stderr}") from exc
+        located = remap_generated_locations(
+            stderr, settings.client_build_dir, settings.pages_dir
+        )
+        raise RuntimeError(
+            f"Vite build failed (exit {exc.returncode}): {located}"
+        ) from exc
 
 
 def _run_npm_script(project_root: Path, script: str, logger: Any, *, required: bool = True) -> None:
@@ -464,21 +478,21 @@ def _build_page_manifest(
             if isinstance(vite_entry, dict):
                 # Vite manifest paths are relative to Vite's outDir
                 # (.pyxle-build/client/dist/), which gets copied as
-                # dist/client/dist/.  Prefix with "dist/" so the
-                # static file middleware resolves the correct path
-                # under dist/client/.
+                # dist/client/dist/.  Prefix with the bundle directory name so
+                # the recorded asset path stays relative to dist/client/ — the
+                # form both the page template and the static mount expect.
                 vite_file = vite_entry.get("file", "")
                 if vite_file:
-                    client_file = f"dist/{vite_file}"
+                    client_file = f"{CLIENT_BUNDLE_DIR_NAME}/{vite_file}"
 
                 # Walk the imports chain so CSS imported from layouts or
                 # shared component chunks still lands on this page's entry.
                 vite_css = _collect_css_from_vite_entry(vite_manifest, vite_key)
-                css_assets = [f"dist/{c}" for c in vite_css]
+                css_assets = [f"{CLIENT_BUNDLE_DIR_NAME}/{c}" for c in vite_css]
 
                 # The JS chunks the entry imports — preloaded by the template.
                 vite_js = _collect_js_imports_from_vite_entry(vite_manifest, vite_key)
-                js_imports = [f"dist/{j}" for j in vite_js]
+                js_imports = [f"{CLIENT_BUNDLE_DIR_NAME}/{j}" for j in vite_js]
 
         entry: Dict[str, Any] = {
             "client": {

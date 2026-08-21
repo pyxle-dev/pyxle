@@ -18,9 +18,10 @@ per file at once instead of stopping at the first.
 from __future__ import annotations
 
 import ast
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Literal, Sequence
+from typing import Callable, Iterable, Literal, Sequence
 
 from .exceptions import CompilationError
 from .head_elements import find_discarded_head_content
@@ -553,6 +554,92 @@ def _looks_like_jsx_toplevel(line: str) -> bool:
     return _contains_jsx_element_marker(stripped)
 
 
+# ---------------------------------------------------------------------------
+# Coordinate translation for line numbers *inside* an error message
+# ---------------------------------------------------------------------------
+
+#: Phrases after which a compiler-facing tool writes a *second* line number into
+#: the body of its own message. Every tool the parser calls is handed one
+#: extracted block — a segment, the joined Python stream, the joined JSX stream —
+#: so any line number it names is numbered from the start of that block, not the
+#: start of the ``.pyxl`` file. The known producers:
+#:
+#: * CPython — ``closing parenthesis ')' does not match opening parenthesis '['
+#:   on line 3`` and ``unterminated string literal (detected at line 9)``.
+#: * pyflakes — ``redefinition of unused 'os' from line 1``, ``import 'os' from
+#:   line 1 shadowed by loop variable``, ``local variable 'x' defined in
+#:   enclosing scope on line 4 referenced before assignment``.
+#:
+#: The pattern is anchored to these three prepositions rather than any ``line
+#: N``, which narrows it to the shapes a tool actually writes.
+_MESSAGE_LINE_REFERENCE = re.compile(r"\b(on|from|at) line (\d+)\b")
+
+
+def _reference_is_quoted(message: str, index: int) -> bool:
+    """Whether the reference at *index* sits inside a quoted span of *message*.
+
+    Every producer above writes its coordinate as plain prose and quotes only
+    the *name* it is talking about — ``redefinition of unused 'os' from line
+    1``. So a ``line N`` that falls inside quotes is not a coordinate at all: it
+    is the developer's own text echoed back. ``__all__ = ["ghost on line 999"]``
+    yields ``undefined name 'ghost on line 999' in __all__``, where 999 is part
+    of a string they wrote, names no line, and must survive untouched — the one
+    fragment of the message they would otherwise recognise.
+
+    An odd number of either quote character before the match means the match is
+    inside one. When that heuristic is wrong the reference is left raw, which is
+    the same fallback an unmappable number gets.
+    """
+    prefix = message[:index]
+    return prefix.count("'") % 2 == 1 or prefix.count('"') % 2 == 1
+
+
+def _remap_message_line_refs(
+    message: str, to_source_line: Callable[[int], int | None]
+) -> str:
+    """Rewrite block-relative line numbers *inside* ``message`` to file lines.
+
+    The position a diagnostic carries structurally is already translated by the
+    caller. This handles the other one — the line number a tool wrote into its
+    own prose — which is otherwise reported raw, in the coordinates of an
+    extracted block the developer never sees. An error pointing at the wrong
+    line of the right file is worse than one that points nowhere: it sends the
+    developer to read innocent code and costs them their trust in the compiler.
+
+    ``to_source_line`` maps one block-relative line to its ``.pyxl`` line;
+    returning ``None`` (no mapping possible) leaves that reference untouched
+    rather than inventing a number. Callers must supply a mapper that answers
+    ``None`` outside its block rather than clamping to an edge — a clamped
+    number is exactly the confident wrong answer this is here to avoid.
+    """
+
+    def _replace(match: re.Match[str]) -> str:
+        if _reference_is_quoted(message, match.start()):
+            return match.group(0)
+        mapped = to_source_line(int(match.group(2)))
+        if mapped is None:
+            return match.group(0)
+        return f"{match.group(1)} line {mapped}"
+
+    return _MESSAGE_LINE_REFERENCE.sub(_replace, message)
+
+
+def _exact_source_line(relative: int, line_numbers: Sequence[int]) -> int | None:
+    """The ``.pyxl`` line for block-relative line *relative*, or ``None``.
+
+    Deliberately unlike :func:`_map_lineno`, which clamps an out-of-range
+    number to the block's last line. Clamping is right for a diagnostic's
+    structural position — some line has to be reported, and the last one is the
+    closest true statement available. It is wrong for a number embedded in
+    prose, where "no answer" is representable: a reference the block cannot
+    account for is not a line of the developer's file, and answering with the
+    nearest one would present a fabricated location as a real one.
+    """
+    if 1 <= relative <= len(line_numbers):
+        return line_numbers[relative - 1]
+    return None
+
+
 def _detect_broken_python_in_jsx_segments(
     segments: Sequence[_Segment],
     lines: Sequence[str],
@@ -626,8 +713,21 @@ def _detect_broken_python_in_jsx_segments(
         except SyntaxError as exc:
             relative_line = exc.lineno or 1
             absolute_line = segment.start + relative_line
+            # The segment's own lines, in ``.pyxl`` coordinates: it is a
+            # contiguous run, so line N of it is file line ``start + N``. A
+            # number outside that run is not a line of this segment and gets no
+            # answer rather than one extrapolated past its end.
+            segment_lines = range(segment.start + 1, segment.end + 1)
             collector.emit(
-                exc.msg or "invalid syntax",
+                # ``exc.msg`` is CPython's, written against the isolated
+                # segment: "does not match opening parenthesis '[' on line 3"
+                # means the third line *of the segment*. Translate it the same
+                # way the position above is translated, or the message sends
+                # the developer to a line that is perfectly fine.
+                _remap_message_line_refs(
+                    exc.msg or "invalid syntax",
+                    lambda relative: _exact_source_line(relative, segment_lines),
+                ),
                 absolute_line,
                 section="python",
                 # ``SyntaxError.offset`` is already 1-indexed within its line
@@ -1259,6 +1359,22 @@ def _map_jsx_line(
     return jsx_line_numbers[0] if jsx_line_numbers else None
 
 
+def _remap_jsx_message(message: str, jsx_line_numbers: Sequence[int]) -> str:
+    """Translate any line number written into a JSX tool's own message.
+
+    The extractor already strips Babel's trailing ``(line:column)`` — that
+    coordinate is section-relative and the compiler reports the real one
+    separately. This covers the rest: any message that names a line in prose
+    (its own, or one a future extractor rule adds) gets the same section →
+    file translation the structural position gets. A reference outside the
+    section is left alone rather than clamped to its first line, so a stray
+    number can never masquerade as a real location.
+    """
+    return _remap_message_line_refs(
+        message, lambda relative: _exact_source_line(relative, jsx_line_numbers)
+    )
+
+
 def _validate_jsx_syntax(
     jsx_code: str,
     jsx_line_numbers: Sequence[int],
@@ -1290,7 +1406,9 @@ def _validate_jsx_syntax(
     ):
         line = jsx_line_numbers[result.error_line - 1]
     collector.emit(
-        f"JSX syntax error: {result.error}", line, section="jsx"
+        f"JSX syntax error: {_remap_jsx_message(result.error, jsx_line_numbers)}",
+        line,
+        section="jsx",
     )
 
 
@@ -1413,6 +1531,12 @@ def _validate_python_semantics(
             text = message.message % message.message_args
         except (TypeError, ValueError):  # pragma: no cover - defensive
             text = str(message.message)
+        # Several pyflakes findings name a *second* location in their prose
+        # ("redefinition of unused 'os' from line 1"), taken from the joined
+        # Python stream this checker was handed — not from the ``.pyxl``.
+        text = _remap_message_line_refs(
+            text, lambda relative: _exact_source_line(relative, python_line_numbers)
+        )
         line = _map_lineno(getattr(message, "lineno", None), python_line_numbers)
         collector.emit(
             text, line, section="python", severity=_pyflakes_severity(message)
@@ -1577,7 +1701,7 @@ class PyxParser:
         if jsx_metadata.ts_violation is not None and not has_python_errors:
             ts_message, ts_jsx_line = jsx_metadata.ts_violation
             collector.emit(
-                ts_message,
+                _remap_jsx_message(ts_message, jsx_line_numbers),
                 _map_jsx_line(ts_jsx_line, jsx_line_numbers),
                 section="jsx",
             )
@@ -1594,8 +1718,9 @@ class PyxParser:
             and not has_python_errors
         ):
             jsx_message, jsx_error_line = jsx_metadata.syntax_error
+            located_jsx_message = _remap_jsx_message(jsx_message, jsx_line_numbers)
             collector.emit(
-                f"JSX syntax error: {jsx_message}",
+                f"JSX syntax error: {located_jsx_message}",
                 _map_jsx_line(jsx_error_line, jsx_line_numbers),
                 section="jsx",
             )

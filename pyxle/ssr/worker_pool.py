@@ -254,6 +254,7 @@ class SsrWorkerPool:
         size: int,
         project_root: Path,
         client_root: Path,
+        pages_root: Path | None = None,
         node_executable: str | None = None,
         render_timeout: float = 30.0,
         vite_owns_css: bool = False,
@@ -261,6 +262,7 @@ class SsrWorkerPool:
         self._size = max(1, size)
         self._project_root = project_root
         self._client_root = client_root
+        self._pages_root = pages_root
         # A manifest-backed render links every stylesheet Vite compiled for the
         # page, so inlining the same CSS into a <style> block ships it twice.
         # Constant for the life of the process — a build either has a page
@@ -288,6 +290,17 @@ class SsrWorkerPool:
         wrote. See :mod:`pyxle.ssr.source_locations`.
         """
         return self._client_root
+
+    @property
+    def pages_root(self) -> Path | None:
+        """The project's ``pages/`` directory, when the caller supplied one.
+
+        Not every ``.jsx`` under :attr:`client_root` was generated — a component
+        the developer wrote beside their pages is copied there unchanged. This
+        is what lets a build error against one of those be reported as the
+        author's own file rather than labelled as compiler output.
+        """
+        return self._pages_root
 
     @property
     def alive_count(self) -> int:

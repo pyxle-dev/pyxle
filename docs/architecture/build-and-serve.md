@@ -9,7 +9,7 @@ their code with the dev server but make a few important changes:
 | Vite | dev server on :5173 | one-time bundle, then no Vite |
 | Source compilation | incremental on file change | full rebuild, all at once |
 | File watcher | running | not running |
-| HMR / React Refresh | enabled | disabled |
+| Browser refresh | full page reload on every rebuild | none |
 | Module reloading | per-request `sys.modules` purge | imported once at startup |
 | Error responses | full stack trace + dev overlay | generic `Server Error` |
 | Asset serving | proxy to Vite | static files from `dist/client/` |
@@ -151,6 +151,93 @@ Vite's output:
 
 Vite's output is captured rather than streamed; on a non-zero exit the
 build aborts and the captured stderr is included in the error.
+
+Rollup and esbuild name the module they were given — `pages/about.jsx:2:8` —
+which is the artifact Step 1 generated, at a line numbered from the start of the
+page's JSX half. That stderr is run through
+`pyxle.ssr.source_locations.remap_generated_locations`, the same map the SSR
+error path uses.
+
+**It only ever touches a `.jsx` path that carries a `:line`.** The line number is
+what proves the path is a position a compiler reported, rather than a `.jsx` you
+typed yourself — an import specifier, or a line of your own source echoed back
+inside a code frame. Rewriting those would edit your source instead of
+describing it, so a bare `.jsx` is always left alone.
+
+**And it never touches a `.jsx` inside a URL**, coordinate or not. That is a
+separate rule with a separate reason: a URL is a link, and rewriting the path
+inside one breaks it. It also cannot be covered by the rule above, because a URL
+can carry a coordinate of its own — a stack frame is one.
+
+Precisely what it does to each `.jsx` path in the output:
+
+| The failure names | You are shown | Why |
+|---|---|---|
+| `pages/about.jsx:2:8` — a compiled page, with a coordinate | `pages/about.pyxl:13:8` | The sidecar maps the generated line to the source line. |
+| `pages/ui/Card.jsx:4:2` — a `.jsx` **you** wrote | `pages/ui/Card.jsx:4:2` | Pyxle copies your own components into the build tree unchanged, so the line and column are already yours. Nothing is translated and nothing is labelled. |
+| A position inside code the compiler emitted | `pages/about.pyxl (in generated output at pages/about.jsx:41:1)` | The page is known, the line is not. Naming the page without claiming the position is the honest answer. |
+| A `.jsx` path it cannot place, with a coordinate | unchanged, plus `(generated)` | Better an admitted artifact than an artifact mistaken for your file. |
+| Any `.jsx` path with **no** coordinate | unchanged — see the limitation below | A bare path is indistinguishable from one you wrote yourself, so it is never rewritten. |
+| A `.jsx` inside a quoted specifier or an esbuild code frame | unchanged | Same rule as the row above, and the reason for it: these are your words, and a build error must not rewrite them. |
+| A `.jsx` inside a URL, **with or without** a coordinate | unchanged, byte for byte | A URL is a link, not a location, and rewriting the path inside it breaks it. Applies to `https`, `file://` and Vite's `/@fs/` alike. |
+
+Only positions are translated. The line numbers in the gutter of an esbuild code
+frame are numbered against the generated `.jsx`, so they will not match the
+`.pyxl` line beside the message above them.
+
+### Known limitation: an unresolved import still names the build artifact
+
+Rollup reports a missing import with no line number at all, so nothing in that
+message meets the bar above and the whole message passes through as Rollup wrote
+it. Adding `./components/Missing.jsx` to `pages/rollup.pyxl` when that file does
+not exist prints:
+
+```
+❌ Build failed: Vite build failed (exit 1): ✗ Build failed in 185ms
+error during build:
+Could not resolve "./components/Missing.jsx" from ".pyxle-build/client/pages/rollup.jsx"
+file: /your/project/.pyxle-build/client/pages/rollup.jsx
+    at getRollupError (…/node_modules/rollup/dist/es/shared/parseAst.js:317:41)
+    …
+```
+
+**There is no reliable way to turn that path back into one of your files, so
+don't try.** `.pyxle-build/client/pages/rollup.jsx` is a path inside Pyxle's
+build directory. The module it names came from one of two places: the `.pyxl` of
+the same name, or a `.jsx` component you wrote that Pyxle copied there
+unchanged. Both live under `pages/`, which is why the table above spends a row
+telling them apart — and why swapping the extension is right for one and
+produces a file that cannot exist for the other.
+
+What *is* unambiguous is the specifier in quotes: it is exactly the one you
+typed. Search your own sources for it and fix it there. There is no line number
+to look up, because Rollup did not report one.
+
+Pyxle does not rewrite that path, even though it could often resolve it. Doing
+so requires matching bare `.jsx` paths, and a bare `.jsx` in a build error is far
+more often something you wrote — the specifier on the same line, an `import`
+statement quoted back in an esbuild code frame — than it is an artifact path.
+Corrupting your own source text in the message meant to help you read it is the
+worse failure, so the narrower rule wins. A path with a coordinate, which is
+every other row in the table above, is unaffected.
+
+Vite's stderr under `pyxle dev` has the same limitation. Vite runs as a live
+subprocess and its stderr is forwarded to your terminal verbatim, prefixed
+`❌ [vite]` — it is Vite talking, not Pyxle, so it is not remapped and it names
+build paths too:
+
+```
+❌ [vite] [vite] Internal server error: Failed to resolve import "./components/Missing.jsx" from ".pyxle-build/client/pages/index.jsx". Does the file exist?
+❌ [vite]   Plugin: vite:import-analysis
+❌ [vite]   File: /your/project/.pyxle-build/client/pages/index.jsx:25:0
+```
+
+The same caution applies, and one more: the coordinate on a line like that is
+not necessarily numbered against the file the path names. Pyxle hands Vite a
+source map for every compiled page in dev, so Vite reports the position it maps
+to — `25` above is line 25 of `pages/index.pyxl`; the failing import sits on
+line 4 of the `.jsx` the path names. Path and line can come from two different
+files.
 
 ---
 
@@ -332,6 +419,17 @@ The double `dist/client/dist/` nesting is intentional — Vite's output
 naturally lives under a `dist/` subdirectory of its base path, and
 Pyxle preserves that. The serving layer is configured to mount it at
 the right URL prefix (`/client/dist/...`).
+
+**Only the inner `dist/` is public.** `dist/client/` is the *input* to
+that bundle — every page's unbundled JSX, the layout route wrappers,
+Pyxle's own client components, the generated `vite.config.js`,
+`tsconfig.json` and `index.html`. The browser never requests any of it:
+the rendered HTML references nothing outside `dist/client/dist/`. So
+`pyxle serve` mounts `dist/client/dist/` at `/client/dist/`, not
+`dist/client/` at `/client/`, and a request for
+`/client/pages/guestbook.jsx` or `/client/vite.config.js` is a 404 like
+any other unknown path. `pyxle build --analyze` walks the same directory,
+so its totals count only bytes a browser downloads.
 
 ---
 

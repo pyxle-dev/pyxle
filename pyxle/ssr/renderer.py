@@ -531,16 +531,21 @@ def pool_render_factory(pool: Any) -> _RenderFactory:
                 )
             except WorkerPoolError as exc:
                 raise ComponentRenderError(
-                    remap_generated_locations(str(exc), pool.client_root)
+                    remap_generated_locations(
+                        str(exc), pool.client_root, pool.pages_root
+                    )
                 ) from exc
 
             if not result.get("ok"):
                 message = result.get("message") or "SSR worker reported a failure"
                 # esbuild/Babel name the generated ``.jsx`` module, at a line
                 # number that belongs to it and not to the author's file. Report
-                # the ``.pyxl`` they actually edit.
+                # the ``.pyxl`` they actually edit — or, for a component the
+                # author wrote and Pyxle only copied, that file at its own line.
                 raise ComponentRenderError(
-                    remap_generated_locations(message, pool.client_root)
+                    remap_generated_locations(
+                        message, pool.client_root, pool.pages_root
+                    )
                 )
 
             html = result.get("html")

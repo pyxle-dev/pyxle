@@ -1,4 +1,5 @@
 import json
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -558,3 +559,44 @@ def test_run_build_refuses_to_write_a_dist_that_cannot_be_served(monkeypatch, tm
     # Nothing unservable was written: the previous deployment survives a failed
     # rebuild rather than being replaced by a broken one.
     assert not (project / "dist").exists()
+
+
+def test_vite_build_failure_names_the_pyxl_source_and_line(monkeypatch, tmp_path):
+    """A bundler error must point at the file the author wrote.
+
+    Rollup and esbuild report the *generated* module — ``pages/index.jsx:2:8`` —
+    and number its lines from the start of the page's JSX section. Printed raw,
+    that is a path the author never created at a line that is not theirs. The
+    compiler already writes the section's line map to a sidecar; the failure is
+    run through it, exactly as the SSR error path does.
+    """
+    from pyxle.build import pipeline
+
+    project_root, settings = _npm_build_project(tmp_path, {"build": "vite build"})
+    client = settings.client_build_dir
+    (client / "pages").mkdir(parents=True, exist_ok=True)
+    (client / CLIENT_SOURCEMAP_SIDECAR).write_text(
+        json.dumps(
+            # JSX line 1 is .pyxl line 12, JSX line 2 is .pyxl line 13.
+            {"pages/index.jsx": {"pyxl": "../../pages/index.pyxl", "lines": [12, 13]}}
+        ),
+        encoding="utf-8",
+    )
+
+    def _failing_vite(*args, **kwargs):
+        raise subprocess.CalledProcessError(
+            1,
+            ["npx", "vite", "build"],
+            output="",
+            stderr="ERROR: Expected \")\" but found \"}\"\n  pages/index.jsx:2:8",
+        )
+
+    monkeypatch.setattr(pipeline.subprocess, "run", _failing_vite)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        pipeline._run_npm_build(project_root, silent_logger(), settings=settings)
+
+    message = str(excinfo.value)
+    assert "pages/index.pyxl:13:8" in message
+    # The generated artifact's own coordinates are gone, not merely annotated.
+    assert "pages/index.jsx:2:8" not in message

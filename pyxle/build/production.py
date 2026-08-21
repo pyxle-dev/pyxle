@@ -43,7 +43,7 @@ from pyxle.devserver.build import (
 from pyxle.devserver.registry import build_metadata_registry
 from pyxle.devserver.routes import build_route_table
 from pyxle.devserver.scripts import GlobalScript, resolve_global_scripts
-from pyxle.devserver.settings import DevServerSettings
+from pyxle.devserver.settings import CLIENT_BUNDLE_DIR_NAME, DevServerSettings
 from pyxle.devserver.starlette_app import create_starlette_app
 from pyxle.devserver.styles import GlobalStylesheet, resolve_global_stylesheets
 from pyxle.env import load_env_files
@@ -296,12 +296,18 @@ def _resolve_static_dirs(
         )
         public_static_dir = settings.public_dir
 
-    client_dir = resolved_dist / "client"
+    # Vite's bundle output, not the tree above it. ``dist/client/`` is the build
+    # *input* directory — every page's unbundled JSX, Pyxle's own client
+    # components, ``vite.config.js``, ``tsconfig.json`` — and the browser only
+    # ever loads what Vite emitted into ``dist/client/dist/``. Mounting the
+    # parent published the whole input tree; see CLIENT_BUNDLE_DIR_NAME.
+    client_dir = resolved_dist / "client" / CLIENT_BUNDLE_DIR_NAME
     if client_dir.exists():
         client_static_dir: Optional[Path] = client_dir
     else:
         logger.warning(
-            f"Client asset directory '{client_dir}' does not exist; /client requests will 404."
+            f"Client bundle directory '{client_dir}' does not exist; "
+            f"/client requests will 404."
         )
         client_static_dir = None
 
@@ -486,6 +492,7 @@ def build_production_app(
             size=pool_size,
             project_root=settings.project_root,
             client_root=settings.client_build_dir,
+            pages_root=settings.pages_dir,
             vite_owns_css=vite_owns_stylesheets(settings),
         )
 
