@@ -564,6 +564,13 @@ Before deploying:
 - [ ] `pyxle build` completes successfully (it exits non-zero if it cannot run Vite — never ship a `dist/` from a build that failed)
 - [ ] Node.js `>= 20.19` **and npm** are on the build machine's `PATH`
 - [ ] Node.js is `>= 20.19` on the server's `PATH`
+- [ ] **`node_modules` is installed on the server too** — copy `package.json` and
+      `package-lock.json` next to `dist/` and run `npm ci` there. Server-side
+      rendering runs React through Node at request time and loads `esbuild` from
+      your project, so a `dist/` deployed without them answers **500 on every
+      page**. The errors name one missing package at a time, so installing them
+      individually goes in circles; `npm ci` is the fix. (The Dockerfile below
+      already does this.)
 - [ ] Set `PYXLE_DEBUG=false` in production
 - [ ] Set `PYXLE_SECRET_KEY` to a long random value (**required** — `pyxle serve` won't start without it)
 - [ ] Apply database migrations, if you use `pyxle-db` (see below)

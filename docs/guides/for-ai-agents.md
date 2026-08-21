@@ -455,9 +455,14 @@ on the actual problem.
 
 Pyxle's dev server watches `pages/`, incrementally rebuilds only
 the changed files, purges stale `sys.modules` entries so Python
-changes take effect on the next request, and invalidates the
-relevant Vite HMR modules so the browser updates without a full
-reload.
+changes take effect on the next request, and then reloads every
+connected browser.
+
+It is a full page reload, not a React Fast Refresh hot update:
+component state does not survive a rebuild. That is the trade for
+a `.pyxl` file whose Python half and JSX half change together —
+the server data behind the page may have changed too, so the page
+is refetched rather than patched in place.
 
 For an agent working in a tight edit-check-edit loop, this means
 **every change is immediately reflected** without the agent having
