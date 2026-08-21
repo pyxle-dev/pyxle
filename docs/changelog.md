@@ -4,6 +4,29 @@ Release notes for Pyxle. While we're in beta (`0.x`), minor versions may include
 
 ## Unreleased
 
+- **Fix: `pyxle check` no longer passes an action that can never run.**
+  An `@action` whose second parameter carries no type annotation —
+  `async def bump(request, payload)`, the signature you write without thinking —
+  cannot be called: there is nothing to build a request model from, so the first
+  request that triggers it fails. `pyxle openapi` already refused such a file and
+  said exactly why, while `pyxle check` on the identical tree reported *"All
+  checks passed"* and exited `0`. The framework knew; the command the
+  [deployment checklist](guides/deployment.md) names as the gate was the one that
+  did not ask. It asks now, with the same message `openapi` gives, naming the
+  action, the parameter and the line.
+
+  `check` stays **static** — this is read off the parsed source, not by importing
+  your module, so there are no import-time side effects, no import errors as a
+  new failure class, and no slower gate. Consequently it sees only what the file
+  says: an *annotated* body parameter is left alone, because whether Pydantic is
+  installed is a fact about the environment you deploy into rather than about
+  your code, and a parameter with a default is optional and always fine. The
+  error text now lives in `pyxle.runtime` beside `@action` itself, so the gate
+  and the dispatcher cannot drift into describing the same mistake two ways.
+  [`pyxle check`](reference/cli.md#pyxle-check).
+
+## 0.9.0
+
 - **Docs: why the `log.info` that worked all through development is silent once you deploy.**
   `pyxle dev` installs a logging bridge that lowers the root logger to `INFO` so
   your records reach the terminal and the browser console. `pyxle serve` installs
