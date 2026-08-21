@@ -1924,3 +1924,139 @@ class TestAnUnclosedBracketNamesTheBracket:
         errors = [d for d in result.diagnostics if d.section == "python"]
         assert errors and "was never closed" in errors[0].message
         assert errors[0].line == 3
+
+
+class TestActionSignatureValidation:
+    """``pyxle check`` refuses an ``@action`` whose body parameter can never be filled.
+
+    ``pyxle openapi`` already refused these files while ``check`` — the command
+    the deploy guide names as the gate — passed them (P2-30). The rule is read
+    off the AST, so the gate stays static: it never imports the user's module.
+    """
+
+    def _sem(self, text: str):
+        return PyxParser().parse_text(
+            dedent(text).strip("\n"), tolerant=True, validate_semantics=True
+        )
+
+    def _findings(self, text: str):
+        return [
+            d
+            for d in self._sem(text).diagnostics
+            if "no type annotation" in d.message
+        ]
+
+    JSX = """
+
+        import React from 'react'
+
+        export default function P({ data }) {
+            return <div>{data.n}</div>
+        }
+        """
+
+    def _page(self, python: str) -> str:
+        return dedent(python).strip("\n") + "\n" + dedent(self.JSX)
+
+    def test_unannotated_body_parameter_is_an_error(self):
+        findings = self._findings(
+            self._page(
+                """
+                @action
+                async def bump(request, payload):
+                    return {"got": payload}
+
+                @server
+                async def load(request):
+                    return {"n": 1}
+                """
+            )
+        )
+        assert len(findings) == 1
+        assert findings[0].severity == "error"
+        assert findings[0].section == "python"
+        # Names the action and the parameter, and points at the ``def`` line.
+        assert "Action 'bump'" in findings[0].message
+        assert "'payload'" in findings[0].message
+        assert findings[0].line == 2
+
+    def test_message_is_the_dispatchers_own(self):
+        """One writer: the gate quotes ``pyxle.runtime``'s error, not a copy."""
+        from pyxle.runtime import UnannotatedActionBodyError
+
+        findings = self._findings(
+            self._page(
+                """
+                @action
+                async def bump(request, payload):
+                    return {"got": payload}
+                """
+            )
+        )
+        assert findings[0].message == str(
+            UnannotatedActionBodyError(param="payload", action="bump")
+        )
+
+    def test_required_keyword_only_body_parameter_is_an_error(self):
+        findings = self._findings(
+            self._page(
+                """
+                @action
+                async def bump(request, *, payload):
+                    return {"got": payload}
+                """
+            )
+        )
+        assert len(findings) == 1
+
+    @pytest.mark.parametrize(
+        "python",
+        [
+            # The documented single-parameter form.
+            "@action\nasync def bump(request):\n    return {'ok': True}",
+            # Annotated: whether Pydantic is installed is an environment fact a
+            # static gate cannot know, so it is the dispatcher's call, not ours.
+            "@action\nasync def bump(request, payload: Body):\n    return {'ok': True}",
+            # Optional: a default means the call succeeds without a body.
+            "@action\nasync def bump(request, payload=None):\n    return {'ok': True}",
+            "@action\nasync def bump(request, *, payload=None):\n    return {'ok': True}",
+            # Not an action at all — no contract to break.
+            "async def helper(request, whatever):\n    return {'n': 1}",
+            # ``self``/``cls`` are skipped exactly as the dispatcher skips them.
+            "@action\nasync def bump(self, request):\n    return {'ok': True}",
+        ],
+    )
+    def test_valid_shapes_are_not_flagged(self, python):
+        assert self._findings(self._page(python)) == []
+
+    def test_decorator_call_and_attribute_forms_are_recognised(self):
+        for decorator in ("@action()", "@pyxle.action"):
+            findings = self._findings(
+                self._page(
+                    f"""
+                    {decorator}
+                    async def bump(request, payload):
+                        return {{"got": payload}}
+                    """
+                )
+            )
+            assert len(findings) == 1, decorator
+
+    def test_gate_never_imports_the_users_module(self):
+        """The whole point of reading the AST: no import-time side effects.
+
+        A module-level ``raise`` would abort any import-based gate. The static
+        one still reports the signature.
+        """
+        findings = self._findings(
+            self._page(
+                """
+                raise RuntimeError("import-time side effect")
+
+                @action
+                async def bump(request, payload):
+                    return {"got": payload}
+                """
+            )
+        )
+        assert len(findings) == 1

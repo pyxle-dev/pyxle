@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import inspect
 import logging
@@ -2153,7 +2154,12 @@ def create_starlette_app(
             set_active_cache(page_cache)
             # Warm the cache from any build-time pre-rendered pages
             # (`pyxle build --static`) so their first request is a hit.
-            if prerender_dir is not None and prerender_dir.exists():
+            # ``Path.exists`` is a blocking stat, and this runs on the event
+            # loop during startup — ASYNC240, and CLAUDE.md §8. Once per
+            # process, but the rule is right and the fix is a thread hop.
+            if prerender_dir is not None and await asyncio.to_thread(
+                prerender_dir.exists
+            ):
                 static_paths = [route.path for route in select_static_pages(routes.pages)]
                 warmed = await warm_page_cache(page_cache, static_paths, prerender_dir)
                 if warmed:

@@ -25,103 +25,21 @@ from dataclasses import dataclass
 from typing import Any, Callable
 from weakref import WeakKeyDictionary
 
-from pyxle.runtime import ValidationActionError
+# Re-exported: these moved to ``pyxle.runtime`` so ``pyxle check`` can reach the
+# same message without importing the devserver (and Starlette with it). Imported
+# here by name so every existing ``from pyxle.devserver.validation import ...``
+# keeps working and catches the identical class object.
+from pyxle.runtime import (
+    ActionBodyError,
+    PydanticNotInstalledError,
+    UnannotatedActionBodyError,
+    ValidationActionError,
+)
 
 try:  # PEP 604 ``X | None`` unions (Python 3.10+)
     from types import UnionType as _UnionType
 except ImportError:  # pragma: no cover - 3.9 and earlier
     _UnionType = None  # type: ignore[assignment]
-
-
-class ActionBodyError(RuntimeError):
-    """Pyxle cannot work out how to supply an action's body parameter.
-
-    Two shapes, one base so a caller cannot catch one and miss the other: the
-    parameter is annotated with a model but Pydantic is missing
-    (:class:`PydanticNotInstalledError`), or it carries no annotation at all,
-    so there is nothing to build a model from
-    (:class:`UnannotatedActionBodyError`). Every caller only surfaces
-    ``str(exc)``; the base exists to keep their ``except`` clauses honest, not
-    to carry behaviour.
-    """
-
-    def __init__(
-        self, message: str, *, action: str | None = None, source: str | None = None
-    ) -> None:
-        super().__init__(message)
-        self.action = action
-        self.source = source
-
-    def with_identity(self, *, action: str, source: str | None) -> "ActionBodyError":
-        """Return the same failure, naming the action and the file to edit.
-
-        The dispatcher raises these bare — reached while handling a request for
-        one specific action, "this action" is unambiguous. Schema generation
-        walks every action in the project, so it re-raises through this to say
-        which file.
-        """
-        raise NotImplementedError  # pragma: no cover - subclasses implement
-
-
-class PydanticNotInstalledError(ActionBodyError):
-    """An action needs Pydantic to validate its body, but it isn't installed.
-
-    Raised only when the body parameter **is** annotated: an unannotated one
-    does not need Pydantic to begin with, and saying otherwise sends the reader
-    to install a dependency that will not fix their problem — see
-    :class:`UnannotatedActionBodyError`.
-    """
-
-    def __init__(self, *, action: str | None = None, source: str | None = None) -> None:
-        if action is None:
-            subject = "This action validates"
-        else:
-            where = f" in {source}" if source else ""
-            subject = f"Action '{action}'{where} validates"
-        super().__init__(
-            f"{subject} its request body with a Pydantic model, but "
-            "Pydantic is not installed. Install it with: "
-            "pip install 'pyxle-framework[pydantic]'.",
-            action=action,
-            source=source,
-        )
-
-    def with_identity(self, *, action: str, source: str | None) -> "PydanticNotInstalledError":
-        return PydanticNotInstalledError(action=action, source=source)
-
-
-class UnannotatedActionBodyError(ActionBodyError):
-    """An action requires a parameter it never described, so nothing can fill it.
-
-    ``async def act(request, payload)`` asks Pyxle to supply ``payload`` from
-    the request body while saying nothing about its shape. Installing Pydantic
-    does not help — with Pydantic present the same call fails with
-    ``TypeError: act() missing 1 required positional argument`` — so the message
-    names the two things that do.
-    """
-
-    def __init__(
-        self, *, param: str, action: str | None = None, source: str | None = None
-    ) -> None:
-        if action is None:
-            subject = "This action"
-        else:
-            where = f" in {source}" if source else ""
-            subject = f"Action '{action}'{where}"
-        super().__init__(
-            f"{subject} requires a parameter '{param}' that Pyxle would have to "
-            f"supply from the request body, but '{param}' has no type "
-            "annotation, so there is nothing to build a request model from. "
-            "Either annotate it with a Pydantic model (and install Pydantic "
-            "with: pip install 'pyxle-framework[pydantic]'), or take only "
-            "'request' and read the body yourself with: await request.json().",
-            action=action,
-            source=source,
-        )
-        self.param = param
-
-    def with_identity(self, *, action: str, source: str | None) -> "UnannotatedActionBodyError":
-        return UnannotatedActionBodyError(param=self.param, action=action, source=source)
 
 
 @dataclass(frozen=True, slots=True)

@@ -1585,6 +1585,87 @@ def _validate_python_semantics(
         )
 
 
+def _decorator_names(node: ast.AST) -> set[str]:
+    """Every decorator's trailing name — ``@action``, ``@action()``, ``@pyxle.action``."""
+    names: set[str] = set()
+    for decorator in getattr(node, "decorator_list", ()):
+        target = decorator.func if isinstance(decorator, ast.Call) else decorator
+        if isinstance(target, ast.Name):
+            names.add(target.id)
+        elif isinstance(target, ast.Attribute):
+            names.add(target.attr)
+    return names
+
+
+def _validate_action_signatures(
+    tree: ast.Module | None,
+    python_line_numbers: Sequence[int],
+    *,
+    collector: _DiagnosticCollector,
+) -> None:
+    """Flag an ``@action`` whose body parameter can never be filled.
+
+    ``async def act(request, payload)`` asks Pyxle to supply ``payload`` from
+    the request body while saying nothing about its shape, so the call fails
+    the first time anyone triggers it. ``pyxle openapi`` already refuses this
+    file; ``pyxle check`` — the command the deploy guide names as the gate —
+    used to pass it, which is worse than having no gate at all.
+
+    This reads the shape off the AST rather than importing the user's module,
+    so ``check`` stays static: no import-time side effects, no import errors as
+    a new failure class, no slower gate. It therefore sees only what is written
+    literally in the file, which is the shape the mistake actually takes. The
+    parameter rule and the message are :func:`resolve_body_model`'s, imported
+    from ``pyxle.runtime`` so the gate and the dispatcher cannot drift.
+    """
+    if tree is None:
+        return
+    from pyxle.runtime import UnannotatedActionBodyError
+
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if "action" not in _decorator_names(node):
+            continue
+
+        args = node.args
+        # Mirrors ``resolve_body_model``: the body is the first parameter other
+        # than ``request`` that the dispatcher could pass by name. Positional-only
+        # and ``*args``/``**kwargs`` are excluded there, so they are excluded here.
+        positional = list(args.args)
+        # A default makes the parameter optional, so it can never be the thing
+        # that breaks the call. ``args.defaults`` aligns to the tail of the
+        # positional list; ``kw_defaults`` aligns 1:1 with ``kwonlyargs``, where
+        # ``None`` means "no default".
+        optional = set(map(id, positional[len(positional) - len(args.defaults):])) if args.defaults else set()
+        optional |= {
+            id(arg)
+            for arg, default in zip(args.kwonlyargs, args.kw_defaults)
+            if default is not None
+        }
+        candidates = [
+            arg
+            for arg in positional + args.kwonlyargs
+            if arg.arg not in ("request", "self", "cls")
+        ]
+        if not candidates:
+            continue
+        body_arg = candidates[0]
+        required = id(body_arg) not in optional
+        if body_arg.annotation is not None or not required:
+            # Annotated is the dispatcher's problem (it may still need Pydantic
+            # installed, which is an environment fact this static gate cannot
+            # know). Optional simply keeps its default.
+            continue
+
+        collector.emit(
+            str(UnannotatedActionBodyError(param=body_arg.arg, action=node.name)),
+            _map_lineno(getattr(body_arg, "lineno", None), python_line_numbers),
+            section="python",
+            severity="error",
+        )
+
+
 # ---------------------------------------------------------------------------
 # Public parser
 # ---------------------------------------------------------------------------
@@ -1784,6 +1865,9 @@ class PyxParser:
         # code, not content a mis-split absorbed into the wrong section.
         if validate_semantics and python_code.strip() and not has_python_errors:
             _validate_python_semantics(
+                tree, python_line_numbers, collector=collector
+            )
+            _validate_action_signatures(
                 tree, python_line_numbers, collector=collector
             )
 

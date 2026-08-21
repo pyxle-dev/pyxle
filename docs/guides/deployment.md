@@ -560,7 +560,7 @@ migration tool per app. See [pyxle-db → Migrations](../plugins/pyxle-db.md#mig
 
 Before deploying:
 
-- [ ] `pyxle check` passes with no errors (it exits `0` on warnings alone — an unused import will not block you; an unresolved reference **in the Python half** will). It does not resolve identifiers in the JSX half, so it is not a substitute for opening the page — do that too.
+- [ ] `pyxle check` passes with no errors (it exits `0` on warnings alone — an unused import will not block you; an unresolved reference **in the Python half**, or an `@action` asking for a body parameter it never annotated, will). It does not resolve identifiers in the JSX half, so it is not a substitute for opening the page — do that too.
 - [ ] `pyxle build` completes successfully (it exits non-zero if it cannot run Vite — never ship a `dist/` from a build that failed)
 - [ ] Node.js `>= 20.19` **and npm** are on the build machine's `PATH`
 - [ ] Node.js is `>= 20.19` on the server's `PATH`

@@ -281,11 +281,12 @@ sizing guidance.
 
 ## `pyxle check`
 
-Validate `.pyxl` files, configuration, and dependencies without starting the server. Each `.pyxl` file is checked at three levels:
+Validate `.pyxl` files, configuration, and dependencies without starting the server. Each `.pyxl` file is checked at four levels:
 
 - **Python syntax** (via `ast`) and Pyxle structural rules (loader/action shape, `HEAD`, …).
 - **Python semantics** (via pyflakes): undefined names — e.g. a symbol you `raise` but never imported — unused imports, redefinitions. Compiler-injected runtime names (`server`, `action`, `LoaderError`, `ActionError`, …) are recognized, so the idiomatic patterns never read as undefined.
 - **JSX syntax** (via Babel): unclosed tags/expressions, mismatched braces, TypeScript in a client block, and **duplicate `export default`** (which Babel accepts but the build rejects).
+- **`@action` signatures**: an action that asks for a request body it never described — `async def bump(request, payload)` with no annotation on `payload` — is reported here rather than failing the first time someone triggers it. This is read off the parsed source, so `check` still never imports your module. An *annotated* body parameter is not flagged: whether Pydantic is installed is a property of the environment you deploy into, and `pyxle openapi` and the dev server answer that one.
 
 As of 0.7.0 the JSX level works out of the box — `pyxle-langkit`, which provides the Babel-based checker, ships with the framework. On earlier versions it required the `[langkit]` extra (`pip install 'pyxle-framework[langkit]'`); without it, the JSX check reported itself unavailable.
 
@@ -312,7 +313,7 @@ Findings are split by whether the code will actually break when it runs.
 
 | Severity | What it covers | Exit code |
 |----------|----------------|-----------|
-| **error** | Syntax errors, Pyxle structural rules, JSX syntax, and semantics that fail at runtime: unresolved references (`undefined name 'x'`), unbound locals, malformed `%`/`.format()` strings, `raise NotImplemented` | `1` |
+| **error** | Syntax errors, Pyxle structural rules, JSX syntax, an `@action` body parameter with no annotation, and semantics that fail at runtime: unresolved references (`undefined name 'x'`), unbound locals, malformed `%`/`.format()` strings, `raise NotImplemented` | `1` |
 | **warning** | Code that runs correctly but wants tidying: unused imports, unused locals and annotations, redefinitions, duplicate dict keys, f-strings with no placeholders, `is` against a literal | `0` |
 
 A semantic rule Pyxle does not recognise — one added by a future pyflakes — is reported as a warning, so upgrading a dependency can never turn into a surprise deploy blocker. This is what lets [the deployment checklist](../guides/deployment.md) gate a release on `pyxle check`: a leftover `import json` will not stop a deploy, an unresolved reference will.
