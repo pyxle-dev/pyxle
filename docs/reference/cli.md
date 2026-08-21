@@ -132,6 +132,16 @@ pyxle dev --verbose             # troubleshoot: full Vite + debug output
 5. Starts the Starlette ASGI server
 6. Watches for file changes and recompiles automatically
 
+**Opening the page from another device.** `--host 0.0.0.0` makes the dev server
+answer on your machine's network address, and the startup banner prints the
+`Network:` URL to use. Pyxle widens the whole dev server to match: Vite binds the
+same address, and both servers accept the private-network origins that address
+implies — the JavaScript modules, the hot-reload socket and the error overlay all
+reach that browser. Open the printed URL; a page opened at some *other* address
+(a hostname, a public IP, an https tunnel) is served but cannot load its modules,
+and the terminal says so on the first request. See
+[which browsers the dev server trusts](../architecture/dev-server.md#which-browsers-the-dev-server-trusts).
+
 **Console output.** By default `pyxle dev` prints a clean, curated console — a
 startup summary (the local URL, the Vite URL, the route count, the
 [Studio](../guides/studio.md) URL, and the total "ready in X ms"), a concise
@@ -146,11 +156,33 @@ shown, at every verbosity.
 your server-side `logging` output (from loaders, actions, and your own modules)
 is forwarded to the browser devtools console, prefixed `[pyxle:server]` and
 mapped to the matching `console` method (`info` → `console.info`, `warning` →
-`console.warn`, `error` → `console.error`). This lets you follow server logs
-without leaving the browser. By default only `INFO` and above from your own
-loggers are forwarded; `--verbose` additionally forwards `DEBUG` records and the
-framework's own internal loggers. This is strictly a development feature — it
+`console.warn`, `error` → `console.error`). The same records also print in the
+terminal, so you can follow server logs from whichever window you are already
+in. By default only `INFO` and above from your own loggers are forwarded;
+`--verbose` additionally forwards `DEBUG` records and the framework's own
+internal loggers to the browser. This is strictly a development feature — it
 never runs under `pyxle serve` and never appears in the production bundle.
+
+The idiomatic Python logger works as-is inside a `.pyxl` page:
+
+```python
+import logging
+
+log = logging.getLogger(__name__)
+
+@server
+async def load_dashboard(request):
+    log.info("loading dashboard")
+    ...
+```
+
+```
+[pyxle:server pages/dashboard.pyxl] loading dashboard
+```
+
+A page's records are labelled with the `.pyxl` file that emitted them rather
+than the module name it is compiled under. A logger you name yourself keeps
+that name: `logging.getLogger("shopapp")` prints as `[pyxle:server shopapp]`.
 
 ## `pyxle studio`
 
@@ -306,6 +338,21 @@ Findings are reported per file as `[section] line N: message`, with the file pat
 ```
 
 Exit code is `0` when no error is found (warnings alone do not fail the command), `1` otherwise.
+
+Every line number in a finding is a line of the `.pyxl` file — including a second
+one named inside the message, such as the `[` a mismatched `)` should have closed
+or the earlier binding a redefinition shadows:
+
+```
+  error: [python] line 11: closing parenthesis ')' does not match opening parenthesis '[' on line 8
+    --> pages/products.pyxl
+  warning: [python] line 9: import 'os' from line 7 shadowed by loop variable
+    --> pages/products.pyxl
+```
+
+The checkers behind these levels each see one extracted half of your file and
+number their findings from the start of it; Pyxle translates those coordinates
+back to the file you are editing before printing them.
 
 ## `pyxle typecheck`
 

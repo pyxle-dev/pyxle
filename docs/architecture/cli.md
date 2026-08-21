@@ -259,7 +259,7 @@ for the full walkthrough.
 | `--config <path>` | `pyxle.config.json` | Config file path |
 | `--dist-dir <path>` | `./dist` | Where to read the build from |
 | `--skip-build / --no-skip-build` | `false` | Skip the implicit `pyxle build` |
-| `--serve-static / --no-serve-static` | `true` | Serve `dist/client/` and `dist/public/` |
+| `--serve-static / --no-serve-static` | `true` | Serve `dist/client/dist/` and `dist/public/` |
 | `--ssr-workers <n>` | from config | Override SSR worker count |
 
 ### What it does

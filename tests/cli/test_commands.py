@@ -138,6 +138,10 @@ def test_install_rejects_file_path() -> None:
 
 
 def test_install_dependencies_executes_commands(monkeypatch, tmp_path) -> None:
+    # Python deps are only installed when there is something to install;
+    # these tests assert on the pip command, so give them a reason to run one.
+    (tmp_path / "requirements.txt").write_text("pyxle-framework\n", encoding="utf-8")
+
     calls: list[tuple[list[str], Path]] = []
 
     def fake_run(command, *, cwd, check, stdout=None, stderr=None, text=False):
@@ -305,6 +309,10 @@ def test_in_virtualenv_detects_environments(monkeypatch) -> None:
 def test_install_dependencies_warns_outside_virtualenv(monkeypatch, tmp_path) -> None:
     """Outside a venv, install warns about PEP 668 with venv guidance instead of
     letting pip throw its raw 'externally-managed-environment' wall."""
+    # Python deps are only installed when there is something to install;
+    # these tests assert on the pip command, so give them a reason to run one.
+    (tmp_path / "requirements.txt").write_text("pyxle-framework\n", encoding="utf-8")
+
     monkeypatch.setattr(cli, "_in_virtualenv", lambda: False)
     monkeypatch.setattr(cli.subprocess, "run", lambda *a, **k: None)
     warnings: list[str] = []
@@ -399,7 +407,8 @@ def test_serve_command_runs_build_and_uvicorn(monkeypatch) -> None:
         (project / "public").mkdir(parents=True)
 
         dist_root = project / "dist"
-        client_dir = dist_root / "client"
+        # Vite's bundle directory — the only part of dist/client/ that is served.
+        client_dir = dist_root / "client" / "dist"
         public_dir = dist_root / "public"
         client_dir.mkdir(parents=True, exist_ok=True)
         public_dir.mkdir(parents=True, exist_ok=True)
@@ -546,6 +555,10 @@ def test_serve_command_requires_manifest_when_skipping_build(monkeypatch) -> Non
 
 
 def test_install_dependencies_flag_skips(monkeypatch, tmp_path) -> None:
+    # Python deps are only installed when there is something to install;
+    # these tests assert on the pip command, so give them a reason to run one.
+    (tmp_path / "requirements.txt").write_text("pyxle-framework\n", encoding="utf-8")
+
     calls: list[list[str]] = []
 
     def fake_run(command, *, cwd, check, stdout=None, stderr=None, text=False):
@@ -1159,6 +1172,58 @@ def test_build_command_supports_incremental_flag(monkeypatch) -> None:
 
         assert result.exit_code == 0, result.stdout
         assert captured.get("force_rebuild") is False
+
+
+def test_build_command_analyze_counts_only_the_bundle(monkeypatch) -> None:
+    """``--analyze`` must report what the browser downloads, nothing else.
+
+    Walking ``dist/client/`` instead of ``dist/client/dist/`` swept in the
+    generated ``vite.config.js``, ``client-entry.js`` and the CSS sources Vite
+    consumed — build inputs no browser fetches — and inflated the total.
+    """
+    with runner.isolated_filesystem():
+        project = Path("demo")
+        (project / "pages").mkdir(parents=True)
+        (project / "public").mkdir(parents=True)
+
+        def fake_run_build(settings, *, logger, dist_dir=None, force_rebuild=True):
+            from pyxle.build.pipeline import BuildResult
+            from pyxle.devserver.builder import BuildSummary
+            from pyxle.devserver.registry import MetadataRegistry
+
+            result_dist = settings.project_root / "dist"
+            client = result_dist / "client"
+            (client / "dist" / "assets").mkdir(parents=True, exist_ok=True)
+            (client / "dist" / "assets" / "index-a1b2c3d4.js").write_bytes(b"a" * 1000)
+            # Build inputs beside the bundle.
+            (client / "vite.config.js").write_bytes(b"b" * 6000)
+            (client / "client-entry.js").write_bytes(b"c" * 46000)
+            for name in ("server", "metadata", "public"):
+                (result_dist / name).mkdir(parents=True, exist_ok=True)
+            page_manifest_path = result_dist / "page-manifest.json"
+            page_manifest_path.write_text("{}", encoding="utf-8")
+            return BuildResult(
+                dist_dir=result_dist,
+                client_dir=client,
+                server_dir=result_dist / "server",
+                metadata_dir=result_dist / "metadata",
+                public_dir=result_dist / "public",
+                client_manifest_path=None,
+                page_manifest={},
+                page_manifest_path=page_manifest_path,
+                summary=BuildSummary(),
+                registry=MetadataRegistry(pages=[], apis=[]),
+            )
+
+        monkeypatch.setattr("pyxle.cli.run_build", fake_run_build)
+
+        result = runner.invoke(app, ["build", "demo", "--analyze"], catch_exceptions=False)
+
+        assert result.exit_code == 0, result.stdout
+        assert "assets/index-a1b2c3d4.js" in result.stdout
+        assert "vite.config.js" not in result.stdout
+        assert "client-entry.js" not in result.stdout
+        assert "(1 file(s))" in result.stdout
 
 
 def test_build_command_logs_missing_public_assets(monkeypatch) -> None:
@@ -3063,7 +3128,7 @@ def test_serve_command_falls_back_when_dist_public_and_client_missing(monkeypatc
         assert result.exit_code == 0, result.stdout
         assert "Public assets directory" in result.stdout
         assert "does not exist" in result.stdout
-        assert "Client asset directory" in result.stdout
+        assert "Client bundle directory" in result.stdout
         assert "/client requests will 404" in result.stdout
         # Fallback: public served from source dir, client disabled.
         kwargs = captured["create_kwargs"]
@@ -3431,6 +3496,10 @@ def test_dist_has_websocket_pages(tmp_path: Path) -> None:
 
 def test_install_dependencies_break_system_packages(monkeypatch, tmp_path) -> None:
     """--break-system-packages threads through to the pip command for PEP-668."""
+    # Python deps are only installed when there is something to install;
+    # these tests assert on the pip command, so give them a reason to run one.
+    (tmp_path / "requirements.txt").write_text("pyxle-framework\n", encoding="utf-8")
+
     calls: list[list[str]] = []
     monkeypatch.setattr(
         cli.subprocess,
@@ -3450,6 +3519,8 @@ def test_install_dependencies_break_system_packages(monkeypatch, tmp_path) -> No
 
 
 def test_install_no_break_flag_by_default(monkeypatch, tmp_path) -> None:
+    (tmp_path / "requirements.txt").write_text("pyxle-framework\n", encoding="utf-8")
+
     calls: list[list[str]] = []
     monkeypatch.setattr(
         cli.subprocess,
@@ -3768,3 +3839,25 @@ def test_serve_command_stops_when_the_client_build_cannot_run(monkeypatch) -> No
 
     assert result.exit_code == 1, result.stdout
     assert "npx was not found on your PATH" in result.stdout
+
+
+def test_install_dependencies_skips_python_without_requirements(monkeypatch, tmp_path) -> None:
+    """No requirements.txt is a normal shape — skip pip, still install node.
+
+    `pip install -r` exits 1 on a missing target, which used to abort the whole
+    command before `npm install` ever ran. Our own charts example has no
+    requirements file, so its documented first command failed.
+    """
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        cli.subprocess,
+        "run",
+        lambda command, *, cwd, check, stdout=None, stderr=None, text=False: calls.append(
+            command
+        ),
+    )
+
+    cli._install_dependencies(tmp_path, logger=cli.ConsoleLogger())
+
+    assert not any("pip" in part for command in calls for part in command)
+    assert ["npm", "install"] in calls

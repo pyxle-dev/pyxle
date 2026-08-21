@@ -1,3 +1,8 @@
+// The global stylesheet is imported HERE, in the layout, not in a page — a
+// layout wraps every route, so every page you add is styled without you having
+// to remember anything. Importing it from index.pyxl instead means your second
+// page renders unstyled, which is a confusing five minutes for no reason.
+import './styles/app.css';
 import React from 'react';
 
 export default function AppLayout({ children }) {

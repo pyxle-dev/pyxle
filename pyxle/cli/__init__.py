@@ -559,6 +559,14 @@ def _install_dependencies(
         logger.warning("Skipping dependency installation (both installers disabled).")
         return
 
+    if install_python and not (project_root / "requirements.txt").is_file():
+        # A project without a requirements file is a normal shape — our own
+        # charts example is one — and pip exits 1 on a missing -r target, which
+        # aborted the command before `npm install` ever ran. Skipping is the
+        # honest behaviour: there are no Python dependencies to install.
+        logger.info("No requirements.txt; skipping Python dependencies.")
+        install_python = False
+
     if install_python:
         if not _in_virtualenv() and not break_system_packages:
             logger.warning(
@@ -1198,8 +1206,12 @@ def build(
 
     if analyze:
         from pyxle.build.analyze import analyze_bundle, format_bundle_report  # noqa: PLC0415
+        from pyxle.devserver.settings import CLIENT_BUNDLE_DIR_NAME  # noqa: PLC0415
 
-        assets = analyze_bundle(result.dist_dir / "client")
+        # Only Vite's bundle — the tree above it holds build inputs
+        # (generated JSX, vite.config.js) the browser never downloads, so
+        # counting them would inflate every reported total.
+        assets = analyze_bundle(result.dist_dir / "client" / CLIENT_BUNDLE_DIR_NAME)
         for line in format_bundle_report(assets).splitlines():
             logger.info(line)
 

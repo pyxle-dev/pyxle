@@ -121,11 +121,19 @@ class ConsoleLogger:
         self._emit(level="debug", console_message=f"🔍 {message}", style="white")
 
     def info(self, message: str) -> None:
-        """Emit an informational message (suppressed in quiet mode)."""
+        """Emit an informational message (suppressed in quiet mode).
+
+        An empty message is a deliberate blank spacer — commands like
+        ``pyxle routes`` use one to separate sections — so it is emitted as a
+        genuinely blank line rather than a bare ``ℹ️`` prefix floating in the
+        output. Decorating a separator with an icon made our own documented
+        sample output wrong.
+        """
 
         if self.verbosity == Verbosity.QUIET:
             return
-        self._emit(level="info", console_message=f"ℹ️  {message}", style="cyan")
+        console_message = f"ℹ️  {message}" if message.strip() else ""
+        self._emit(level="info", console_message=console_message, style="cyan")
 
     def success(self, message: str) -> None:
         """Emit a success message."""

@@ -45,8 +45,17 @@ A minimal deployment is therefore:
 dist/                 # everything pyxle build produced
 pyxle.config.json     # your configuration
 package.json          # so Node resolves react / react-dom
-node_modules/         # server-side rendering runs React on Node
+node_modules/         # server-side rendering runs React on Node — and esbuild
 ```
+
+> **Installing with `--omit=dev` is not enough on its own.** Server rendering
+> loads **esbuild** from your project at request time. Before 0.9.0 the scaffold
+> did not declare it — it arrived only transitively through Vite, a
+> devDependency — so a production-only install produced a server that started
+> cleanly and then returned a 500 for *every* page, with the real cause visible
+> only in the log. 0.9.0's scaffold lists `esbuild` under `dependencies`; if you
+> generated your project with an earlier version, add it.
+
 
 plus your Python dependencies and your environment variables — including
 `PYXLE_SECRET_KEY`, which `pyxle serve` requires. `.env` files are **not** part
@@ -57,7 +66,7 @@ Inside `dist/`:
 | Path | What it holds |
 |------|---------------|
 | `server/` | Compiled Python for every page and API route |
-| `client/` | Vite output — hashed JS and CSS, served under `/client` |
+| `client/dist/` | Vite output — hashed JS and CSS, served under `/client/dist`. It is the only part of `client/` that is served; the rest is the input Vite bundled |
 | `metadata/`, `meta.json`, `page-manifest.json` | Routing metadata |
 | `public/` | A copy of your `public/` directory |
 | `app/` | A copy of the source files the server reads at runtime |
@@ -348,8 +357,9 @@ server {
         proxy_read_timeout 3600s;   # keep long-lived WebSockets from idling out
     }
 
-    # Cache static assets
-    location /client/ {
+    # Cache static assets. Everything Pyxle serves here is a content-hashed
+    # bundle, so a one-year immutable cache is safe.
+    location /client/dist/ {
         proxy_pass http://127.0.0.1:8000;
         expires 1y;
         add_header Cache-Control "public, immutable";
@@ -415,7 +425,7 @@ Two things to know before relying on it:
    - **Nginx / Caddy / Varnish** — enable `proxy_cache` (or the equivalent) for
      those routes; they respect `s-maxage` out of the box.
 
-Content-hashed client bundles (under `/client/.../dist/assets/`) are already sent
+Content-hashed client bundles (under `/client/dist/assets/`) are already sent
 `Cache-Control: public, max-age=31536000, immutable`, and other static files get
 `public, max-age=3600` -- independent of the `cache` block above, which governs
 *page* responses.
@@ -550,7 +560,7 @@ migration tool per app. See [pyxle-db → Migrations](../plugins/pyxle-db.md#mig
 
 Before deploying:
 
-- [ ] `pyxle check` passes with no errors (it exits `0` on warnings alone — an unused import will not block you; an unresolved reference will)
+- [ ] `pyxle check` passes with no errors (it exits `0` on warnings alone — an unused import will not block you; an unresolved reference **in the Python half** will). It does not resolve identifiers in the JSX half, so it is not a substitute for opening the page — do that too.
 - [ ] `pyxle build` completes successfully (it exits non-zero if it cannot run Vite — never ship a `dist/` from a build that failed)
 - [ ] Node.js `>= 20.19` **and npm** are on the build machine's `PATH`
 - [ ] Node.js is `>= 20.19` on the server's `PATH`
@@ -564,6 +574,7 @@ Before deploying:
 - [ ] Set up a reverse proxy for TLS
 - [ ] Declare publicly-cacheable routes in the `cache` block (and opt your CDN in)
 - [ ] Configure health check monitoring on `/api/pulse`
+- [ ] Configure Python logging if you rely on your own `log.info` calls — `pyxle serve` does not, so `INFO` records are dropped while `WARNING` and above still reach stderr ([Debugging](debugging.md#your-own-loginfo-is-silent-in-production-until-you-configure-it))
 - [ ] Add `.env.local` to `.gitignore`
 
 ## Next steps

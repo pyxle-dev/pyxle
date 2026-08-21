@@ -16,7 +16,6 @@ async def load_home(request):
     }
 
 
-import './styles/app.css';
 import React from 'react';
 import { Head } from 'pyxle/client';
 
