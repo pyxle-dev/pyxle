@@ -85,6 +85,33 @@ body {
   color: var(--accent);
 }
 
+.live {
+  margin-top: 1.5rem;
+}
+
+.live-button {
+  font: inherit;
+  font-size: 0.875rem;
+  padding: 0.5rem 1rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: inherit;
+  cursor: pointer;
+  transition: border-color 0.15s ease, color 0.15s ease;
+}
+
+.live-button:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.live-note {
+  margin: 0.5rem 0 0;
+  font-size: 0.8125rem;
+  color: var(--muted);
+}
+
 .nav {
   display: flex;
   flex-wrap: wrap;

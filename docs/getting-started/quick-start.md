@@ -83,6 +83,8 @@ The last line is [Pyxle Studio](../guides/studio.md), the dev-only dashboard for
 
 Open [http://localhost:8000](http://localhost:8000) in your browser. You should see the Pyxle starter page — a centered card showing the framework version, server time, and the file to edit first, `pages/index.pyxl`.
 
+The card also has a **Clicked 0 times** button, and it is there to be pressed. The version and the time above it were produced by Python on the server; the button is React running in your browser, from the same file. If the count goes up when you click, your page hydrated — the server HTML was handed to React and React took over. That is worth checking once on a new machine, because a page that renders perfectly and does nothing is exactly what a hydration failure looks like, and nothing else on a starter page would tell you.
+
 Each edit you save prints one concise `Rebuilt … in X ms` line. Your server-side `logging` output — including the usual `log = logging.getLogger(__name__)` at the top of a page — streams to the **browser** devtools console (prefixed `[pyxle:server pages/index.pyxl]`) as well as the terminal, so you can follow loaders and actions without switching windows. Need the full picture — raw Vite logs and debug internals? Run `pyxle dev --verbose`. See the [CLI reference](../reference/cli.md#pyxle-dev) for details.
 
 CSS just works: Vite compiles every stylesheet you import — plain CSS, CSS Modules, and (if you enabled it) Tailwind v4 via the `@tailwindcss/vite` plugin — with hot reload. There's nothing separate to start. See the [Styling guide](../guides/styling.md).
