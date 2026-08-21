@@ -58,6 +58,60 @@ def test_render_document_injects_expected_scripts(page_route: PageRoute, tmp_pat
     assert 'nonce="test-nonce"' in html
 
 
+def test_dev_document_reports_a_module_that_never_loaded(
+    page_route: PageRoute, tmp_path: Path
+) -> None:
+    """The browser's half of the framework's most silent failure.
+
+    A module Vite refuses is not a JavaScript error: no ``window.onerror``
+    handler, no framework overlay and no Vite log line ever hears about it, and
+    the page is left rendered and inert. A capturing listener does hear it, so
+    the console stops being one more place that says nothing.
+    """
+
+    settings = DevServerSettings.from_project_root(tmp_path, starlette_host="0.0.0.0")
+
+    html = render_document(
+        settings=settings,
+        page=page_route,
+        body_html="<p>Hello</p>",
+        props={},
+        script_nonce="test-nonce",
+        head_elements=page_route.head_elements,
+        request_host="192.168.1.11",
+    )
+
+    reporter = html.split("@vite/client")[0]
+    # Installed BEFORE the module scripts it is there to watch.
+    assert "addEventListener('error'" in reporter
+    assert "}, true);" in reporter  # capturing: load failures do not bubble
+    # Watches the exact origin this page's modules come from.
+    assert "http://192.168.1.11:5173" in reporter
+    assert 'nonce="test-nonce"' in reporter
+    assert "did not load, so this page will not become " in reporter
+
+
+def test_production_document_carries_no_dev_reporter(
+    page_route: PageRoute, tmp_path: Path
+) -> None:
+    settings = replace(
+        DevServerSettings.from_project_root(tmp_path),
+        debug=False,
+        page_manifest={"pages/index.jsx": {"file": "assets/index.js"}},
+    )
+
+    html = render_document(
+        settings=settings,
+        page=page_route,
+        body_html="<p>Hello</p>",
+        props={},
+        script_nonce="test-nonce",
+        head_elements=page_route.head_elements,
+    )
+
+    assert "addEventListener('error'" not in html
+
+
 def test_default_title_uses_configured_app_name(page_route: PageRoute, tmp_path: Path) -> None:
     """`name` in pyxle.config.json is the default <title> for untitled pages."""
     settings = DevServerSettings.from_project_root(tmp_path, app_name="Acme Dashboard")

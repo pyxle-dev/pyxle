@@ -51,6 +51,30 @@ The client receives `{ "ok": false, "error": "Name must be at least 2 characters
 | `status_code` | `int` | `400` | HTTP status code |
 | `data` | `dict` | `{}` | Additional data in the error response |
 
+### When an action raises something else
+
+An `ActionError` is your answer to the caller. Any *other* exception — a
+`KeyError`, a driver error, a bug — is not an answer, and its message may carry
+a file path, a row ID or a connection string. So it is split the same way a
+page's is:
+
+- **In production**, the caller receives `{"ok": false, "error": "An
+  unexpected error occurred."}` with status `500`. The real exception never
+  reaches the browser. It **is** written to the server log, once, with its
+  full traceback and the name of the action that raised it — that log is your
+  only record, so make sure you collect it.
+- **In development**, the response carries the real message and the traceback
+  is logged the same way, so the terminal and the caller agree.
+
+Actions do not render `error.pyxl` (see [below](#what-reaches-errorpyxl)) — an
+action answers with JSON, not a page. Handle the failure at the call site,
+where `useAction` exposes it as `error`.
+
+The log line is written for every `500` an action can produce, not just a raised
+exception: a module that fails to import, an unset `request.state` attribute, and
+an action that returns something other than a dict are all recorded before the
+response is sent.
+
 ## Error boundaries (`error.pyxl`)
 
 Create an `error.pyxl` file to catch errors from pages in the same directory and below:
@@ -120,6 +144,8 @@ Does **not** reach `error.pyxl`:
   serve the fallback document. If you see one, it is a bug — please report it.
 - **`@action` failures.** An action answers the caller with JSON, not a page.
   Raise `ActionError` and handle it where you called it (`useAction`'s error).
+  An action that raises anything else answers `500` and is logged — see
+  [when an action raises something else](#when-an-action-raises-something-else).
 - **API routes** (`pages/api/**.py`) and **middleware**, neither of which is a
   page render.
 - **A request matching no route at all** — that is [`not-found.pyxl`](#not-found-pages-not-foundpyxl).
@@ -263,6 +289,15 @@ Like error boundaries, not-found pages follow directory scoping -- a `not-found.
 
 `not-found.pyxl` is a **normal page**, not an error boundary: it receives **no** `error` prop, and it may declare its own `@server` loader (it gets that loader's props). Use `error.pyxl` when you need the `error` context; use `not-found.pyxl` for an unmatched-route landing page.
 
+> **One thing outranks it, in dev only.** A page whose source does not compile
+> registers no route, so its URL would land here — and a designed "page not
+> found" is a confident answer to the wrong question when the file is present
+> and correctly named. Under `pyxle dev` such a URL answers `500` with the
+> compile error instead (file, line, message), and only such a URL: everything
+> else still reaches your `not-found.pyxl`. `pyxle serve` never sees this,
+> because `pyxle build` refuses to build a project that does not compile. See
+> [when a rebuild fails](../architecture/dev-server.md#when-a-rebuild-fails).
+
 ## Dev mode error overlay
 
 During development (`pyxle dev`), errors also appear in a browser overlay with:
@@ -294,6 +329,33 @@ reported the same way, against the `.pyxl` line you wrote — not the line of th
 ```
 ❌ Rebuild failed: pages/about.pyxl:16: JSX syntax error: Unexpected token, expected "jsxTagEnd"
 ```
+
+### Every line number is a line of your file
+
+Some errors name a **second** line — the one where the trouble started, as
+opposed to the one where the compiler noticed it:
+
+```
+❌ Rebuild failed: pages/about.pyxl:11:5: closing parenthesis ')' does not match opening parenthesis '[' on line 8
+```
+
+Both are lines of `pages/about.pyxl`. Line 11 is the `)` that does not fit; line
+8 is the `[` it should have matched. The same holds for
+`unterminated string literal (detected at line 14)` and for `pyxle check`'s
+`redefinition of unused 'os' from line 7`.
+
+This is worth stating because Pyxle hands each half of your file to a different
+checker — CPython for the Python, Babel for the React — and each of those
+numbers its findings from the start of the block it was given, not from the
+start of your file. Pyxle translates both the position and any line the message
+itself names, so you never have to work out which coordinate system you are
+reading.
+
+A number Pyxle cannot account for is left exactly as the checker wrote it,
+never nudged to the nearest line it does know. That covers numbers that were
+never line references in the first place: a name you wrote is quoted back to you
+untouched, so `__all__ = ["ghost on line 999"]` reports
+`undefined name 'ghost on line 999' in __all__` and not some line of your file.
 
 Only the routes that depend on the broken file are affected. A broken
 `pages/about.pyxl` takes down `/about`; a broken `pages/blog/layout.pyxl` takes

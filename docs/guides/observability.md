@@ -194,6 +194,8 @@ variable for the duration of the request, so **your own** log calls within a
 loader or action carry the same `request_id` automatically when you log through
 the `pyxle.access` logger or your own logger configured the same way.
 
+Note that this configures the `pyxle.access` logger only — it does not change the level of your own loggers. Under `pyxle serve` those keep Python's defaults, so a `log.info` in a loader stays invisible until you configure logging yourself; see [Debugging](debugging.md#your-own-loginfo-is-silent-in-production-until-you-configure-it).
+
 Structured logging works with **no extra dependency** (a stdlib JSON/console
 formatter). Installing the optional `[observability]` extra adds
 [structlog](https://www.structlog.org/) for richer rendering:

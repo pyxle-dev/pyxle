@@ -241,27 +241,46 @@ def _describe_failure(
         column=error.column,
         code_frame=build_code_frame(contents, error.line_number, error.column),
         url_paths=_static_url_paths(source.relative_path),
+        url_patterns=_dynamic_url_patterns(source.relative_path),
     )
+
+
+#: Sources that wrap or decorate other pages rather than serving a URL of their
+#: own, so a failure in one is never explained by the URL that was requested.
+_NON_SERVING_FILENAMES = frozenset(
+    {"layout.pyxl", "template.pyxl", "error.pyxl", "not-found.pyxl", "loading.pyxl"}
+)
+
+
+def _route_paths(page_relative: Path) -> tuple[str, ...]:
+    """Every route path *page_relative* would register if it compiled."""
+
+    if page_relative.name.lower() in _NON_SERVING_FILENAMES:
+        return ()
+    spec = route_path_variants_from_relative(page_relative)
+    return (spec.primary, *spec.aliases)
 
 
 def _static_url_paths(page_relative: Path) -> tuple[str, ...]:
     """The parameterless URLs *page_relative* would serve if it compiled.
 
     Only used for a source with no compiled route — one that has never built —
-    where the URL is the only link back to the file. Paths carrying a route
-    parameter are left out: matching those means matching patterns, and a page
-    that has never compiled *and* is dynamic *and* is shadowed by another
-    dynamic route is not worth a pattern matcher on the request path.
+    where the URL is the only link back to the file. A plain string compare, so
+    it is cheap enough for the request path of a page that *did* route.
     """
 
-    name = page_relative.name.lower()
-    if name in {"layout.pyxl", "template.pyxl", "error.pyxl", "not-found.pyxl", "loading.pyxl"}:
-        # None of these serve a URL of their own.
-        return ()
-    spec = route_path_variants_from_relative(page_relative)
-    return tuple(
-        path for path in (spec.primary, *spec.aliases) if "{" not in path
-    )
+    return tuple(path for path in _route_paths(page_relative) if "{" not in path)
+
+
+def _dynamic_url_patterns(page_relative: Path) -> tuple[str, ...]:
+    """The parameterised route patterns *page_relative* would serve.
+
+    Split from :func:`_static_url_paths` because matching these costs a regex
+    and is only sound on the 404 path, where nothing routed at all — see
+    :meth:`~pyxle.devserver.build_errors.BuildFailureRegistry.find_for_unrouted_url`.
+    """
+
+    return tuple(path for path in _route_paths(page_relative) if "{" in path)
 
 
 def _is_changed(

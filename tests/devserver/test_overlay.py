@@ -6,7 +6,13 @@ import pytest
 from starlette.websockets import WebSocketDisconnect
 
 from pyxle.cli.logger import ConsoleLogger
-from pyxle.devserver.overlay import OverlayEvent, OverlayManager, _format_stacktrace
+from pyxle.devserver.dev_origins import private_origin_pattern
+from pyxle.devserver.overlay import (
+    _REFUSED_ORIGIN_MEMORY,
+    OverlayEvent,
+    OverlayManager,
+    _format_stacktrace,
+)
 
 
 @pytest.fixture
@@ -202,6 +208,64 @@ def test_is_allowed_origin_rejects_non_loopback_origin() -> None:
 
     # A genuinely foreign origin is rejected when origins are configured.
     assert manager._is_allowed_origin("http://attacker.test:8000") is False  # type: ignore[attr-defined]
+
+
+def test_is_allowed_origin_matches_the_private_network_pattern() -> None:
+    """A dev server bound to every interface must accept the browsers it invited.
+
+    ``pyxle dev --host 0.0.0.0`` prints a ``Network:`` URL. A phone that opens it
+    and is then refused the overlay socket loses hot reload and the error
+    overlay, and the build-failure page it may be looking at — which promises to
+    reload itself once the rebuild succeeds — never does.
+    """
+
+    manager = OverlayManager(
+        logger=StubLogger(),
+        allowed_origins={"http://localhost:3000", "http://127.0.0.1:3000"},
+        allowed_origin_pattern=private_origin_pattern(3000, 5173),
+    )
+
+    assert manager._is_allowed_origin("http://192.168.1.11:3000") is True  # type: ignore[attr-defined]
+    assert manager._is_allowed_origin("http://192.168.1.11:5173") is True  # type: ignore[attr-defined]
+    assert manager._is_allowed_origin("http://10.0.0.4:3000/") is True  # type: ignore[attr-defined]
+    # Deliberately not "any origin": the socket carries source paths, stack
+    # traces and forwarded server logs.
+    assert manager._is_allowed_origin("http://evil.example.com") is False  # type: ignore[attr-defined]
+    assert manager._is_allowed_origin("http://192.168.1.11:9999") is False  # type: ignore[attr-defined]
+
+
+@pytest.mark.anyio
+async def test_websocket_endpoint_reports_a_refused_origin_once() -> None:
+    """A refusal is invisible in the browser, so the terminal has to say it."""
+
+    lines: list[str] = []
+    logger = ConsoleLogger(secho=lambda message, **_kwargs: lines.append(message))
+    manager = OverlayManager(logger=logger, allowed_origins={"http://localhost:3000"})
+
+    await manager.websocket_endpoint(StubWebSocket(origin="http://192.168.1.11:3000"))
+    await manager.websocket_endpoint(StubWebSocket(origin="http://192.168.1.11:3000"))
+    await manager.websocket_endpoint(StubWebSocket(origin="http://evil.example.com"))
+
+    refusals = [line for line in lines if "Refused a dev overlay connection" in line]
+    # One per origin — a browser reconnecting on a timer must not fill the
+    # terminal, and a second origin must not be swallowed by the first.
+    assert len(refusals) == 2
+    assert "http://192.168.1.11:3000" in refusals[0]
+    assert "http://evil.example.com" in refusals[1]
+
+
+@pytest.mark.anyio
+async def test_refused_origin_memory_stops_growing() -> None:
+    """The dedupe set is a cache, and every cache here has a bound."""
+
+    manager = OverlayManager(logger=StubLogger(), allowed_origins={"http://localhost:3000"})
+
+    for index in range(_REFUSED_ORIGIN_MEMORY + 10):
+        await manager.websocket_endpoint(
+            StubWebSocket(origin=f"http://host-{index}.test")
+        )
+
+    assert len(manager._refused_origins) == _REFUSED_ORIGIN_MEMORY  # type: ignore[attr-defined]
 
 
 @pytest.mark.anyio

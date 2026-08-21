@@ -17,6 +17,11 @@ from pyxle.ssr.paths import clear_resolved_paths
 
 from .builder import BuildFailed, BuildSummary, build_once
 from .client_files import write_client_bootstrap_files
+from .dev_origins import (
+    is_wildcard_host,
+    local_ipv4_addresses,
+    vite_reachability_warning,
+)
 from .registry import build_metadata_registry
 from .routes import RouteTable, build_route_table
 from .settings import DevServerSettings
@@ -41,18 +46,28 @@ def _attach_log_forwarding(
     overlay: "OverlayManager",
     loop: asyncio.AbstractEventLoop,
     logger: "ConsoleLogger",
+    project_root: Optional[Path] = None,
+    build_root: Optional[Path] = None,
 ) -> "BrowserConsoleLogHandler":
     """Attach the dev-only server-log → browser-console forwarding handler.
 
     Forwards INFO+ records to connected overlay clients; in verbose mode it also
-    forwards DEBUG and the framework's own internal loggers.
+    forwards DEBUG and the framework's own internal loggers. *project_root* and
+    *build_root* let a page's records be labelled with the ``.pyxl`` that
+    emitted them instead of the module key it is compiled under.
     """
     from pyxle.cli.logger import Verbosity  # noqa: PLC0415
 
     from .log_forwarding import BrowserConsoleLogHandler  # noqa: PLC0415
 
     verbose = getattr(logger, "verbosity", None) == Verbosity.VERBOSE
-    handler = BrowserConsoleLogHandler(overlay, loop, verbose=verbose)
+    handler = BrowserConsoleLogHandler(
+        overlay,
+        loop,
+        verbose=verbose,
+        project_root=project_root,
+        build_root=build_root,
+    )
     handler.attach()
     return handler
 
@@ -99,15 +114,23 @@ class DevServer:
 
         await self._ensure_node_modules(settings)
 
+        # Claim the project's dev-server record before anything generates a
+        # client config from it. The record says which addresses this project's
+        # ``vite.config.js`` describes (see ``dev_origins.active_dev_session``),
+        # and a stale one — left by a crashed run, its pid since recycled by an
+        # unrelated process — would otherwise be treated as a live server whose
+        # settings this build must preserve.
+        self._write_discovery_file(settings)
+
         summary = self._run_initial_build(settings)
         self._log_initial_build(summary)
 
         write_client_bootstrap_files(settings)
 
-        # Discovery file for editor tooling (the VS Code extension reads it to
-        # attach the debugger and open Studio). Written only after the initial
-        # build: the first build pass may rmtree a stale build root, and the
-        # watcher never observes .pyxle-build, so the file is stable from here.
+        # Re-assert the discovery file (the VS Code extension reads it to attach
+        # the debugger and open Studio): the first build pass may rmtree a stale
+        # build root, taking the claim above with it. The watcher never observes
+        # .pyxle-build, so the file is stable from here.
         self._write_discovery_file(settings)
 
         # Everything from here until the serve try/finally can still fail — most
@@ -142,6 +165,7 @@ class DevServer:
                     size=settings.ssr_workers,
                     project_root=settings.project_root,
                     client_root=settings.client_build_dir,
+                    pages_root=settings.pages_dir,
                     vite_owns_css=vite_owns_stylesheets(settings),
                 )
 
@@ -265,7 +289,9 @@ class DevServer:
             # the app is ready) and detached in the ``finally`` below so nothing
             # leaks past shutdown. Never runs under ``pyxle serve``.
             if settings.debug and overlay is not None:
-                log_forwarder = _attach_log_forwarding(overlay, loop, logger)
+                log_forwarder = _attach_log_forwarding(
+                    overlay, loop, logger, settings.project_root, settings.build_root
+                )
 
             # The readiness banner is announced from a side task rather than
             # here, because everything that can still fail — the ASGI lifespan
@@ -577,27 +603,47 @@ class DevServer:
         """
         elapsed_ms = (time.perf_counter() - start_time) * 1000
         logger.success(f"Pyxle dev server ready in {elapsed_ms:.0f} ms")
-        logger.info(
-            f"  Local:   http://{settings.starlette_host}:{settings.starlette_port}"
+        # Print addresses a browser can actually open. ``0.0.0.0`` is a bind
+        # address, not a destination — printing it verbatim gives the developer
+        # a URL that cannot be clicked.
+        local_host = (
+            "localhost"
+            if is_wildcard_host(settings.starlette_host)
+            else settings.starlette_host
         )
-        logger.info(
-            f"  Vite:    http://{settings.vite_host}:{settings.vite_port}"
+        logger.info(f"  Local:   http://{local_host}:{settings.starlette_port}")
+        if is_wildcard_host(settings.starlette_host):
+            for address in local_ipv4_addresses():
+                logger.info(
+                    f"  Network: http://{address}:{settings.starlette_port}"
+                )
+        vite_host = (
+            "localhost" if is_wildcard_host(settings.vite_host) else settings.vite_host
         )
+        logger.info(f"  Vite:    http://{vite_host}:{settings.vite_port}")
         logger.info(
             f"  Routes:  {len(route_table.pages)} page(s), "
             f"{len(route_table.apis)} API route(s)"
         )
+        # A page whose scripts are served from a host the visitor cannot reach
+        # renders completely and never hydrates, and says nothing about it in
+        # the browser. Say it here instead.
+        unreachable = vite_reachability_warning(
+            starlette_host=settings.starlette_host,
+            starlette_port=settings.starlette_port,
+            vite_host=settings.vite_host,
+            vite_port=settings.vite_port,
+        )
+        if unreachable is not None:
+            logger.warning(unreachable)
         # Surface Studio so the dashboard is discoverable — otherwise a flagship
         # dev feature is invisible unless you already know its URL.
         from .studio import STUDIO_PATH  # noqa: PLC0415
         from .studio import is_enabled as _studio_is_enabled  # noqa: PLC0415
 
         if settings.debug and _studio_is_enabled(getattr(settings, "studio", None)):
-            browser_host = settings.starlette_host
-            if browser_host in ("0.0.0.0", "::", ""):
-                browser_host = "127.0.0.1"
             logger.info(
-                f"  Studio:  http://{browser_host}:{settings.starlette_port}{STUDIO_PATH}"
+                f"  Studio:  http://{local_host}:{settings.starlette_port}{STUDIO_PATH}"
             )
 
     def _ensure_vite_port_available(self, settings: DevServerSettings) -> DevServerSettings:

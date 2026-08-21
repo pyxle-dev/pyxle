@@ -196,6 +196,152 @@ async def test_build_page_response_without_loader(settings: DevServerSettings, t
     assert overlay.events == [("clear", "/")]
 
 
+def _request_from(host: str, *, path: str = "/") -> Request:
+    """A request as it arrives from a browser that reached this server at *host*."""
+
+    return Request(
+        {
+            "type": "http",
+            "http_version": "1.1",
+            "method": "GET",
+            "path": path,
+            "root_path": "",
+            "headers": [(b"host", host.encode())],
+        }
+    )
+
+
+@pytest.mark.anyio
+async def test_page_served_to_an_unreachable_origin_says_so(
+    settings: DevServerSettings, tmp_path: Path, caplog
+) -> None:
+    """The framework's most silent failure gets exactly one line, and it is here.
+
+    A browser whose origin Vite refuses receives a whole, correct document and
+    no modules: the page renders and never becomes interactive. Vite answered
+    ``200`` and logs nothing; the browser reports it to nothing a page can see.
+    Pyxle holds both facts — the origin it served, and the allow-list it wrote —
+    so it is the only party that can name the failure.
+    """
+
+    ssr_view._warn_once.cache_clear()
+    renderer = StubRenderer()
+    renderer.responses.append(RenderResult(html="<main>hi</main>"))
+    dev_settings = replace(settings, starlette_host="0.0.0.0", starlette_port=3000)
+    page = _page_route(tmp_path, loader_name=None)
+
+    with caplog.at_level(logging.WARNING, logger="pyxle.ssr.view"):
+        await build_page_response(
+            request=_request_from("dev.internal:3000"),
+            settings=dev_settings,
+            page=page,
+            renderer=renderer,
+        )
+
+    warnings = [record.getMessage() for record in caplog.records]
+    assert any("http://dev.internal:3000" in message for message in warnings)
+    assert any("never become interactive" in message for message in warnings)
+
+
+@pytest.mark.anyio
+async def test_page_served_to_a_reachable_origin_stays_quiet(
+    settings: DevServerSettings, tmp_path: Path, caplog
+) -> None:
+    """The addresses the startup banner printed are not worth warning about."""
+
+    ssr_view._warn_once.cache_clear()
+    renderer = StubRenderer()
+    renderer.responses.append(RenderResult(html="<main>hi</main>"))
+    renderer.responses.append(RenderResult(html="<main>hi</main>"))
+    dev_settings = replace(settings, starlette_host="0.0.0.0", starlette_port=3000)
+    page = _page_route(tmp_path, loader_name=None)
+
+    with caplog.at_level(logging.WARNING, logger="pyxle.ssr.view"):
+        for host in ("192.168.1.11:3000", "localhost:3000"):
+            await build_page_response(
+                request=_request_from(host),
+                settings=dev_settings,
+                page=page,
+                renderer=renderer,
+            )
+
+    assert [record.getMessage() for record in caplog.records] == []
+
+
+@pytest.mark.anyio
+async def test_unreachable_origin_warning_is_not_repeated(
+    settings: DevServerSettings, tmp_path: Path, caplog
+) -> None:
+    """A browser reloading a dead page must not reprint the paragraph."""
+
+    ssr_view._warn_once.cache_clear()
+    renderer = StubRenderer()
+    renderer.responses.extend(RenderResult(html="<main>hi</main>") for _ in range(3))
+    dev_settings = replace(settings, starlette_host="0.0.0.0", starlette_port=3000)
+    page = _page_route(tmp_path, loader_name=None)
+
+    with caplog.at_level(logging.WARNING, logger="pyxle.ssr.view"):
+        for host in ("dev.internal:3000", "dev.internal:3000", "other.internal:3000"):
+            await build_page_response(
+                request=_request_from(host),
+                settings=dev_settings,
+                page=page,
+                renderer=renderer,
+            )
+
+    # Once per origin: repeats are silenced, a *different* origin is not.
+    assert len(caplog.records) == 2
+
+
+@pytest.mark.anyio
+async def test_production_never_warns_about_origins(
+    settings: DevServerSettings, tmp_path: Path, caplog
+) -> None:
+    ssr_view._warn_once.cache_clear()
+    renderer = StubRenderer()
+    renderer.responses.append(RenderResult(html="<main>hi</main>"))
+    prod_settings = replace(
+        settings,
+        debug=False,
+        starlette_host="0.0.0.0",
+        starlette_port=3000,
+        page_manifest={"pages/index.jsx": {"file": "assets/index.js"}},
+    )
+    page = _page_route(tmp_path, loader_name=None)
+
+    with caplog.at_level(logging.WARNING, logger="pyxle.ssr.view"):
+        await build_page_response(
+            request=_request_from("app.example.com"),
+            settings=prod_settings,
+            page=page,
+            renderer=renderer,
+        )
+
+    assert [record.getMessage() for record in caplog.records] == []
+
+
+def test_document_origin_always_carries_an_explicit_port() -> None:
+    """The allow-list is written with ports, so the comparison needs one."""
+
+    assert (
+        ssr_view._document_origin(_request_from("192.168.1.11:3000"))
+        == "http://192.168.1.11:3000"
+    )
+    assert ssr_view._document_origin(_request_from("dev.internal")) == (
+        "http://dev.internal:80"
+    )
+    # An IPv6 literal needs its brackets back before it meets a port separator.
+    assert ssr_view._document_origin(_request_from("[::1]:3000")) == "http://[::1]:3000"
+    assert ssr_view._document_origin(Request({
+        "type": "http",
+        "http_version": "1.1",
+        "method": "GET",
+        "path": "/",
+        "root_path": "",
+        "headers": [],
+    })) is None
+
+
 @pytest.mark.anyio
 async def test_build_page_navigation_response_returns_payload(
     settings: DevServerSettings,

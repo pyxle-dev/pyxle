@@ -141,6 +141,41 @@ The client receives:
 { "ok": false, "error": "Not authorised" }
 ```
 
+### When an action crashes
+
+`ActionError` is a refusal you wrote. An exception you did not expect is a bug,
+and Pyxle treats the two differently.
+
+In production the caller is told nothing about it:
+
+```json
+{ "ok": false, "error": "An unexpected error occurred." }
+```
+
+with status `500` — the real message could carry a file path, a row ID or a
+connection string, so it never leaves the server. What does leave is a log
+line, written once, with the full traceback and the action that raised it:
+
+```
+Action 'add_note' in module 'pyxle.server.pages.notes' failed: 'title'
+Traceback (most recent call last):
+  ...
+  File "pages/notes.py", line 12, in add_note
+    title = body["title"]
+KeyError: 'title'
+```
+
+That line is your only record of the failure, so collect your server's log in
+production — with nothing capturing stdout, a crash leaves no trace you can
+read afterwards. Under `pyxle dev` the same traceback is written and the
+caller additionally receives the real message.
+
+Nothing the action scheduled is applied when it crashes: cookies set through
+`request.state.cookies` and tasks added to `request.state.background` are both
+dropped, because the action's intent is unknown. A deliberate `ActionError`
+keeps both — see [Setting a cookie](#setting-a-cookie) and [Running work after
+the response](#running-work-after-the-response).
+
 ## Validating request bodies with Pydantic
 
 Reading `await request.json()` and pulling fields out by hand means writing the

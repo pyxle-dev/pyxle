@@ -436,15 +436,44 @@ class TestFailureUrlPaths:
             build_once(project)
 
         assert excinfo.value.failures[0].url_paths == ()
+        assert excinfo.value.failures[0].url_patterns == ()
 
-    def test_a_dynamic_page_records_no_url(self, project: DevServerSettings) -> None:
-        """Matching a pattern is not worth a matcher on the request path."""
+    def test_a_dynamic_page_records_a_pattern_not_a_url(
+        self, project: DevServerSettings
+    ) -> None:
+        """Kept apart from the static URLs: matching a pattern is only sound on
+        the 404 path, where no live route outranks it."""
         write_file(project.pages_dir / "[slug].pyxl", BROKEN_PAGE)
 
         with pytest.raises(BuildFailed) as excinfo:
             build_once(project)
 
         assert excinfo.value.failures[0].url_paths == ()
+        assert excinfo.value.failures[0].url_patterns == ("/{slug}",)
+
+    def test_a_nested_dynamic_page_records_its_full_pattern(
+        self, project: DevServerSettings
+    ) -> None:
+        write_file(project.pages_dir / "posts/[slug].pyxl", BROKEN_PAGE)
+
+        with pytest.raises(BuildFailed) as excinfo:
+            build_once(project)
+
+        assert excinfo.value.failures[0].url_patterns == ("/posts/{slug}",)
+
+    def test_an_optional_catchall_records_both_of_its_paths(
+        self, project: DevServerSettings
+    ) -> None:
+        """``[[...slug]].pyxl`` serves the bare prefix as well as the subtree,
+        so the static alias and the pattern are recorded separately."""
+        write_file(project.pages_dir / "docs/[[...slug]].pyxl", BROKEN_PAGE)
+
+        with pytest.raises(BuildFailed) as excinfo:
+            build_once(project)
+
+        failure = excinfo.value.failures[0]
+        assert failure.url_paths == ("/docs",)
+        assert failure.url_patterns == ("/docs/{slug:path}",)
 
 
 BROKEN_JSX_PAGE = (

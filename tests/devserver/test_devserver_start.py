@@ -1278,6 +1278,37 @@ def test_write_discovery_file_payload(tmp_path: Path) -> None:
     assert not (settings.build_root / "dev-server.json.tmp").exists()
 
 
+async def test_dev_server_claims_the_session_record_before_it_builds(
+    anyio_backend, monkeypatch, tmp_path: Path
+) -> None:
+    """The record exists before the first thing that reads it runs.
+
+    The build regenerates ``vite.config.js``, and that writer asks the record
+    which dev server the config is for. A record left by a *previous*,
+    long-dead run — its pid since recycled by an unrelated process — would
+    otherwise be treated as a live server whose addresses this build must
+    preserve. Claiming it first makes the answer this process, every time.
+    """
+
+    settings = DevServerSettings.from_project_root(tmp_path)
+    seen: Dict[str, Any] = {}
+
+    class _StopHere(RuntimeError):
+        pass
+
+    def fake_build_once(config: DevServerSettings, *, force_rebuild: bool = False):
+        seen["record"] = _read_discovery(config)
+        raise _StopHere("the build is as far as this test needs to go")
+
+    monkeypatch.setattr("pyxle.devserver.build_once", fake_build_once)
+    server = DevServer(settings=settings, logger=ConsoleLogger(secho=LogCapture()))
+
+    with pytest.raises(_StopHere):
+        await server.start()
+
+    assert seen["record"]["pid"] == os.getpid()
+
+
 def test_write_discovery_file_normalises_bind_all_host(tmp_path: Path) -> None:
     settings = DevServerSettings.from_project_root(tmp_path, starlette_host="0.0.0.0")
     server = DevServer(settings=settings, logger=ConsoleLogger(secho=LogCapture()))

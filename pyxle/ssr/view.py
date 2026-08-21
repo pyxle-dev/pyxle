@@ -12,6 +12,7 @@ import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
@@ -19,6 +20,7 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 
 from pyxle.compiler.head_elements import find_discarded_head_content
+from pyxle.devserver.dev_origins import unhydratable_origin_warning
 from pyxle.devserver.error_pages import ErrorBoundaryRegistry
 from pyxle.devserver.overlay import OverlayManager
 from pyxle.devserver.routes import PageRoute
@@ -257,6 +259,79 @@ def _enrich_render_error(exc: ComponentRenderError, page: PageRoute) -> Componen
     return exc
 
 
+def _document_host(request: Request) -> str | None:
+    """The hostname the browser used to reach this document.
+
+    Dev-only: a Vite bound to every interface answers under this name too, so
+    the ``<script src>`` in the document points at the same host the visitor
+    already typed rather than a ``localhost`` that means their own machine.
+    """
+
+    return request.url.hostname
+
+
+def _document_origin(request: Request) -> str | None:
+    """The origin this document is being served to, port always explicit.
+
+    The browser sends exactly this string as ``Origin`` on every module request
+    the document makes, so it is what the dev server's allow-list is matched
+    against. ``None`` when the request carries no host to speak of.
+    """
+
+    url = request.url
+    hostname = url.hostname
+    if not hostname:
+        return None
+    # An IPv6 literal needs its brackets back; ``hostname`` strips them, and
+    # without them the address runs into the port separator.
+    if ":" in hostname and not hostname.startswith("["):
+        hostname = f"[{hostname}]"
+    port = url.port or (443 if url.scheme == "https" else 80)
+    return f"{url.scheme}://{hostname}:{port}"
+
+
+#: How many distinct "this page cannot hydrate" warnings a process keeps, so a
+#: browser reloading a dead page does not reprint the same paragraph every time.
+#: Each entry is one origin that reached this dev server.
+_ORIGIN_WARNING_MEMORY = 32
+
+
+@lru_cache(maxsize=_ORIGIN_WARNING_MEMORY)
+def _warn_once(message: str) -> None:
+    """Emit ``message`` the first time it is seen (the cache *is* the dedupe)."""
+
+    _logger.warning("%s", message)
+
+
+def _warn_if_document_cannot_hydrate(
+    settings: DevServerSettings, request: Request
+) -> None:
+    """Report a page served to a browser Vite will not serve modules to.
+
+    The failure this catches has no other symptom: the document arrives whole
+    and correct, the module requests are refused by CORS, and React never
+    mounts. Vite logs nothing (it answered ``200``), the browser logs nothing a
+    page can see, and the developer is left with an interface that renders and
+    does nothing. Pyxle is the only party holding both facts — the origin it
+    just served, and the allow-list it generated — so it is the only one that
+    can say so.
+    """
+
+    if not settings.debug:
+        return
+    origin = _document_origin(request)
+    if origin is None:
+        return
+    message = unhydratable_origin_warning(
+        document_origin=origin,
+        starlette_host=settings.starlette_host,
+        starlette_port=settings.starlette_port,
+        vite_port=settings.vite_port,
+    )
+    if message is not None:
+        _warn_once(message)
+
+
 def _error_response(
     *,
     settings: DevServerSettings,
@@ -265,6 +340,7 @@ def _error_response(
     error: BaseException,
     status_code: int,
     already_logged: bool = False,
+    request_host: str | None = None,
 ) -> HTMLResponse:
     """Log the failure server-side, then return the sanitized HTML error page.
 
@@ -276,7 +352,11 @@ def _error_response(
     if not already_logged:
         _log_render_failure(page, stage=stage, error=error, status_code=status_code)
     fallback = render_error_document(
-        settings=settings, page=page, error=error, status_code=status_code
+        settings=settings,
+        page=page,
+        error=error,
+        status_code=status_code,
+        request_host=request_host,
     )
     return HTMLResponse(fallback, status_code=status_code)
 
@@ -338,6 +418,7 @@ async def build_page_response(
     suppress_per_user: bool = False,
 ) -> Response:
     loader_breadcrumb = _initial_loader_breadcrumb(page)
+    _warn_if_document_cannot_hydrate(settings, request)
 
     try:
         artifacts = await _create_page_artifacts(
@@ -360,6 +441,7 @@ async def build_page_response(
                 inline_styles=artifacts.inline_styles,
                 nav_cache_ttl=nav_cache_ttl,
                 auth_seed=_auth_seed_for_request(request),
+                request_host=_document_host(request),
             )
         except ManifestLookupError:
             document = render_document(
@@ -372,6 +454,7 @@ async def build_page_response(
                 inline_styles=artifacts.inline_styles,
                 nav_cache_ttl=nav_cache_ttl,
                 auth_seed=_auth_seed_for_request(request),
+                request_host=_document_host(request),
             )
             if overlay is not None:
                 await overlay.notify_clear(route_path=page.path)
@@ -506,7 +589,12 @@ async def _handle_render_exception(
                 breadcrumbs=_compose_breadcrumbs(loader_breadcrumb, stage="server", message=str(exc)),
             )
         return _error_response(
-            settings=settings, page=page, stage="server", error=exc, status_code=500,
+            settings=settings,
+            page=page,
+            stage="server",
+            error=exc,
+            status_code=500,
+            request_host=_document_host(request),
         )
 
     if overlay is not None:
@@ -538,6 +626,7 @@ async def _handle_render_exception(
         error=exc,
         status_code=status_code,
         already_logged=True,
+        request_host=_document_host(request),
     )
 
 
@@ -611,6 +700,7 @@ async def build_streaming_page_response(
                 inline_styles=(),
                 nav_cache_ttl=nav_cache_ttl,
                 auth_seed=_auth_seed_for_request(request),
+                request_host=_document_host(request),
             )
         except ManifestLookupError:
             # No client manifest to link the hydration bundle — fall back to the
@@ -871,6 +961,7 @@ async def build_not_found_response(
             head_elements=artifacts.head_elements,
             inline_styles=artifacts.inline_styles,
             auth_seed=_auth_seed_for_request(request),
+            request_host=_document_host(request),
         )
         return HTMLResponse(document, status_code=404)
     except Exception:
@@ -1412,6 +1503,7 @@ async def _try_error_boundary(
             head_elements=head_elements,
             inline_styles=render_result.inline_styles,
             auth_seed=_auth_seed_for_request(request),
+            request_host=_document_host(request),
         )
         return HTMLResponse(document, status_code=status_code)
     except Exception:

@@ -465,6 +465,46 @@ def test_create_starlette_app_combines_routes(project: DevServerSettings, monkey
         websocket.close()
 
 
+def test_overlay_socket_accepts_the_network_url_the_server_printed(
+    project: DevServerSettings, monkeypatch
+) -> None:
+    """A dev server bound to every interface answers its own ``Network:`` URL.
+
+    Hot reload, the error overlay and the build-failure page's self-reload all
+    ride this socket. Refusing the very origin the startup banner invites the
+    developer to use leaves a remote browser with none of them — and JSX edits
+    still arrive over Vite's own socket, so *some* edits land and the rest look
+    like they did.
+    """
+
+    settings = replace(project, starlette_host="0.0.0.0", starlette_port=3000)
+    build_once(settings)
+    table = build_route_table(load_metadata_registry(settings))
+
+    monkeypatch.setattr(
+        "pyxle.devserver.starlette_app.ComponentRenderer", lambda: object()
+    )
+    client = TestClient(create_starlette_app(settings, table))
+
+    for origin in (
+        "http://192.168.1.11:3000",
+        f"http://10.0.0.4:{settings.vite_port}",
+        "http://localhost:3000",
+    ):
+        with client.websocket_connect(
+            "/__pyxle__/overlay", headers={"origin": origin}
+        ) as websocket:
+            websocket.close()
+
+    # Still not every origin: the socket streams source paths and stack traces.
+    with pytest.raises(WebSocketDisconnect) as excinfo:
+        with client.websocket_connect(
+            "/__pyxle__/overlay", headers={"origin": "http://evil.example.com"}
+        ):
+            pass
+    assert getattr(excinfo.value, "code", None) == 4003
+
+
 def test_static_assets_middleware_handles_catchall_routes(project: DevServerSettings, monkeypatch, tmp_path: Path) -> None:
     write_file(
         project.pages_dir / "[...slug].pyxl",
@@ -481,7 +521,8 @@ export default function Fallback() {
     public_styles.mkdir(parents=True, exist_ok=True)
     (public_styles / "site.css").write_text("body { color: red; }", encoding="utf-8")
 
-    client_assets = tmp_path / "dist-client"
+    # The Vite bundle directory — what `pyxle serve` mounts (dist/client/dist).
+    client_assets = tmp_path / "dist-client" / "dist"
     (client_assets / "assets").mkdir(parents=True)
     (client_assets / "assets" / "bundle.js").write_text("console.log('hi')", encoding="utf-8")
 
@@ -512,7 +553,7 @@ export default function Fallback() {
     assert css_response.status_code == 200
     assert "color: red" in css_response.text
 
-    bundle_response = client.get("/client/assets/bundle.js")
+    bundle_response = client.get("/client/dist/assets/bundle.js")
     assert bundle_response.status_code == 200
     assert "console.log" in bundle_response.text
 
@@ -583,7 +624,7 @@ def test_create_starlette_app_serves_client_assets_in_production(
     )
 
     dist_root = project.project_root / "dist"
-    client_dir = dist_root / "client"
+    client_dir = dist_root / "client" / "dist"
     public_dir = dist_root / "public"
     client_dir.mkdir(parents=True, exist_ok=True)
     public_dir.mkdir(parents=True, exist_ok=True)
@@ -604,7 +645,7 @@ def test_create_starlette_app_serves_client_assets_in_production(
     assert getattr(app.state, "overlay", None) is None
 
     with TestClient(app) as client:
-        asset = client.get("/client/assets/bundle.js")
+        asset = client.get("/client/dist/assets/bundle.js")
         assert asset.status_code == 200
         assert "prod" in asset.text
 
@@ -1175,6 +1216,82 @@ def _static_assets_app(
     return app
 
 
+class TestOnlyTheBundleIsPublic:
+    """``dist/client/`` is a build-*input* tree with a bundle inside it.
+
+    Its root holds every page's unbundled JSX, Pyxle's own client components,
+    the generated ``vite.config.js`` and ``tsconfig.json`` — none of which a
+    browser ever requests; the rendered HTML references nothing outside
+    ``dist/client/dist/``. Mounting the parent published all of it, source
+    comments and all, under a one-hour cache header. The mount is rooted at the
+    bundle so those files simply are not addressable.
+    """
+
+    @staticmethod
+    def _built_client_tree(tmp_path: Path) -> Path:
+        """A miniature ``dist/client``; returns the bundle dir that gets mounted."""
+        client_root = tmp_path / "client"
+        bundle = client_root / "dist" / "assets"
+        bundle.mkdir(parents=True)
+        (bundle / "index-a1b2c3d4.js").write_text("export const x = 1;", encoding="utf-8")
+
+        # Build inputs living beside the bundle.
+        (client_root / "pages").mkdir()
+        (client_root / "pages" / "guestbook.jsx").write_text(
+            "import React from 'react';\n", encoding="utf-8"
+        )
+        (client_root / "routes").mkdir()
+        (client_root / "routes" / "guestbook.jsx").write_text("//route\n", encoding="utf-8")
+        (client_root / "pyxle").mkdir()
+        (client_root / "pyxle" / "use-auth.jsx").write_text("//hook\n", encoding="utf-8")
+        (client_root / "vite.config.js").write_text("export default {};\n", encoding="utf-8")
+        (client_root / "tsconfig.json").write_text("{}\n", encoding="utf-8")
+        (client_root / "index.html").write_text("<html></html>\n", encoding="utf-8")
+        (client_root / "manifest.json").write_text("{}\n", encoding="utf-8")
+        return client_root / "dist"
+
+    #: Every URL the leaked tree was reachable at.
+    LEAKED = [
+        "/client/pages/guestbook.jsx",
+        "/client/routes/guestbook.jsx",
+        "/client/pyxle/use-auth.jsx",
+        "/client/vite.config.js",
+        "/client/tsconfig.json",
+        "/client/index.html",
+        "/client/manifest.json",
+    ]
+
+    @pytest.mark.parametrize("url", LEAKED)
+    def test_build_inputs_are_not_served(self, tmp_path: Path, url: str) -> None:
+        client = TestClient(
+            _static_assets_app(client_directory=self._built_client_tree(tmp_path))
+        )
+        # Falls through to the app, which in a real serve is a 404 page.
+        assert client.get(url).text == "FELL-THROUGH"
+
+    @pytest.mark.parametrize("url", LEAKED)
+    def test_build_inputs_are_not_memory_cached_either(
+        self, tmp_path: Path, url: str
+    ) -> None:
+        """The production cache is consulted before any prefix test, so a leak
+        that only the disk path closed would still be served from memory."""
+        client = TestClient(
+            _cached_static_app(client_directory=self._built_client_tree(tmp_path))
+        )
+        assert client.get(url).text == "FELL-THROUGH"
+
+    def test_the_bundle_itself_still_loads(self, tmp_path: Path) -> None:
+        """The whole point: what the browser does request keeps working."""
+        client = TestClient(
+            _static_assets_app(client_directory=self._built_client_tree(tmp_path))
+        )
+
+        asset = client.get("/client/dist/assets/index-a1b2c3d4.js")
+        assert asset.status_code == 200
+        assert "export const x" in asset.text
+        assert asset.headers["cache-control"] == "public, max-age=31536000, immutable"
+
+
 def test_static_assets_middleware_passes_through_non_get_methods(
     tmp_path: Path,
 ) -> None:
@@ -1224,8 +1341,8 @@ def test_static_assets_middleware_serves_hashed_client_asset_immutable(
 ) -> None:
     """Vite hashed assets under /client/dist/assets/ are immutable and get a
     one-year ``immutable`` cache header (line 230)."""
-    client_dir = tmp_path / "client"
-    hashed_dir = client_dir / "dist" / "assets"
+    client_dir = tmp_path / "client" / "dist"
+    hashed_dir = client_dir / "assets"
     hashed_dir.mkdir(parents=True)
     (hashed_dir / "index-a1b2c3d4.js").write_text("export const x = 1;", encoding="utf-8")
 
@@ -1320,19 +1437,19 @@ class TestPublicFilesNamedLikeTheClientNamespace:
         public_dir = tmp_path / "public"
         public_dir.mkdir()
         (public_dir / "client-logo.svg").write_text("<svg/>", encoding="utf-8")
-        client_dir = tmp_path / "client"
-        client_dir.mkdir()
+        client_dir = tmp_path / "client" / "dist"
+        client_dir.mkdir(parents=True)
         (client_dir / "app.js").write_text("CLIENTJS", encoding="utf-8")
 
         client = TestClient(
             _static_assets_app(public_directory=public_dir, client_directory=client_dir)
         )
 
-        bundle = client.get("/client/app.js")
+        bundle = client.get("/client/dist/app.js")
         assert bundle.status_code == 200
         assert bundle.text == "CLIENTJS"
 
-        assert client.get("/client/missing.js").text == "FELL-THROUGH"
+        assert client.get("/client/dist/missing.js").text == "FELL-THROUGH"
 
 
 def test_try_static_strips_only_whole_segments_of_the_prefix(tmp_path: Path) -> None:
@@ -1776,8 +1893,8 @@ def test_dispatch_action_generic_exception_envelope_debug(tmp_path: Path) -> Non
 
 
 def test_dispatch_action_generic_exception_envelope_production(tmp_path: Path) -> None:
-    """In production (debug=False) the same exception is masked behind a
-    generic 'Internal server error' message (line 643 false branch)."""
+    """In production (debug=False) the same exception is masked behind the
+    generic sanitized message (line 643 false branch)."""
     from pyxle.devserver.routes import ActionRoute
     from pyxle.devserver.starlette_app import build_action_router
 
@@ -1806,7 +1923,7 @@ def test_dispatch_action_generic_exception_envelope_production(tmp_path: Path) -
     assert resp.status_code == 500
     body = resp.json()
     assert body["ok"] is False
-    assert body["error"] == "Internal server error"
+    assert body["error"] == "An unexpected error occurred."
     assert "leaky internal detail" not in resp.text
 
 
@@ -3026,8 +3143,8 @@ def test_static_memory_cache_respects_total_budget(tmp_path: Path) -> None:
 
 
 def test_static_memory_cache_hashed_client_assets_stay_immutable(tmp_path: Path) -> None:
-    client_dir = tmp_path / "client"
-    hashed_dir = client_dir / "dist" / "assets"
+    client_dir = tmp_path / "client" / "dist"
+    hashed_dir = client_dir / "assets"
     hashed_dir.mkdir(parents=True)
     (hashed_dir / "index-a1b2c3d4.js").write_text("export const x = 1;", encoding="utf-8")
 
@@ -3093,8 +3210,8 @@ def test_static_assets_middleware_dev_client_hashed_stays_immutable(
 
     from pyxle.devserver.starlette_app import StaticAssetsMiddleware
 
-    client_dir = tmp_path / "client"
-    hashed_dir = client_dir / "dist" / "assets"
+    client_dir = tmp_path / "client" / "dist"
+    hashed_dir = client_dir / "assets"
     hashed_dir.mkdir(parents=True)
     (hashed_dir / "index-a1b2c3d4.js").write_text("export const x = 1;", encoding="utf-8")
 
@@ -3455,3 +3572,193 @@ class TestBrokenSourceIsNeverServedAsHealthy:
         app = create_starlette_app(prod, table, serve_static=False)
 
         assert app.state.pyxle_build_failures is None
+
+
+class TestNeverCompiledPageIsNotA404:
+    """A page whose source has never compiled registers no route, so the
+    request lands on the 404 — where every answer is about routing, and the
+    compile error the framework already holds goes unmentioned."""
+
+    @staticmethod
+    def _app(project: DevServerSettings, monkeypatch, *, with_not_found: bool = False):
+        if with_not_found:
+            _project_with_not_found(project)
+        build_once(project)
+        table = build_route_table(load_metadata_registry(project))
+
+        async def fake_build_page_response(*, request, settings, page, renderer, **_kw):
+            return HTMLResponse(f"<div>healthy {page.path}</div>")
+
+        monkeypatch.setattr(
+            "pyxle.devserver.starlette_app.build_page_response",
+            fake_build_page_response,
+        )
+
+        async def fake_not_found(*, request, settings, renderer, error_boundaries, overlay=None):
+            return HTMLResponse("<div>Custom 404</div>", status_code=404)
+
+        monkeypatch.setattr(
+            "pyxle.devserver.starlette_app.build_not_found_response",
+            fake_not_found,
+        )
+        return create_starlette_app(project, table)
+
+    @staticmethod
+    def _record(app, **kwargs) -> None:
+        app.state.pyxle_build_failures.replace(
+            [
+                BuildFailure(
+                    message="invalid syntax",
+                    line=6,
+                    column=9,
+                    code_frame="> 6 |     x = = 1",
+                    **kwargs,
+                )
+            ]
+        )
+
+    def test_unrouted_url_serves_the_compile_error(
+        self, project: DevServerSettings, monkeypatch
+    ) -> None:
+        app = self._app(project, monkeypatch)
+        self._record(
+            app,
+            page_relative_path=Path("broken.pyxl"),
+            display_path="pages/broken.pyxl",
+            url_paths=("/broken",),
+        )
+
+        response = TestClient(app).get("/broken", headers={"accept": "text/html"})
+
+        assert response.status_code == 500
+        assert "Build failed" in response.text
+        assert "pages/broken.pyxl:6:9" in response.text
+        assert "invalid syntax" in response.text
+        assert "&gt; 6 |     x = = 1" in response.text
+        assert response.headers["cache-control"] == "no-store"
+
+    def test_the_advice_is_about_the_build_not_about_routing(
+        self, project: DevServerSettings, monkeypatch
+    ) -> None:
+        app = self._app(project, monkeypatch)
+        self._record(
+            app,
+            page_relative_path=Path("broken.pyxl"),
+            display_path="pages/broken.pyxl",
+            url_paths=("/broken",),
+        )
+
+        response = TestClient(app).get("/broken", headers={"accept": "text/html"})
+
+        assert "no route for this address" in response.text
+        assert "pages/not-found.pyxl" not in response.text
+        assert "There is nothing at this address" not in response.text
+
+    def test_a_never_compiled_dynamic_page_claims_its_urls(
+        self, project: DevServerSettings, monkeypatch
+    ) -> None:
+        app = self._app(project, monkeypatch)
+        self._record(
+            app,
+            page_relative_path=Path("shop/[sku].pyxl"),
+            display_path="pages/shop/[sku].pyxl",
+            url_patterns=("/shop/{sku}",),
+        )
+
+        response = TestClient(app).get("/shop/abc", headers={"accept": "text/html"})
+
+        assert response.status_code == 500
+        assert "pages/shop/[sku].pyxl" in response.text
+
+    def test_a_route_that_genuinely_does_not_exist_still_gets_the_404(
+        self, project: DevServerSettings, monkeypatch
+    ) -> None:
+        app = self._app(project, monkeypatch)
+        self._record(
+            app,
+            page_relative_path=Path("broken.pyxl"),
+            display_path="pages/broken.pyxl",
+            url_paths=("/broken",),
+        )
+
+        response = TestClient(app).get("/nowhere", headers={"accept": "text/html"})
+
+        assert response.status_code == 404
+        assert "<h1>Not found</h1>" in response.text
+        assert "pages/not-found.pyxl" in response.text
+        assert "Build failed" not in response.text
+
+    def test_a_clean_build_leaves_every_404_alone(
+        self, project: DevServerSettings, monkeypatch
+    ) -> None:
+        app = self._app(project, monkeypatch)
+
+        response = TestClient(app).get("/broken", headers={"accept": "text/html"})
+
+        assert response.status_code == 404
+        assert "Build failed" not in response.text
+
+    def test_a_project_not_found_page_does_not_hide_the_compile_error(
+        self, project: DevServerSettings, monkeypatch
+    ) -> None:
+        """With a ``not-found.pyxl`` the wrong answer is even more convincing:
+        the project's own designed 404 for a file that is simply broken."""
+        app = self._app(project, monkeypatch, with_not_found=True)
+        self._record(
+            app,
+            page_relative_path=Path("broken.pyxl"),
+            display_path="pages/broken.pyxl",
+            url_paths=("/broken",),
+        )
+        client = TestClient(app)
+
+        broken = client.get("/broken", headers={"accept": "text/html"})
+        missing = client.get("/nowhere", headers={"accept": "text/html"})
+
+        assert broken.status_code == 500
+        assert "Build failed" in broken.text
+        assert "Custom 404" not in broken.text
+        assert missing.status_code == 404
+        assert "Custom 404" in missing.text
+
+    def test_an_endpoint_raising_404_is_never_overruled(
+        self, project: DevServerSettings, monkeypatch
+    ) -> None:
+        """A route that ran and reported a missing *record* is telling the
+        truth; a broken catch-all page must not rewrite it as a build error."""
+        write_file(
+            project.pages_dir / "api/missing.py",
+            "from starlette.exceptions import HTTPException\n\n"
+            "async def endpoint(request):\n"
+            "    raise HTTPException(status_code=404, detail='User not found')\n",
+        )
+        app = self._app(project, monkeypatch)
+        self._record(
+            app,
+            page_relative_path=Path("[...slug].pyxl"),
+            display_path="pages/[...slug].pyxl",
+            url_patterns=("/{slug:path}",),
+        )
+
+        response = TestClient(app).get("/api/missing", headers={"accept": "application/json"})
+
+        assert response.status_code == 404
+        assert response.text == "User not found"
+
+    def test_production_404s_never_mention_the_build(
+        self, project: DevServerSettings, monkeypatch
+    ) -> None:
+        """Rule 18: a visitor must never be shown a source path. Production has
+        no registry at all, so there is nothing for the 404 path to read."""
+        build_once(project)
+        table = build_route_table(load_metadata_registry(project))
+        prod = replace(project, debug=False)
+        app = create_starlette_app(prod, table, serve_static=False)
+
+        response = TestClient(app).get("/broken", headers={"accept": "text/html"})
+
+        assert app.state.pyxle_build_failures is None
+        assert response.status_code == 404
+        assert "Build failed" not in response.text
+        assert "pages/" not in response.text
+        assert "broken.pyxl" not in response.text

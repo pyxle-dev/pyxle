@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
+import sys
+import re
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
+
+from tests.devserver.test_dev_origins import write_session
 
 from pyxle.devserver.client_files import (
     CLIENT_ENTRY_FILENAME,
@@ -30,6 +35,7 @@ from pyxle.devserver.client_files import (
     _render_use_websocket_component,
     _render_use_websocket_component_types,
     _render_vite_config,
+    dev_server_network_in_effect,
     write_client_bootstrap_files,
 )
 from pyxle.devserver.settings import DevServerSettings
@@ -209,6 +215,73 @@ def test_write_client_bootstrap_files_generates_expected_artifacts(tmp_path: Pat
     assert index_types == _render_client_runtime_index_types()
     assert link_types == _render_client_runtime_link_types()
     assert slot_types == _render_slot_runtime_types()
+
+
+def test_regenerating_keeps_the_running_dev_servers_addresses(tmp_path: Path) -> None:
+    """A second command must not reconfigure a dev server that is running.
+
+    ``pyxle routes`` (and ``check``, and ``build``) regenerate the client files
+    from the config file, where the dev server's ``--host 0.0.0.0`` never
+    appears. Vite watches its own config and restarts onto whatever it finds, so
+    a regeneration from loopback defaults silently narrows a running server's
+    CORS allow-list back to this machine: every remote browser attached to it
+    gets a page that renders, never hydrates, and reports nothing in the
+    console, the overlay or the server log.
+    """
+
+    settings = create_project(tmp_path)
+    write_session(
+        settings.build_root,
+        pid=os.getppid(),
+        server={"host": "0.0.0.0", "port": 9610},
+        vite={"host": "0.0.0.0", "port": 9611},
+    )
+
+    write_client_bootstrap_files(settings)
+    vite_config = (settings.client_build_dir / VITE_CONFIG_FILENAME).read_text(
+        encoding="utf-8"
+    )
+
+    # The running server's addresses, not this command's defaults.
+    assert "const viteHost = '0.0.0.0';" in vite_config
+    assert "?? 9611);" in vite_config
+    # …and with them, the allow-list that lets a remote browser load a module.
+    assert "cors: {" in vite_config
+    assert re.search(r"192\\\.168[^\n]*:\(\?:9610\)", vite_config)
+
+
+def test_regenerating_ignores_a_dead_dev_servers_record(tmp_path: Path) -> None:
+    """Only a *running* server's coordinates outrank the command's own.
+
+    A crashed dev server leaves its record behind; adopting it would pin the
+    project's client config to a server nobody can reach.
+    """
+
+    settings = create_project(tmp_path)
+    process = subprocess.Popen([sys.executable, "-c", ""])
+    process.wait()
+    write_session(
+        settings.build_root,
+        pid=process.pid,
+        server={"host": "0.0.0.0", "port": 9610},
+        vite={"host": "0.0.0.0", "port": 9611},
+    )
+
+    write_client_bootstrap_files(settings)
+    vite_config = (settings.client_build_dir / VITE_CONFIG_FILENAME).read_text(
+        encoding="utf-8"
+    )
+
+    assert vite_config == _render_vite_config(settings)
+    assert "const viteHost = '127.0.0.1';" in vite_config
+
+
+def test_dev_server_network_in_effect_leaves_settings_alone_without_a_session(
+    tmp_path: Path,
+) -> None:
+    settings = create_project(tmp_path)
+
+    assert dev_server_network_in_effect(settings) is settings
 
 
 def test_tsconfig_avoids_typescript_7_deprecated_options() -> None:
@@ -614,17 +687,25 @@ def test_vite_config_origin_normalises_wildcard_bind_host(tmp_path: Path) -> Non
     """A wildcard bind host (0.0.0.0 / ::) is normalised to a connectable host.
 
     Browsers cannot connect to ``0.0.0.0``/``::``, so the emitted asset origin
-    falls back to ``localhost`` — mirroring ``ssr/template.py``'s <script>
-    origin so scripts and assets always share one origin.
+    must name a host the browser can actually reach. It is resolved once, at
+    config-generation time, into a literal — **not** left as a runtime
+    ``? 'localhost'`` fallback, which was the old behaviour and the reason
+    ``pyxle dev --host 0.0.0.0`` emitted an asset origin of
+    ``http://localhost:<port>``: unusable from a phone, a container, a VM or
+    another machine, while the page itself rendered perfectly. See P0-12.
     """
 
     settings = replace(create_project(tmp_path), vite_host="0.0.0.0")
     vite_config = _render_vite_config(settings)
 
     assert "const viteHost = '0.0.0.0';" in vite_config
-    # browserHost falls back to localhost for wildcard binds.
-    assert "? 'localhost'" in vite_config
     assert "origin: `http://${browserHost}:${vitePort}`" in vite_config
+
+    # The browser-facing host is a resolved literal, and it is never the
+    # wildcard the server binds to.
+    match = re.search(r"const browserHost = '([^']+)';", vite_config)
+    assert match, "browserHost must be emitted as a resolved literal"
+    assert match.group(1) not in {"0.0.0.0", "::"}
 
 
 def test_build_public_env_defines_empty(monkeypatch) -> None:

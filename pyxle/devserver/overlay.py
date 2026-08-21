@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import traceback
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Set
@@ -12,6 +13,11 @@ from urllib.parse import urlparse
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from pyxle.cli.logger import ConsoleLogger
+
+#: How many distinct refused origins a manager remembers before it stops
+#: deduplicating its warnings. One per browser that was turned away is the
+#: realistic maximum; the cap only exists so the set cannot grow without bound.
+_REFUSED_ORIGIN_MEMORY = 64
 
 
 @dataclass(frozen=True)
@@ -30,6 +36,11 @@ class OverlayManager:
     allowed_origins:
         Set of allowed WebSocket origins (e.g. ``{"http://localhost:8000"}``).
         An empty set disables origin validation (not recommended).
+    allowed_origin_pattern:
+        Optional regex source matching further allowed origins — the
+        private-network ranges a dev server bound to every interface answers on.
+        Both come from :mod:`pyxle.devserver.dev_origins`, so the socket trusts
+        exactly the browsers the rest of the dev server trusts.
     """
 
     def __init__(
@@ -37,11 +48,20 @@ class OverlayManager:
         *,
         logger: Optional[ConsoleLogger] = None,
         allowed_origins: Set[str] | None = None,
+        allowed_origin_pattern: str | None = None,
     ) -> None:
         self._connections: Set[WebSocket] = set()
         self._lock = asyncio.Lock()
         self._logger = logger or ConsoleLogger()
         self._allowed_origins: Set[str] = allowed_origins or set()
+        self._allowed_origin_pattern = (
+            re.compile(allowed_origin_pattern) if allowed_origin_pattern else None
+        )
+        # Origins already refused, so a browser that reconnects on a timer
+        # reports itself once instead of every second. Capped at
+        # ``_REFUSED_ORIGIN_MEMORY``; past that the memory simply stops growing
+        # and later refusals log again, which is the harmless direction.
+        self._refused_origins: Set[str] = set()
         # Errors that are still unresolved, keyed by the route that reported
         # them. A browser that connects *after* the failure — the ordinary case,
         # because reloading a page reconnects the socket — is told about it on
@@ -58,7 +78,7 @@ class OverlayManager:
         (backwards-compatible default for dev servers started without
         explicit configuration).
         """
-        if not self._allowed_origins:
+        if not self._allowed_origins and self._allowed_origin_pattern is None:
             return True
         if not origin:
             # Missing Origin header — browsers always send it for
@@ -68,6 +88,10 @@ class OverlayManager:
         # Normalise trailing slashes for comparison.
         normalised = origin.rstrip("/")
         if normalised in self._allowed_origins:
+            return True
+        if self._allowed_origin_pattern is not None and self._allowed_origin_pattern.match(
+            normalised
+        ):
             return True
         # Allow the origin if its host part is localhost/127.0.0.1
         # and the port matches one of the allowed origins.
@@ -84,6 +108,25 @@ class OverlayManager:
         except Exception:  # pragma: no cover — defensive
             pass
         return False
+
+    def _report_refused_origin(self, origin: str) -> None:
+        """Say out loud that a browser was refused the dev socket.
+
+        A refusal costs the browser its hot reload and its error overlay, and
+        the page it left behind looks exactly like a working one. The developer
+        sees nothing in the browser (a closed WebSocket is not an error the page
+        surfaces) and, until this line existed, nothing in the terminal either.
+        """
+        if origin in self._refused_origins:
+            return
+        if len(self._refused_origins) < _REFUSED_ORIGIN_MEMORY:
+            self._refused_origins.add(origin)
+        self._logger.warning(
+            f"Refused a dev overlay connection from {origin} — hot reload and "
+            "the error overlay will not work in that browser. Allowed: the "
+            "addresses this dev server was started on. Restart it with --host "
+            "if it should answer that one."
+        )
 
     async def register(self, websocket: WebSocket) -> None:
         await websocket.accept()
@@ -208,6 +251,7 @@ class OverlayManager:
     async def websocket_endpoint(self, websocket: WebSocket) -> None:
         origin = websocket.headers.get("origin", "")
         if not self._is_allowed_origin(origin):
+            self._report_refused_origin(origin)
             await websocket.close(code=4003)
             return
 

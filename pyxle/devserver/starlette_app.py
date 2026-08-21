@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import inspect
+import logging
 import math
 import mimetypes
 import sys
@@ -52,8 +53,10 @@ from pyxle.ssr.view import (
 from .build_errors import (
     BuildFailureRegistry,
     find_build_failure,
+    find_unrouted_build_failure,
     render_build_failure_document,
 )
+from .dev_origins import allowed_origins, websocket_origins
 from .error_pages import ErrorBoundaryRegistry, build_error_boundary_registry
 from .middleware import (
     MiddlewareHookError,
@@ -75,7 +78,7 @@ from .route_hooks import (
 )
 from . import llms
 from .routes import ActionRoute, ApiRoute, PageRoute, RouteTable, select_static_pages
-from .settings import DevServerSettings
+from .settings import CLIENT_BUNDLE_DIR_NAME, DevServerSettings
 from .studio import STUDIO_PATH, StudioManager
 from .studio import is_enabled as _studio_is_enabled
 
@@ -240,6 +243,17 @@ class StaticFileIndex:
 #: the app's own public files and has nothing to do with it.
 _CLIENT_URL_PREFIX = "/client"
 
+#: Where the *bundle* actually mounts inside that namespace, matching the
+#: ``PYXLE_VITE_BASE`` the build hands Vite (``/client/dist/``) and the asset
+#: URLs the rendered HTML emits.
+#:
+#: Only Vite's output is public. The directory above it (``dist/client/``) is
+#: the build *input* tree — every page's unbundled JSX, Pyxle's own client
+#: components, ``vite.config.js``, ``tsconfig.json`` — which no browser ever
+#: requests. Mounting one level up published all of it, source comments and
+#: all, so the mount is rooted at the bundle instead.
+_CLIENT_ASSET_URL_PREFIX = f"{_CLIENT_URL_PREFIX}/{CLIENT_BUNDLE_DIR_NAME}"
+
 # Per-file and per-process budgets for the in-memory static cache. Both are
 # enforced once at startup (the production build is immutable, so the cache
 # never grows afterwards — bounded by construction, no runtime eviction).
@@ -364,6 +378,12 @@ def _load_static_memory_cache(
 class StaticAssetsMiddleware:
     """Serve client + public assets ahead of dynamic catch-all routes.
 
+    ``client_directory`` is Vite's bundle output and is exposed at
+    :data:`_CLIENT_ASSET_URL_PREFIX`. Anything under ``/client`` that is not in
+    that bundle falls through to the app and 404s — it is deliberately *not*
+    reachable, since the surrounding build-input tree holds page sources and
+    tool configuration that no browser requests.
+
     When ``cache_in_memory`` is enabled (production serve — the build output
     is immutable), small files are fully loaded into memory at startup and
     served without touching the filesystem or hopping to a worker thread.
@@ -405,7 +425,7 @@ class StaticAssetsMiddleware:
             public_index if public_index is not None else StaticFileIndex(public_directory)
         )
         self._client_paths = _index_static_files(
-            client_directory, prefix=_CLIENT_URL_PREFIX
+            client_directory, prefix=_CLIENT_ASSET_URL_PREFIX
         )
 
         self._memory_cache: dict[str, _CachedAsset] = {}
@@ -418,7 +438,7 @@ class StaticAssetsMiddleware:
             )
             client_cache, budget = _load_static_memory_cache(
                 client_directory,
-                prefix=_CLIENT_URL_PREFIX,
+                prefix=_CLIENT_ASSET_URL_PREFIX,
                 max_file_bytes=cache_max_file_bytes,
                 budget=budget,
             )
@@ -454,7 +474,7 @@ class StaticAssetsMiddleware:
                 scope,
                 receive,
                 send,
-                prefix=_CLIENT_URL_PREFIX,
+                prefix=_CLIENT_ASSET_URL_PREFIX,
                 debug=self._debug,
             ):
                 return
@@ -524,8 +544,9 @@ class StaticAssetsMiddleware:
 
         # Vite hashed assets (e.g. /client/dist/assets/index-a1b2c3d4.js)
         # are immutable and can be cached forever; see _static_cache_control.
+        # Only the client mount passes a prefix, matching _load_static_memory_cache.
         cache_control = _static_cache_control(
-            original_path, is_client=prefix == _CLIENT_URL_PREFIX, debug=debug
+            original_path, is_client=bool(prefix), debug=debug
         )
 
         async def _send_with_cache_headers(message):
@@ -1377,6 +1398,43 @@ def build_action_router(
 
 _MAX_ACTION_BODY_BYTES = 10 * 1024 * 1024  # 10 MB
 
+_logger = logging.getLogger(__name__)
+
+# What a caller is told when an action fails for a reason that is not its own
+# ``ActionError``. It is deliberately free of detail (CLAUDE.md rule 18) and is
+# the same sentence a page's error boundary shows for the same class of
+# failure, so ``docs/guides/error-handling.md`` can document one wording for
+# both surfaces.
+_PRODUCTION_ACTION_ERROR = "An unexpected error occurred."
+
+
+def _log_action_failure(
+    module_key: str,
+    action_name: str,
+    detail: object,
+    *,
+    error: BaseException | None = None,
+) -> None:
+    """Record a server-side log line for an action that answered ``500``.
+
+    Production action responses are deliberately sanitized -- the caller gets
+    :data:`_PRODUCTION_ACTION_ERROR` and no exception detail -- so this log is
+    the only record of what actually failed. Every ``500`` the dispatcher can
+    return calls this **before** building the response, exactly once, so the
+    record does not depend on which branch produced the failure.
+
+    Sub-500 answers stay quiet: an ``ActionError`` is the action's own reply to
+    its caller, not a server fault, and the same holds for a rejected action
+    name or an oversized body.
+    """
+    _logger.error(
+        "Action '%s' in module '%s' failed: %s",
+        action_name,
+        module_key,
+        detail,
+        exc_info=error,
+    )
+
 
 def _maybe_install_form_body_shim(request: Request) -> None:
     """Make ``await request.json()`` work for form-encoded action bodies.
@@ -1454,7 +1512,8 @@ async def _dispatch_action(
     try:
         module = _import_module(module_key, server_module_path, debug=debug)
     except ApiRouteError as exc:
-        error_msg = str(exc) if debug else "Internal server error"
+        _log_action_failure(module_key, action_name, exc, error=exc)
+        error_msg = str(exc) if debug else _PRODUCTION_ACTION_ERROR
         return JSONResponse({"ok": False, "error": error_msg}, status_code=500)
 
     # M-5: collapse existence + decorator check to prevent enumeration.
@@ -1467,9 +1526,7 @@ async def _dispatch_action(
 
     # I-5: warn when a synchronous function is decorated as @action.
     if not inspect.iscoroutinefunction(action_fn):
-        import logging as _logging  # noqa: PLC0415
-
-        _logging.getLogger(__name__).warning(
+        _logger.warning(
             "Action '%s' in module '%s' is synchronous. "
             "Actions should be async functions.",
             action_name,
@@ -1491,7 +1548,8 @@ async def _dispatch_action(
     try:
         resolved = get_cached_body_model(action_fn)
     except PydanticNotInstalledError as exc:
-        error_msg = str(exc) if debug else "Internal server error"
+        _log_action_failure(module_key, action_name, exc, error=exc)
+        error_msg = str(exc) if debug else _PRODUCTION_ACTION_ERROR
         return JSONResponse({"ok": False, "error": error_msg}, status_code=500)
 
     from pyxle.observability.otel import span  # noqa: PLC0415
@@ -1551,22 +1609,31 @@ async def _dispatch_action(
         # guidance (chained, so the original traceback stays in the log).
         # Every other exception flows through unchanged.
         attribute = missing_state_attribute(exc)
-        if attribute is not None:
-            import logging as _logging  # noqa: PLC0415
+        if attribute is None:
+            reported: BaseException = exc
+        else:
+            reported = MissingRequestStateError(attribute)
+            reported.__cause__ = exc
 
-            state_error = MissingRequestStateError(attribute)
-            state_error.__cause__ = exc
-            _logging.getLogger(__name__).error(
-                "Action '%s' failed: %s", action_name, state_error, exc_info=state_error
-            )
-            error_msg = str(state_error) if debug else "Internal server error"
-            return JSONResponse({"ok": False, "error": error_msg}, status_code=500)
-        error_msg = str(exc) if debug else "Internal server error"
+        # Log before answering, not while answering. In production the reply
+        # carries no detail, so this line is the developer's only account of
+        # the crash — and emitting it here, from one place, is what makes it
+        # happen for a plain exception and a wrapped one alike, exactly once.
+        _log_action_failure(module_key, action_name, reported, error=reported)
+        error_msg = str(reported) if debug else _PRODUCTION_ACTION_ERROR
         return JSONResponse({"ok": False, "error": error_msg}, status_code=500)
 
     _record_action_metric(request, (time.perf_counter() - _action_start) * 1000.0)
 
     if not isinstance(result, dict):
+        # The reply names the contract but not the action, and it is the same
+        # sentence for every action that breaks it — so the log is still where
+        # a developer finds out *which* one did.
+        _log_action_failure(
+            module_key,
+            action_name,
+            f"action returned {type(result).__name__}, expected a dict",
+        )
         return JSONResponse(
             {"ok": False, "error": "Action must return a JSON-serializable dict"},
             status_code=500,
@@ -1579,8 +1646,9 @@ async def _dispatch_action(
         try:
             _schedule_background_spec(request.state.background, background_spec)
         except ValueError as exc:
+            _log_action_failure(module_key, action_name, exc, error=exc)
             return JSONResponse(
-                {"ok": False, "error": str(exc) if debug else "Internal server error"},
+                {"ok": False, "error": str(exc) if debug else _PRODUCTION_ACTION_ERROR},
                 status_code=500,
             )
 
@@ -1824,6 +1892,9 @@ def create_starlette_app(
 ) -> Starlette:
     """Assemble a Starlette application exposing API/page routes and optional static mounts.
 
+    ``client_static_dir`` is Vite's *bundle output* directory (``dist/client/dist``),
+    served at :data:`_CLIENT_ASSET_URL_PREFIX` — not the build-input tree above it.
+
     If ``pool`` is an :class:`~pyxle.ssr.worker_pool.SsrWorkerPool`, renders are
     dispatched to the pool instead of spawning a new Node.js process per request.
     The pool is started in the Starlette lifespan and stopped on shutdown.
@@ -1866,14 +1937,22 @@ def create_starlette_app(
                 settings=settings, config=_studio_cfg, logger=console_logger
             )
         vite_proxy = ViteProxy(settings, logger=console_logger)
-        overlay_origins: set[str] = {
-            f"http://localhost:{settings.starlette_port}",
-            f"http://127.0.0.1:{settings.starlette_port}",
-            f"http://localhost:{settings.vite_port}",
-            f"http://127.0.0.1:{settings.vite_port}",
-        }
+        # The overlay socket is opened from the page's own origin, so the
+        # allow-list is the same one that decides which browsers may load the
+        # page's modules — a dev server that invites a phone to
+        # ``http://192.168.1.11:3000`` and then refuses that origin's socket
+        # leaves it with no hot reload and a build-failure page that promises to
+        # reload itself and never does. Still not "any origin": these sockets
+        # carry source paths, stack traces and forwarded server logs.
+        overlay_exact, overlay_pattern = websocket_origins(
+            starlette_host=settings.starlette_host,
+            starlette_port=settings.starlette_port,
+            vite_port=settings.vite_port,
+        )
         overlay = OverlayManager(
-            logger=console_logger, allowed_origins=overlay_origins
+            logger=console_logger,
+            allowed_origins=set(overlay_exact),
+            allowed_origin_pattern=overlay_pattern,
         )
 
         class _ViteProxyMiddleware(BaseHTTPMiddleware):
@@ -1901,39 +1980,22 @@ def create_starlette_app(
     # --- CORS middleware ---
     cors_middleware: Middleware | None = None
 
-    _ALL_INTERFACES = ("0.0.0.0", "::", "")
-    _LOOPBACK_HOSTS = (*_ALL_INTERFACES, "127.0.0.1", "localhost")
-
     def _vite_dev_cors_kwargs(host: str, port: int) -> dict:
         """Return ``CORSMiddleware`` origin kwargs for the Vite dev server.
 
-        Browsers treat ``localhost`` and ``127.0.0.1`` as distinct origins,
-        so both are listed when the server is on a loopback address.  When
-        bound to all interfaces (``0.0.0.0`` / ``::``), LAN access is
-        allowed via a regex restricted to ``localhost``, loopback, and
-        RFC 1918 private IP ranges — **not** arbitrary hostnames.
+        The origin policy itself lives in :mod:`pyxle.devserver.dev_origins`, so
+        Pyxle's answer to "may this origin read my responses" is the same one
+        the generated ``vite.config.js`` gives — the two servers back each other
+        rather than disagreeing about which browser is trusted.
         """
-        import re  # noqa: PLC0415
-
-        if host in _ALL_INTERFACES:
+        exact, pattern = allowed_origins(host, port)
+        if pattern is not None:
             console_logger.warning(
                 "Dev server bound to all interfaces (0.0.0.0). "
                 "CORS allows localhost and private-network origins only."
             )
-            # Match localhost, 127.0.0.1, and RFC 1918 private ranges only.
-            private_re = re.compile(
-                rf"^https?://(?:localhost|127\.0\.0\.1"
-                rf"|10\.\d{{1,3}}\.\d{{1,3}}\.\d{{1,3}}"
-                rf"|172\.(?:1[6-9]|2\d|3[01])\.\d{{1,3}}\.\d{{1,3}}"
-                rf"|192\.168\.\d{{1,3}}\.\d{{1,3}}):{port}$"
-            )
-            return {
-                "allow_origins": [f"http://localhost:{port}", f"http://127.0.0.1:{port}"],
-                "allow_origin_regex": private_re.pattern,
-            }
-        if host in _LOOPBACK_HOSTS:
-            return {"allow_origins": [f"http://localhost:{port}", f"http://127.0.0.1:{port}"]}
-        return {"allow_origins": [f"http://{host}:{port}"]}
+            return {"allow_origins": list(exact), "allow_origin_regex": pattern}
+        return {"allow_origins": list(exact)}
 
     if settings.cors is not None and getattr(settings.cors, "enabled", False):
         from starlette.middleware.cors import CORSMiddleware
@@ -2367,6 +2429,44 @@ def create_starlette_app(
     return app
 
 
+def _unrouted_build_failure_response(
+    request: Request, *, settings: DevServerSettings
+) -> HTMLResponse | None:
+    """The compile error behind an unmatched URL, if that is what happened.
+
+    A page whose source has never compiled registers no route, so the request
+    lands on the 404 path — where every answer available is about routing: the
+    built-in document says there is nothing at this address, and a project's
+    own ``not-found.pyxl`` says it in the project's own words. Both send the
+    developer to check a file that is present and correctly named, while the
+    compiler error that is the actual cause sits in the registry unmentioned.
+
+    Returns the same build-failure document a stale-artifact route serves, so
+    the two ways of arriving at a broken page look identical, and ``None``
+    whenever the URL is an ordinary 404 — which is every 404 in production,
+    where no registry is ever created.
+    """
+
+    registry = getattr(request.app.state, "pyxle_build_failures", None)
+    failure = find_unrouted_build_failure(registry, request.url.path)
+    if failure is None:
+        return None
+    return HTMLResponse(
+        render_build_failure_document(
+            failure,
+            settings=settings,
+            route_path=request.url.path,
+            # Nothing routed, so there is no earlier successful pass to blame
+            # the rendered page on — the hint has to say the opposite thing.
+            had_route=False,
+        ),
+        # The file does not build: that is a server fault, not a missing page.
+        status_code=500,
+        # A snapshot of a broken build must not outlive the fix.
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 def _make_not_found_handler(
     *,
     settings: DevServerSettings,
@@ -2377,6 +2477,12 @@ def _make_not_found_handler(
     """Create a catch-all handler that renders the nearest ``not-found.pyxl``."""
 
     async def handler(request: Request):  # pragma: no cover - thin wrapper
+        # Before the project's own 404 page: a source that never compiled has
+        # no route, and a designed "page not found" is the wrong answer for a
+        # file that is right there and simply does not build.
+        broken = _unrouted_build_failure_response(request, settings=settings)
+        if broken is not None:
+            return broken
         response = await build_not_found_response(
             request=request,
             settings=settings,
@@ -2405,10 +2511,24 @@ def _default_not_found_response(
     including an ``HTTPException``'s own ``detail`` and headers: an endpoint
     raising ``HTTPException(404, "User not found")`` must still say so, and a
     JSON caller has no use for a styled page.
+
+    Unless the address is one a page was supposed to serve and could not be
+    compiled, in which case the compile error replaces all of that — see
+    :func:`_unrouted_build_failure_response`.
     """
     from starlette.responses import HTMLResponse, PlainTextResponse
 
     from pyxle.ssr.template import render_not_found_document
+
+    # Only where the router matched nothing. Starlette merges ``endpoint`` into
+    # the scope on every match, so its absence separates "no page answered this
+    # URL" from a route that ran and deliberately raised 404 — an endpoint
+    # reporting a missing *record* is telling the truth and must not be
+    # overruled by a broken catch-all page whose pattern covers the same URL.
+    if "endpoint" not in request.scope:
+        broken = _unrouted_build_failure_response(request, settings=settings)
+        if broken is not None:
+            return broken
 
     detail = getattr(exc, "detail", None) or "Not Found"
     headers = getattr(exc, "headers", None)

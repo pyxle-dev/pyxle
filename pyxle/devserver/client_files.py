@@ -2,10 +2,22 @@
 
 from __future__ import annotations
 
+import logging
+from dataclasses import replace
 from pathlib import Path
 from textwrap import dedent, indent
 
+from .dev_origins import (
+    VITE_DEFAULT_ORIGIN_PATTERN,
+    active_dev_session,
+    allowed_hostnames,
+    allowed_origins,
+    browser_vite_host,
+    is_off_box_host,
+)
 from .settings import DevServerSettings
+
+_logger = logging.getLogger(__name__)
 
 CLIENT_ENTRY_FILENAME = "client-entry.js"
 CLIENT_HTML_FILENAME = "index.html"
@@ -76,7 +88,50 @@ def _write_text_if_changed(path: Path, contents: str) -> None:
     path.write_text(contents, encoding="utf-8")
 
 
+def dev_server_network_in_effect(settings: DevServerSettings) -> DevServerSettings:
+    """``settings`` with the running dev server's addresses, when one is running.
+
+    The generated ``vite.config.js`` is a description of a *server*: which
+    address Vite binds, which origin it declares, which browsers it serves
+    modules to. Every command that builds regenerates it — but only ``pyxle
+    dev`` was told the addresses. ``pyxle routes`` in a project whose dev server
+    is on ``0.0.0.0`` would otherwise rewrite that description from the config
+    file's loopback default, and Vite, which watches its own config, restarts
+    onto it. Nothing fails: the page still renders, every module request from a
+    remote browser is now refused, and no console message, overlay or log line
+    says so.
+
+    So the addresses come from the one process that knows them (see
+    :func:`~pyxle.devserver.dev_origins.active_dev_session`). Everything else in
+    the regenerated config — aliases, plugins, env defines — is rewritten
+    normally, which is what the command was called for.
+    """
+
+    session = active_dev_session(settings.build_root)
+    if session is None:
+        return settings
+    adopted = replace(
+        settings,
+        starlette_host=session.starlette_host,
+        starlette_port=session.starlette_port,
+        vite_host=session.vite_host,
+        vite_port=session.vite_port,
+    )
+    if adopted != settings:
+        _logger.debug(
+            "Keeping the client config for the dev server running as pid %s "
+            "(%s:%s, vite %s:%s)",
+            session.pid,
+            session.starlette_host,
+            session.starlette_port,
+            session.vite_host,
+            session.vite_port,
+        )
+    return adopted
+
+
 def write_client_bootstrap_files(settings: DevServerSettings) -> None:
+    settings = dev_server_network_in_effect(settings)
     client_root = settings.client_build_dir
     client_root.mkdir(parents=True, exist_ok=True)
 
@@ -518,9 +573,92 @@ def _project_import_aliases(project_root: Path) -> list[tuple[str, str]]:
     return aliases
 
 
+def _js_regex_literal(pattern: str) -> str:
+    """Render a regex source as a JavaScript regex literal.
+
+    Only ``/`` needs escaping: :mod:`pyxle.devserver.dev_origins` emits patterns
+    whose syntax is common to Python and JavaScript, but an unescaped slash
+    would close the literal early.
+    """
+
+    return "/" + pattern.replace("/", r"\/") + "/"
+
+
+def _render_vite_server_access(settings: DevServerSettings) -> str:
+    """Render Vite's ``cors``/``allowedHosts`` for this dev server, or nothing.
+
+    Vite 6.0.9 and later answer cross-origin asset requests only for loopback
+    origins. Pyxle serves the document from its own port, so *every* script on
+    the page is a cross-origin request — and on a dev server reachable off-box
+    (``--host 0.0.0.0``, ``--host 192.168.1.11``) the document's origin is not
+    loopback, so Vite sends no ``Access-Control-Allow-Origin`` and the browser
+    drops every module. The page renders completely and never hydrates.
+
+    So a dev server that answers off-box declares the origins it is itself
+    served from. A loopback-only dev server declares nothing and keeps Vite's
+    defaults untouched — the overwhelmingly common ``pyxle dev`` is byte-for-byte
+    the config it always was.
+    """
+
+    starlette_host = settings.starlette_host
+    if not is_off_box_host(starlette_host):
+        return ""
+
+    exact, pattern = allowed_origins(starlette_host, settings.starlette_port)
+    entries = [
+        # Setting `origin` REPLACES Vite's default allow-list, so restate it:
+        # loopback on any port, which is how the developer's own browser reaches
+        # this server.
+        _js_regex_literal(VITE_DEFAULT_ORIGIN_PATTERN),
+    ]
+    entries.extend(
+        f"'{origin}'"
+        for origin in exact
+        if "localhost" not in origin and "127.0.0.1" not in origin
+    )
+    if pattern is not None:
+        entries.append(_js_regex_literal(pattern))
+    origin_lines = "\n".join(f"                    {entry}," for entry in entries)
+
+    hostnames = allowed_hostnames(starlette_host, settings.vite_host)
+    allowed_hosts_block = ""
+    if hostnames:
+        rendered = ", ".join(f"'{name}'" for name in hostnames)
+        allowed_hosts_block = (
+            "\n                // Vite rejects a Host header it does not know "
+            "(DNS-rebinding defence).\n"
+            "                // IP literals and localhost are always accepted; a "
+            "NAMED host is not,\n"
+            "                // so every name this dev server was told to answer "
+            "to is declared here.\n"
+            f"                allowedHosts: [{rendered}],"
+        )
+
+    return (
+        "\n                // Which browser origins may read this dev server's "
+        "modules. Deliberately\n"
+        "                // NOT `cors: true`: that would let any page the "
+        "developer has open — an ad\n"
+        "                // iframe, a stray tab — read the source of the project "
+        "they are working on.\n"
+        "                // Listed instead are the origins this dev server is "
+        "itself served from.\n"
+        "                cors: {\n"
+        "                  origin: [\n"
+        f"{origin_lines}\n"
+        "                  ],\n"
+        "                },"
+        f"{allowed_hosts_block}"
+    )
+
+
 def _render_vite_config(settings: DevServerSettings) -> str:
     vite_host = settings.vite_host
     vite_port = settings.vite_port
+    browser_host = browser_vite_host(
+        vite_host=vite_host, starlette_host=settings.starlette_host
+    )
+    server_access_block = _render_vite_server_access(settings)
     define_block = _build_public_env_defines()
 
     uses_tailwind = _project_uses_tailwind(settings.project_root)
@@ -566,13 +704,11 @@ def _render_vite_config(settings: DevServerSettings) -> str:
             // origin (Pyxle) — not Vite — so they 404. Declaring Vite's public
             // `server.origin` makes it emit ABSOLUTE asset URLs against its own
             // origin instead. The bind host is normalised to a
-            // browser-connectable host the same way `ssr/template.py` does for
-            // the <script> origin, so assets and scripts always share one origin.
+            // browser-connectable host by `devserver/dev_origins.py`, the same
+            // module `ssr/template.py` asks for the <script> origin, so assets
+            // and scripts always share one origin.
             const viteHost = '{vite_host}';
-            const browserHost =
-              viteHost === '0.0.0.0' || viteHost === '::' || viteHost === ''
-                ? 'localhost'
-                : viteHost;
+            const browserHost = '{browser_host}';
             const vitePort = Number(process.env.PYXLE_VITE_PORT ?? {vite_port});
 
             __PYXLE_CSS_MODULE_HELPER__
@@ -615,7 +751,7 @@ def _render_vite_config(settings: DevServerSettings) -> str:
                 host: viteHost,
                 port: vitePort,
                 strictPort: false,
-                origin: `http://${{browserHost}}:${{vitePort}}`,
+                origin: `http://${{browserHost}}:${{vitePort}}`,{server_access_block}
                 fs: {{
                   allow: [projectRoot],
                 }},
@@ -4348,6 +4484,7 @@ __all__ = [
     "CLIENT_HTML_FILENAME",
     "VITE_CONFIG_FILENAME",
     "TSCONFIG_FILENAME",
+    "dev_server_network_in_effect",
     "write_client_bootstrap_files",
     "_render_client_entry",
   "_render_client_runtime_index",

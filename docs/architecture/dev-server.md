@@ -269,6 +269,31 @@ wraps: a broken `pages/about.pyxl` leaves `/`, `/blog` and every API
 route untouched, and a broken `pages/blog/layout.pyxl` takes down
 `/blog/*` and nothing above it.
 
+**A page that has never compiled reaches the 404 path, not a page
+handler.** No successful pass ever registered a route for it, so the
+request falls through to whatever answers unmatched URLs — the built-in
+404 document, or the project's own `not-found.pyxl`. Both describe a
+missing address, which is the wrong problem: the file is in `pages/`
+and named correctly, and the compiler error explaining why nothing
+serves it is already in the registry.
+
+So the 404 path consults the registry too, before either answer. Each
+`BuildFailure` records what the source *would* have served —
+`url_paths` for parameterless URLs, `url_patterns` for dynamic ones
+(`/posts/{slug}`, compiled with Starlette's own `compile_path` so
+matching cannot drift from routing) — and a request matching one gets
+the same `500` compile-error document a stale route serves, with the
+closing hint changed to say there is no route for the address yet. The
+most specific claim wins: a static URL over a pattern, a concrete
+pattern over a catch-all, a deeper catch-all over a shallower one.
+
+Two boundaries keep that from over-claiming. Patterns are matched
+**only** where the router matched nothing (Starlette merges `endpoint`
+into the scope on a match, and its absence is the test), so a live
+route always outranks a pattern that was never registered — an endpoint
+raising `HTTPException(404, "User not found")` still says exactly that.
+And a URL no broken source claims is an ordinary 404, unchanged.
+
 **Both halves of a `.pyxl` are checked, for the price of one.** The
 Python half is checked by `ast.parse`. The JSX half is checked by the
 Babel extractor pass that already runs on every compile to read
@@ -407,9 +432,13 @@ production tree is immutable.)
 `ViteProcess` (`devserver/vite.py`) supervises the Vite dev
 server subprocess. The Vite process is responsible for:
 
-- Bundling JSX for the browser (with React Refresh / HMR)
+- Bundling JSX for the browser
 - Serving static assets from `.pyxle-build/client/`
-- Handling client-side hot module replacement when JSX files change
+
+Vite's React Refresh runtime is present in the page, but Pyxle's own
+watcher reloads the browser on every successful rebuild
+(`_maybe_schedule_reload`), so a source edit lands as a full page
+reload rather than a hot update — see [For AI agents](../guides/for-ai-agents.md).
 
 Pyxle's dev server **does not** serve JS/CSS to the browser
 directly. Instead, it **proxies** asset requests to Vite's port.
@@ -481,6 +510,60 @@ are filtered to drop hop-by-hop fields.
 
 For non-matching requests, the middleware passes through to the
 next layer (the page/API router).
+
+### Which browsers the dev server trusts
+
+`pyxle dev` runs two HTTP servers. Pyxle serves the document; Vite
+serves the JavaScript modules that document loads. Same machine,
+different port is still a **different origin**, so every
+`<script type="module">` on the page is a cross-origin request, and
+Vite answers it only for an origin on its CORS allow-list — which by
+default is loopback only.
+
+That default is the whole reason this needs a policy. Run
+`pyxle dev --host 0.0.0.0`, open the page from a phone, and the
+document arrives complete and correct while every module request is
+refused: a page that renders and never becomes interactive. Nothing
+reports it. Vite answered `200`, so it logs nothing; a refused module
+is not a JavaScript error, so no `window.onerror` handler and no
+overlay hears about it.
+
+`devserver/dev_origins.py` is the single definition of "an origin this
+dev server may serve", and every place that has to answer the question
+reads it: the generated `vite.config.js`, Pyxle's own dev CORS
+middleware, the `<script src>` host, the overlay WebSocket, and the
+startup banner. A dev server that answers off-box allows the addresses
+it can itself be reached at — loopback, and the private-network ranges
+on its own ports. Never `cors: true`: that would let any page the
+developer happens to have open read the source of the project they are
+working on.
+
+**The generated config describes the running server.** Every command
+that builds — `pyxle routes`, `pyxle check`, `pyxle build` — regenerates
+`.pyxle-build/client/vite.config.js`, and only `pyxle dev` was told the
+addresses. Vite watches its own config and restarts onto whatever it
+finds there, so a regeneration from the config file's loopback defaults
+would silently narrow a running server's allow-list and kill every
+remote browser attached to it. So the addresses come from the one
+process that knows them: `pyxle dev` records them in
+`.pyxle-build/dev-server.json`, and any command that regenerates the
+config while that server is alive keeps them
+(`dev_origins.active_dev_session`). A record whose process is gone — a
+crashed or `kill -9`'d server — is ignored.
+
+**When it does go wrong, something says so.** Two lines exist because
+this failure otherwise has no symptom at all:
+
+- The server warns when it serves a document to an origin its own
+  allow-list does not cover ("this page … will render and never become
+  interactive"), once per origin.
+- The dev document installs a capturing `error` listener that names any
+  module from Vite's origin that failed to load, in the browser console.
+
+The overlay WebSocket uses the same allow-list, so a browser the dev
+server invited with its `Network:` URL gets hot reload and the error
+overlay too — and a refused socket is logged rather than silently
+closed.
 
 ---
 
@@ -561,11 +644,19 @@ opens a new one, so without the replay a reload made the error vanish
 while the fault remained. `"clear"` for a route drops that route's entry
 and only that one, so a healthy render of `/` never silences a build
 failure in `pages/about.pyxl`.
+The socket accepts the origins in
+[the dev server's allow-list](#which-browsers-the-dev-server-trusts) —
+the same ones Vite is told to serve modules to, so a browser that can
+load the page can also receive its reloads and errors. Any other origin
+is closed with code `4003` and named in the terminal; it is deliberately
+not "any origin", because these messages carry source paths, stack
+traces and forwarded server logs.
+
 - `"log"` — a server-side `logging` record forwarded to the browser
   devtools console (dev only). The payload carries the target
   `console` method (`info`/`warn`/`error`/`debug`), the formatted
-  message, and the originating logger name; the client prints it
-  prefixed `[pyxle:server]`. A bounded `logging.Handler`
+  message, and a display name for the source; the client prints it
+  prefixed `[pyxle:server <source>]`. A bounded `logging.Handler`
   (`devserver/log_forwarding.py`) is attached to the root logger while
   the dev server runs and detached on shutdown. It never blocks the
   event loop, drops records when no client is connected or the send
@@ -575,11 +666,34 @@ failure in `pages/about.pyxl`.
   records reachable (Python's root logger defaults to `WARNING`, which
   drops `INFO` before any handler sees it), the handler lowers the root
   logger level to `INFO` (`DEBUG` under `--verbose`) for the lifetime of
-  the dev session and restores the previous level on shutdown. A side
-  effect is that if your app has configured its own root handler (e.g.
-  via `logging.basicConfig`), your `INFO` logs also become visible in the
-  terminal during `pyxle dev`. This is dev-only; `pyxle serve` never
-  touches your logging configuration.
+  the dev session and restores the previous level on shutdown. This is
+  dev-only; `pyxle serve` never touches your logging configuration.
+
+  Two details make the canonical `log = logging.getLogger(__name__)`
+  behave the way a Python developer expects.
+
+  **Compiled pages are user code, not internals.** Inside a `.pyxl`,
+  `__name__` is the synthetic module key the dev server imports the page
+  under — `pyxle.server.pages.about` (see `registry._module_key`). The
+  namespace filter that keeps `uvicorn`, `watchfiles` and Pyxle's own
+  `pyxle.*` loggers out of the console therefore has an explicit
+  carve-out for `pyxle.server.*`: there is no such package, and every
+  logger beneath it belongs to the developer. The console prefix shows
+  the `.pyxl` file instead of that key, resolved from the record's own
+  `pathname` — compiled pages execute with their source as
+  `co_filename`, so the record already knows. A record carrying a
+  generated path instead (an API module runs from its copy under
+  `.pyxle-build/`) keeps the module key rather than naming a file nobody
+  edits.
+
+  **The terminal keeps what the browser gets.** Attaching a handler to
+  the root logger ends `logging.lastResort`, so the dev server installs
+  an equivalent stderr sink when nothing else is listening. That sink is
+  gated by a filter rather than a level: `WARNING`+ from anything
+  (exactly what `lastResort` printed) *plus* whatever is being forwarded
+  to the browser. Pinned at `WARNING` it would send the `INFO` records
+  the lowered root level exists to capture *only* to a devtools console
+  that may not be open.
 
 The browser-side overlay client lives in `pyxle/client/` and is
 included in the default scaffold.

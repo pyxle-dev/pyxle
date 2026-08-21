@@ -11,6 +11,7 @@ from pyxle.devserver.build_errors import (
     BuildFailureRegistry,
     build_code_frame,
     find_build_failure,
+    find_unrouted_build_failure,
     format_failures,
     render_build_failure_document,
 )
@@ -317,3 +318,160 @@ class TestNeverCompiledSource:
 
         assert found is not None
         assert found.display_path == "pages/about.pyxl"
+
+
+def make_unrouted_failure(
+    page_relative: str,
+    *,
+    url_paths: tuple[str, ...] = (),
+    url_patterns: tuple[str, ...] = (),
+) -> BuildFailure:
+    """A failure for a source that never compiled, so it owns URLs, not a route."""
+
+    return BuildFailure(
+        page_relative_path=Path(page_relative),
+        display_path=f"pages/{page_relative}",
+        message="invalid syntax",
+        line=6,
+        column=9,
+        url_paths=url_paths,
+        url_patterns=url_patterns,
+    )
+
+
+class TestUnroutedUrlLookup:
+    """The 404 path: a URL matched no route *because* its page does not build.
+
+    Without this the request reaches the ordinary 404, whose only advice is
+    about routing — a dead end when the file is present and correctly named.
+    """
+
+    def test_static_url_of_a_never_compiled_page_is_matched(self) -> None:
+        registry = BuildFailureRegistry()
+        registry.replace([make_unrouted_failure("about.pyxl", url_paths=("/about",))])
+
+        found = registry.find_for_unrouted_url("/about")
+
+        assert found is not None
+        assert found.display_path == "pages/about.pyxl"
+
+    def test_a_url_no_broken_page_claims_is_an_ordinary_404(self) -> None:
+        registry = BuildFailureRegistry()
+        registry.replace([make_unrouted_failure("about.pyxl", url_paths=("/about",))])
+
+        assert registry.find_for_unrouted_url("/elsewhere") is None
+
+    def test_an_empty_registry_claims_nothing(self) -> None:
+        assert BuildFailureRegistry().find_for_unrouted_url("/about") is None
+
+    def test_dynamic_page_claims_the_urls_it_would_have_served(self) -> None:
+        """``pages/posts/[slug].pyxl`` would have answered ``/posts/hello``, so
+        its failure to compile is why nothing did."""
+        registry = BuildFailureRegistry()
+        registry.replace(
+            [make_unrouted_failure("posts/[slug].pyxl", url_patterns=("/posts/{slug}",))]
+        )
+
+        found = registry.find_for_unrouted_url("/posts/hello")
+
+        assert found is not None
+        assert found.display_path == "pages/posts/[slug].pyxl"
+
+    def test_a_dynamic_pattern_does_not_claim_urls_outside_it(self) -> None:
+        registry = BuildFailureRegistry()
+        registry.replace(
+            [make_unrouted_failure("posts/[slug].pyxl", url_patterns=("/posts/{slug}",))]
+        )
+
+        assert registry.find_for_unrouted_url("/posts/a/b") is None
+        assert registry.find_for_unrouted_url("/shop/hello") is None
+
+    def test_catchall_pattern_claims_its_whole_subtree(self) -> None:
+        registry = BuildFailureRegistry()
+        registry.replace(
+            [make_unrouted_failure("docs/[...path].pyxl", url_patterns=("/docs/{path:path}",))]
+        )
+
+        assert registry.find_for_unrouted_url("/docs/a/b/c") is not None
+        assert registry.find_for_unrouted_url("/guides/a") is None
+
+    def test_a_static_url_outranks_a_pattern_that_also_matches(self) -> None:
+        registry = BuildFailureRegistry()
+        registry.replace(
+            [
+                make_unrouted_failure("[...slug].pyxl", url_patterns=("/{slug:path}",)),
+                make_unrouted_failure("about.pyxl", url_paths=("/about",)),
+            ]
+        )
+
+        found = registry.find_for_unrouted_url("/about")
+
+        assert found is not None
+        assert found.display_path == "pages/about.pyxl"
+
+    def test_a_concrete_pattern_outranks_a_catchall(self) -> None:
+        registry = BuildFailureRegistry()
+        registry.replace(
+            [
+                make_unrouted_failure("[...slug].pyxl", url_patterns=("/{slug:path}",)),
+                make_unrouted_failure("posts/[slug].pyxl", url_patterns=("/posts/{slug}",)),
+            ]
+        )
+
+        found = registry.find_for_unrouted_url("/posts/hello")
+
+        assert found is not None
+        assert found.display_path == "pages/posts/[slug].pyxl"
+
+    def test_the_deeper_catchall_wins_over_the_shallower_one(self) -> None:
+        registry = BuildFailureRegistry()
+        registry.replace(
+            [
+                make_unrouted_failure("[...slug].pyxl", url_patterns=("/{slug:path}",)),
+                make_unrouted_failure(
+                    "docs/[...path].pyxl", url_patterns=("/docs/{path:path}",)
+                ),
+            ]
+        )
+
+        found = registry.find_for_unrouted_url("/docs/intro")
+
+        assert found is not None
+        assert found.display_path == "pages/docs/[...path].pyxl"
+
+    def test_absent_registry_never_claims_a_url(self) -> None:
+        """Production never builds a registry, so the 404 check tolerates None."""
+        assert find_unrouted_build_failure(None, "/about") is None
+        assert find_unrouted_build_failure(object(), "/about") is None
+
+    def test_helper_delegates_to_a_real_registry(self) -> None:
+        registry = BuildFailureRegistry()
+        registry.replace([make_unrouted_failure("about.pyxl", url_paths=("/about",))])
+
+        assert find_unrouted_build_failure(registry, "/about") is not None
+        assert find_unrouted_build_failure(registry, "/other") is None
+
+
+class TestBuildFailureHint:
+    """The closing hint has to match how the developer got here."""
+
+    def test_a_route_that_used_to_work_explains_the_page_they_were_seeing(
+        self, settings: DevServerSettings
+    ) -> None:
+        html = render_build_failure_document(make_failure("about.pyxl"), settings=settings)
+
+        assert "the last one that compiled" in html
+        assert "no route for this address" not in html
+
+    def test_a_page_that_never_compiled_says_routing_is_not_the_problem(
+        self, settings: DevServerSettings
+    ) -> None:
+        """The whole point of the fix: the file *is* in pages/ and *is* named
+        correctly, so the hint must not send the reader looking there."""
+        html = render_build_failure_document(
+            make_failure("about.pyxl"), settings=settings, had_route=False
+        )
+
+        assert "no route for this address" in html
+        assert "right place with the right name is not the problem" in html
+        assert "the last one that compiled" not in html

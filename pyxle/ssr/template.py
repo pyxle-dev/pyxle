@@ -8,6 +8,7 @@ from html import escape
 from typing import Any, Final
 
 from pyxle.config import default_csrf_cookie_name
+from pyxle.devserver.dev_origins import browser_vite_host
 from pyxle.devserver.routes import PageRoute
 from pyxle.devserver.settings import DevServerSettings
 from pyxle.devserver.styles import load_inline_stylesheets
@@ -34,16 +35,24 @@ def vite_owns_stylesheets(settings: DevServerSettings) -> bool:
     return not settings.debug and settings.page_manifest is not None
 
 
-def _browser_vite_origin(settings: DevServerSettings) -> str:
+def _browser_vite_origin(
+    settings: DevServerSettings, request_host: str | None = None
+) -> str:
     """Return a browser-connectable origin for the Vite dev server.
 
     Bind addresses like ``0.0.0.0`` or ``::`` are valid for *listening* but
-    browsers cannot connect to them.  Replace with ``localhost`` so that
-    ``<script src="...">`` tags in the HTML actually resolve.
+    browsers cannot connect to them, so a ``<script src="http://0.0.0.0:5173/…">``
+    never loads. ``request_host`` is the hostname the browser used to reach this
+    document: when Vite binds every interface it answers under that name too, so
+    a page served at ``http://192.168.1.11:3000`` correctly loads its scripts
+    from ``http://192.168.1.11:5173`` instead of a ``localhost`` that means the
+    visitor's own machine. See :mod:`pyxle.devserver.dev_origins`.
     """
-    host = settings.vite_host
-    if host in ("0.0.0.0", "::", ""):
-        host = "localhost"
+    host = browser_vite_host(
+        vite_host=settings.vite_host,
+        starlette_host=settings.starlette_host,
+        request_host=request_host,
+    )
     return f"http://{host}:{settings.vite_port}"
 
 
@@ -76,6 +85,7 @@ def render_document(
   inline_styles: tuple[InlineStyleFragment, ...] = tuple(),
   nav_cache_ttl: int | None = None,
   auth_seed: Any = _AUTH_SEED_ABSENT,
+  request_host: str | None = None,
 ) -> str:
   """Compose the HTML document for a rendered page."""
   try:
@@ -88,6 +98,7 @@ def render_document(
       inline_styles=inline_styles,
       nav_cache_ttl=nav_cache_ttl,
       auth_seed=auth_seed,
+      request_host=request_host,
     )
   except ManifestLookupError:
     return _render_manifest_error(page)
@@ -104,6 +115,7 @@ def build_document_shell(
   inline_styles: tuple[InlineStyleFragment, ...] = tuple(),
   nav_cache_ttl: int | None = None,
   auth_seed: Any = _AUTH_SEED_ABSENT,
+  request_host: str | None = None,
 ) -> DocumentShell:
   props_payload = _serialize_props(props)
   page_path_literal = json.dumps(page.client_asset_path)
@@ -234,22 +246,24 @@ def build_document_shell(
     )
     return DocumentShell(prefix=prefix, suffix=suffix)
 
-  vite_origin = _browser_vite_origin(settings)
+  vite_origin = _browser_vite_origin(settings, request_host)
+  module_load_reporter = _render_module_load_reporter(vite_origin, nonce_attr)
   react_refresh_preamble = _render_react_refresh_preamble(vite_origin, nonce_attr)
   before_interactive_scripts = _render_before_interactive_scripts(page.scripts, nonce_attr)
   scripts_metadata = _serialize_scripts_metadata(page.scripts)
-  
+
   prefix = """<!DOCTYPE html>
 <html lang=\"en\">
   <head>
   <meta charset=\"utf-8\" />
-  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />{module_load_reporter}
   <script type=\"module\" src=\"{vite_origin}/@vite/client\"{nonce_attr}></script>{react_refresh_preamble}{before_interactive_scripts}{global_styles}{inline_styles_markup}{head_block}
   </head>
   <body>
   <div id=\"root\">""".format(
     vite_origin=vite_origin,
     nonce_attr=nonce_attr,
+    module_load_reporter=module_load_reporter,
     react_refresh_preamble=react_refresh_preamble,
     before_interactive_scripts=before_interactive_scripts,
     global_styles=global_styles,
@@ -418,6 +432,41 @@ def _head_contains_title(elements: tuple[str, ...]) -> bool:
     return False
 
 
+def _render_module_load_reporter(vite_origin: str, nonce_attr: str) -> str:
+    """A dev-only listener that says when the page's modules never arrived.
+
+    Every interactive part of a Pyxle page comes from a ``<script
+    type="module">`` served by Vite, cross-origin. When Vite declines the
+    document's origin the browser drops those responses and the page stays
+    exactly as the server rendered it: complete, styled, and inert. Nothing in
+    the page reports it — a refused module is not a JavaScript error, so no
+    ``window.onerror`` handler and no framework overlay ever hears about it.
+
+    Resource load failures do reach a *capturing* listener on ``window``, which
+    is what this installs: one line in the console naming the module that never
+    loaded, so the browser stops being the only place that says nothing. The
+    server side of the same failure is
+    :func:`pyxle.devserver.dev_origins.unhydratable_origin_warning`.
+    """
+
+    return """
+    <script{nonce_attr}>
+      window.addEventListener('error', function (event) {{
+        var el = event.target;
+        if (!el || el.tagName !== 'SCRIPT' || !el.src) {{ return; }}
+        if (el.src.indexOf("{vite_origin}") !== 0) {{ return; }}
+        console.error(
+          '[Pyxle] ' + el.src + ' did not load, so this page will not become ' +
+          'interactive. The usual cause is that the dev server does not serve ' +
+          'modules to ' + window.location.origin + ': open the page at one of ' +
+          'the addresses it printed at startup, or restart it with --host so ' +
+          'it answers on this one.'
+        );
+      }}, true);
+    </script>
+""".format(vite_origin=vite_origin, nonce_attr=nonce_attr)
+
+
 def _render_react_refresh_preamble(vite_origin: str, nonce_attr: str) -> str:
     return """
     <script type=\"module\"{nonce_attr}>
@@ -494,6 +543,7 @@ def render_error_document(
     page: PageRoute,
     error: BaseException,
     status_code: int = 500,
+    request_host: str | None = None,
 ) -> str:
     """Render a fallback HTML document when SSR fails.
 
@@ -519,7 +569,7 @@ def render_error_document(
 
     from pyxle.devserver._security import redact_sensitive_patterns
 
-    vite_origin = _browser_vite_origin(settings)
+    vite_origin = _browser_vite_origin(settings, request_host)
     error_type = escape(error.__class__.__name__)
     raw_message = str(error) or error.__class__.__name__
     message = escape(redact_sensitive_patterns(raw_message))

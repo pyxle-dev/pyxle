@@ -21,10 +21,12 @@ this path.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
+from functools import lru_cache
 from html import escape
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, Sequence
+from typing import TYPE_CHECKING, Final, Sequence
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from .routes import PageRoute
@@ -61,6 +63,11 @@ class BuildFailure:
     #: its own, so a dynamic or catch-all page answers its URL — with a
     #: perfectly healthy 200 for a file that does not build.
     url_paths: tuple[str, ...] = ()
+    #: The parameterised route patterns (``/posts/{slug}``) this source would
+    #: have served. Kept apart from :attr:`url_paths` because matching them
+    #: costs a regex and is only ever correct where *no* route matched at all:
+    #: a live route always outranks a pattern that was never registered.
+    url_patterns: tuple[str, ...] = ()
 
     @property
     def location(self) -> str:
@@ -151,6 +158,38 @@ class BuildFailureRegistry:
                 return failure
         return None
 
+    def find_for_unrouted_url(self, url_path: str) -> BuildFailure | None:
+        """The failure that explains why *url_path* matched no route at all.
+
+        Only for the 404 path. A source that has never compiled registers no
+        route, so the request falls through to the 404 handler, which would
+        otherwise advise the developer about routing — telling them to check a
+        file that is present and correctly named while the compiler error the
+        framework already has sits unmentioned.
+
+        Broader than :meth:`find_for_url`: because nothing matched, a *dynamic*
+        source that failed to compile is a candidate too. That inference is
+        sound only here — had ``pages/posts/[slug].pyxl`` compiled, it would
+        have answered ``/posts/hello``, so its absence is the reason there is
+        no route. On a request a live route did match, the live route is the
+        truth and a pattern must never override it.
+
+        The most specific match wins: a static URL over any pattern, a concrete
+        pattern over a catch-all, and a deeper pattern over a shallower one.
+        """
+
+        static = self.find_for_url(url_path)
+        if static is not None:
+            return static
+        matches: list[tuple[tuple[int, int], str, int]] = []
+        for index, failure in enumerate(self._failures):
+            for pattern in failure.url_patterns:
+                if _pattern_matches(pattern, url_path):
+                    matches.append((_pattern_specificity(pattern), pattern, index))
+        if not matches:
+            return None
+        return self._failures[min(matches)[2]]
+
     def find_for_page(self, page_relative_path: Path) -> BuildFailure | None:
         """The failure that stops *page_relative_path* rendering, if any.
 
@@ -178,6 +217,38 @@ class BuildFailureRegistry:
         # Deepest wrapper directory = nearest ancestor of the page.
         nearest = max(wrappers, key=lambda key: (len(PurePosixPath(key).parts), key))
         return wrappers[nearest]
+
+
+@lru_cache(maxsize=256)
+def _compiled_pattern(pattern: str) -> re.Pattern[str]:
+    """Starlette's own regex for *pattern*, so matching cannot drift from routing.
+
+    Bounded LRU (256 entries, least-recently-used evicted): the keys are route
+    patterns of failing sources, so the working set is tiny, and an entry is a
+    pure function of its key — eviction only costs a recompile.
+    """
+
+    from starlette.routing import compile_path  # noqa: PLC0415 - lazy, 404 path only
+
+    regex, _format, _convertors = compile_path(pattern)
+    return regex
+
+
+def _pattern_matches(pattern: str, url_path: str) -> bool:
+    """Whether *url_path* would have been served by the route *pattern*."""
+
+    return _compiled_pattern(pattern).match(url_path) is not None
+
+
+def _pattern_specificity(pattern: str) -> tuple[int, int]:
+    """Sort key ranking route patterns from most to least specific.
+
+    A catch-all (``{slug:path}``) swallows whole subtrees, so it loses to any
+    concrete pattern; among equals the one with more segments is the closer
+    description of the URL.
+    """
+
+    return (1 if ":path}" in pattern else 0, -pattern.count("/"))
 
 
 def _wraps(wrapper_dir: PurePosixPath, page: PurePosixPath) -> bool:
@@ -212,11 +283,26 @@ def find_build_failure(
     return registry.find_for_url(url_path)
 
 
+def find_unrouted_build_failure(registry: object, url_path: str) -> BuildFailure | None:
+    """The compile failure behind *url_path* matching no route, if any.
+
+    The 404 counterpart to :func:`find_build_failure`. Same loose typing and
+    the same reason for it: the registry is read off ``app.state``, where a
+    production app never has one, so the check costs one attribute read and a
+    ``None`` test before every ordinary 404.
+    """
+
+    if not isinstance(registry, BuildFailureRegistry):
+        return None
+    return registry.find_for_unrouted_url(url_path)
+
+
 def render_build_failure_document(
     failure: BuildFailure,
     *,
     settings: "DevServerSettings",
     route_path: str | None = None,
+    had_route: bool = True,
 ) -> str:
     """Render the dev page served in place of a stale, still-compiling render.
 
@@ -226,6 +312,11 @@ def render_build_failure_document(
     before reading a word of it — with the content a compile failure actually
     has: the file, the line and column, the compiler's message, and the source
     around it.
+
+    ``had_route`` is False when the source has never compiled, so no route was
+    ever registered for it. Only the closing hint differs, but it has to: there
+    was no previous version to have been looking at, and what the developer saw
+    instead was a 404 that blamed the address.
 
     The page reconnects to the dev overlay socket and reloads itself when the
     next rebuild succeeds, so fixing the file is the whole recovery procedure.
@@ -250,6 +341,7 @@ def render_build_failure_document(
     if failure.code_frame:
         rendered = escape(redact_sensitive_patterns(failure.code_frame))
         frame = f'\n      <pre class="pyxle-frame">{rendered}</pre>'
+    hint = _STALE_ROUTE_HINT if had_route else _NO_ROUTE_HINT
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -275,14 +367,31 @@ def render_build_failure_document(
       <p>Pyxle could not compile <code>{display_path}</code>, so {subject}.</p>
       <p><code>{location}</code></p>
       <pre>{message}</pre>{frame}
-      <p class="pyxle-hint">Fix the file and save — this page reloads itself
-      once the rebuild succeeds. The version you were seeing before was the
-      last one that compiled, which is why it looked fine.</p>
+      <p class="pyxle-hint">{hint}</p>
     </main>
     <script>{_RELOAD_SCRIPT}</script>
   </body>
 </html>
 """
+
+
+#: Shown when the route exists from an earlier, successful pass. Names the
+#: previous render explicitly, because a page that looked healthy a moment ago
+#: is the confusing part.
+_STALE_ROUTE_HINT: Final[str] = (
+    "Fix the file and save — this page reloads itself once the rebuild "
+    "succeeds. The version you were seeing before was the last one that "
+    "compiled, which is why it looked fine."
+)
+
+#: Shown when the source has never compiled, so no route was ever registered.
+#: Says so outright: without it the developer is left with a 404 blaming the
+#: address, and goes looking for a routing mistake that was never made.
+_NO_ROUTE_HINT: Final[str] = (
+    "Fix the file and save — this page reloads itself once the rebuild "
+    "succeeds. Until it compiles there is no route for this address, so the "
+    "file being in the right place with the right name is not the problem."
+)
 
 
 #: Reconnects to the dev overlay socket and reloads once a rebuild succeeds.
@@ -321,6 +430,7 @@ __all__ = [
     "BuildFailureRegistry",
     "build_code_frame",
     "find_build_failure",
+    "find_unrouted_build_failure",
     "format_failures",
     "render_build_failure_document",
 ]

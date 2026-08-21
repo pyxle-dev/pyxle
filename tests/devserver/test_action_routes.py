@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import sys
 from pathlib import Path
 from textwrap import dedent
@@ -1376,7 +1377,7 @@ def test_action_dispatch_missing_state_generic_in_production(tmp_path: Path) -> 
     assert response.status_code == 500
     data = response.json()
     assert data["ok"] is False
-    assert data["error"] == "Internal server error"
+    assert data["error"] == "An unexpected error occurred."
 
 
 def test_action_dispatch_other_attribute_error_flows_through(tmp_path: Path) -> None:
@@ -1522,3 +1523,167 @@ class TestAnActionCanSetACookie:
 
         headers = response.headers.get_list("set-cookie")
         assert [h.split(";")[0] for h in headers] == ["a=1", "b=2"]
+
+
+# ---------------------------------------------------------------------------
+# A failed action is written to the server log
+# ---------------------------------------------------------------------------
+
+
+class TestAFailedActionIsLogged:
+    """In production the caller is told nothing, so the log is the only record.
+
+    Each test asserts the record exists **and** that there is exactly one of
+    it: the dispatcher wraps some exceptions before answering, and logging on
+    both sides of that wrap would report a single crash twice.
+    """
+
+    ACTION_LOGGER = "pyxle.devserver.starlette_app"
+
+    def _app(self, tmp_path: Path, *, page: str, body: str, debug: bool = False) -> TestClient:
+        module_path = _write_module(tmp_path / "server" / "pages" / f"{page}.py", body)
+        route = ActionRoute(
+            path=f"/api/__actions/{page}/run",
+            page_path=f"/{page}",
+            action_name="run",
+            server_module_path=module_path,
+            module_key=f"pyxle.server.pages.{page}",
+        )
+        router = build_action_router([route], debug=debug)
+
+        from starlette.applications import Starlette
+
+        app = Starlette()
+        app.router.routes.extend(router.routes)
+        return TestClient(app, raise_server_exceptions=False)
+
+    @staticmethod
+    def _failures(caplog) -> list:
+        return [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+    def test_a_crashing_action_writes_one_traceback(self, tmp_path: Path, caplog) -> None:
+        """The regression P0-13 was filed for: the response is sanitized and
+        the log was empty, leaving the crash with no record anywhere."""
+        client = self._app(tmp_path, page="log_crash", body="""
+        from pyxle.runtime import action
+
+        @action
+        async def run(request):
+            raise ValueError("boom from action")
+        """)
+
+        with caplog.at_level(logging.ERROR, logger=self.ACTION_LOGGER):
+            response = client.post("/api/__actions/log_crash/run", json={})
+
+        assert response.status_code == 500
+        assert response.json()["error"] == "An unexpected error occurred."
+        assert "boom from action" not in response.text
+
+        failures = self._failures(caplog)
+        assert len(failures) == 1
+        record = failures[0]
+        assert record.exc_info is not None
+        assert isinstance(record.exc_info[1], ValueError)
+        # The traceback names the action and the module, so a developer
+        # reading only the log knows which one of their actions crashed.
+        assert "run" in record.getMessage()
+        assert "log_crash" in record.getMessage()
+
+    def test_a_wrapped_failure_is_still_logged_only_once(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """An unset ``request.state`` attribute is re-raised as guidance. The
+        wrap chains the original, so one record carries both -- and the branch
+        that builds the guidance must not log on top of the shared path."""
+        client = self._app(tmp_path, page="log_state", body="""
+        from pyxle.runtime import action
+
+        @action
+        async def run(request):
+            request.state.db.execute("SELECT 1")
+            return {}
+        """)
+
+        with caplog.at_level(logging.ERROR, logger=self.ACTION_LOGGER):
+            response = client.post("/api/__actions/log_state/run", json={})
+
+        assert response.status_code == 500
+        failures = self._failures(caplog)
+        assert len(failures) == 1
+        logged = failures[0].exc_info[1]
+        assert "db" in str(logged)
+        # The bare AttributeError survives as the cause, so the traceback
+        # still points at the line that read the attribute.
+        assert isinstance(logged.__cause__, AttributeError)
+
+    def test_an_action_returning_a_non_dict_names_itself(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """The reply is the same sentence for every action that breaks the
+        contract, so only the log says which one did."""
+        client = self._app(tmp_path, page="log_nondict", body="""
+        from pyxle.runtime import action
+
+        @action
+        async def run(request):
+            return ["not", "a", "dict"]
+        """)
+
+        with caplog.at_level(logging.ERROR, logger=self.ACTION_LOGGER):
+            response = client.post("/api/__actions/log_nondict/run", json={})
+
+        assert response.status_code == 500
+        failures = self._failures(caplog)
+        assert len(failures) == 1
+        message = failures[0].getMessage()
+        assert "log_nondict" in message
+        assert "list" in message
+
+    def test_an_action_error_is_not_a_server_fault(self, tmp_path: Path, caplog) -> None:
+        """A deliberate refusal is the action's own answer to its caller. It
+        must not fill the error log -- that is what makes a real crash findable."""
+        client = self._app(tmp_path, page="log_refusal", body="""
+        from pyxle.runtime import action, ActionError
+
+        @action
+        async def run(request):
+            raise ActionError("Not authorised", status_code=403)
+        """)
+
+        with caplog.at_level(logging.ERROR, logger=self.ACTION_LOGGER):
+            response = client.post("/api/__actions/log_refusal/run", json={})
+
+        assert response.status_code == 403
+        assert self._failures(caplog) == []
+
+    def test_development_logs_the_crash_it_also_shows(self, tmp_path: Path, caplog) -> None:
+        """``pyxle dev`` returns the real message; the log is written all the
+        same, so the two environments differ only in what the caller sees."""
+        client = self._app(tmp_path, page="log_dev", body="""
+        from pyxle.runtime import action
+
+        @action
+        async def run(request):
+            raise ValueError("boom in dev")
+        """, debug=True)
+
+        with caplog.at_level(logging.ERROR, logger=self.ACTION_LOGGER):
+            response = client.post("/api/__actions/log_dev/run", json={})
+
+        assert response.status_code == 500
+        assert response.json()["error"] == "boom in dev"
+        assert len(self._failures(caplog)) == 1
+
+
+def test_action_and_page_share_one_production_wording() -> None:
+    """A crashing action and a crashing loader are the same class of failure,
+    so a developer designing for one message is designing for both. These two
+    constants drifting apart is what made the action wording undocumented."""
+    from pyxle.devserver.starlette_app import _PRODUCTION_ACTION_ERROR
+
+    boundary_message = (
+        Path(__file__).resolve().parents[2] / "pyxle" / "ssr" / "view.py"
+    ).read_text(encoding="utf-8")
+
+    assert _PRODUCTION_ACTION_ERROR == "An unexpected error occurred."
+    assert f'"message"] = "{_PRODUCTION_ACTION_ERROR}"' in boundary_message

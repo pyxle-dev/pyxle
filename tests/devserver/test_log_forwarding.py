@@ -32,8 +32,9 @@ def _make_record(
     name: str = "app.users",
     level: int = logging.INFO,
     msg: str = "hello",
+    pathname: str = __file__,
 ) -> logging.LogRecord:
-    return logging.LogRecord(name, level, __file__, 1, msg, None, None)
+    return logging.LogRecord(name, level, pathname, 1, msg, None, None)
 
 
 def _sync_scheduler(coro, loop) -> None:
@@ -147,6 +148,141 @@ def test_non_internal_lookalike_logger_is_forwarded() -> None:
     handler.emit(_make_record(name="pyxletools", level=logging.INFO, msg="ok"))
 
     assert overlay.calls == [("info", "ok", "pyxletools")]
+
+
+class TestCompiledPagesAreUserCodeNotInternals:
+    """``log = logging.getLogger(__name__)`` at the top of a ``.pyxl`` must work.
+
+    Inside a compiled page ``__name__`` is the synthetic module key the dev
+    server imports it under — ``pyxle.server.pages.about``. Matching that
+    against the ``pyxle`` internals prefix classifies the developer's own page
+    as framework noise and drops it, so the single most common line of Python
+    logging anyone writes produces nothing in the browser at all.
+    """
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "pyxle.server.pages.about",
+            "pyxle.server.pages.blog.slug_1a2b3c",
+            "pyxle.server.api.orders",
+            "pyxle.server",
+        ],
+    )
+    def test_page_and_api_module_loggers_are_forwarded(self, name: str) -> None:
+        overlay = FakeOverlay()
+        handler = BrowserConsoleLogHandler(overlay, loop=None, scheduler=_sync_scheduler)
+
+        handler.emit(_make_record(name=name, level=logging.INFO, msg="from my page"))
+
+        assert [call[1] for call in overlay.calls] == ["from my page"]
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "pyxle",
+            "pyxle.ssr.renderer",
+            "pyxle.devserver.vite",
+            "pyxle.serverless",  # a lookalike: not the pyxle.server namespace
+            "uvicorn.access",
+            "watchfiles.main",
+        ],
+    )
+    def test_real_internals_are_still_dropped(self, name: str) -> None:
+        """The carve-out must not reopen the flood the filter exists to stop."""
+        overlay = FakeOverlay()
+        handler = BrowserConsoleLogHandler(overlay, loop=None, scheduler=_sync_scheduler)
+
+        handler.emit(_make_record(name=name, level=logging.INFO, msg="noise"))
+
+        assert overlay.calls == []
+
+
+class TestBrowserPrefixNamesTheSourceFile:
+    """The console prefix should name something the developer recognises."""
+
+    def test_a_page_is_labelled_by_its_pyxl_source(self, tmp_path) -> None:
+        overlay = FakeOverlay()
+        handler = BrowserConsoleLogHandler(
+            overlay, loop=None, project_root=tmp_path, scheduler=_sync_scheduler
+        )
+
+        handler.emit(
+            _make_record(
+                name="pyxle.server.pages.about",
+                msg="hi",
+                pathname=str(tmp_path / "pages" / "about.pyxl"),
+            )
+        )
+
+        # Not "pyxle.server.pages.about" — the file they actually wrote.
+        assert overlay.calls == [("info", "hi", "pages/about.pyxl")]
+
+    def test_a_hand_named_logger_keeps_its_own_name(self, tmp_path) -> None:
+        """Only the auto-generated module key is replaced."""
+        overlay = FakeOverlay()
+        handler = BrowserConsoleLogHandler(
+            overlay, loop=None, project_root=tmp_path, scheduler=_sync_scheduler
+        )
+
+        handler.emit(
+            _make_record(
+                name="shopapp",
+                msg="hi",
+                pathname=str(tmp_path / "pages" / "about.pyxl"),
+            )
+        )
+
+        assert overlay.calls == [("info", "hi", "shopapp")]
+
+    def test_a_generated_artifact_path_is_never_shown(self, tmp_path) -> None:
+        """Only pages get the ``.pyxl`` line remap.
+
+        An API module runs from its copy under ``.pyxle-build``, so its records
+        carry a generated path. Labelling with it would point the developer at
+        a file they must not edit — worse than the module key.
+        """
+        overlay = FakeOverlay()
+        handler = BrowserConsoleLogHandler(
+            overlay,
+            loop=None,
+            project_root=tmp_path,
+            build_root=tmp_path / ".pyxle-build",
+            scheduler=_sync_scheduler,
+        )
+
+        handler.emit(
+            _make_record(
+                name="pyxle.server.api.pulse",
+                msg="hi",
+                pathname=str(tmp_path / ".pyxle-build" / "server" / "api" / "pulse.py"),
+            )
+        )
+
+        assert overlay.calls == [("info", "hi", "pyxle.server.api.pulse")]
+
+    @pytest.mark.parametrize(
+        ("project_root", "pathname"),
+        [
+            (None, "/anywhere/pages/about.pyxl"),  # root not supplied
+            ("tmp_path", "/elsewhere/pages/about.pyxl"),  # outside the project
+            ("tmp_path", ""),  # no source on the record
+        ],
+    )
+    def test_falls_back_to_the_logger_name_when_unresolvable(
+        self, tmp_path, project_root, pathname: str
+    ) -> None:
+        root = tmp_path if project_root == "tmp_path" else None
+        overlay = FakeOverlay()
+        handler = BrowserConsoleLogHandler(
+            overlay, loop=None, project_root=root, scheduler=_sync_scheduler
+        )
+
+        handler.emit(
+            _make_record(name="pyxle.server.pages.about", msg="hi", pathname=pathname)
+        )
+
+        assert overlay.calls == [("info", "hi", "pyxle.server.pages.about")]
 
 
 # -- throttling ----------------------------------------------------------
@@ -361,10 +497,14 @@ def test_attach_leaves_an_already_configured_root_alone(preserve_root_logger) ->
     assert root.handlers == [existing]
 
 
-def test_stderr_fallback_ignores_records_below_warning(
+def test_stderr_fallback_ignores_internal_records_below_warning(
     preserve_root_logger, capsys
 ) -> None:
-    """The fallback mirrors ``lastResort`` exactly — it is not a new log sink."""
+    """Framework internals below WARNING are not new terminal output.
+
+    ``uvicorn`` prints its own startup lines; echoing its INFO records here
+    would double them.
+    """
     root = preserve_root_logger
     root.handlers[:] = []
     handler = BrowserConsoleLogHandler(FakeOverlay(), loop=None, scheduler=_sync_scheduler)
@@ -376,6 +516,58 @@ def test_stderr_fallback_ignores_records_below_warning(
         handler.detach()
 
     assert capsys.readouterr().err == ""
+
+
+class TestTheTerminalSeesWhatTheBrowserSees:
+    """``attach`` lowers the root logger to INFO so those records reach the
+    browser. A stderr fallback pinned at WARNING sends them *only* there — so a
+    plain ``log.info(...)`` vanishes from the terminal the developer is already
+    watching, which combined with the name filter made a page's logging silent
+    in both places at once.
+    """
+
+    @pytest.mark.parametrize(
+        "name", ["shopapp", "pyxle.server.pages.about", "pyxle.server.api.orders"]
+    )
+    def test_user_info_records_reach_the_terminal(
+        self, preserve_root_logger, capsys, name: str
+    ) -> None:
+        root = preserve_root_logger
+        root.handlers[:] = []
+        overlay = FakeOverlay()
+        handler = BrowserConsoleLogHandler(
+            overlay, loop=None, scheduler=_sync_scheduler
+        )
+
+        handler.attach()
+        try:
+            logging.getLogger(name).info("order placed")
+        finally:
+            handler.detach()
+
+        # Both destinations, not one or the other.
+        assert "order placed" in capsys.readouterr().err
+        assert [call[1] for call in overlay.calls] == ["order placed"]
+
+    def test_debug_stays_off_the_terminal_even_in_verbose(
+        self, preserve_root_logger, capsys
+    ) -> None:
+        """Verbose opens the browser firehose; it must not bury the terminal."""
+        root = preserve_root_logger
+        root.handlers[:] = []
+        overlay = FakeOverlay()
+        handler = BrowserConsoleLogHandler(
+            overlay, loop=None, verbose=True, scheduler=_sync_scheduler
+        )
+
+        handler.attach()
+        try:
+            logging.getLogger("watchfiles.main").debug("1 change detected")
+        finally:
+            handler.detach()
+
+        assert capsys.readouterr().err == ""
+        assert [call[1] for call in overlay.calls] == ["1 change detected"]
 
 
 def test_attached_handler_forwards_user_logs(preserve_root_logger) -> None:
