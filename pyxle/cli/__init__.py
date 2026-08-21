@@ -2044,13 +2044,13 @@ def openapi(
         raise typer.Exit(code=1) from exc
 
     from pyxle.devserver.openapi import build_openapi_document
-    from pyxle.devserver.validation import PydanticNotInstalledError
+    from pyxle.devserver.validation import ActionBodyError
 
     try:
         result = build_openapi_document(
             settings, title=title, version=api_version
         )
-    except PydanticNotInstalledError as exc:
+    except ActionBodyError as exc:
         logger.error(str(exc))
         raise typer.Exit(code=1) from exc
 

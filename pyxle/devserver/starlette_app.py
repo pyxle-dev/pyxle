@@ -1488,7 +1488,7 @@ async def _dispatch_action(
     """Shared dispatch logic for both specific and catch-all action handlers."""
     from pyxle.devserver._security import SAFE_IDENTIFIER_RE
     from pyxle.devserver.validation import (
-        PydanticNotInstalledError,
+        ActionBodyError,
         get_cached_body_model,
         validate_body,
     )
@@ -1547,7 +1547,7 @@ async def _dispatch_action(
     # cached per function object.
     try:
         resolved = get_cached_body_model(action_fn)
-    except PydanticNotInstalledError as exc:
+    except ActionBodyError as exc:
         _log_action_failure(module_key, action_name, exc, error=exc)
         error_msg = str(exc) if debug else _PRODUCTION_ACTION_ERROR
         return JSONResponse({"ok": False, "error": error_msg}, status_code=500)

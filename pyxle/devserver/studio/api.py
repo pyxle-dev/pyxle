@@ -447,7 +447,7 @@ def _action_schema_payload(
         return {"ok": False, "error": f"No action {action_name!r} on page {page_path!r}."}
 
     from ..starlette_app import _import_module  # noqa: PLC0415 - lazy, avoids cycle
-    from ..validation import PydanticNotInstalledError, resolve_body_model  # noqa: PLC0415
+    from ..validation import ActionBodyError, resolve_body_model  # noqa: PLC0415
 
     try:
         module = _import_module(
@@ -460,7 +460,7 @@ def _action_schema_payload(
                 "error": f"Action {action_name!r} is not exported by its module.",
             }
         resolved = resolve_body_model(action_fn)
-    except PydanticNotInstalledError as exc:
+    except ActionBodyError as exc:
         return {"ok": True, "url": target.path, "schema": None, "note": str(exc)}
     except Exception as exc:  # noqa: BLE001 — importing user code can fail arbitrarily
         return {"ok": False, "error": _redact_error(f"{type(exc).__name__}: {exc}")}

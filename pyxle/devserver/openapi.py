@@ -14,7 +14,7 @@ Pydantic is the optional ``[pydantic]`` extra, and it is only needed for the
 actions that actually declare a model body: a project whose actions take no
 body — or which has no actions at all — generates its document without it, and
 an empty ``paths`` object is the correct answer for a project with no actions.
-:class:`PydanticNotInstalledError` is raised only when a specific action needs
+:class:`ActionBodyError` is raised only when a specific action needs
 a model resolved and Pydantic is absent; it names that action and its file.
 """
 
@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING, Any
 
 from pyxle.devserver.settings import DevServerSettings
 from pyxle.devserver.validation import (
-    PydanticNotInstalledError,
+    ActionBodyError,
     resolve_body_model,
 )
 
@@ -67,7 +67,7 @@ def build_openapi_document(
 ) -> OpenApiResult:
     """Build the OpenAPI 3.1 document for every ``@action`` in the project.
 
-    Raises :class:`PydanticNotInstalledError` only if an action declares a
+    Raises :class:`ActionBodyError` only if an action declares a
     model-typed body and Pydantic is missing — the document for a project that
     needs no models is generated either way.
     """
@@ -101,11 +101,12 @@ def build_openapi_document(
 
         try:
             operation = _build_operation(route, action_fn, schemas)
-        except PydanticNotInstalledError as exc:
+        except ActionBodyError as exc:
             # Re-raised with this route's identity: the deeper raise knows only
-            # that *an* action needs a model, and a project-wide walk has to say
-            # which file to edit.
-            raise PydanticNotInstalledError(
+            # that *an* action's body cannot be resolved, and a project-wide
+            # walk has to say which file to edit. ``with_identity`` preserves
+            # which of the two failures it was.
+            raise exc.with_identity(
                 action=route.action_name,
                 source=_source_label(settings, route),
             ) from exc

@@ -200,6 +200,8 @@ pages/             routes (.pyxl) + pages/api/*.py endpoints
   components/       shared JSX + CSS Modules (only when Tailwind is off, by default)
 public/            static files served at /
 db.py              (you add this) — e.g. SQLite helpers; import with `from db import ...`
+                   Code outside pages/ is NOT copied into dist/ — deploy it
+                   alongside dist/ the way you deploy the rest of your source.
 jsconfig.json      import alias (default `@/*`) + editor hints
 vite.config.js     re-exports Pyxle's generated Vite config (for shadcn/editor tooling)
 pyxle.config.json  project config
