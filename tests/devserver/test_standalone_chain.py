@@ -71,6 +71,18 @@ def project(tmp_path):
     )
     metadata("public/status.json")
     metadata("admin/monitors.json")
+    # A standalone **template**, not layout. Templates carry the same directive
+    # and are walked by the same three passes, so they belong in the same
+    # fixture -- the wrapper walk read only `layout.json` and honoured the head
+    # and the loader here while still wrapping the page in the root layout.
+    metadata(
+        "checkout/template.json",
+        loader_name="load",
+        standalone=True,
+        head_jsx_blocks=['<meta name="checkout" content="yes" />'],
+        head=['<style>.checkout{color:green}</style>'],
+    )
+    metadata("checkout/pay.json")
     return settings
 
 
@@ -135,6 +147,32 @@ class TestTheWrapperChain:
             "the root layout still wraps a standalone section"
         )
 
+    def test_discovery_stops_at_a_standalone_template_too(self, project):
+        """`template.pyxl` carries `STANDALONE` exactly as `layout.pyxl` does.
+
+        This walk used to read only `layout.json`, so a standalone template got
+        its head dropped and its ancestors' loaders skipped while their markup
+        still wrapped the page -- it rendered inside a layout whose loader never
+        ran, so any component of that layout reading its own data found nothing.
+        """
+        from pyxle.devserver.layouts import _discover_wrappers
+
+        pages_root = project.client_build_dir / "pages"
+        for relative in ("layout.jsx", "checkout/template.jsx"):
+            path = pages_root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("export default function L({children}){return children}")
+
+        wrappers = _discover_wrappers(Path("checkout"), project)
+        relatives = [str(w.relative_path) for w in wrappers]
+
+        assert any("checkout" in r for r in relatives), (
+            "the standalone template stopped wrapping its own pages"
+        )
+        assert "layout.jsx" not in relatives, (
+            "the root layout still wraps a section behind a standalone template"
+        )
+
     def test_an_ordinary_directory_still_gets_every_ancestor(self, project):
         from pyxle.devserver.layouts import _discover_wrappers
 
@@ -145,3 +183,22 @@ class TestTheWrapperChain:
 
         wrappers = _discover_wrappers(Path("admin"), project)
         assert [str(w.relative_path) for w in wrappers] == ["layout.jsx"]
+
+
+class TestAllThreeWalksAgreeForATemplate:
+    """The module docstring claims all three walks agree. Until the wrapper walk
+    learned about templates that was true for `layout.pyxl` only, and untested
+    for `template.pyxl` -- which is exactly where it was false."""
+
+    def test_the_loader_walk_stops_at_a_standalone_template(self, project):
+        found = find_layout_loaders(project, Path("checkout/pay.pyxl"))
+        paths = [str(info.relative_path) for info in found]
+        assert any("checkout" in p for p in paths)
+        assert "layout.pyxl" not in paths
+
+    def test_the_head_walk_stops_at_a_standalone_template(self, project):
+        contribution = find_layout_head_contributions(project, Path("checkout/pay.pyxl"))
+        assert any("checkout" in b for b in contribution.jsx_blocks)
+        assert not any("analytics" in b for b in contribution.jsx_blocks)
+        assert any(".checkout" in e for e in head_variable(contribution))
+        assert not any(".app" in e for e in head_variable(contribution))

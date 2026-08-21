@@ -81,13 +81,31 @@ def _discover_wrappers(relative_dir: Path, settings: DevServerSettings) -> List[
 
 
 def _is_standalone(ancestor: Path, settings: DevServerSettings) -> bool:
-    """Whether the layout in *ancestor* declares itself the root of its chain."""
-    relative = (ancestor / "layout.json") if ancestor != Path(".") else Path("layout.json")
-    metadata_path = settings.metadata_build_dir / "pages" / relative
-    try:
-        return json.loads(metadata_path.read_text()).get("standalone") is True
-    except (OSError, ValueError):
-        return False
+    """Whether a layout **or template** in *ancestor* is the root of its chain.
+
+    Both kinds carry the directive -- the parser reads ``STANDALONE`` from any
+    wrapper -- and both must be read here. This walk used to consult only
+    ``layout.json``, while the head walk
+    (:func:`~pyxle.devserver.registry.find_layout_head_contributions`) and the
+    loader walk (:func:`~pyxle.devserver.registry.find_layout_loaders`) each
+    iterate ``("layout.pyxl", "template.pyxl")``. So a ``template.pyxl``
+    declaring ``STANDALONE`` had its head dropped and its ancestors' loaders
+    skipped, while those same ancestors' **markup still wrapped the page** --
+    the page rendered inside a layout whose loader never ran and whose head was
+    discarded, which surfaces as a component reading its own loader data and
+    finding nothing.
+    """
+    for base_name in _LAYOUT_FILENAMES.values():
+        relative = Path(f"{base_name}.json")
+        if ancestor != Path("."):
+            relative = ancestor / relative
+        metadata_path = settings.metadata_build_dir / "pages" / relative
+        try:
+            if json.loads(metadata_path.read_text()).get("standalone") is True:
+                return True
+        except (OSError, ValueError):
+            continue
+    return False
 
 
 def _apply_wrappers(

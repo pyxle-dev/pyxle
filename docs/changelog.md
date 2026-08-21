@@ -4,6 +4,21 @@ Release notes for Pyxle. While we're in beta (`0.x`), minor versions may include
 
 ## Unreleased
 
+- **Fix: `STANDALONE` on a `template.pyxl` now stops the wrapper chain, not just
+  the head and loader chains.** `STANDALONE = True` makes a wrapper the root of
+  its own chain, and three separate walks have to agree on where that root is:
+  the loaders that run, the head contributions that land, and the markup that
+  wraps the page. On a `layout.pyxl` all three stopped. On a `template.pyxl`
+  only two did — the wrapper walk consulted `layout.json` alone and never
+  looked at `template.json`, so a section behind a standalone template had its
+  ancestors' loaders skipped and their head dropped **while their markup still
+  wrapped it.** The page then rendered inside a layout whose loader had never
+  run, so any component of that layout reading its own data found nothing —
+  a wrapper-chain bug that presents as a data bug, in the one place the reader
+  has no reason to look. The rule the other two walks already used is now the
+  only rule: any wrapper, of either kind, declaring `STANDALONE` ends the chain
+  above it. [Layouts](core-concepts/layouts.md#sections-that-are-not-part-of-the-app-standalone).
+
 - **Fix: `pyxle check` no longer passes an action that can never run.**
   An `@action` whose second parameter carries no type annotation —
   `async def bump(request, payload)`, the signature you write without thinking —
