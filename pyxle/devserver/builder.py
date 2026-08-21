@@ -308,8 +308,16 @@ def _remove_page_artifacts(paths: BuildPaths, relative_path: Path) -> None:
     server_file = paths.server_root / "pages" / relative_path.with_suffix(".py")
     client_file = paths.client_root / "pages" / relative_path.with_suffix(".jsx")
     metadata_file = paths.metadata_root / "pages" / relative_path.with_suffix(".json")
+    # A page compiles to *four* artifacts, and the route entry module is the one
+    # that bites when it is left behind: it imports ``../pages/<name>.jsx``,
+    # which the line above correctly deletes, and Vite globs the whole routes
+    # directory. So deleting a page and rebuilding failed with
+    # ``Could not resolve "../pages/x.jsx" from ".pyxle-build/client/routes/x.jsx"``
+    # — two paths inside a cache directory the author never created, naming
+    # neither the page they deleted nor anything they could act on.
+    route_file = paths.client_root / "routes" / relative_path.with_suffix(".jsx")
 
-    for target in (server_file, client_file, metadata_file):
+    for target in (server_file, client_file, metadata_file, route_file):
         if target.exists():
             target.unlink()
 

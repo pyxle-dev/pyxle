@@ -551,3 +551,65 @@ class TestJsxSyntaxIsADevBuildFailure:
 
         assert build_once(project, force_rebuild=True).failures == []
         assert build_once(replace(project, debug=False), force_rebuild=True).failures == []
+
+
+def test_deleting_a_page_removes_its_route_entry_module(
+    project: DevServerSettings,
+) -> None:
+    """Deleting a page and rebuilding used to fail the build.
+
+    A page compiles to four artifacts. Three were cleaned up on removal; the
+    route entry module was not. It imports ``../pages/<name>.jsx``, which *was*
+    deleted, and Vite globs the whole routes directory — so the next build died
+    with ``Could not resolve "../pages/about.jsx" from
+    ".pyxle-build/client/routes/about.jsx"``: two paths inside a cache the
+    author never created, naming neither the page they deleted nor a fix.
+    Deleting a page is an ordinary thing to do, so this bricked the build for an
+    ordinary action.
+    """
+    # A route entry module is only composed for a page that has a layout to
+    # wrap it, so the fixture needs one for this to be the real shape.
+    write_file(
+        project.pages_dir / "layout.pyxl",
+        "import React from 'react';\n\nexport default function Layout({ children }) {\n  return <div>{children}</div>;\n}\n",
+    )
+    build_once(project)
+
+    route_entry = project.build_root / "client/routes/about.jsx"
+    assert route_entry.exists(), "precondition: a built page has a route entry"
+
+    (project.pages_dir / "about.pyxl").unlink()
+    summary = build_once(project)
+
+    assert summary.removed == ["about.pyxl"]
+    # All four artifacts, not three.
+    assert not route_entry.exists()
+    assert not (project.build_root / "client/pages/about.jsx").exists()
+    assert not (project.build_root / "server/pages/about.py").exists()
+    assert not (project.build_root / "metadata/pages/about.json").exists()
+
+
+def test_deleting_a_nested_page_removes_its_nested_route_entry(
+    project: DevServerSettings,
+) -> None:
+    """The route tree mirrors ``pages/``, so the cleanup has to mirror it too —
+    a flat-only fix would leave every nested page behind."""
+    # A route entry module is only composed for a page that has a layout to
+    # wrap it, so the fixture needs one for this to be the real shape.
+    write_file(
+        project.pages_dir / "layout.pyxl",
+        "import React from 'react';\n\nexport default function Layout({ children }) {\n  return <div>{children}</div>;\n}\n",
+    )
+    write_file(
+        project.pages_dir / "blog/post.pyxl",
+        "import React from 'react';\n\nexport default function Post() {\n  return <div>Post</div>;\n}\n",
+    )
+    build_once(project)
+
+    nested_entry = project.build_root / "client/routes/blog/post.jsx"
+    assert nested_entry.exists(), "precondition: nested pages get nested entries"
+
+    (project.pages_dir / "blog/post.pyxl").unlink()
+    build_once(project)
+
+    assert not nested_entry.exists()
