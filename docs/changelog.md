@@ -2,7 +2,7 @@
 
 Release notes for Pyxle. While we're in beta (`0.x`), minor versions may include breaking changes — those are called out explicitly. To upgrade, run `pip install --upgrade pyxle-framework`.
 
-## Unreleased
+## 0.9.1
 
 - **Fix: `STANDALONE` on a `template.pyxl` now stops the wrapper chain, not just
   the head and loader chains.** `STANDALONE = True` makes a wrapper the root of
