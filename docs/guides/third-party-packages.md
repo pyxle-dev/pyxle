@@ -66,6 +66,210 @@ client:
 import { formatDate } from '@/lib/format';
 ```
 
+## Charts, and other libraries that measure the DOM
+
+A `@server` loader returns a dict; a third-party React component renders it.
+Nothing sits in between — no API route, no `fetch`, no serializer:
+
+```python
+@server
+async def load(request):
+    days = await asyncio.to_thread(summarize, LOG)   # plain Python
+    return {"days": days}
+```
+
+```jsx
+import { ComposedChart, Bar, Line, XAxis, YAxis } from 'recharts';
+
+export default function Latency({ data }) {
+  return (
+    <ComposedChart id="latency-chart" width={880} height={340} data={data.days}>
+      <XAxis dataKey="day" interval={2} />
+      <YAxis interval={0} />
+      <Bar dataKey="requests" isAnimationActive={false} />
+      <Line dataKey="p95" isAnimationActive={false} />
+    </ComposedChart>
+  );
+}
+```
+
+That renders to real SVG **on the server** — the plotted path, the bars and the
+axis labels are all in the HTML before any JavaScript runs — and it is a live
+React tree once hydrated. A complete, runnable version is in
+[`examples/charts`](https://github.com/pyxle-dev/pyxle/tree/main/examples/charts).
+
+### Why the extra props
+
+Charting libraries are the one category where SSR needs care, because they work
+out their layout by **measuring the DOM** — and during a server render there is
+no DOM to measure. The server and the browser can then produce different markup,
+and React treats that as a hydration mismatch.
+
+What a mismatch costs you depends on what disagreed, and the two cases are worth
+telling apart before you go looking for one:
+
+- **An attribute** — a coordinate, a `width`, an `href`. React keeps the
+  **server's** value and says so: *"A tree hydrated but some attributes of the
+  server rendered HTML didn't match the client properties. This won't be patched
+  up."* Nothing is re-rendered and the page is fully interactive; you are simply
+  left with a value the client never agreed to, and a later re-render will not
+  necessarily correct it, because React is comparing against what it thinks it
+  already rendered. This is the quiet one.
+- **Text or structure** — a label the browser wraps onto a second line, an
+  element one side emits and the other does not. React cannot patch that in
+  place: *"Hydration failed because the server rendered text didn't match the
+  client. As a result this tree will be regenerated on the client."* It discards
+  the server HTML for the **whole root** and re-renders it in the browser. The
+  page ends up interactive, but the server render is thrown away — you pay for
+  SSR and the visitor gets a client render anyway.
+
+Only the second is reported outside a development build. See
+[Verifying it hydrates](#verifying-it-hydrates) below.
+
+The fix for both is the same shape — **give the library the number instead of
+letting it measure**:
+
+| Measures the DOM | Symptom | Fix |
+|---|---|---|
+| Axis tick layout | Server keeps every label and leaves the end tick where the scale put it; the browser measures, drops labels that will not fit and nudges the end tick inwards | Give **every** axis a numeric `interval` (see below) |
+| Default axis tick text | A tick label with a space in it wraps in the browser whenever its measured word widths exceed the axis `width` — one `<tspan>` per line, two for a two-word label; the server measures nothing, so it emits exactly one | Keep labels to one short line, or supply a custom `tick` renderer |
+| Entry animations | Extra wrapper element on the client only | `isAnimationActive={false}` |
+
+Two other things Recharts measures are **not** mismatches, because the
+measurement lands after mount rather than during hydration.
+`<ResponsiveContainer>` renders an empty `<div>` on the server and the chart
+appears only once JS has run — see
+[Staying responsive without `ResponsiveContainer`](#staying-responsive-without-responsivecontainer).
+`<Legend>` feeds its own measured height back into the plot area, which comes out
+26px shorter in the browser than on the server; render the legend as your own
+markup if you want the server's layout to be the final one.
+
+The tick row catches people out because a vertical axis looks like it has nothing
+to thin. Recharts runs one tick pass for every axis, and `interval` decides which
+one: a **number** means "take these ticks as they are", anything else — including
+the `preserveEnd` default — means "measure the labels first". Measuring is what
+the server cannot do, so it always takes the first path. Leave a `<YAxis>` on its
+default and the server leaves the end tick where the scale put it — against the
+chart's top margin, so `y=5` with Recharts' own defaults — while the browser
+pulls it in to `y=12.796875`, and React names the mismatch in the console on
+every development load. It is an attribute mismatch, so what ships is the
+server's coordinate, on a chart that is otherwise working perfectly.
+`interval={0}` keeps every tick and pins both sides to the same path.
+
+That second number is worth a look, because it says what "measuring" means here.
+Recharts sizes a label in `getStringSize` (`recharts/util/DOMUtils`): it appends
+a hidden `<span id="recharts_measurement_span">` to `document.body`, sets the
+text on it and reads `getBoundingClientRect()`. The span takes its font from the
+axis, which `CartesianAxis` only reads in `componentDidMount` — so on the render
+that hydrates it has none to take and inherits the page's, giving a line box as
+tall as the body's `line-height`. The end tick is then placed half a label below
+the top of the chart's viewBox. With a `16px/1.6` body that box is `25.59375px`
+and the tick lands at `12.796875`. `getBBox()` on the rendered `<text>` reports
+something else entirely — a different element, in the SVG, at whatever
+`font-size` the tick draws with — so halving *that* will never give you the
+coordinate. The element the layout measured is not the one you are looking at.
+The same span also decides where a tick label wraps, so a label can be measured
+in one font and painted in another.
+
+Separately, watch for **module-level counters**. Recharts names its `<clipPath>`
+from one, and an SSR worker serves many requests, so the counter keeps climbing
+(`recharts1-clip`, `recharts6-clip`, …) while the browser always starts from one.
+Passing a stable `id` to the chart pins it. Any library that keeps mutable
+module-global state behaves this way under SSR.
+
+None of this is specific to Pyxle — it applies to any framework that renders
+React on the server.
+
+### Verifying it hydrates
+
+Run `pyxle dev`, open the browser console, and read **all** of it. React reports a
+mismatch *after* its own DevTools notice, not before it, so a page that is broken
+and a page that is clean look identical at the top of the console. Filter the
+console for `hydrat` instead — that one word separates the three cases:
+
+- **Clean** — no match. What is left is `[vite] connecting...`,
+  `[vite] connected.`, the DevTools notice, and whatever your own page logs.
+  Judge by the absence of a match, not by the console being empty — your app's
+  own warnings are not hydration failures. Clear them anyway, so the console
+  stays readable: a missing `public/favicon.ico` logs a 404 on every load, and
+  noise you have taught yourself to scroll past is noise you will scroll past
+  again.
+- **An attribute mismatch** — `A tree hydrated but some attributes of the server
+  rendered HTML didn't match the client properties. This won't be patched up.`
+- **A text or structure mismatch** — an uncaught `Error: Hydration failed because
+  the server rendered text didn't match the client. As a result this tree will be
+  regenerated on the client.`
+
+Both messages continue with the component path and a `+`/`-` diff of the two
+renders, which is what tells you the prop to pin and the component to pin it on.
+
+That is the only test that finds both kinds. A production build is not a
+substitute:
+
+- An **attribute** mismatch is completely silent in production. Nothing is
+  logged, the page is interactive, and it behaves identically to a page with no
+  mismatch at all.
+- Comparing the production DOM against the server HTML does not find one either.
+  React kept the server's value, so the two agree *because* of the bug.
+- A **text or structure** mismatch does surface in production, as a thrown
+  minified React error — `#418` for the wrapped-label case above — carrying no
+  detail. That tells you a mismatch exists, not where.
+
+So verify in `pyxle dev`, then treat the production build as a build, not a
+check.
+
+One symptom this check is *not* for: a page that renders correctly and responds
+to nothing. Neither mismatch does that. Both leave the page interactive — the
+text/structure one re-renders the whole root in the browser and you still end up
+with a working tree, just without the server render you paid for. A page that is
+genuinely inert never ran its JavaScript at all, which is a different problem
+with a different cause; see
+[Which browsers the dev server trusts](../architecture/dev-server.md#which-browsers-the-dev-server-trusts).
+
+### Staying responsive without `ResponsiveContainer`
+
+`<ResponsiveContainer>` is the one you will miss. Replace it with a hook that
+renders at a fixed width on the server and measures once mounted. The fallback
+width is used for the server render *and* the first client render, so the two
+agree and hydration stays clean:
+
+```jsx
+export function useMeasuredWidth(fallback) {
+  const ref = useRef(null);
+  const [width, setWidth] = useState(fallback);
+
+  useEffect(() => {
+    const node = ref.current;
+    if (!node || typeof ResizeObserver === 'undefined') return undefined;
+    const observer = new ResizeObserver(([entry]) => {
+      setWidth(Math.round(entry.contentRect.width));
+    });
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, []);
+
+  return [ref, width];
+}
+```
+
+```jsx
+const [chartBox, width] = useMeasuredWidth(880);
+
+<div ref={chartBox}>
+  <ComposedChart width={width} height={340} data={data.days}>{/* … */}</ComposedChart>
+</div>
+```
+
+Anything derived from `width` — a tick `interval`, say — is safe too, because at
+hydration time `width` is the fallback on both sides and only changes afterwards.
+
+### When a library cannot render on the server at all
+
+Some libraries touch `window` or `document` at module scope and will never
+server-render. Those belong in a `<ClientOnly>` boundary, which skips them during
+SSR and mounts them in the browser — you lose the server-rendered markup for that
+subtree, but nothing breaks. See [Client Components](client-components.md).
+
 ## shadcn/ui
 
 [shadcn/ui](https://ui.shadcn.com) is a collection of components you copy into

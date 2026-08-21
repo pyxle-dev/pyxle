@@ -1,0 +1,280 @@
+import asyncio
+import csv
+import statistics
+from collections import Counter, defaultdict
+from pathlib import Path
+
+# A raw access log: one row per request, 30 days of traffic.
+LOG = Path("data/requests.csv")
+
+
+def summarize(path):
+    """Roll the raw log up into one row per day: traffic, latency, error rate."""
+    latencies = defaultdict(list)
+    failures = Counter()
+    with path.open(newline="") as handle:
+        for row in csv.DictReader(handle):
+            day = row["timestamp"][:10]
+            latencies[day].append(float(row["duration_ms"]))
+            if int(row["status"]) >= 500:
+                failures[day] += 1
+
+    days = []
+    for day, samples in sorted(latencies.items()):
+        samples.sort()
+        days.append(
+            {
+                "day": day,
+                "requests": len(samples),
+                "p50": round(statistics.median(samples)),
+                "p95": round(samples[int(len(samples) * 0.95)]),
+                "errorRate": round(100 * failures[day] / len(samples), 2),
+            }
+        )
+    return days
+
+
+@server
+async def load(request):
+    # Reading and aggregating a file blocks, so keep it off the event loop.
+    days = await asyncio.to_thread(summarize, LOG)
+    worst = max(days, key=lambda day: day["p95"])
+    return {
+        "days": days,
+        "requests": sum(day["requests"] for day in days),
+        "worstDay": worst["day"],
+        "worstP95": worst["p95"],
+        "errorRate": round(statistics.mean(day["errorRate"] for day in days), 2),
+    }
+
+
+# --- JavaScript/PSX (Client + Server) ---
+
+import React, { useState } from 'react';
+import {
+  Bar,
+  CartesianGrid,
+  ComposedChart,
+  Line,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from 'recharts';
+import { Head } from 'pyxle/client';
+import { useMeasuredWidth } from '@/lib/use-measured-width';
+import './styles/app.css';
+
+const METRICS = {
+  p95: { label: '95th percentile', colour: '#c2521f' },
+  p50: { label: 'Median', colour: '#2f6f9f' },
+};
+
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+// Deterministic on the server and the client — no Intl, so no hydration drift.
+const shortDate = (day) => `${MONTHS[Number(day.slice(5, 7)) - 1]} ${Number(day.slice(8, 10))}`;
+const grouped = (n) => String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+
+// A tick renderer of our own, mostly for the colour and the offset. It also
+// steps around one real hazard in Recharts' built-in <Text>: handed an axis
+// `width` — which CartesianAxis always passes — it measures word widths in the
+// browser and breaks a multi-word label onto one <tspan> per line, two for a
+// two-word label, while the server, with nothing to measure, emits one. Labels
+// this short never reach that, but a <text> we draw ourselves is arithmetic,
+// and arithmetic agrees everywhere.
+// Recharts passes x/y/payload/textAnchor in; tone/offsetY/format are ours.
+const AxisTick = ({ x, y, payload, textAnchor, tone, offsetY, format }) => (
+  <text x={x} y={y + offsetY} textAnchor={textAnchor} fill={tone} fontSize={12}>
+    {format(payload.value)}
+  </text>
+);
+
+export default function Latency({ data }) {
+  const [metric, setMetric] = useState('p95');
+  const [chartBox, width] = useMeasuredWidth(880);
+
+  return (
+    <main className="page">
+      <Head>
+        <title>Request latency — Pyxle × Recharts</title>
+        <meta
+          name="description"
+          content="A Recharts chart rendered from data a Python @server loader returned, in one .pyxl file."
+        />
+        {/* public/favicon.ico is served at /favicon.ico. Without it a browser
+            still asks for that path and logs a 404 — noise in an example whose
+            whole point is a console you can read. */}
+        <link rel="icon" href="/favicon.ico" />
+      </Head>
+
+      <p className="eyebrow">Pyxle example — third-party React libraries</p>
+      <h1>Request latency, last 30 days</h1>
+      <p className="lede">
+        The chart is <a href="https://recharts.org">Recharts</a>, installed with{' '}
+        <code>npm install recharts</code>. Every number in it came from the Python{' '}
+        <code>@server</code> loader at the top of this same file, which aggregated{' '}
+        {grouped(data.requests)} raw log rows with <code>csv</code> and <code>statistics</code>.
+        No API route, no <code>fetch</code>, no serializer — the loader returns a dict and the
+        component receives it as <code>data</code>.
+      </p>
+
+      <dl className="stats">
+        <div>
+          <dt>Requests</dt>
+          <dd>{grouped(data.requests)}</dd>
+        </div>
+        <div>
+          <dt>Worst p95</dt>
+          <dd>
+            {grouped(data.worstP95)} <small>ms on {shortDate(data.worstDay)}</small>
+          </dd>
+        </div>
+        <div>
+          <dt>5xx rate</dt>
+          <dd>
+            {data.errorRate} <small>%</small>
+          </dd>
+        </div>
+      </dl>
+
+      <section className="card">
+        <div className="card-head">
+          <div>
+            <h2>Latency against traffic</h2>
+            {/* Recharts ships a <Legend>, but it sizes itself by measuring the
+                rendered DOM and feeds that height back into the chart layout —
+                which the server cannot know, so the plot area would come out
+                26px taller there than in the browser. Plain markup has no such
+                problem. */}
+            <ul className="legend">
+              <li>
+                <span className="swatch" style={{ background: '#ddd6c8' }} />
+                Requests
+              </li>
+              <li>
+                <span className="swatch" style={{ background: METRICS[metric].colour }} />
+                {METRICS[metric].label} (ms)
+              </li>
+            </ul>
+          </div>
+          <div className="toggle" role="group" aria-label="Latency metric">
+            {Object.entries(METRICS).map(([key, { label }]) => (
+              <button
+                key={key}
+                type="button"
+                className={metric === key ? 'on' : ''}
+                aria-pressed={metric === key}
+                onClick={() => setMetric(key)}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* Two props make this server-render *and* hydrate cleanly:
+            `width`, because ResponsiveContainer needs a DOM to measure and the
+            server has none (see lib/use-measured-width.js), and `id`, because
+            without it Recharts names its <clipPath> from a module-level
+            counter that keeps climbing inside a reused SSR worker — so the
+            server and the browser would disagree on the id. */}
+        <div className="chart" ref={chartBox}>
+          <ComposedChart
+            id="latency-chart"
+            width={width}
+            height={340}
+            data={data.days}
+            margin={{ top: 8, right: 8, bottom: 0, left: 0 }}
+          >
+            <CartesianGrid stroke="#e6e0d4" vertical={false} />
+            {/* `interval` is explicit on purpose. Left to itself Recharts
+                decides how many date labels fit by *measuring* the rendered
+                text, which is zero-width on the server — so the server keeps all
+                30 labels while the browser, in a 1280px-wide window, thins them
+                to 8, and hydration fails on the difference. Deriving it from
+                `width` is still safe: at hydration `width` is the fallback on
+                both sides, and it only changes afterwards. */}
+            <XAxis
+              dataKey="day"
+              stroke="#8c8577"
+              tickLine={false}
+              interval={width < 560 ? 6 : 2}
+              tick={<AxisTick tone="#8c8577" offsetY={14} format={shortDate} />}
+            />
+            {/* A numeric `interval` matters here for a sharper reason than on
+                the XAxis. When `interval` is a number Recharts takes the ticks
+                exactly as given; with anything else — including the
+                `preserveEnd` default a vertical axis gets — it runs a pass that
+                measures every label and pulls the end tick inwards so the text
+                cannot overflow the axis. The server has no DOM, so it always
+                skips that pass. Recharts then put the top tick at y=8 on the
+                server and y=12.796875 in the browser: half of 25.59375, which
+                is not the SVG <text> but a hidden <span> Recharts appends to
+                <body> to size labels (getStringSize, in its util/DOMUtils) and
+                measures with getBoundingClientRect — so it carries the body's
+                16px/1.6 line box, not this tick's fontSize={12}. Add our own
+                offsetY={4} and React's diff read y="12" against y={16.796875},
+                on both axes, on every dev load. It is an *attribute* mismatch,
+                so React keeps the server's value rather than correcting it and
+                a production build says nothing at all: the chart looks and
+                behaves fine while being quietly wrong. A number is the one
+                value that makes the browser skip the same pass the server
+                does. */}
+            <YAxis
+              yAxisId="traffic"
+              stroke="#8c8577"
+              tickLine={false}
+              axisLine={false}
+              interval={0}
+              tick={<AxisTick tone="#8c8577" offsetY={4} format={grouped} />}
+            />
+            <YAxis
+              yAxisId="latency"
+              orientation="right"
+              stroke={METRICS[metric].colour}
+              tickLine={false}
+              axisLine={false}
+              interval={0}
+              tick={
+                <AxisTick
+                  tone={METRICS[metric].colour}
+                  offsetY={4}
+                  format={(value) => `${grouped(value)}ms`}
+                />
+              }
+            />
+            <Tooltip
+              labelFormatter={shortDate}
+              contentStyle={{ border: '1px solid #e6e0d4', borderRadius: 6, fontSize: 13 }}
+            />
+            {/* Animation is off because the entry animation renders an extra
+                wrapper on the client that the server never emits. */}
+            <Bar
+              yAxisId="traffic"
+              dataKey="requests"
+              name="Requests"
+              fill="#ddd6c8"
+              radius={[3, 3, 0, 0]}
+              isAnimationActive={false}
+            />
+            <Line
+              yAxisId="latency"
+              type="monotone"
+              dataKey={metric}
+              name={`${METRICS[metric].label} (ms)`}
+              stroke={METRICS[metric].colour}
+              strokeWidth={2}
+              dot={false}
+              isAnimationActive={false}
+            />
+          </ComposedChart>
+        </div>
+
+        <p className="note">
+          Hover a day for the tooltip, or switch the metric — the chart is a live React tree
+          after hydration, not a picture of one.
+        </p>
+      </section>
+    </main>
+  );
+}

@@ -137,6 +137,13 @@ For framework contributors and power users.
 - [SSR Pipeline](advanced/ssr-pipeline.md) -- High-level SSR overview (see [architecture/ssr.md](architecture/ssr.md) for the full deep-dive)
 - [Compiler Internals](advanced/compiler-internals.md) -- High-level compiler overview (see [architecture/compiler.md](architecture/compiler.md) and [architecture/parser.md](architecture/parser.md) for the full deep-dive)
 
+## Examples
+
+Complete, runnable apps in the [`examples/`](../examples) directory of the repo.
+
+- [Charts](../examples/charts) -- A [Recharts](https://recharts.org) chart rendered from data a Python `@server` loader aggregated, in one `.pyxl` file. Server-rendered SVG, live after hydration, and a written-down account of what it takes to make a DOM-measuring library hydrate cleanly.
+- [Chat](../examples/chat) -- Realtime chat: a page that serves both HTML and a WebSocket at the same path, using `pyxle.realtime` and the `useWebSocket()` hook.
+
 ## FAQ
 
 - [Frequently Asked Questions](faq.md)
