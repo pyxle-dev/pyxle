@@ -82,8 +82,6 @@ def _discover_wrappers(relative_dir: Path, settings: DevServerSettings) -> List[
 
 def _is_standalone(ancestor: Path, settings: DevServerSettings) -> bool:
     """Whether the layout in *ancestor* declares itself the root of its chain."""
-    import json
-
     relative = (ancestor / "layout.json") if ancestor != Path(".") else Path("layout.json")
     metadata_path = settings.metadata_build_dir / "pages" / relative
     try:
