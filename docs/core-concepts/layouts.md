@@ -183,7 +183,7 @@ that is exactly wrong. A public status page inside an admin console, a print
 view, an embedded widget: these are not the app, and they should not carry its
 navigation, its stylesheet, its analytics tag, or the cost of its layout loader.
 
-A layout can declare itself the root of its own chain:
+A layout **or a template** can declare itself the root of its own chain:
 
 ```python
 @server
@@ -213,6 +213,10 @@ the loader means an outer layout's query running on every request to a section
 that never renders it. Stopping the loader but not the head means a page that
 opted out of the app shell still inheriting its analytics snippet.
 
+The directive works the same way on a [`template.pyxl`](#templates) as on a
+`layout.pyxl` — a template is a wrapper that remounts, and it stops the chain
+above it exactly as a layout does.
+
 ### Why not just branch in the outer layout
 
 You can write `if (isPublicSection) return <>{children}</>` in your root layout,
@@ -229,7 +233,7 @@ section lose the app shell for no visible reason.
 
 When Pyxle compiles your pages, it:
 
-1. Walks up from each page to the root, collecting `layout.pyxl` and `template.pyxl` files — stopping at any layout that declares `STANDALONE = True`
+1. Walks up from each page to the root, collecting `layout.pyxl` and `template.pyxl` files — stopping at any layout **or template** that declares `STANDALONE = True`
 2. Generates a composed wrapper module that nests them in the correct order
 3. At render time, the page component is passed as `children` to the innermost layout
 
