@@ -4,6 +4,157 @@ Release notes for Pyxle. While we're in beta (`0.x`), minor versions may include
 
 ## Unreleased
 
+- **Docs: why the `log.info` that worked all through development is silent once you deploy.**
+  `pyxle dev` installs a logging bridge that lowers the root logger to `INFO` so
+  your records reach the terminal and the browser console. `pyxle serve` installs
+  nothing — the process is yours and Python's defaults apply, so `INFO` is
+  dropped while `WARNING` and above still reach stderr. Nothing is broken and
+  nothing warns you, which is exactly what makes it cost an afternoon. The
+  debugging guide now says so, shows the one-line `basicConfig` that fixes it,
+  and rules out the two things developers reach for first: the observability
+  `accessLog` option configures the `pyxle.access` logger only, and a layout is
+  not a startup hook — its module is imported lazily during a render, so
+  configuration written there can land after the first page loader has logged.
+  Uncaught loader and action exceptions are unaffected: they are logged with
+  their full traceback regardless. [Debugging](guides/debugging.md).
+- **Fix: a page that does not compile stops being reported as a page that does not exist.**
+  A `.pyxl` with a syntax error never compiles, so `pyxle dev` never registers a
+  route for it, so requesting its URL fell through to the 404 — which advised
+  checking that the file is in `pages/` and correctly named. It was, both. The
+  compiler error explaining why nothing served the address was already recorded
+  and simply not shown, and a project with its own `not-found.pyxl` made the
+  wrong answer look designed. In dev, a URL a broken source would have served
+  now answers `500` with the same build-failure page a route that used to work
+  serves: the file, the line and column, the message, and the source around it,
+  reloading itself once the rebuild succeeds. Dynamic sources are covered too —
+  a broken `pages/posts/[slug].pyxl` answers `/posts/hello` — matched with
+  Starlette's own path compiler, and only where no route matched at all, so an
+  endpoint raising `HTTPException(404, "User not found")` still says exactly
+  that. A URL no broken source claims keeps the ordinary 404, and production is
+  untouched: no failure registry is ever created there, and `pyxle build` still
+  refuses to produce a `dist/` from a project that does not compile.
+  [Dev server](architecture/dev-server.md#when-a-rebuild-fails),
+  [Debugging](guides/debugging.md#common-symptoms).
+- **Fix: a compile error that names a second line now names a line of your file.**
+  Some errors point at two places — where the compiler noticed the problem, and
+  where it started. `pages/products.pyxl:11:5: closing parenthesis ')' does not
+  match opening parenthesis '[' on line 3` got the first right and the second
+  wrong: the `[` was on line 8, and 3 was its position inside the block Pyxle had
+  extracted and handed to CPython. Line 3 of the file was fine, so the developer
+  read correct code looking for a bug that was five lines further down — worse
+  than an error that points nowhere, because it looks authoritative. Every
+  checker Pyxle calls numbers its findings from the start of the half of the file
+  it was given, and the ones that write a line number into their own prose were
+  going out untranslated: CPython's mismatched-bracket and
+  `unterminated string literal (detected at line N)` messages, and `pyxle check`'s
+  `redefinition of unused 'os' from line N`, `import 'os' from line N shadowed by
+  loop variable` and `local variable 'v' defined in enclosing scope on line N`.
+  All of them are now translated to `.pyxl` lines, the same way the position
+  already was — in the terminal, in `pyxle check`, in the dev error overlay and on
+  the build-failure page, which all read the compiler's message. A number that
+  cannot be mapped is left alone rather than replaced with a guess — including a
+  number that was never a line at all: `__all__ = ["ghost on line 999"]` is
+  reported back to you as `undefined name 'ghost on line 999' in __all__`, with
+  your own string intact.
+  [Error handling](guides/error-handling.md#every-line-number-is-a-line-of-your-file),
+  [`pyxle check`](reference/cli.md#pyxle-check).
+- **Fix: a failed `pyxle build` names the file you wrote, not the one Pyxle generated.**
+  A bundler error was printed with Rollup's own location — `pages/about.jsx:2:8`,
+  a file in a build directory the author never created, at a line numbered from
+  the start of the page's JSX half. Vite's stderr now goes through the same line
+  map the render-time path has used since 0.8.0, so the failure reads
+  `pages/about.pyxl:13:8`. A plain **`.jsx` component you wrote yourself** is
+  copied into the build tree unchanged, so its line and column are already
+  yours: an error in one is reported against your file, at your line, with
+  nothing added and no build directory named. A position Pyxle genuinely cannot
+  place is still marked `(generated)`, so an artifact is never passed off as
+  your own file. Only paths carrying a line number are rewritten — a bare `.jsx`
+  is indistinguishable from an import specifier you typed or a line of your
+  source quoted back in a code frame, and your own text is never edited. The
+  known cost is that Rollup's unresolved-import error, which reports no line at
+  all, still names a path inside the build directory — and that path cannot be
+  converted back to one of your files reliably, because the module it names came
+  either from the `.pyxl` of the same name or from a `.jsx` component you wrote
+  that Pyxle copied there. The import specifier in quotes is unambiguously
+  yours; search your own sources for it.
+  [Build and serve](architecture/build-and-serve.md#known-limitation-an-unresolved-import-still-names-the-build-artifact).
+- **Hardening: a `.jsx` inside a URL is never rewritten.**
+  The pattern that rewrites generated positions in build and SSR error text
+  could not see a URL scheme, so a match inside
+  `http://localhost:5176/pages/index.jsx:3:9` began after one and would have
+  rewritten the URL's own path, eating the port. No build or render error has
+  been observed carrying a URL of that shape, so this closes a latent
+  corruption rather than a reported failure. A `.jsx` inside a URL is now left
+  byte for byte, with or without a coordinate. The test is the scheme and the
+  `//` that follow it rather than a list of hostnames, so `https`, `file://`
+  and Vite's `/@fs/` are all covered by the same rule — and a path with no
+  scheme is still a path, so `/@fs/…` with the origin stripped names a real
+  generated module and is translated exactly as before.
+  [Build and serve](architecture/build-and-serve.md#step-2-run-vite-build).
+- **Fix: `pyxle serve` no longer publishes the sources your bundle was built from.**
+  The client static mount was rooted one directory too high, at `dist/client/`
+  instead of `dist/client/dist/`. The browser only ever loads the latter — the
+  rendered HTML references nothing outside it — so everything else in that tree
+  was reachable and nothing ever asked for it: every page's unbundled JSX at
+  `/client/pages/*.jsx`, the layout route wrappers, Pyxle's own client
+  components, and the generated `/client/vite.config.js`, `/client/tsconfig.json`,
+  `/client/index.html` and `/client/manifest.json` — served with a one-hour cache
+  header, comments and all. Only Vite's output is mounted now, at `/client/dist/`;
+  every other path under `/client/` is a 404 like any other unknown URL. Hashed
+  bundles keep their immutable cache header and nothing about page loading
+  changes. `pyxle build --analyze` walks the same directory, so its report no
+  longer counts build inputs (`vite.config.js`, `client-entry.js`, the JSX and CSS
+  sources Vite consumed) that no browser downloads — expect a smaller, truthful
+  total. [Build and serve](architecture/build-and-serve.md),
+  [Build optimization](guides/build-optimization.md#inspecting-the-bundle-pyxle-build-analyze).
+- **Fix: a page's own `logging.getLogger(__name__)` now reaches the browser and
+  the terminal.** `log = logging.getLogger(__name__)` is the first line of
+  logging most Python developers write, and inside a `.pyxl` it produced complete
+  silence in both places. A compiled page runs under a private module name that
+  begins with `pyxle.`, and the filter that keeps `uvicorn`, `watchfiles` and
+  Pyxle's own logs out of your console classified the page — your code — as
+  framework internals and dropped it. The terminal missed it for a second,
+  independent reason: forwarding lowers the root logger to `INFO`, but the stderr
+  fallback beside it stayed at `WARNING`, so a plain `log.info(...)` written any
+  other way reached only the browser. Both are fixed: a logger belonging to your
+  page or API module is always forwarded, and the terminal now prints whatever
+  the browser is shown, plus the warnings and errors it always printed. A page's
+  records are also labelled by the file that emitted them —
+  `[pyxle:server pages/about.pyxl]` rather than an internal module name — while a
+  logger you name yourself keeps that name. Genuine framework internals are still
+  filtered out unless you pass `--verbose`. [`pyxle dev`](reference/cli.md#pyxle-dev),
+  [Debugging](guides/debugging.md).
+- The scaffold declares `esbuild` as a runtime dependency. Server rendering loads
+  it from your project at request time, but it previously arrived only
+  transitively through Vite — a devDependency — so a production install with
+  `--omit=dev` produced a server that started cleanly and returned a 500 for every
+  page, with the cause visible only in the log. If you generated your project with
+  an earlier version, add `esbuild` to `dependencies`.
+
+
+- The scaffold imports its global stylesheet in `pages/layout.pyxl` rather than in
+  `pages/index.pyxl`. A layout wraps every route, so the second page you add is
+  styled without you having to know that. Previously it rendered unstyled, with
+  nothing to explain why.
+- `examples/charts/` ships a `public/` directory, so it starts as cloned. The dev
+  server requires one and the example did not have it.
+
+
+### Fixed
+
+- The scaffold no longer gitignores `package-lock.json`. An application wants its
+  lockfile committed — it is what makes an install reproducible and what `npm ci`
+  requires — and ignoring it meant the Dockerfile in our own deployment guide
+  could not build a freshly cloned project.
+
+
+- **New example: a charting library, driven straight from a Python loader.** [`examples/charts`](https://github.com/pyxle-dev/pyxle/tree/main/examples/charts) renders a [Recharts](https://recharts.org) chart from a dict a `@server` loader returned — one `.pyxl` file, `npm install recharts`, no API route or `fetch` in between. The chart's SVG is in the server-rendered HTML and the tree is live after hydration. [Third-party packages](guides/third-party-packages.md#charts-and-other-libraries-that-measure-the-dom) gains a section on the one category that needs care: libraries that decide their layout by measuring the DOM, which does not exist during a server render. It names each thing Recharts measures — axis tick thinning, default tick text, entry animations — the mismatch each one produces and the fix, plus the `ResponsiveContainer` replacement that server-renders and stays responsive. Module-level counters get the same treatment: Recharts names its `<clipPath>` from one, so it climbs across requests inside a reused SSR worker while the browser always starts from one, and a stable `id` fixes it. The example ships a real `public/favicon.ico`: an example whose central instruction is "read the whole console" has no business putting a 404 in it.
+- **Fix: the charts example hydrated with a mismatch on both `<YAxis>` elements — the exact failure its README is about.** Recharts runs one tick pass per axis and `interval` picks which: a number means "take these ticks as they are", anything else — including the `preserveEnd` default a `<YAxis>` gets — means "measure the labels first", which is the path a server render can never take. React therefore named it in the console on every development load, as `y="12"` against `y={16.796875}` — the `8` and the `12.796875` Recharts computed, each plus the example's own `offsetY={4}`. That `12.796875` is half of `25.59375`, which is not the tick's own box: Recharts sizes a label by appending a hidden `<span>` to `document.body` and measuring *that*, and on the render that hydrates the axis has no font size to give it yet, so it inherits the page's `16px/1.6` instead of the tick's `font-size: 12`. Both the guide and the example's README now say so, because a coordinate we teach people to recognise should come with the element it was measured from. Both axes now carry `interval={0}`, and [Third-party packages](guides/third-party-packages.md#why-the-extra-props) says to give *every* axis a numeric `interval`, not just the horizontal one. Both that guide and the example's README now separate the two kinds of hydration mismatch, because the difference decides how you find one. An **attribute** mismatch like this is kept as the server rendered it — "this won't be patched up" — so the page hydrates, stays interactive and ships a value the client never agreed to, with nothing logged outside a development build. A **text or structure** mismatch makes React discard the server HTML for the whole root and re-render it in the browser, which production reports only as a minified error code. Neither produces a page that renders correctly and responds to nothing, and neither can be found by comparing the production DOM against the server HTML — for an attribute mismatch the two agree precisely *because* React kept the server's value. The guide gains a short section on the check that does work: `pyxle dev` with the console open, filtered for `hydrat` — React logs a mismatch *after* its own DevTools notice, so the top of the console looks the same either way. The same guide's tick-text row is corrected while we are here: Recharts' `<Text>` diverges by wrapping a label whose measured words overflow the axis `width` into one `<tspan>` per line — two for a two-word label — where the server emits exactly one, not by resolving `em` offsets. The example's README also told you to verify with `pyxle build && pyxle serve`, which cannot start — `pyxle serve` requires `PYXLE_SECRET_KEY` — and now shows a command that runs.
+- **Known issue: the charts documentation quotes React's hydration error wrongly.** [`examples/charts`](https://github.com/pyxle-dev/pyxle/tree/main/examples/charts) and [Third-party packages](guides/third-party-packages.md#verifying-it-hydrates) say a hydration failure is one of two messages. There are three. React writes `Hydration failed because the server rendered text didn't match the client` when an element's text differs, and `Hydration failed because the server rendered HTML didn't match the client` when one side emits an element the other does not — the entry-animation row in both documents is the second kind, and both documents quote it as the first. The check still works: filtering the dev console for `hydrat` matches all three cases, and the fix listed against each row is correct. The wording is corrected in the next release.
+- **Fix: `pyxle dev --host 0.0.0.0` serves a page that actually hydrates off this machine.** `pyxle dev` runs two servers — Pyxle serves the document, Vite serves the JavaScript modules it loads — and same host on a different port is a different origin, so every `<script type="module">` on the page is a cross-origin request. Vite 6.0.9 narrowed its default allow-list to loopback (`defaultAllowedOrigins`), and Pyxle's generated `vite.config.js` set `host`, `port`, `origin` and `fs` but never `cors` or `allowedHosts`. So opening the `Network:` URL the startup banner prints — from a phone, a second laptop, WSL2, a devcontainer, Codespaces, a VM — rendered the page perfectly and then nothing: no hydration, no interactivity, no console error, no line in the server log, because Vite refuses by withholding a response header rather than by failing. There was no way to override it either: `--vite-host 0.0.0.0` still emitted `localhost`, the config's `vite` block accepted only host and port, and the project's own root `vite.config.js` is not the file Vite reads. The generated config now carries the origins the dev server itself answers on — loopback, and, when it is bound to every interface, private-network addresses on its own two ports. Deliberately not `cors: true`: a dev server that answers every origin lets any page the developer happens to have open read the source of the project they are working on. A public site holds none of these addresses and still gets no header. [Dev server](architecture/dev-server.md#which-browsers-the-dev-server-trusts).
+- **Fix: a second `pyxle` command no longer reconfigures a running dev server.** Every command that builds — `pyxle routes`, `pyxle check`, `pyxle build` — regenerates `.pyxle-build/client/vite.config.js`, and only `pyxle dev` was ever told which addresses the server is on. So running one of them beside a `pyxle dev --host 0.0.0.0` rewrote that config from the config file's loopback defaults; Vite watches its own config, restarted onto it, and every browser that was not on this machine lost the ability to load a single module. What those browsers got afterwards was the worst possible failure: a complete, correctly rendered page that never becomes interactive, with no console error, no overlay and no line in the server log — because Vite answered `200` and a refused module is not a JavaScript error. `pyxle dev` now records its addresses in `.pyxle-build/dev-server.json`, and any command that regenerates the client config while that server is alive keeps them, rewriting everything else (aliases, plugins, env defines) as before. A record left behind by a crashed server is ignored. [Dev server](architecture/dev-server.md#which-browsers-the-dev-server-trusts).
+- **Fix: hot reload and the error overlay now reach the browsers the dev server invited.** The dev WebSocket at `/__pyxle__/overlay` refused every origin that was not loopback, including the `Network:` URL `pyxle dev --host 0.0.0.0` prints at startup and asks you to use. A phone or a second laptop opening that URL got a working page and nothing else: no reload on save (JSX edits still arrived over Vite's own socket, so *some* edits landed and the rest looked like they had), no error overlay, and a build-failure page whose own text promises to reload itself once the rebuild succeeds, which never did. The socket now accepts exactly the origins the rest of the dev server accepts — the addresses it answers on, loopback and private-network, on its own two ports — and no others, since it carries source paths, stack traces and forwarded server logs. A refused connection is now named in the terminal instead of being closed silently. [Dev server](architecture/dev-server.md#the-error-overlay).
+- **A page that cannot load its own JavaScript stops failing silently.** Opening a dev page at an address the server does not serve modules to — a hostname, a public IP, an https tunnel — produced a rendered, inert page and total silence everywhere. The dev server now warns on the first such request, naming the origin and what will happen ("it will render and never become interactive"), once per origin; and the dev document reports any module that failed to load to the browser console. [Dev server](architecture/dev-server.md#which-browsers-the-dev-server-trusts), [`pyxle dev`](reference/cli.md#pyxle-dev).
 - **Docs: `<Form>` on a shared-cached page is now a documented limitation.** A page made cacheable with `revalidate` is stored once and served to many people, so Pyxle suppresses the per-user CSRF token — and `<Form>` renders without its hidden `_csrf_token` field on the server, then adds it on the client once it can read the cookie. That produces a React hydration warning and one re-rendered subtree. With JavaScript the form still works (submissions authenticate with the `x-csrf-token` header); without JavaScript, on such a page, the submission is rejected, because there is no token it could honestly carry. Keep the form on an uncached route. [Caching](guides/caching.md), [`<Form>`](reference/client-api.md#form).
 - **A page that no longer compiles stops pretending to work.** `pyxle dev` kept the previous pass' compiled output when a rebuild failed, so a page with a syntax error carried on answering `200` with the last version that built — the browser looked healthy while the file was broken. That route now serves the compile error instead: the file, the line and column, the message, and the source around it, on the same document the 500 path already used. It reloads itself once the rebuild succeeds. A broken `layout.pyxl` takes down the pages it wraps and nothing else. [Dev server](architecture/dev-server.md#when-a-rebuild-fails).
 - **A JSX typo fails the rebuild instead of logging a green tick.** A syntax error in the React half compiled "successfully" — `✅ Rebuilt pages/about.pyxl in 139 ms` — and then 500'd the request, because the pass that reads `<Head>`/`<Script>`/`<Image>`/`<Suspense>` discarded the parse failure and returned empty metadata. The page's `<Head>` was silently dropped with it. It is now reported like any other compile error, against the `.pyxl` source you edit rather than the generated `.jsx`: `Rebuild failed: pages/about.pyxl:16: JSX syntax error: Unexpected token, expected "jsxTagEnd"`. This costs no extra time — that pass already ran on every compile and already had to parse the section. Dev only; `pyxle build` is unchanged.
@@ -27,6 +178,7 @@ Release notes for Pyxle. While we're in beta (`0.x`), minor versions may include
 - **Fix: `pyxle openapi` no longer refuses to run on a project that needs no Pydantic.** The command required the optional `[pydantic]` extra before it looked at your project at all, so on a machine without it every project failed — including a freshly scaffolded one, which contains no `@action` whatsoever — with a message asserting that "this action validates its request body with a Pydantic model". There was no such action: the wording belongs to the request-validation path, where it is accurate, and was being raised where nothing had been inspected yet. Pydantic is now required only where a model actually has to be resolved, so a project whose actions declare no body — or which has no actions yet — generates its document with the extra absent, an empty `paths` object being the right answer for a project with no actions. When an action does declare a model body and Pydantic is missing, the command still stops, and the message now names the action and the file it lives in instead of leaving you to find it. [CLI](reference/cli.md#pyxle-openapi).
 - **Fix: `error.pyxl` now catches an ordinary exception from a loader, not only a `LoaderError`.** The error boundary was reached for four framework-recognised failures — an author-raised `LoaderError`, a loader Pyxle could not run or whose return value it rejected, a bad `HEAD`, a failed component render — and *only* those. Anything a loader's own body raised propagated unclassified and landed in the guardrail meant for unexpected framework faults, which returns Pyxle's fallback document without consulting the boundary at all. So the most ordinary bug in the world — a missing dict key, a `None` where an object was expected, a database driver's exception — showed the framework's "Server Error" page on a site that had written its own. The gap was invisible while building: a developer testing their `error.pyxl` naturally raises `LoaderError`, sees their page, and ships. An exception escaping a loader is now classified where it happens, as the loader-stage failure it is: the nearest `error.pyxl` renders with status `500`, the dev overlay's breadcrumbs mark the renderer as blocked by the loader rather than "outcome unknown", and the original exception is chained so tracebacks still point at the line in your `.pyxl` file. The same applies to a loader on a `layout.pyxl`. What reaches the visitor is unchanged in kind — the boundary receives the real message in development and a generic one in production, and an author-raised `LoaderError` still passes through with its own status code and its own wording in every environment. A fault in Pyxle's own render pipeline deliberately still bypasses the boundary: handling a framework fault by running more application code can compound the failure. [Error handling](guides/error-handling.md#what-reaches-errorpyxl).
 - **Fix: a `500` that renders through `error.pyxl` is written to the server log.** The failure was logged only when the fallback document was served, so an application that shipped an error boundary silently swallowed its own server errors — and because a production response is deliberately sanitized, that log is the only record of what broke. The boundary was hiding exactly what it exists to survive. The failure is now recorded before the boundary is attempted, once, with its traceback. Intentional sub-500 statuses stay quiet as before.
+- **Fix: an `@action` that crashes in production is written to the server log.** A loader that raised logged a full traceback; an action that raised logged **nothing at all** — the dispatcher converts an exception into a JSON `500` itself, so it never reached the handler that does the logging, and only one narrow sub-case (an unset `request.state` attribute) had been given a log line of its own. Because the production response is deliberately sanitized, this left an action with no record anywhere: the developer saw `{"ok": false, "error": "..."}`, checked the log, found an empty file, and had nothing to debug from. Measured around a single failing request, the log grew by zero bytes. Every `500` the action dispatcher can return is now recorded before the response is built — a raised exception, a module that will not import, an unset `request.state` attribute, an action returning something other than a dict — once each, with the traceback and the name of the action that failed. `ActionError` stays quiet: a refusal is the action's own answer to its caller, not a server fault, and keeping it out of the error log is what makes a real crash findable. **Behaviour change:** the sanitized message an action returns in production is now `"An unexpected error occurred."`, matching the wording a page's error boundary has always used and the one [Error handling](guides/error-handling.md#when-an-action-raises-something-else) documents; it was previously an undocumented `"Internal server error"`. Anything asserting on the old string needs updating. [Server actions](core-concepts/server-actions.md#when-an-action-crashes).
 - **Fix: an error page is no longer served without a head.** A page rendered through an `error.pyxl` boundary took that file's `HEAD` variable verbatim and nothing else, skipping the merge every other page goes through — so the page a confused visitor is most likely to see arrived without the site's stylesheet, favicon, description or title, and without its own `<Head>`. It rendered as unstyled black-on-white text in the browser's default serif, on a site that looks nothing like that. The boundary now merges the same four sources a normal render does: the layout chain's `<Head>` blocks and its already-evaluated `HEAD` variable, the boundary's own `HEAD`, and the `<Head>` elements its render produced — with the usual precedence, so an error page's `<title>` still beats the layout's. A `HEAD` that has to be evaluated is handed the error context rather than loader data; if it raises, the head degrades to what could be extracted statically and the boundary still reaches the visitor. [Error handling](guides/error-handling.md), [Head management](guides/head-management.md).
 - **Fix: `pyxle build` no longer reports success when it could not build your client bundle.** A build that cannot reach `npx` — a machine with Node.js but no npm, the shape `apt install nodejs` leaves behind, and the slim CI images and Docker bases built the same way — logged a one-line warning, skipped Vite, and exited `0` under a green "Build completed" banner. The `dist/` it left held no browser JavaScript and named each page by its dev-server path, which `pyxle serve` refuses at startup as an unsafe path — so the first sign of trouble was a deployment that would not boot, reported as a path-safety error that said nothing about Node. The build now stops where the bundle cannot be produced, names the missing prerequisite and the command that fixes it, and exits non-zero; a project with no `package.json` is refused the same way. Nothing is written to `dist/` when it fails, so a rebuild that cannot succeed leaves the previous deployment in place rather than replacing it with an unservable one. As a backstop, the page manifest is checked against the same rule `pyxle serve` applies before it is written — a build that reports success is a build that can be served. [Deployment](guides/deployment.md#build-for-production).
 - **Fix: a CSRF token, signed cookie or bearer credential containing a non-ASCII character is now rejected rather than answered with a `500`.** The constant-time comparison Python provides is only defined for ASCII text and raises on anything else, so a value that should simply have failed to match instead escaped as an unhandled error. Every position this affected takes its value straight off the wire — the `X-CSRF-Token` header, the `_csrf_token` form field (urlencoded or multipart), the CSRF cookie, a `pyxle.verify_cookie` argument, and the metrics endpoint's `Authorization` header — and a browser reaches all of them in ordinary use, since a form field holding an accented character is percent-encoded UTF-8 by the time it arrives. The cookie case was the durable one: a CSRF cookie carrying such a value is read on *every* request including plain page views, so a single bad cookie made the site answer `500` to that browser until it was cleared. All of these are now ordinary mismatches — `403` for a bad CSRF token, `401` for a bad bearer token, `None` from `verify_cookie` — and a CSRF cookie that could not have been issued by the server is replaced with a fresh one instead of being trusted.
