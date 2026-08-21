@@ -140,6 +140,8 @@ For framework contributors and power users.
 ## Examples
 
 Complete, runnable apps in the [`examples/`](../examples) directory of the repo.
+Each is written up in [Example applications](examples.md), which explains what
+each one is meant to prove and what to look at first.
 
 - [Charts](../examples/charts) -- A [Recharts](https://recharts.org) chart rendered from data a Python `@server` loader aggregated, in one `.pyxl` file. Server-rendered SVG, live after hydration, and a written-down account of what it takes to make a DOM-measuring library hydrate cleanly.
 - [Chat](../examples/chat) -- Realtime chat: a page that serves both HTML and a WebSocket at the same path, using `pyxle.realtime` and the `useWebSocket()` hook.
