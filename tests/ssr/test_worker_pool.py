@@ -1060,7 +1060,11 @@ async def test_pool_invalidate_specific_component() -> None:
 
     assert len(captured) == 1
     assert captured[0]["type"] == "invalidate"
-    assert captured[0]["componentPath"] == str(target.resolve())
+    # ASYNC240 flags the blocking ``resolve()``; here it is an assertion on a
+    # literal path, not event-loop work, and a thread hop would only obscure
+    # what is being compared. Scoped to this line so the rule still guards
+    # the rest of the file.
+    assert captured[0]["componentPath"] == str(target.resolve())  # noqa: ASYNC240
 
     await pool.stop()
 
