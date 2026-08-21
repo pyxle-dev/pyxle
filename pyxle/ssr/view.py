@@ -1711,11 +1711,24 @@ def _import_server_module(
 
     _ensure_app_root_importable(module_path)
 
-    # Debug mode execs the generated module as its .pyxl source (remapped
-    # co_filename + line numbers via the compiler's embedded debug footer) —
-    # .pyxl tracebacks and native debugger breakpoints. See compiler.linemap.
+    # Generated page modules are exec'd as their ``.pyxl`` source: the loader
+    # remaps ``co_filename`` and line numbers via the debug footer the compiler
+    # embeds, so tracebacks name the file the author wrote and debugger
+    # breakpoints set in a ``.pyxl`` bind natively.
+    #
+    # This is NOT gated on debug, deliberately. Production sanitises its error
+    # responses, so the server log is the only record of a failure (see
+    # ``_log_render_failure``) — which makes correct coordinates matter *more*
+    # in production, not less. Pointing an on-call reader at
+    # ``dist/server/pages/x.py`` line 9 sends them to a generated artifact that
+    # may not exist on their machine, for a line that is not the one they wrote.
+    #
+    # It is safe where the sources are not deployed: ``remap_code`` returns
+    # ``None`` when the ``.pyxl`` is missing, and the import falls back to the
+    # stock loader exactly as before. Modules without a footer (plain API
+    # modules, static stubs) are unaffected either way.
     loader = None
-    if debug and module_path.suffix == ".py":
+    if module_path.suffix == ".py":
         from pyxle.compiler.linemap import PyxlSourceFileLoader  # noqa: PLC0415
 
         loader = PyxlSourceFileLoader(module_key, str(module_path))
