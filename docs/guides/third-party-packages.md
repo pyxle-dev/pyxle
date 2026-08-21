@@ -116,14 +116,19 @@ telling apart before you go looking for one:
   necessarily correct it, because React is comparing against what it thinks it
   already rendered. This is the quiet one.
 - **Text or structure** — a label the browser wraps onto a second line, an
-  element one side emits and the other does not. React cannot patch that in
-  place: *"Hydration failed because the server rendered text didn't match the
-  client. As a result this tree will be regenerated on the client."* It discards
+  element one side emits and the other does not. React cannot patch either in
+  place, and it distinguishes them: *"Hydration failed because the server
+  rendered **text** didn't match the client"* when the two sides disagree about a
+  string, and *"Hydration failed because the server rendered **HTML** didn't
+  match the client"* when one side emits an element the other does not — which is
+  the kind the entry animations below produce. Both continue *"As a result this
+  tree will be regenerated on the client."* Either way React discards
   the server HTML for the **whole root** and re-renders it in the browser. The
   page ends up interactive, but the server render is thrown away — you pay for
   SSR and the visitor gets a client render anyway.
 
-Only the second is reported outside a development build. See
+Only that second kind — text or structure — is reported outside a development
+build, and then only as a minified error code. See
 [Verifying it hydrates](#verifying-it-hydrates) below.
 
 The fix for both is the same shape — **give the library the number instead of
@@ -196,11 +201,15 @@ console for `hydrat` instead — that one word separates the three cases:
   again.
 - **An attribute mismatch** — `A tree hydrated but some attributes of the server
   rendered HTML didn't match the client properties. This won't be patched up.`
-- **A text or structure mismatch** — an uncaught `Error: Hydration failed because
-  the server rendered text didn't match the client. As a result this tree will be
+- **A text mismatch** — an uncaught `Error: Hydration failed because the server
+  rendered text didn't match the client. As a result this tree will be
   regenerated on the client.`
+- **A structure mismatch** — an uncaught `Error: Hydration failed because the
+  server rendered HTML didn't match the client. As a result this tree will be
+  regenerated on the client.` `text` and `HTML` are the only words that differ
+  between these two, and the second is the one an entry animation produces.
 
-Both messages continue with the component path and a `+`/`-` diff of the two
+All three messages continue with the component path and a `+`/`-` diff of the two
 renders, which is what tells you the prop to pin and the component to pin it on.
 
 That is the only test that finds both kinds. A production build is not a

@@ -60,9 +60,13 @@ cases behave nothing alike:
   not against the DOM. Here that is a tick a few pixels out; elsewhere it is a
   stale `href` or `aria-*`.
 - **Text or structure** — a label the browser wraps and the server does not, an
-  element one side emits and the other does not. React cannot patch that in
-  place: *"Hydration failed because the server rendered text didn't match the
-  client. As a result this tree will be regenerated on the client."* It throws
+  element one side emits and the other does not. React cannot patch either in
+  place, and it distinguishes them: *"Hydration failed because the server
+  rendered **text** didn't match the client"* when the two sides disagree about a
+  string, and *"Hydration failed because the server rendered **HTML** didn't
+  match the client"* when one side emits an element the other does not. Both
+  continue *"As a result this tree will be regenerated on the client."* The entry
+  animation in the table below is the second kind. Either way React throws
   away the server HTML for the **whole root** and re-renders it in the browser.
   The page still ends up interactive — but the server render you paid for was
   discarded, so the first paint is rebuilt from scratch on the client, which is
@@ -145,10 +149,12 @@ test is `pyxle dev` with the browser console open. Read the **whole** console, n
 the top of it: React logs the mismatch *after* its own DevTools notice, so a
 broken load and a clean one are indistinguishable until you scroll past it. Filter
 the console for `hydrat` and you get a straight answer — no match means clean, and
-a match is one of two messages: `A tree hydrated but some attributes … won't be
-patched up` (an attribute) or `Hydration failed because the server rendered text
-didn't match the client` (text or structure). Add an axis, a label or a series and
-look again.
+a match is one of three messages: `A tree hydrated but some attributes … won't be
+patched up` (an attribute), `Hydration failed because the server rendered text
+didn't match the client` (a string differs), or `Hydration failed because the
+server rendered HTML didn't match the client` (one side emitted an element the
+other did not — the kind an entry animation produces). Add an axis, a label or a
+series and look again.
 
 A production build is not a substitute, and neither is reading the finished DOM.
 An attribute mismatch leaves *no* trace in production — nothing is logged, the
