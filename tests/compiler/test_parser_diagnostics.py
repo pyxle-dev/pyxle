@@ -17,7 +17,11 @@ import pytest
 
 from pyxle.compiler.exceptions import CompilationError
 from pyxle.compiler.jsx_parser import JSXParseResult
-from pyxle.compiler.parser import PyxDiagnostic, PyxParser
+from pyxle.compiler.parser import (
+    INJECTED_RUNTIME_NAMES,
+    PyxDiagnostic,
+    PyxParser,
+)
 
 _NODE_AVAILABLE = shutil.which("node") is not None
 
@@ -1143,6 +1147,22 @@ class TestSemanticValidation:
         )
         assert not any(d.section == "python" for d in result.diagnostics)
 
+    def test_injected_runtime_names_are_public(self):
+        # Editor tooling (pyxle-langkit) whitelists this exact set, so it is a
+        # public export of ``pyxle.compiler`` — adding an injected name here
+        # means the compiler must inject it too.
+        from pyxle import compiler
+
+        assert compiler.INJECTED_RUNTIME_NAMES is INJECTED_RUNTIME_NAMES
+        assert INJECTED_RUNTIME_NAMES == {
+            "server",
+            "action",
+            "ActionError",
+            "ValidationActionError",
+            "LoaderError",
+            "invalidate_routes",
+        }
+
     def test_off_by_default(self):
         result = PyxParser().parse_text(
             dedent(
@@ -1219,3 +1239,688 @@ class TestJsxErrorLineMapping:
         result = self._run(monkeypatch, error_line=None)
         jsx = [d for d in result.diagnostics if d.section == "jsx"]
         assert jsx and jsx[0].line == 1
+
+
+class TestSemanticSeverity:
+    """Semantic findings are split into "this will break" and "this is untidy".
+
+    ``pyxle check`` is the documented deploy gate, so only code that fails when
+    it runs may fail the command; hygiene findings are reported as warnings.
+    """
+
+    def _sem(self, text: str):
+        return PyxParser().parse_text(
+            dedent(text).strip("\n"), tolerant=True, validate_semantics=True
+        )
+
+    def _severity_of(self, text: str, needle: str) -> str:
+        matches = [d for d in self._sem(text).diagnostics if needle in d.message]
+        assert matches, f"no diagnostic matched {needle!r}"
+        return matches[0].severity
+
+    def test_unused_import_is_a_warning(self):
+        severity = self._severity_of(
+            """
+            import json
+
+            import React from 'react'
+
+            export default function P() {
+                return <div>ok</div>
+            }
+            """,
+            "'json' imported but unused",
+        )
+        assert severity == "warning"
+
+    def test_undefined_name_is_an_error(self):
+        severity = self._severity_of(
+            """
+            @server
+            async def load(request):
+                return {"x": compute_total(request)}
+
+            import React from 'react'
+
+            export default function P({ data }) {
+                return <div>{data.x}</div>
+            }
+            """,
+            "undefined name 'compute_total'",
+        )
+        assert severity == "error"
+
+    def test_unused_local_is_a_warning(self):
+        severity = self._severity_of(
+            """
+            @server
+            async def load(request):
+                scratch = 1
+                return {"x": 2}
+
+            import React from 'react'
+
+            export default function P() {
+                return <div>ok</div>
+            }
+            """,
+            "'scratch'",
+        )
+        assert severity == "warning"
+
+    def test_syntax_errors_remain_errors(self):
+        """Structural/syntax diagnostics never pass through the pyflakes
+        classifier, so they stay errors."""
+        result = self._sem(
+            """
+            def broken(:
+
+            import React from 'react'
+
+            export default function P() {
+                return <div>ok</div>
+            }
+            """
+        )
+        assert result.diagnostics
+        assert all(d.severity == "error" for d in result.diagnostics)
+
+    def test_unknown_pyflakes_rule_defaults_to_warning(self):
+        """A rule added by a future pyflakes must not become a surprise deploy
+        blocker on a dependency upgrade."""
+        from pyxle.compiler.parser import _pyflakes_severity
+
+        class SomeBrandNewRule:  # noqa: D106 - stand-in for a future message class
+            pass
+
+        assert _pyflakes_severity(SomeBrandNewRule()) == "warning"
+
+    def test_runtime_breaking_rules_are_errors(self):
+        """Spot-check the classification table against pyflakes' real classes."""
+        from pyflakes import messages as pyflakes_messages
+
+        from pyxle.compiler.parser import _pyflakes_severity
+
+        for name in ("UndefinedName", "UndefinedLocal", "RaiseNotImplemented"):
+            instance = object.__new__(getattr(pyflakes_messages, name))
+            assert _pyflakes_severity(instance) == "error", name
+        for name in ("UnusedImport", "UnusedVariable", "RedefinedWhileUnused"):
+            instance = object.__new__(getattr(pyflakes_messages, name))
+            assert _pyflakes_severity(instance) == "warning", name
+
+
+class TestAHeadEntryHoldsOneElement:
+    """A second element in one ``HEAD`` entry never reaches the document.
+
+    The sanitiser rebuilds each entry from its first element and drops the
+    rest — the same pass that discards markup injected after an attribute
+    quote breakout, so it is a security boundary, not a limitation to route
+    around. Where the entry is a literal the author is looking at it right
+    now, so this is the moment to refuse it: a build error beats a rich-results
+    report months later saying the structured data was never there.
+    """
+
+    _TWO_IN_ONE = (
+        'HEAD = ["<title>Page</title><meta name=\\"description\\" content=\\"D\\" />"]\n'
+        "\n"
+        "import React from 'react';\n"
+        "export default function P() { return <div />; }\n"
+    )
+
+    def test_strict_mode_refuses_the_build(self):
+        with pytest.raises(CompilationError) as excinfo:
+            _parse(self._TWO_IN_ONE)
+
+        message = str(excinfo.value)
+        assert "only one element" in message
+        assert "Split it into separate list entries" in message
+        # The dropped markup itself, so the author does not have to guess which
+        # half went missing.
+        assert 'content="D"' in message or "content=\\\"D\\\"" in message
+
+    def test_a_bare_string_head_is_checked_too(self):
+        with pytest.raises(CompilationError):
+            _parse(
+                'HEAD = "<title>Page</title><link rel=\\"icon\\" href=\\"/f.ico\\" />"\n'
+                "\n"
+                "import React from 'react';\n"
+                "export default function P() { return <div />; }\n"
+            )
+
+    def test_tolerant_mode_reports_it_as_an_error_diagnostic(self):
+        """``pyxle check`` and the LSP must show it, positioned, rather than
+        stopping at the first problem in the file."""
+        result = _parse(self._TWO_IN_ONE, tolerant=True)
+
+        matching = [d for d in result.diagnostics if "only one element" in d.message]
+        assert matching, result.diagnostics
+        assert matching[0].severity == "error"
+        assert matching[0].section == "python"
+        assert matching[0].line is not None
+
+    def test_the_documented_fix_compiles(self):
+        """The error tells the author to split the entry. That has to work."""
+        result = _parse(
+            'HEAD = ["<title>Page</title>", "<meta name=\\"description\\" content=\\"D\\" />"]\n'
+            "\n"
+            "import React from 'react';\n"
+            "export default function P() { return <div />; }\n"
+        )
+        assert len(result.head_elements) == 2
+
+    def test_an_inline_script_is_not_mistaken_for_two_elements(self):
+        """Inline code containing ``<`` and markup-shaped text is one element.
+        A false positive here would block a build that was already correct."""
+        result = _parse(
+            'HEAD = [\'<script>if (a < b) { document.write("<p>x</p>") }</script>\']\n'
+            "\n"
+            "import React from 'react';\n"
+            "export default function P() { return <div />; }\n"
+        )
+        assert len(result.head_elements) == 1
+
+    def test_a_computed_head_is_left_to_the_render(self):
+        """A non-literal cannot be judged here — its value is only known at
+        render time, where the check continues as a warning."""
+        result = _parse(
+            "SITE = 'x'\n"
+            "HEAD = [f'<meta name=\"a\" content=\"{SITE}\" /><meta name=\"b\" content=\"c\" />']\n"
+            "\n"
+            "import React from 'react';\n"
+            "export default function P() { return <div />; }\n"
+        )
+        assert result.head_is_dynamic is True
+
+
+class TestSecondaryLineNumbersAreFileCoordinates:
+    """A line number *inside* a message must name the file, not the block.
+
+    Every checker the parser calls — CPython on one segment, pyflakes on the
+    joined Python stream, Babel on the joined JSX stream — is handed an
+    extracted block and numbers its findings from the start of that block. The
+    position the diagnostic carries is translated; the line numbers those tools
+    write into their own prose ("on line 3", "from line 1", "detected at line
+    9") used to be printed raw. That sends the developer to a line that is
+    perfectly fine, which is worse than pointing nowhere.
+
+    Every source here puts the failing block *below* the top of the file, so a
+    mapping that silently does nothing cannot pass by coincidence.
+    """
+
+    # The Python block starts on file line 6, so a block-relative number is
+    # always 5 lower than the file line it should name.
+    _MISMATCHED_BRACKET = (
+        '"""A page."""\n'                    # 1
+        "\n"                                  # 2
+        "from pyxle.runtime import server\n"  # 3
+        "\n"                                  # 4
+        "\n"                                  # 5
+        "@server\n"                           # 6
+        "async def loader(request):\n"        # 7
+        "    items = [\n"                     # 8  <- the '[' the message names
+        "        1,\n"                        # 9
+        "        2,\n"                        # 10
+        "    )\n"                             # 11 <- the ')' the position names
+        "    return {}\n"                     # 12
+        "\n"                                  # 13
+        "\n"                                  # 14
+        "export default function P() {\n"     # 15
+        "  return <div />;\n"                 # 16
+        "}\n"                                 # 17
+    )
+
+    def test_mismatched_bracket_names_the_opening_line_in_the_file(self):
+        result = PyxParser().parse_text(self._MISMATCHED_BRACKET, tolerant=True)
+
+        diagnostics = [d for d in result.diagnostics if d.section == "python"]
+        assert len(diagnostics) == 1, result.diagnostics
+        # The position: the mismatched ')' on file line 11.
+        assert diagnostics[0].line == 11
+        # The message body: the '[' it does not match, on file line 8 — not 3,
+        # which is where it sits inside the extracted block.
+        assert "does not match opening parenthesis '['" in diagnostics[0].message
+        assert diagnostics[0].message.endswith("on line 8")
+
+    def test_strict_mode_carries_the_same_file_line(self):
+        """The build path raises rather than collecting, and must not regress
+        to block coordinates on the way out."""
+        with pytest.raises(CompilationError) as excinfo:
+            PyxParser().parse_text(self._MISMATCHED_BRACKET)
+
+        assert excinfo.value.line_number == 11
+        assert excinfo.value.message.endswith("on line 8")
+        # ``__str__`` is what the terminal and the build-failure page print.
+        assert str(excinfo.value).endswith("on line 8")
+
+    def test_unterminated_string_names_the_detection_line_in_the_file(self):
+        source = (
+            '"""A page."""\n'                    # 1
+            "\n"                                  # 2
+            "from pyxle.runtime import server\n"  # 3
+            "\n"                                  # 4
+            "\n"                                  # 5
+            "@server\n"                           # 6
+            "async def loader(request):\n"        # 7
+            '    text = """oops\n'                # 8  <- opens here
+            "    return {}\n"                     # 9
+            "\n"                                  # 10
+            "\n"                                  # 11
+            "export default function P() {\n"     # 12
+            "  return <div />;\n"                 # 13
+            "}\n"                                 # 14  <- runs out here
+        )
+        result = PyxParser().parse_text(source, tolerant=True)
+
+        diagnostics = [d for d in result.diagnostics if d.section == "python"]
+        assert len(diagnostics) == 1, result.diagnostics
+        assert diagnostics[0].line == 8
+        assert "unterminated triple-quoted string literal" in diagnostics[0].message
+        # CPython says "(detected at line N)"; N is the last line of the file,
+        # which is line 14 — not line 9 of the block it was handed.
+        assert "(detected at line 14)" in diagnostics[0].message
+
+    # JSX first, Python second, so the Python stream starts at file line 7.
+    _PYFLAKES_SOURCE = (
+        "import React from 'react'\n"    # 1
+        "\n"                              # 2
+        "export default function P() {\n" # 3
+        "    return <div>ok</div>\n"      # 4
+        "}\n"                             # 5
+        "\n"                              # 6
+        "import os\n"                     # 7  <- the import both messages name
+        "\n"                              # 8
+        "for os in range(3):\n"           # 9
+        "    pass\n"                      # 10
+        "\n"                              # 11
+        "def outer():\n"                  # 12
+        "    value = 1\n"                 # 13 <- the enclosing binding
+        "    def inner():\n"              # 14
+        "        print(value)\n"          # 15
+        "        value = 2\n"             # 16
+        "    return inner\n"              # 17
+    )
+
+    def _semantic_diagnostics(self):
+        result = PyxParser().parse_text(
+            self._PYFLAKES_SOURCE, tolerant=True, validate_semantics=True
+        )
+        assert result.python_line_numbers[0] == 7, "block offset must be non-zero"
+        return result.diagnostics
+
+    def test_pyflakes_shadowed_import_names_the_file_line(self):
+        matching = [
+            d for d in self._semantic_diagnostics()
+            if "shadowed by loop variable" in d.message
+        ]
+        assert matching, "expected an ImportShadowedByLoopVar finding"
+        assert matching[0].line == 9
+        # "from line 7" — the `import os` in the file, not line 1 of the stream.
+        assert matching[0].message == (
+            "import 'os' from line 7 shadowed by loop variable"
+        )
+
+    def test_pyflakes_undefined_local_names_the_file_line(self):
+        matching = [
+            d for d in self._semantic_diagnostics()
+            if "referenced before assignment" in d.message
+        ]
+        assert matching, "expected an UndefinedLocal finding"
+        assert matching[0].line == 15
+        # "on line 13" — `value = 1` in the file, not line 7 of the stream.
+        assert matching[0].message == (
+            "local variable 'value' defined in enclosing scope on line 13 "
+            "referenced before assignment"
+        )
+
+    def test_pyflakes_redefinition_names_the_file_line(self):
+        source = (
+            "import React from 'react'\n"     # 1
+            "\n"                               # 2
+            "export default function P() {\n"  # 3
+            "    return <div>ok</div>\n"       # 4
+            "}\n"                              # 5
+            "\n"                               # 6
+            "import os\n"                      # 7  <- first binding
+            "import os\n"                      # 8  <- redefinition
+            "\n"                               # 9
+            "@server\n"                        # 10
+            "async def loader(request):\n"     # 11
+            "    return {'cwd': os.getcwd()}\n" # 12
+        )
+        result = PyxParser().parse_text(
+            source, tolerant=True, validate_semantics=True
+        )
+        matching = [
+            d for d in result.diagnostics if "redefinition of unused" in d.message
+        ]
+        assert matching, result.diagnostics
+        assert matching[0].line == 8
+        assert matching[0].message == "redefinition of unused 'os' from line 7"
+
+    def test_jsx_message_line_reference_maps_through_the_jsx_block(self, monkeypatch):
+        """The extractor strips Babel's trailing ``(line:col)``, but any line a
+        JSX-side tool names in prose is section-relative too."""
+        from pyxle.compiler import jsx_parser
+
+        monkeypatch.setattr(
+            jsx_parser,
+            "parse_jsx_components",
+            lambda jsx_code, *, target_components=None: JSXParseResult(
+                components=(),
+                error="Unexpected token — opening tag on line 2 is never closed",
+                error_line=3,
+            ),
+        )
+        source = (
+            "@server\n"                        # 1
+            "async def loader(request):\n"     # 2
+            "    return {}\n"                  # 3
+            "\n"                               # 4
+            "\n"                               # 5
+            "import React from 'react'\n"      # 6  <- JSX block line 1
+            "\n"                               # 7  <- JSX block line 2
+            "export default function P() {\n"  # 8  <- JSX block line 3
+            "    return <div>ok</div>\n"       # 9
+            "}\n"                              # 10
+        )
+        result = PyxParser().parse_text(source, tolerant=True, validate_jsx=True)
+
+        jsx = [d for d in result.diagnostics if d.section == "jsx"]
+        assert jsx and jsx[0].line == 8
+        assert "opening tag on line 7 is never closed" in jsx[0].message
+
+    def test_jsx_message_keeps_a_reference_it_cannot_map(self, monkeypatch):
+        """A number outside the JSX block is left alone rather than clamped —
+        a stray figure must never be dressed up as a real location."""
+        from pyxle.compiler import jsx_parser
+
+        monkeypatch.setattr(
+            jsx_parser,
+            "parse_jsx_components",
+            lambda jsx_code, *, target_components=None: JSXParseResult(
+                components=(), error="broken at line 900", error_line=1
+            ),
+        )
+        result = PyxParser().parse_text(
+            "import React from 'react'\nexport default function P() { return <div/>; }\n",
+            tolerant=True,
+            validate_jsx=True,
+        )
+
+        jsx = [d for d in result.diagnostics if d.section == "jsx"]
+        assert jsx and "at line 900" in jsx[0].message
+
+    def test_typescript_guard_message_is_remapped_too(self, monkeypatch):
+        """The TS guard takes the same path, so it gets the same treatment."""
+        from pyxle.compiler import jsx_parser
+
+        monkeypatch.setattr(
+            jsx_parser,
+            "parse_jsx_components",
+            lambda jsx_code, *, target_components=None: JSXParseResult(
+                components=(),
+                error="TypeScript syntax first seen on line 1",
+                error_code="ts_in_client_block",
+                error_line=1,
+            ),
+        )
+        source = (
+            "@server\n"                        # 1
+            "async def loader(request):\n"     # 2
+            "    return {}\n"                  # 3
+            "\n"                               # 4
+            "\n"                               # 5
+            "import React from 'react'\n"      # 6  <- JSX block line 1
+            "export default function P() {\n"  # 7
+            "    return <div>ok</div>\n"       # 8
+            "}\n"                              # 9
+        )
+        result = PyxParser().parse_text(source, tolerant=True)
+
+        jsx = [d for d in result.diagnostics if d.section == "jsx"]
+        assert jsx and "first seen on line 6" in jsx[0].message
+
+
+class TestRemapMessageLineRefs:
+    """The rewriting rule itself: anchored, reversible, and conservative."""
+
+    def _remap(self, message, offset=10):
+        from pyxle.compiler.parser import _remap_message_line_refs
+
+        return _remap_message_line_refs(message, lambda relative: relative + offset)
+
+    @pytest.mark.parametrize(
+        ("message", "expected"),
+        [
+            (
+                "closing parenthesis ')' does not match opening "
+                "parenthesis '[' on line 3",
+                "closing parenthesis ')' does not match opening "
+                "parenthesis '[' on line 13",
+            ),
+            (
+                "unterminated triple-quoted string literal (detected at line 4)",
+                "unterminated triple-quoted string literal (detected at line 14)",
+            ),
+            (
+                "redefinition of unused 'os' from line 1",
+                "redefinition of unused 'os' from line 11",
+            ),
+            (
+                "local variable 'v' defined in enclosing scope on line 2 "
+                "referenced before assignment",
+                "local variable 'v' defined in enclosing scope on line 12 "
+                "referenced before assignment",
+            ),
+        ],
+    )
+    def test_known_phrasings_are_rewritten(self, message, expected):
+        assert self._remap(message) == expected
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            # No line reference at all — the overwhelmingly common case.
+            "invalid syntax",
+            "'[' was never closed",
+            "unindent does not match any outer indentation level",
+            "Missing parentheses in call to 'print'. Did you mean print(...)?",
+            # "line" without one of the three prepositions in front of it, and a
+            # number that is not a line: neither may be touched.
+            "Dropped: <meta content=\"line 3\" />",
+            "expected 4 spaces of indentation, line up the arguments",
+        ],
+    )
+    def test_unrelated_text_is_left_alone(self, message):
+        assert self._remap(message) == message
+
+    def test_an_unmappable_reference_is_left_alone(self):
+        from pyxle.compiler.parser import _remap_message_line_refs
+
+        message = "opening parenthesis '(' on line 4"
+        assert _remap_message_line_refs(message, lambda relative: None) == message
+
+    def test_every_reference_in_one_message_is_rewritten(self):
+        assert self._remap("opened on line 1, detected at line 2") == (
+            "opened on line 11, detected at line 12"
+        )
+
+
+class TestAnUnmappableNumberIsLeftAlone:
+    """The promise is that a number the compiler cannot place stays as it is.
+
+    It is easy to make that promise and quietly break it, because the mapper
+    used for a diagnostic's *structural* position clamps an out-of-range line to
+    the block's last one. Clamping is right there — some line has to be
+    reported. Inside a message it is a fabricated location wearing the same
+    clothes as a real one, and there is no way for the reader to tell.
+    """
+
+    # JSX first, so the Python stream starts at file line 7 and a mapped
+    # reference is visibly different from an unmapped one.
+    _JSX_FIRST_PREAMBLE = (
+        "import React from 'react'\n"      # 1
+        "\n"                                # 2
+        "export default function P() {\n"   # 3
+        "    return <div>ok</div>\n"        # 4
+        "}\n"                               # 5
+        "\n"                                # 6
+    )
+
+    def test_a_number_in_the_developers_own_string_is_not_rewritten(self):
+        """pyflakes quotes the name it is talking about, and a name taken from
+        ``__all__`` is an arbitrary string the developer wrote. Rewriting a
+        number inside it corrupts the one fragment of the message they would
+        recognise — and 999 was never a line of anything."""
+        source = self._JSX_FIRST_PREAMBLE + (
+            "import os\n"                        # 7
+            "\n"                                  # 8
+            '__all__ = ["ghost on line 999"]\n'   # 9
+            "\n"                                  # 10
+            "@server\n"                           # 11
+            "async def loader(request):\n"        # 12
+            "    return {'cwd': os.getcwd()}\n"   # 13
+        )
+        result = PyxParser().parse_text(
+            source, tolerant=True, validate_semantics=True
+        )
+        assert result.python_line_numbers[0] == 7, "block offset must be non-zero"
+
+        matching = [d for d in result.diagnostics if "__all__" in d.message]
+        assert matching, result.diagnostics
+        assert matching[0].message == "undefined name 'ghost on line 999' in __all__"
+
+    def test_a_reference_past_the_end_of_the_block_is_not_clamped(self):
+        from pyxle.compiler.parser import _exact_source_line, _remap_message_line_refs
+
+        # A three-line block: file lines 7, 8, 9.
+        block = (7, 8, 9)
+        assert _exact_source_line(3, block) == 9
+        # The mapper the message path uses must decline, not answer 9.
+        assert _exact_source_line(4, block) is None
+        assert _exact_source_line(0, block) is None
+
+        message = "opening parenthesis '[' on line 4"
+        remapped = _remap_message_line_refs(
+            message, lambda relative: _exact_source_line(relative, block)
+        )
+        assert remapped == message, "an unplaceable number was replaced with a guess"
+
+    def test_the_structural_position_still_clamps(self):
+        """The two mappers differ on purpose; the position one must not change."""
+        from pyxle.compiler.parser import _map_lineno
+
+        assert _map_lineno(4, (7, 8, 9)) == 9
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            # Every real producer writes its coordinate outside quotes, so each
+            # of these must still be rewritten (offset mapper below adds 10).
+            "closing parenthesis ')' does not match opening parenthesis '[' on line 3",
+            "unterminated triple-quoted string literal (detected at line 3)",
+            "redefinition of unused 'os' from line 3",
+            "import 'os' from line 3 shadowed by loop variable",
+            "local variable 'x' defined in enclosing scope on line 3 "
+            "referenced before assignment",
+        ],
+    )
+    def test_the_quote_rule_does_not_block_a_real_coordinate(self, message):
+        from pyxle.compiler.parser import _remap_message_line_refs
+
+        remapped = _remap_message_line_refs(message, lambda relative: relative + 10)
+        assert "line 13" in remapped
+        assert "line 3" not in remapped
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "undefined name 'ghost on line 3' in __all__",
+            'undefined name "it\'s on line 3" in __all__',
+        ],
+    )
+    def test_a_quoted_number_survives(self, message):
+        from pyxle.compiler.parser import _remap_message_line_refs
+
+        assert _remap_message_line_refs(message, lambda relative: relative + 10) == message
+
+    def test_a_segment_reference_is_bounded_by_its_segment(self):
+        """The segment path translates by addition, which has no natural end.
+        A number past the segment must not become a line beyond it."""
+        from pyxle.compiler.parser import _exact_source_line, _remap_message_line_refs
+
+        # A segment occupying file lines 5-7.
+        segment_lines = range(5, 8)
+        assert _exact_source_line(1, segment_lines) == 5
+        assert _exact_source_line(3, segment_lines) == 7
+        assert _exact_source_line(4, segment_lines) is None
+
+        message = "opening parenthesis '[' on line 4"
+        assert _remap_message_line_refs(
+            message, lambda relative: _exact_source_line(relative, segment_lines)
+        ) == message
+
+
+class TestAnUnclosedBracketNamesTheBracket:
+    """An unclosed bracket inside an indented block used to be reported as
+    ``unexpected indent``.
+
+    The split walker stops at the largest prefix that parses, which is the line
+    *before* the bracket's line, and hands the rest over as JSX. Parsing that
+    remainder alone describes the tear (`the fragment starts indented`) rather
+    than the fault (`the bracket two lines up is open`). CPython, given the
+    whole thing, says the useful sentence — so we widen back to the Python this
+    segment was torn from and report that.
+    """
+
+    SOURCE = """
+    from __future__ import annotations
+
+
+    @server
+    async def load(request):
+        body = {"a": 1}
+        step = int(body.get("a", 1)
+        return {"step": step}
+
+
+    import React from "react";
+
+    export default function A() {
+        return <main>hi</main>;
+    }
+    """
+
+    def _python_errors(self):
+        result = _parse(self.SOURCE, tolerant=True)
+        return [d for d in result.diagnostics if d.section == "python"]
+
+    def test_it_names_the_bracket_not_the_indentation(self):
+        errors = self._python_errors()
+        assert errors, "an unclosed bracket must produce a python diagnostic"
+        message = errors[0].message
+        assert "was never closed" in message
+        assert "unexpected indent" not in message
+
+    def test_it_points_at_the_line_holding_the_bracket(self):
+        # File line 7 is ``step = int(body.get("a", 1)``. Line 8 is the
+        # ``return``, which is fine, and line 6 is fine too — an off-by-one
+        # here sends the reader to code that is correct.
+        assert self._python_errors()[0].line == 7
+
+    def test_a_top_level_bracket_is_unaffected(self):
+        # No indented block, so nothing is torn and the narrow path already
+        # produced CPython's message. This guards the widening from becoming a
+        # blanket override.
+        result = _parse(
+            """
+            from __future__ import annotations
+
+            X = int(str(5)
+            Y = 2
+            """,
+            tolerant=True,
+        )
+        errors = [d for d in result.diagnostics if d.section == "python"]
+        assert errors and "was never closed" in errors[0].message
+        assert errors[0].line == 3

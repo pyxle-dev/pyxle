@@ -146,6 +146,15 @@ Full docs at **[pyxle.dev/docs](https://pyxle.dev/docs/getting-started/installat
 [CLI](https://pyxle.dev/docs/reference/cli) &middot;
 [Configuration](https://pyxle.dev/docs/reference/configuration)
 
+## Examples
+
+Runnable apps in [`examples/`](examples):
+
+- **[charts](examples/charts)** &mdash; a [Recharts](https://recharts.org) chart rendered from
+  data a Python `@server` loader aggregated, in one `.pyxl` file. `npm install recharts`, import
+  it, done &mdash; server-rendered SVG and a live React tree after hydration.
+- **[chat](examples/chat)** &mdash; realtime chat over a page WebSocket with `useWebSocket()`.
+
 ## CLI
 
 ```

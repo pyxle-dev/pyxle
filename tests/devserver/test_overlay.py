@@ -6,7 +6,13 @@ import pytest
 from starlette.websockets import WebSocketDisconnect
 
 from pyxle.cli.logger import ConsoleLogger
-from pyxle.devserver.overlay import OverlayManager, _format_stacktrace
+from pyxle.devserver.dev_origins import private_origin_pattern
+from pyxle.devserver.overlay import (
+    _REFUSED_ORIGIN_MEMORY,
+    OverlayEvent,
+    OverlayManager,
+    _format_stacktrace,
+)
 
 
 @pytest.fixture
@@ -204,6 +210,64 @@ def test_is_allowed_origin_rejects_non_loopback_origin() -> None:
     assert manager._is_allowed_origin("http://attacker.test:8000") is False  # type: ignore[attr-defined]
 
 
+def test_is_allowed_origin_matches_the_private_network_pattern() -> None:
+    """A dev server bound to every interface must accept the browsers it invited.
+
+    ``pyxle dev --host 0.0.0.0`` prints a ``Network:`` URL. A phone that opens it
+    and is then refused the overlay socket loses hot reload and the error
+    overlay, and the build-failure page it may be looking at — which promises to
+    reload itself once the rebuild succeeds — never does.
+    """
+
+    manager = OverlayManager(
+        logger=StubLogger(),
+        allowed_origins={"http://localhost:3000", "http://127.0.0.1:3000"},
+        allowed_origin_pattern=private_origin_pattern(3000, 5173),
+    )
+
+    assert manager._is_allowed_origin("http://192.168.1.11:3000") is True  # type: ignore[attr-defined]
+    assert manager._is_allowed_origin("http://192.168.1.11:5173") is True  # type: ignore[attr-defined]
+    assert manager._is_allowed_origin("http://10.0.0.4:3000/") is True  # type: ignore[attr-defined]
+    # Deliberately not "any origin": the socket carries source paths, stack
+    # traces and forwarded server logs.
+    assert manager._is_allowed_origin("http://evil.example.com") is False  # type: ignore[attr-defined]
+    assert manager._is_allowed_origin("http://192.168.1.11:9999") is False  # type: ignore[attr-defined]
+
+
+@pytest.mark.anyio
+async def test_websocket_endpoint_reports_a_refused_origin_once() -> None:
+    """A refusal is invisible in the browser, so the terminal has to say it."""
+
+    lines: list[str] = []
+    logger = ConsoleLogger(secho=lambda message, **_kwargs: lines.append(message))
+    manager = OverlayManager(logger=logger, allowed_origins={"http://localhost:3000"})
+
+    await manager.websocket_endpoint(StubWebSocket(origin="http://192.168.1.11:3000"))
+    await manager.websocket_endpoint(StubWebSocket(origin="http://192.168.1.11:3000"))
+    await manager.websocket_endpoint(StubWebSocket(origin="http://evil.example.com"))
+
+    refusals = [line for line in lines if "Refused a dev overlay connection" in line]
+    # One per origin — a browser reconnecting on a timer must not fill the
+    # terminal, and a second origin must not be swallowed by the first.
+    assert len(refusals) == 2
+    assert "http://192.168.1.11:3000" in refusals[0]
+    assert "http://evil.example.com" in refusals[1]
+
+
+@pytest.mark.anyio
+async def test_refused_origin_memory_stops_growing() -> None:
+    """The dedupe set is a cache, and every cache here has a bound."""
+
+    manager = OverlayManager(logger=StubLogger(), allowed_origins={"http://localhost:3000"})
+
+    for index in range(_REFUSED_ORIGIN_MEMORY + 10):
+        await manager.websocket_endpoint(
+            StubWebSocket(origin=f"http://host-{index}.test")
+        )
+
+    assert len(manager._refused_origins) == _REFUSED_ORIGIN_MEMORY  # type: ignore[attr-defined]
+
+
 @pytest.mark.anyio
 async def test_websocket_endpoint_rejects_disallowed_origin() -> None:
     manager = OverlayManager(
@@ -268,3 +332,98 @@ async def test_notify_error_formats_stack_when_omitted() -> None:
     # traceback derived from the live exception.
     assert "RuntimeError" in message["payload"]["stack"]
     assert "derived stack" in message["payload"]["stack"]
+
+
+class TestErrorSurvivesReload:
+    """An error must outlive the tab that happened to be open when it broke.
+
+    Reloading a page closes the overlay socket and opens a new one. Without
+    replay the new socket is told nothing, so the browser shows a healthy page
+    while the source is still broken — and the developer concludes hot reload
+    is what is broken.
+    """
+
+    @pytest.mark.anyio
+    async def test_error_is_replayed_to_a_client_that_connects_later(self) -> None:
+        manager = OverlayManager(logger=StubLogger())
+        await manager.notify_error(
+            route_path="(rebuild)", error=RuntimeError("pages/about.pyxl:7:9: bad")
+        )
+
+        reconnected = StubWebSocket()
+        await manager.register(reconnected)
+
+        assert len(reconnected.sent) == 1
+        replayed = json.loads(reconnected.sent[0])
+        assert replayed["type"] == "error"
+        assert replayed["payload"]["routePath"] == "(rebuild)"
+        assert "pages/about.pyxl:7:9" in replayed["payload"]["message"]
+
+    @pytest.mark.anyio
+    async def test_nothing_is_replayed_when_the_build_is_healthy(self) -> None:
+        manager = OverlayManager(logger=StubLogger())
+        socket = StubWebSocket()
+
+        await manager.register(socket)
+
+        assert socket.sent == []
+
+    @pytest.mark.anyio
+    async def test_clearing_a_route_stops_it_being_replayed(self) -> None:
+        manager = OverlayManager(logger=StubLogger())
+        await manager.notify_error(route_path="(rebuild)", error=RuntimeError("boom"))
+        await manager.notify_clear(route_path="(rebuild)")
+
+        socket = StubWebSocket()
+        await manager.register(socket)
+
+        assert socket.sent == []
+
+    @pytest.mark.anyio
+    async def test_a_healthy_route_does_not_clear_another_route_error(self) -> None:
+        """Every successful render clears its own route — and only its own."""
+        manager = OverlayManager(logger=StubLogger())
+        await manager.notify_error(route_path="(rebuild)", error=RuntimeError("boom"))
+        await manager.notify_clear(route_path="/")
+
+        socket = StubWebSocket()
+        await manager.register(socket)
+
+        assert len(socket.sent) == 1
+        assert json.loads(socket.sent[0])["payload"]["routePath"] == "(rebuild)"
+
+    @pytest.mark.anyio
+    async def test_the_most_recent_error_is_the_one_replayed(self) -> None:
+        manager = OverlayManager(logger=StubLogger())
+        await manager.notify_error(route_path="/first", error=RuntimeError("older"))
+        await manager.notify_error(route_path="/second", error=RuntimeError("newer"))
+
+        socket = StubWebSocket()
+        await manager.register(socket)
+
+        assert json.loads(socket.sent[0])["payload"]["routePath"] == "/second"
+
+    @pytest.mark.anyio
+    async def test_repeating_an_error_keeps_one_entry_per_route(self) -> None:
+        manager = OverlayManager(logger=StubLogger())
+        await manager.notify_error(route_path="/a", error=RuntimeError("one"))
+        await manager.notify_error(route_path="/b", error=RuntimeError("two"))
+        await manager.notify_error(route_path="/a", error=RuntimeError("three"))
+        await manager.notify_clear(route_path="/a")
+
+        socket = StubWebSocket()
+        await manager.register(socket)
+
+        assert json.loads(socket.sent[0])["payload"]["routePath"] == "/b"
+
+    @pytest.mark.anyio
+    async def test_a_client_that_vanishes_during_replay_is_dropped(self) -> None:
+        manager = OverlayManager(logger=StubLogger())
+        await manager.notify_error(route_path="(rebuild)", error=RuntimeError("boom"))
+
+        socket = StubWebSocket()
+        socket.disconnect_after = 1
+        await manager.register(socket)
+
+        await manager.broadcast(OverlayEvent(type="reload", payload={}))
+        assert len(socket.sent) == 1

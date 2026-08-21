@@ -27,6 +27,7 @@ so multi-process serving needs no shared state. ``--ssr-workers`` is therefore
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional, Sequence
@@ -34,10 +35,17 @@ from typing import TYPE_CHECKING, Optional, Sequence
 from pyxle.build.manifest import load_manifest
 from pyxle.cli.logger import ConsoleLogger
 from pyxle.config import PyxleConfig, apply_env_overrides, load_config
+from pyxle.devserver.build import (
+    CACHE_METADATA_FILENAME,
+    BuildMetadata,
+    load_build_metadata,
+)
 from pyxle.devserver.registry import build_metadata_registry
 from pyxle.devserver.routes import build_route_table
-from pyxle.devserver.settings import DevServerSettings
+from pyxle.devserver.scripts import GlobalScript, resolve_global_scripts
+from pyxle.devserver.settings import CLIENT_BUNDLE_DIR_NAME, DevServerSettings
 from pyxle.devserver.starlette_app import create_starlette_app
+from pyxle.devserver.styles import GlobalStylesheet, resolve_global_stylesheets
 from pyxle.env import load_env_files
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -67,6 +75,54 @@ ENV_SERVE_STATIC = _ENV_PREFIX + "SERVE_STATIC"
 # Importable target for ``uvicorn.run(..., factory=True)``.
 FACTORY_IMPORT_STRING = "pyxle.build.production:create_app"
 
+#: Sub-directory of ``dist`` holding the app's own **source** files, mirrored
+#: there by :func:`pyxle.build.pipeline._prepare_dist`.
+DIST_APP_DIRNAME = "app"
+
+
+def app_source_mirror(resolved_dist: Path) -> Optional[Path]:
+    """Return ``dist/app`` — the shipped copy of the app's source tree.
+
+    ``dist`` holds compiled artifacts, but a *running* server still reads plain
+    source files from the project:
+
+    * the Python modules colocated under ``pages/`` that routes import —
+      ``pages/api/_shared.py``, ``pages/api/__init__.py``,
+      ``pages/api/_internal/…``, ``pages/s/[slug]/queries.py``. They are not
+      routes, so nothing compiles them into ``dist/server``, yet the compiled
+      route that says ``from pages.api._shared import …`` cannot import without
+      them;
+    * ``pages/**/llms.py`` handlers and colocated ``pages/**/*.md`` files, which
+      the AI-accessibility layer reads through ``settings.pages_dir``;
+    * the configured global stylesheets, whose contents are read at render time
+      and inlined into the document head.
+
+    A deployment that ships only ``dist`` (a Docker ``COPY --from=build``, a CI
+    artifact, an rsync of the build output) has none of them — so the build
+    mirrors them into ``dist/app`` and serving falls back to that copy.
+
+    Returns ``None`` when the directory is absent (a ``dist`` built by a Pyxle
+    older than this mirror), leaving the previous project-root-only behaviour.
+    """
+    candidate = resolved_dist / DIST_APP_DIRNAME
+    return candidate if candidate.is_dir() else None
+
+
+def _asset_source_root(
+    project_root: Path, app_mirror: Optional[Path], relative_entry: str
+) -> Path:
+    """Root to read a configured global stylesheet/script from.
+
+    The project's own file always wins when it is deployed: ``pyxle serve``
+    without ``--skip-build`` runs a build first, and that build must read (and
+    re-mirror) the file the developer edited. ``dist/app`` is the fallback that
+    keeps a dist-only deployment working. When the entry is in neither place the
+    project root is returned so the normal validation raises its usual error.
+    """
+    if app_mirror is None or (project_root / relative_entry).is_file():
+        return project_root
+    return app_mirror if (app_mirror / relative_entry).is_file() else project_root
+
 
 def _dedupe_entries(entries: Sequence[str]) -> tuple[str, ...]:
     """Normalise and de-duplicate configured asset paths, preserving order."""
@@ -81,16 +137,21 @@ def _dedupe_entries(entries: Sequence[str]) -> tuple[str, ...]:
     return tuple(normalized)
 
 
-def _resolve_global_style_entries(project_root: Path, config: PyxleConfig) -> tuple[str, ...]:
+def _resolve_global_style_entries(
+    project_root: Path, config: PyxleConfig, *, app_mirror: Optional[Path] = None
+) -> tuple[str, ...]:
     """Configured global styles, auto-detecting ``styles/global.css`` when present.
 
     Mirrors ``pyxle.cli._resolve_global_style_entries`` (kept in sync; ``build``
-    may not import ``cli``).
+    may not import ``cli``). The auto-detection also considers *app_mirror*, so a
+    dist-only deployment finds the stylesheet the build shipped for it.
     """
     entries = list(config.global_styles)
     default_candidate = Path("styles") / "global.css"
-    if not entries and (project_root / default_candidate).is_file():
-        entries.append(default_candidate.as_posix())
+    if not entries:
+        root = _asset_source_root(project_root, app_mirror, default_candidate.as_posix())
+        if (root / default_candidate).is_file():
+            entries.append(default_candidate.as_posix())
     return _dedupe_entries(entries)
 
 
@@ -101,6 +162,36 @@ def _resolve_global_script_entries(project_root: Path, config: PyxleConfig) -> t
     """
     del project_root  # scripts require explicit configuration
     return _dedupe_entries(config.global_scripts)
+
+
+def resolve_global_assets(
+    project_root: Path, config: PyxleConfig, *, app_mirror: Optional[Path] = None
+) -> tuple[tuple[GlobalStylesheet, ...], tuple[GlobalScript, ...]]:
+    """Resolve the configured global stylesheets/scripts for a production serve.
+
+    Each entry is resolved against the project root when the file is deployed
+    and against the ``dist/app`` mirror otherwise (see
+    :func:`_asset_source_root`), then handed to
+    :class:`~pyxle.devserver.settings.DevServerSettings` already resolved —
+    which is what lets a dist-only deployment start at all. Resolving against
+    the project root alone raises
+    :class:`~pyxle.devserver.styles.GlobalStyleConfigError` for a configured
+    stylesheet whose source was never shipped, and ``pyxle serve`` exits.
+
+    Entries are resolved one at a time so configured order is preserved (it is
+    the cascade order of the inlined stylesheets).
+    """
+    styles: list[GlobalStylesheet] = []
+    for entry in _resolve_global_style_entries(project_root, config, app_mirror=app_mirror):
+        root = _asset_source_root(project_root, app_mirror, entry)
+        styles.extend(resolve_global_stylesheets(root, (entry,)))
+
+    scripts: list[GlobalScript] = []
+    for entry in _resolve_global_script_entries(project_root, config):
+        root = _asset_source_root(project_root, app_mirror, entry)
+        scripts.extend(resolve_global_scripts(root, (entry,)))
+
+    return tuple(styles), tuple(scripts)
 
 
 def _resolve_dist_directory(project_root: Path, dist_dir: Optional[Path]) -> Path:
@@ -123,6 +214,7 @@ def build_settings(
     host: Optional[str] = None,
     port: Optional[int] = None,
     ssr_workers: Optional[int] = None,
+    dist_dir: Optional[Path] = None,
 ) -> DevServerSettings:
     """Load ``.env`` + config and build production :class:`DevServerSettings`.
 
@@ -130,6 +222,10 @@ def build_settings(
     so a worker subprocess (which only has environment variables) can reconstruct
     identical settings. The manifest is NOT attached here — that happens in
     :func:`build_production_app` once the built ``dist`` is known.
+
+    *dist_dir* is only used to locate the :func:`app_source_mirror`, so a
+    dist-only deployment can resolve global stylesheets/scripts that were
+    shipped inside ``dist`` rather than beside the project.
 
     Raises the underlying ``EnvFileError`` / ``ConfigError`` /
     ``GlobalStyleConfigError`` / ``GlobalScriptConfigError`` on bad input.
@@ -144,11 +240,15 @@ def build_settings(
     extra: dict[str, object] = {}
     if ssr_workers is not None:
         extra["ssr_workers"] = ssr_workers
+    app_mirror = app_source_mirror(_resolve_dist_directory(project_root, dist_dir))
+    stylesheets, scripts = resolve_global_assets(
+        project_root, production_config, app_mirror=app_mirror
+    )
     return DevServerSettings.from_project_root(
         project_root,
         **production_config.to_devserver_kwargs(),
-        global_stylesheets=_resolve_global_style_entries(project_root, production_config),
-        global_scripts=_resolve_global_script_entries(project_root, production_config),
+        global_stylesheets=stylesheets,
+        global_scripts=scripts,
         **extra,
     )
 
@@ -196,16 +296,139 @@ def _resolve_static_dirs(
         )
         public_static_dir = settings.public_dir
 
-    client_dir = resolved_dist / "client"
+    # Vite's bundle output, not the tree above it. ``dist/client/`` is the build
+    # *input* directory — every page's unbundled JSX, Pyxle's own client
+    # components, ``vite.config.js``, ``tsconfig.json`` — and the browser only
+    # ever loads what Vite emitted into ``dist/client/dist/``. Mounting the
+    # parent published the whole input tree; see CLIENT_BUNDLE_DIR_NAME.
+    client_dir = resolved_dist / "client" / CLIENT_BUNDLE_DIR_NAME
     if client_dir.exists():
         client_static_dir: Optional[Path] = client_dir
     else:
         logger.warning(
-            f"Client asset directory '{client_dir}' does not exist; /client requests will 404."
+            f"Client bundle directory '{client_dir}' does not exist; "
+            f"/client requests will 404."
         )
         client_static_dir = None
 
     return public_static_dir, client_static_dir
+
+
+def rebase_settings_onto_dist(
+    settings: DevServerSettings, resolved_dist: Path
+) -> DevServerSettings:
+    """Point *settings* at the compiled artifacts inside ``dist``.
+
+    ``DevServerSettings.from_project_root`` resolves ``build_root`` and its
+    ``client``/``server``/``metadata`` children to the **intermediate**
+    ``.pyxle-build`` directory, which is correct for ``pyxle dev`` but wrong for
+    ``pyxle serve``: the served artifacts live in ``dist``, and ``dist`` is
+    exactly what a deployment ships. Serving one while reading routing metadata
+    from the other has two failure modes, both silent:
+
+    * ``.pyxle-build`` is **absent** (a deploy or CI job that ships only
+      ``dist``) — the registry finds no sources and every page 404s.
+    * ``.pyxle-build`` is **stale or rewritten** — anything that recompiles a
+      page into it after the build (a project's own ``compile_file``-based test
+      helper, an editor tool, an interrupted ``pyxle dev``) resets that page's
+      ``client_path`` to the unwrapped ``/pages/…`` module and drops its
+      ``wrappers``, because those two fields are written by the layout
+      composition pass and not by the compiler. The page then renders in
+      production **without its layout** — the layout's ``@server`` loader still
+      runs (loader discovery reads different keys of the same metadata), so the
+      hydration payload looks correct while the layout markup is simply gone.
+
+    ``dist/server``, ``dist/metadata`` and ``dist/client`` are verbatim copies
+    of their ``.pyxle-build`` counterparts (see
+    :func:`pyxle.build.pipeline._prepare_dist`), so re-rooting is a pure
+    redirection. A ``dist`` that predates the layout is left alone and the
+    caller keeps the old behaviour.
+
+    ``pages_dir`` is re-rooted too, but only when the project's own ``pages/``
+    is **not** deployed: it points at source files (``llms.py`` handlers,
+    colocated ``.md``), and the deployed source is the developer's own copy, so
+    it stays authoritative whenever it exists. See :func:`app_source_mirror`.
+    """
+    metadata_dir = resolved_dist / "metadata"
+    server_dir = resolved_dist / "server"
+    client_dir = resolved_dist / "client"
+    if not (metadata_dir.is_dir() and server_dir.is_dir() and client_dir.is_dir()):
+        return settings
+
+    extra: dict[str, object] = {}
+    mirrored_pages = _mirrored_pages_dir(settings, resolved_dist)
+    if mirrored_pages is not None:
+        extra["pages_dir"] = mirrored_pages
+
+    return replace(
+        settings,
+        build_root=resolved_dist,
+        metadata_build_dir=metadata_dir,
+        server_build_dir=server_dir,
+        client_build_dir=client_dir,
+        **extra,
+    )
+
+
+def _mirrored_pages_dir(settings: DevServerSettings, resolved_dist: Path) -> Optional[Path]:
+    """The mirrored ``pages/`` inside ``dist/app``, when it has to stand in.
+
+    ``None`` when the project's own pages directory is deployed (it wins), when
+    the dist carries no mirror, or when ``pagesDir`` points outside the project
+    root — in which case nothing could have mirrored it.
+    """
+    if settings.pages_dir.is_dir():
+        return None
+    mirror = app_source_mirror(resolved_dist)
+    if mirror is None:
+        return None
+    try:
+        relative = settings.pages_dir.relative_to(settings.project_root)
+    except ValueError:
+        return None
+    candidate = mirror / relative
+    return candidate if candidate.is_dir() else None
+
+
+def _ensure_app_source_importable(resolved_dist: Path) -> None:
+    """Put ``dist/app`` on ``sys.path`` so the app's own modules import.
+
+    A compiled route that says ``from pages.api._shared import GREETING``
+    resolves that name the same way in production as in development: off
+    ``sys.path``. The project root is added by the Starlette app itself
+    (:func:`pyxle.devserver.starlette_app._ensure_project_root_on_sys_path`);
+    this **appends** the mirror behind it, so a deployment that still carries
+    its source tree keeps importing from source and only a dist-only deployment
+    falls through to the shipped copy.
+    """
+    mirror = app_source_mirror(resolved_dist)
+    if mirror is None:
+        return
+    entry = str(mirror)
+    if entry not in sys.path:
+        sys.path.append(entry)
+
+
+def _load_dist_build_cache(
+    build_root: Path, resolved_dist: Path, log: ConsoleLogger
+) -> BuildMetadata:
+    """Read the build-cache index (``meta.json``) that lists the compiled sources.
+
+    Prefers the copy inside ``dist``. A ``dist`` produced by a Pyxle older than
+    the one that started copying it has none, so fall back to *build_root* (the
+    project's intermediate build directory) and say so — that fallback is what
+    the stale-metadata bug rides on, and a deployment that ships only ``dist``
+    has nothing to fall back to at all.
+    """
+    if (resolved_dist / CACHE_METADATA_FILENAME).is_file():
+        return load_build_metadata(resolved_dist)
+
+    log.warning(
+        f"'{resolved_dist / CACHE_METADATA_FILENAME}' is missing — this dist was produced "
+        f"by an older Pyxle. Falling back to '{build_root}', which may be stale. "
+        "Re-run `pyxle build` to make the dist self-contained."
+    )
+    return load_build_metadata(build_root)
 
 
 def build_production_app(
@@ -238,10 +461,19 @@ def build_production_app(
     except Exception as exc:  # pragma: no cover - defensive logging parity with CLI
         raise ProductionServeError(f"Failed to load page-manifest.json: {exc}") from exc
 
+    # The build cache index has to be read against the *original* build root,
+    # because the rebase below moves it into ``dist``.
+    build_cache = _load_dist_build_cache(settings.build_root, resolved_dist, log)
+    settings = rebase_settings_onto_dist(settings, resolved_dist)
     settings = replace(settings, debug=False, page_manifest=manifest_data)
 
+    # Routes are imported while the route table is built (API modules) and on
+    # every render (page modules); their own imports of the app's colocated
+    # helpers have to resolve first.
+    _ensure_app_source_importable(resolved_dist)
+
     try:
-        route_table = build_route_table(build_metadata_registry(settings))
+        route_table = build_route_table(build_metadata_registry(settings, build_cache))
     except Exception as exc:  # pragma: no cover - unexpected runtime errors
         raise ProductionServeError(f"Failed to prepare routes: {exc}") from exc
 
@@ -254,10 +486,14 @@ def build_production_app(
     if pool_size > 0:
         from pyxle.ssr.worker_pool import SsrWorkerPool  # noqa: PLC0415 - heavy, lazy
 
+        from pyxle.ssr.template import vite_owns_stylesheets  # noqa: PLC0415
+
         pool = SsrWorkerPool(
             size=pool_size,
             project_root=settings.project_root,
             client_root=settings.client_build_dir,
+            pages_root=settings.pages_dir,
+            vite_owns_css=vite_owns_stylesheets(settings),
         )
 
     # A `pyxle build --static` run leaves pre-rendered pages here; the app warms
@@ -339,6 +575,7 @@ def create_app() -> "Starlette":
         host=host,
         port=port,
         ssr_workers=ssr_workers,
+        dist_dir=dist_dir,
     )
     resolved_dist = _resolve_dist_directory(project_root, dist_dir)
     app, _ = build_production_app(settings, resolved_dist, serve_static=serve_static)

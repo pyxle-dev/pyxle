@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -330,6 +331,7 @@ def _load_page_metadata(path: Path) -> Optional[PageMetadata]:
         cache_revalidate = None
 
     uses_suspense = payload.get("uses_suspense") is True
+    standalone = payload.get("standalone") is True
 
     return PageMetadata(
         route_path=route_path,
@@ -343,6 +345,7 @@ def _load_page_metadata(path: Path) -> Optional[PageMetadata]:
         scripts=scripts,
         images=images,
         head_jsx_blocks=head_jsx_blocks,
+        standalone=standalone,
         actions=actions,
         websocket_name=websocket_name,
         websocket_line=websocket_line,
@@ -357,70 +360,203 @@ def _resolve_client_module_path(client_root: Path, client_asset_path: str) -> Pa
 
 
 def _module_key(relative_path: Path, *, prefix: str, drop_leading: str | None = None) -> str:
+    """``sys.modules`` key for a compiled page or API module.
+
+    The key has to be **unique per source file**. Compiled modules are cached in
+    ``sys.modules`` under this key and reused without re-checking which file
+    they came from, so two pages sharing a key means one silently serves the
+    other's loader and component — at two different URLs, with a `200` and no
+    error anywhere.
+
+    Readability wants the route syntax stripped (``[id]`` reading as ``id``),
+    but stripping is lossy and collides: ``[id]``/``id``, ``[[...slug]]``/
+    ``[slug]``, ``(marketing)``/``marketing``, ``my-page``/``my_page`` and
+    ``embed.js``/``embed_js`` all cleaned to one name. Route groups make this
+    ordinary rather than exotic — their whole purpose is a directory that does
+    not appear in the URL, so ``(marketing)/pricing`` and ``marketing/pricing``
+    are two legitimate pages at two URLs.
+
+    So a segment the cleaning *altered* carries a short digest of its original
+    text. Segments that survive cleaning untouched — the overwhelming majority —
+    keep exactly the key they had, and any two distinct source segments now
+    produce distinct keys.
+    """
     parts = [segment for segment in prefix.split(".") if segment]
     segments = list(relative_path.with_suffix("").parts)
     if drop_leading and segments and segments[0] == drop_leading:
         segments = segments[1:]
 
     for segment in segments:
-        cleaned = segment.replace("[", "").replace("]", "")
-        cleaned = cleaned.replace("(", "").replace(")", "")
-        cleaned = cleaned.replace("...", "")
-        cleaned = cleaned.replace("-", "_").replace(" ", "_")
-        cleaned = cleaned.replace(".", "_")
-        if not cleaned:
-            cleaned = "_"
-        if cleaned[0].isdigit():
-            cleaned = "_" + cleaned
-        parts.append(cleaned)
+        parts.append(_module_key_segment(segment))
     return ".".join(parts)
 
 
-def find_layout_head_jsx_blocks(
-    settings: DevServerSettings,
-    page_relative_path: Path,
-) -> tuple[str, ...]:
-    """Find and load head blocks from layout/template files that wrap the page.
-    
-    Searches ancestor directories from the page's location for layout.pyxl and template.pyxl
-    files, loading their compiled metadata to extract both head_jsx_blocks (from <Head>)
-    and head_elements (from legacy HEAD variables). Returns the combined blocks in 
-    directory precedence order (closest ancestor first).
+def _module_key_segment(segment: str) -> str:
+    """Clean one path segment for :func:`_module_key`, keeping it collision-free."""
+    cleaned = segment.replace("[", "").replace("]", "")
+    cleaned = cleaned.replace("(", "").replace(")", "")
+    cleaned = cleaned.replace("...", "")
+    cleaned = cleaned.replace("-", "_").replace(" ", "_")
+    cleaned = cleaned.replace(".", "_")
+    if not cleaned:
+        cleaned = "_"
+    if cleaned[0].isdigit():
+        cleaned = "_" + cleaned
+    if cleaned == segment:
+        return cleaned
+    # Lossy: another segment could clean to the same name. Tie the key back to
+    # the text it came from so the two cannot share a ``sys.modules`` entry.
+    digest = hashlib.blake2s(segment.encode("utf-8"), digest_size=3).hexdigest()
+    return f"{cleaned}_{digest}"
+
+
+@dataclass(frozen=True, slots=True)
+class LayoutHeadSource:
+    """One layout/template's ``HEAD`` variable, located in the wrapping chain.
+
+    ``static_elements`` holds the entries the compiler could read straight off
+    the module's AST — a literal string, a literal list. When ``is_dynamic`` is
+    set it could not: the value is an f-string, a concatenation, a
+    comprehension, a ``json.dumps(...)`` call or a ``def HEAD(data)`` callable,
+    and the only way to learn what it produces is to import the module and
+    evaluate it. The module coordinates travel with the source precisely so the
+    caller can do that — see :func:`pyxle.ssr.view._resolve_layout_head_elements`.
+
+    A layout that reported only its literals is how site-wide JSON-LD used to
+    vanish from every page below it, with no warning and no log line.
     """
-    # Compute ancestor directories in reverse order (closest to root)
+
+    relative_path: Path
+    server_module_path: Path
+    module_key: str
+    static_elements: tuple[str, ...] = ()
+    is_dynamic: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class LayoutHeadContribution:
+    """The head a page inherits from its layout/template chain.
+
+    Two channels, deliberately kept apart, because they are two different kinds
+    of thing and only one of them may be filtered downstream:
+
+    * ``jsx_blocks`` — raw JSX **source** sliced out of ``<Head>`` blocks before
+      any of it has run, so a tag may still hold an unevaluated ``{expression}``.
+    * ``head_sources`` — one entry per layout that declares a ``HEAD`` variable,
+      in wrapping order (closest ancestor first). Each is either finished HTML
+      strings, where a brace is content (a JSON-LD payload, a CSS rule), or a
+      pointer to a module whose ``HEAD`` still has to be evaluated.
+
+    Merging them into one collection is what made a root layout's JSON-LD
+    disappear from every page: the unevaluated-expression filter that
+    ``jsx_blocks`` needs judged the already-finished ``HEAD`` strings by the
+    same rule and deleted them.
+
+    There is deliberately **no** literals-only accessor here. Offering one is
+    what let the layout path quietly serve a partial answer while a page's
+    identical ``HEAD`` rendered in full.
+    """
+
+    jsx_blocks: tuple[str, ...] = ()
+    head_sources: tuple[LayoutHeadSource, ...] = ()
+
+
+def _layout_chain_ancestors(page_relative_path: Path) -> list[Path]:
+    """Directories that may hold a layout wrapping *page_relative_path*.
+
+    Ordered closest ancestor first, project root last — the order a page's
+    wrappers apply in. Shared by :func:`find_layout_head_contributions` and
+    :func:`find_layout_loaders` so a layout's head and its loader can never
+    disagree about which files wrap a page.
+    """
     parts = list(page_relative_path.parent.parts)
     ancestors: List[Path] = []
-    
-    # Start with the page's immediate directory
+
+    # The page's own directory (absent for a page sitting at the root).
     if page_relative_path.parent.name:
         ancestors.append(page_relative_path.parent)
-    
-    # Add each parent directory
+
     for index in range(len(parts) - 1, 0, -1):
         ancestors.append(Path(*parts[:index]))
-    
-    # Add root
+
     ancestors.append(Path("."))
-    
-    layout_head_blocks: List[str] = []
-    
+    return ancestors
+
+
+def _layout_relative_path(ancestor_dir: Path, filename: str) -> Path:
+    """Project-relative path of *filename* inside *ancestor_dir*."""
+    return Path(filename) if ancestor_dir == Path(".") else ancestor_dir / filename
+
+
+def _layout_module_key(relative: Path) -> str:
+    """``sys.modules`` key for a compiled layout/template module.
+
+    A layout's loader and its ``HEAD`` must resolve to the *same* module
+    object, so both call sites derive the key here — otherwise the module runs
+    twice and module-level state (a client handle, a cached template) exists in
+    two copies that disagree.
+    """
+    return relative.with_suffix("").as_posix().replace("/", ".")
+
+
+def find_layout_head_contributions(
+    settings: DevServerSettings,
+    page_relative_path: Path,
+) -> LayoutHeadContribution:
+    """Find and load head contributions from layout/template files that wrap the page.
+
+    Searches ancestor directories from the page's location for layout.pyxl and
+    template.pyxl files, loading their compiled metadata. ``<Head>`` JSX blocks
+    and ``HEAD`` variable sources are returned in **separate** channels (see
+    :class:`LayoutHeadContribution`), each in directory precedence order
+    (closest ancestor first).
+
+    A layout whose ``HEAD`` the compiler could not read statically is reported
+    as a :class:`LayoutHeadSource` with ``is_dynamic`` set, not dropped.
+    """
+    layout_jsx_blocks: List[str] = []
+    head_sources: List[LayoutHeadSource] = []
+
     # Search for layout and template files in ancestor directories
-    for ancestor_dir in ancestors:
+    for ancestor_dir in _layout_chain_ancestors(page_relative_path):
+        stop_here = False
         for filename in ("layout.pyxl", "template.pyxl"):
-            metadata_path = settings.metadata_build_dir / "pages" / ancestor_dir / Path(filename).with_suffix(".json")
-            # Handle root directory case
-            if ancestor_dir == Path("."):
-                metadata_path = settings.metadata_build_dir / "pages" / Path(filename).with_suffix(".json")
-            
+            relative = _layout_relative_path(ancestor_dir, filename)
+            metadata_path = settings.metadata_build_dir / "pages" / relative.with_suffix(".json")
+
             metadata = _load_page_metadata(metadata_path)
             if metadata is not None:
-                # Include both JSX Head blocks and legacy HEAD variable elements
+                # A STANDALONE layout is the root of its own chain, so an
+                # ancestor's <Head> does not belong on these pages either --
+                # otherwise a section that opted out of the app shell still
+                # inherits its analytics snippet and its stylesheet link.
+                if metadata.standalone:
+                    stop_here = True
+                # Two channels, never one list: <Head> JSX is unevaluated source
+                # and is filtered downstream; the HEAD variable is finished HTML
+                # and must reach the document verbatim.
                 if metadata.head_jsx_blocks:
-                    layout_head_blocks.extend(metadata.head_jsx_blocks)
-                if metadata.head_elements:
-                    layout_head_blocks.extend(metadata.head_elements)
-    
-    return tuple(layout_head_blocks)
+                    layout_jsx_blocks.extend(metadata.head_jsx_blocks)
+                if metadata.head_elements or metadata.head_is_dynamic:
+                    head_sources.append(
+                        LayoutHeadSource(
+                            relative_path=relative,
+                            server_module_path=(
+                                settings.server_build_dir / "pages" / relative.with_suffix(".py")
+                            ),
+                            module_key=_layout_module_key(relative),
+                            static_elements=metadata.head_elements,
+                            is_dynamic=metadata.head_is_dynamic,
+                        )
+                    )
+
+        if stop_here:
+            break
+
+    return LayoutHeadContribution(
+        jsx_blocks=tuple(layout_jsx_blocks),
+        head_sources=tuple(head_sources),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -442,41 +578,42 @@ def find_layout_loaders(
     Walks ancestor directories from the page's location (closest first, root last)
     and returns a :class:`LayoutLoaderInfo` for each layout or template whose
     compiled metadata declares a loader.  The order matches the wrapping order
-    used by :func:`find_layout_head_jsx_blocks`.
+    used by :func:`find_layout_head_contributions`.
     """
-
-    parts = list(page_relative_path.parent.parts)
-    ancestors: List[Path] = []
-
-    if page_relative_path.parent.name:
-        ancestors.append(page_relative_path.parent)
-
-    for index in range(len(parts) - 1, 0, -1):
-        ancestors.append(Path(*parts[:index]))
-
-    ancestors.append(Path("."))
 
     loaders: List[LayoutLoaderInfo] = []
 
-    for ancestor_dir in ancestors:
+    for ancestor_dir in _layout_chain_ancestors(page_relative_path):
+        stop_here = False
         for filename in ("layout.pyxl", "template.pyxl"):
-            relative = ancestor_dir / filename if ancestor_dir != Path(".") else Path(filename)
+            relative = _layout_relative_path(ancestor_dir, filename)
             metadata_path = settings.metadata_build_dir / "pages" / relative.with_suffix(".json")
-            if ancestor_dir == Path("."):
-                metadata_path = settings.metadata_build_dir / "pages" / Path(filename).with_suffix(".json")
 
             metadata = _load_page_metadata(metadata_path)
-            if metadata is None or not metadata.loader_name:
+            if metadata is None:
                 continue
 
-            server_module = settings.server_build_dir / "pages" / relative.with_suffix(".py")
-            module_key = relative.with_suffix("").as_posix().replace("/", ".")
+            # A layout declaring STANDALONE is the root of its chain: nothing
+            # above it wraps these pages, so nothing above it should run a
+            # loader for them either. Without this the wrapper would be gone
+            # and the query still charged — the outer layout's loader firing on
+            # every request to a section that does not use it.
+            if metadata.standalone:
+                stop_here = True
+
+            if not metadata.loader_name:
+                continue
 
             loaders.append(LayoutLoaderInfo(
                 relative_path=relative,
-                server_module_path=server_module,
-                module_key=module_key,
+                server_module_path=(
+                    settings.server_build_dir / "pages" / relative.with_suffix(".py")
+                ),
+                module_key=_layout_module_key(relative),
                 loader_name=metadata.loader_name,
             ))
+
+        if stop_here:
+            break
 
     return tuple(loaders)

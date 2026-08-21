@@ -141,6 +141,41 @@ The client receives:
 { "ok": false, "error": "Not authorised" }
 ```
 
+### When an action crashes
+
+`ActionError` is a refusal you wrote. An exception you did not expect is a bug,
+and Pyxle treats the two differently.
+
+In production the caller is told nothing about it:
+
+```json
+{ "ok": false, "error": "An unexpected error occurred." }
+```
+
+with status `500` — the real message could carry a file path, a row ID or a
+connection string, so it never leaves the server. What does leave is a log
+line, written once, with the full traceback and the action that raised it:
+
+```
+Action 'add_note' in module 'pyxle.server.pages.notes' failed: 'title'
+Traceback (most recent call last):
+  ...
+  File "pages/notes.py", line 12, in add_note
+    title = body["title"]
+KeyError: 'title'
+```
+
+That line is your only record of the failure, so collect your server's log in
+production — with nothing capturing stdout, a crash leaves no trace you can
+read afterwards. Under `pyxle dev` the same traceback is written and the
+caller additionally receives the real message.
+
+Nothing the action scheduled is applied when it crashes: cookies set through
+`request.state.cookies` and tasks added to `request.state.background` are both
+dropped, because the action's intent is unknown. A deliberate `ActionError`
+keeps both — see [Setting a cookie](#setting-a-cookie) and [Running work after
+the response](#running-work-after-the-response).
+
 ## Validating request bodies with Pydantic
 
 Reading `await request.json()` and pulling fields out by hand means writing the
@@ -316,6 +351,30 @@ async def signup(request, body: Signup):
 For a single task you can return the shorthand `{"background": [fn, *args]}`
 instead. For fire-and-forget work that isn't tied to this response (including
 from `@server` loaders), use [`pyxle.tasks.enqueue`](../guides/background-tasks.md#fire-and-forget-work-pyxletasks). See the [Background Tasks guide](../guides/background-tasks.md).
+
+## Setting a cookie
+
+An action returns a dict, so it never sees the response that dict becomes. To
+put a cookie on it, record the call on `request.state.cookies`:
+
+```python
+@action
+async def choose_theme(request, body: Theme):
+    request.state.cookies.set(
+        "theme", body.theme, max_age=31536000, httponly=True, samesite="lax"
+    )
+    return {"theme": body.theme}
+```
+
+`set()` and `delete()` take Starlette's
+[`set_cookie`](https://www.starlette.io/responses/#set-cookie) and
+`delete_cookie` arguments and are replayed onto the response unchanged. They
+also apply to an [`ActionError`](#error-handling-in-actions) — a refusal is
+still the action's own answer, and may want to clear a session or record an
+attempt on the way out. An unexpected 500 sets nothing.
+
+For a cookie the client must not be able to forge, sign the value with
+[`pyxle.sign_cookie`](../guides/security.md) first.
 
 ## How actions are routed
 

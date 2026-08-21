@@ -56,7 +56,7 @@ Node.js dependencies (React 19, Vite 7, and — if you opt in — Tailwind CSS v
 
 ## Troubleshooting
 
-Two common failures come from an out-of-date toolchain. Both are fixed by upgrading — Pyxle needs **Python 3.10+** and **Node.js 20.19+**.
+These failures all come from an incomplete or out-of-date toolchain. Pyxle needs **Python 3.10+** and **Node.js 20.19+ with npm**.
 
 ### `pip install` says "No matching distribution found for pyxle-framework"
 
@@ -92,6 +92,25 @@ Vite 7 — which Pyxle uses to build and serve your React code — requires Node
 node --version             # must be v20.19 or later
 nvm install 20             # if you use nvm
 # or download the latest LTS from https://nodejs.org
+```
+
+### `pyxle build` stops with "npx was not found on your PATH"
+
+```
+npx was not found on your PATH — cannot build the client bundle.
+```
+
+Node.js is installed but **npm is not**, so Pyxle cannot run Vite to bundle your
+pages. `pyxle build` stops here on purpose: continuing would produce a `dist/`
+with no browser JavaScript, and `pyxle serve` refuses to start on one.
+
+This is most common on Debian and Ubuntu, where the `nodejs` package does not
+include npm, and in slim container images that ship the `node` binary alone:
+
+```bash
+npx --version              # nothing? npm is missing
+sudo apt install npm       # Debian / Ubuntu
+# or install Node.js from https://nodejs.org (or nvm / fnm) — npm ships with those
 ```
 
 ## Next steps

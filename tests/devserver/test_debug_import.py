@@ -144,11 +144,66 @@ def test_debug_import_tracebacks_reference_the_pyxl(project, module_keys) -> Non
     )
 
 
-def test_plain_import_keeps_generated_module_path(project, module_keys) -> None:
+def test_production_import_also_binds_to_pyxl_source(project, module_keys) -> None:
+    """Remapping is NOT a debug-only affordance.
+
+    This assertion used to be the opposite — production kept the generated
+    ``dist/server/pages/index.py`` path. That was wrong in the place it costs
+    most: production sanitises its error responses, so the server log is the
+    only record of a failure, and it pointed the reader at a generated artifact
+    that may not exist on their machine, at a line they did not write.
+    """
+    module = _import(project, module_keys, "index", debug=False)
+
+    pyxl_path = (project.pages_dir / "index.pyxl").resolve()
+    assert module.load_home.__code__.co_filename == str(pyxl_path)
+
+
+def test_production_import_falls_back_when_pyxl_is_not_deployed(
+    project, module_keys
+) -> None:
+    """A dist-only deploy ships no ``.pyxl``, and must behave exactly as before.
+
+    This is the guarantee that makes the change above safe to ship: with no
+    source on disk there is nothing to remap to, so the import degrades to the
+    generated module rather than failing or naming a path that does not exist.
+    """
+    (project.pages_dir / "index.pyxl").unlink()
+
     module = _import(project, module_keys, "index", debug=False)
 
     generated = project.server_build_dir / "pages" / "index.py"
     assert module.load_home.__code__.co_filename == str(generated)
+
+
+def test_production_traceback_names_the_authors_line(project, module_keys) -> None:
+    """The symptom P2-24 was filed for: the frame an on-call reader actually sees.
+
+    Asserts the traceback, not just ``co_filename``, because the frame is what
+    ends up in the log.
+    """
+    import traceback
+
+    from pyxle.ssr.view import _import_server_module
+
+    key = "pyxle_debug_import_test_prod_tb_index"
+    module_keys.append(key)
+    module_path = project.server_build_dir / "pages" / "index.py"
+    module = _import_server_module(key, module_path, debug=False)
+
+    try:
+        module.boom()
+    except ValueError as exc:
+        frames = traceback.extract_tb(exc.__traceback__)
+    else:  # pragma: no cover - the fixture page raises
+        raise AssertionError("boom() was expected to raise")
+
+    pyxl_path = (project.pages_dir / "index.pyxl").resolve()
+    boom_frame = next(frame for frame in frames if frame.name == "boom")
+    assert boom_frame.filename == str(pyxl_path)
+    assert boom_frame.lineno == _pyxl_line(
+        project, "index", '    raise ValueError("kaboom")'
+    )
 
 
 def test_debug_import_maps_page_with_user_owned_runtime_imports(

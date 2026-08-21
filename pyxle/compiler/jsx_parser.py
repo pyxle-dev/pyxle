@@ -36,6 +36,14 @@ class JSXParseResult:
     error_code: str | None = None
     #: 1-indexed line of the error within the JSX source, when known.
     error_line: int | None = None
+    #: Whether the extractor actually ran and judged the source. ``False`` means
+    #: the *checker* failed, not the code: Node is absent, the language toolkit
+    #: isn't installed, Babel's dependencies are missing, the subprocess timed
+    #: out, or it produced output we could not read. ``error`` then describes
+    #: the broken toolchain rather than the user's JSX, so a caller that turns
+    #: extractor errors into compile failures must not do so — a machine
+    #: without Node would fail every compile in the project.
+    toolchain_available: bool = True
 
 
 def parse_jsx_components(jsx_code: str, *, target_components: set[str] | None = None) -> JSXParseResult:
@@ -120,6 +128,7 @@ def _run_babel_parser(source_path: str, target_components: set[str] | None) -> J
                 "Install it with `pip install 'pyxle-framework[langkit]'` (it also "
                 "needs @babel/parser and @babel/traverse available to Node)."
             ),
+            toolchain_available=False,
         )
 
     # Prepare command
@@ -138,9 +147,12 @@ def _run_babel_parser(source_path: str, target_components: set[str] | None) -> J
         return JSXParseResult(
             components=(),
             error="Node.js not found. Install Node.js >=20.19 to parse JSX components.",
+            toolchain_available=False,
         )
     except subprocess.TimeoutExpired:
-        return JSXParseResult(components=(), error="JSX parser timed out.")
+        return JSXParseResult(
+            components=(), error="JSX parser timed out.", toolchain_available=False
+        )
 
     # Surface a clear message when the extractor's parser dependencies
     # (@babel/parser, @babel/traverse) aren't installed — the most common
@@ -156,6 +168,7 @@ def _run_babel_parser(source_path: str, target_components: set[str] | None) -> J
                 "lives — e.g. `npm install @babel/parser @babel/traverse` in the "
                 "pyxle-langkit package — then re-run."
             ),
+            toolchain_available=False,
         )
 
     # Parse JSON output
@@ -166,6 +179,20 @@ def _run_babel_parser(source_path: str, target_components: set[str] | None) -> J
         return JSXParseResult(
             components=(),
             error=f"JSX parser produced invalid output: {detail[:200]}",
+            toolchain_available=False,
+        )
+
+    # A verdict is a mapping carrying an explicit ``ok``. Anything else — an
+    # empty object, a list, a bare literal — means the extractor did not judge
+    # this source at all, however it came to produce that. Callers turn a
+    # verdict of ``ok: false`` into a compile error, so an absent verdict must
+    # not be mistaken for one: it would fail a file whose JSX nothing examined.
+    if not isinstance(payload, dict) or "ok" not in payload:
+        detail = (proc.stdout or stderr or "(no output)").strip()
+        return JSXParseResult(
+            components=(),
+            error=f"JSX parser returned no verdict: {detail[:200] or '(empty)'}",
+            toolchain_available=False,
         )
 
     # Check for errors

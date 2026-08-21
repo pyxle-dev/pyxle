@@ -18,6 +18,7 @@ my-app/
   public/
     branding/             # SVG logos and assets
     favicon.ico
+  README.md               # Your app's readme — prerequisites and commands
   AGENTS.md               # Conventions guide for AI coding agents
   jsconfig.json           # Import alias (@/*) + editor hints
   vite.config.js          # Re-exports Pyxle's generated Vite config
@@ -37,7 +38,7 @@ Opting into **Tailwind** replaces `pages/styles/app.css` with an
 
 ### `pages/`
 
-The pages directory is the heart of your app. Every `.pyxl` file here becomes a route, and every `.py` file under `pages/api/` becomes an API endpoint.
+The pages directory is the heart of your app. Every `.pyxl` file here becomes a route, and every `.py` file under `pages/api/` becomes an API endpoint — unless its name starts with an underscore, which marks it private.
 
 ```
 pages/
@@ -47,11 +48,14 @@ pages/
     index.pyxl      -->  /blog
     [slug].pyxl     -->  /blog/:slug
   api/
-    pulse.py       -->  /api/pulse
-    users.py       -->  /api/users
+    pulse.py        -->  /api/pulse
+    users.py        -->  /api/users
+    _db.py          -->  (no route — a helper the endpoints import)
 ```
 
-See [Routing](../core-concepts/routing.md) for the full rules.
+A leading underscore follows Python's own convention for "not part of the public surface": `api/_db.py`, `api/__init__.py`, and everything under `api/_internal/` serve no URL but stay importable by the endpoints beside them. The rule reads only the segments at or below `api/` — above it an underscore is just a URL character, so `pages/_admin/api/health.py` still serves `/_admin/api/health`.
+
+See [Routing](../core-concepts/routing.md) and [API Routes](../guides/api-routes.md) for the full rules.
 
 ### `public/`
 

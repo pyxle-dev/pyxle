@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.requests import Request
@@ -9,7 +11,12 @@ from starlette.responses import JSONResponse, PlainTextResponse
 from starlette.routing import Route
 from starlette.testclient import TestClient
 
-from pyxle.devserver.csrf import CsrfMiddleware, _generate_token, _tokens_match
+from pyxle.devserver.csrf import (
+    CsrfMiddleware,
+    _generate_token,
+    _tokens_match,
+    _verify_token_integrity,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -702,7 +709,10 @@ class TestVerifyTokenIntegrity:
 
 class TestCookieAndScopeBehavior:
     def test_secure_cookie_flag_added_when_configured(self):
-        client = TestClient(_build_app_with_secure_cookie())
+        """Configured *and* actually over TLS. A `Secure` cookie is dropped by
+        the browser over plain HTTP, so applying it there breaks the form and
+        protects nothing — see TestTheSecureFlagFollowsTheConnection."""
+        client = TestClient(_build_app_with_secure_cookie(), base_url="https://testserver")
         response = client.get("/page")
         set_cookie = response.headers.get("set-cookie", "")
         assert "Secure" in set_cookie
@@ -1393,3 +1403,251 @@ class TestMultipartStreamScan:
         first, second = asyncio.run(collect())
         assert first == {"type": "http.request", "body": b"hello", "more_body": True}
         assert second == {"type": "http.request", "body": b" world", "more_body": False}
+
+
+class TestTheSecureFlagFollowsTheConnection:
+    """A `Secure` cookie is *dropped entirely* by the browser over plain HTTP.
+
+    Marking it unconditionally in production made every plain-HTTP server —
+    a LAN demo, an evaluation box, anything behind a proxy that forgets
+    `X-Forwarded-Proto` — reject its own sign-in form with "CSRF token
+    missing" and no clue why. It protected nothing either: a connection with
+    no confidentiality has no cookie confidentiality to lose.
+    """
+
+    @staticmethod
+    def _cookie(scheme: str = "http", headers=None) -> str:
+        from pyxle.devserver.csrf import CsrfMiddleware
+
+        captured: list[str] = []
+
+        async def app(scope, receive, send):
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b""})
+
+        async def send(message):
+            if message["type"] == "http.response.start":
+                for name, value in message["headers"]:
+                    if name == b"set-cookie":
+                        captured.append(value.decode())
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        scope = {
+            "type": "http", "method": "GET", "path": "/", "scheme": scheme,
+            "headers": headers or [], "server": ("test", 8000),
+        }
+        middleware = CsrfMiddleware(app, secret="s", cookie_secure=True)
+        asyncio.run(middleware(scope, receive, send))
+        return captured[0] if captured else ""
+
+    def test_plain_http_gets_a_cookie_the_browser_will_keep(self):
+        assert "Secure" not in self._cookie(scheme="http")
+
+    def test_https_still_gets_secure(self):
+        assert "Secure" in self._cookie(scheme="https")
+
+    def test_a_tls_terminating_proxy_is_believed(self):
+        """The overwhelmingly common production shape: the browser spoke HTTPS,
+        the proxy speaks plain HTTP to us, and the scheme alone would say
+        `http`."""
+        cookie = self._cookie(
+            scheme="http", headers=[(b"x-forwarded-proto", b"https")]
+        )
+        assert "Secure" in cookie
+
+    def test_a_forwarded_chain_reads_the_first_hop(self):
+        cookie = self._cookie(
+            scheme="http", headers=[(b"x-forwarded-proto", b"https, http")]
+        )
+        assert "Secure" in cookie
+
+    def test_a_proxy_reporting_plain_http_is_believed_too(self):
+        cookie = self._cookie(
+            scheme="https", headers=[(b"x-forwarded-proto", b"http")]
+        )
+        assert "Secure" not in cookie
+
+
+# ---------------------------------------------------------------------------
+# Hostile bytes in the token positions.
+#
+# Every value the middleware compares arrives off the wire: the header (which
+# Starlette decodes as latin-1), the cookie, and the form field. None of them
+# is guaranteed to be ASCII, and `hmac.compare_digest` raises TypeError when
+# handed a `str` that is not — turning "wrong token" into an unhandled 500.
+#
+# httpx (and therefore TestClient) refuses to *send* a non-ASCII header or
+# cookie, so those two need the ASGI app driven directly — which is exactly
+# what uvicorn does with the bytes h11 hands it.
+# ---------------------------------------------------------------------------
+
+
+def _raw_request(
+    app,
+    *,
+    method: str,
+    path: str,
+    headers: list[tuple[bytes, bytes]],
+    body: bytes = b"",
+) -> tuple[int, bytes, list[tuple[bytes, bytes]]]:
+    """Drive an ASGI app with raw wire bytes; return (status, body, headers)."""
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.1"},
+        "http_version": "1.1",
+        "method": method,
+        "scheme": "http",
+        "path": path,
+        "raw_path": path.encode(),
+        "query_string": b"",
+        "root_path": "",
+        "headers": [(b"host", b"testserver"), *headers],
+        "client": ("1.2.3.4", 5555),
+        "server": ("127.0.0.1", 8000),
+    }
+    sent: list[dict] = []
+
+    async def receive():
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    async def send(message):
+        sent.append(message)
+
+    asyncio.run(app(scope, receive, send))
+    start = next(m for m in sent if m["type"] == "http.response.start")
+    payload = b"".join(
+        m.get("body", b"") for m in sent if m["type"] == "http.response.body"
+    )
+    return start["status"], payload, start.get("headers", [])
+
+
+class TestNonAsciiTokensAreRejectedNotCrashed:
+    """A wrong token must produce a 403, whatever bytes it is made of.
+
+    `hmac.compare_digest` is undefined for non-ASCII `str`; letting those
+    values reach it converted an ordinary rejected request into an unhandled
+    exception, so anyone could turn a 403 into a 500 with one high byte.
+    """
+
+    def test_non_ascii_header_token_is_a_403(self):
+        token = _generate_token("test-secret")
+        status, body, _ = _raw_request(
+            _build_app(),
+            method="POST",
+            path="/action",
+            headers=[
+                (b"cookie", f"pyxle-csrf={token}".encode()),
+                (b"x-csrf-token", b"caf\xe9"),
+            ],
+        )
+        assert status == 403
+        assert b"CSRF token mismatch" in body
+
+    def test_non_ascii_cookie_on_a_safe_method_still_renders(self):
+        """A GET carries no token at all — a junk cookie must not break the
+        page. The cookie is re-minted rather than trusted."""
+        status, body, _ = _raw_request(
+            _build_app(),
+            method="GET",
+            path="/page",
+            headers=[(b"cookie", b"pyxle-csrf=abc.caf\xe9")],
+        )
+        assert status == 200
+        assert body == b"ok"
+
+    def test_percent_encoded_non_ascii_form_field_is_a_403(self):
+        """What a browser actually puts on the wire for a non-ASCII field."""
+        token = _generate_token("test-secret")
+        client = TestClient(_build_app())
+        client.cookies.set("pyxle-csrf", token)
+        response = client.post("/action", data={"_csrf_token": "café"})
+        assert response.status_code == 403
+        assert response.json()["error"] == "CSRF token mismatch"
+
+    def test_invalid_utf8_form_field_is_a_403(self):
+        """Undecodable bytes become U+FFFD, which is still not ASCII."""
+        token = _generate_token("test-secret")
+        status, body, _ = _raw_request(
+            _build_app(),
+            method="POST",
+            path="/action",
+            headers=[
+                (b"cookie", f"pyxle-csrf={token}".encode()),
+                (b"content-type", b"application/x-www-form-urlencoded"),
+            ],
+            body=b"_csrf_token=%FF",
+        )
+        assert status == 403
+        assert b"CSRF token mismatch" in body
+
+    def test_non_ascii_multipart_field_is_a_403(self):
+        token = _generate_token("test-secret")
+        client = TestClient(_build_app())
+        client.cookies.set("pyxle-csrf", token)
+        response = client.post(
+            "/action",
+            content=_multipart_body(("_csrf_token", "café".encode(), None)),
+            headers=_multipart_headers(),
+        )
+        assert response.status_code == 403
+        assert response.json()["error"] == "CSRF token mismatch"
+
+    def test_tokens_match_tolerates_non_ascii(self):
+        assert _tokens_match("café", "café", "") is False
+        assert _tokens_match("abc", "café", "") is False
+
+
+class TestCookieValueIsNeverReflected:
+    """The middleware reuses a valid existing cookie token instead of minting
+    a new one each request (so concurrent requests don't race each other).
+    That reuse writes the value straight into `Set-Cookie` — so a value that
+    could not have been minted here must never be reused.
+
+    `http.cookies` un-escapes octal sequences inside a quoted cookie value, so
+    `"x\\073 Domain\\075evil.example"` parses to `x; Domain=evil.example`. With
+    no `PYXLE_SECRET_KEY` configured (the documented weaker mode) nothing else
+    stood between that and the response header, letting a request dictate the
+    attributes of the cookie the server sets on itself.
+    """
+
+    @staticmethod
+    def _set_cookie(cookie_header: bytes, *, secret: str) -> str:
+        app = _build_app(secret=secret)
+        _, _, headers = _raw_request(
+            app, method="GET", path="/page", headers=[(b"cookie", cookie_header)]
+        )
+        values = [v.decode("latin-1") for n, v in headers if n.lower() == b"set-cookie"]
+        assert values, "middleware should always set a CSRF cookie"
+        return values[0]
+
+    def test_octal_escaped_attributes_do_not_reach_set_cookie(self):
+        hostile = b'pyxle-csrf="x\\073 Domain\\075evil.example\\073 Max-Age\\0759999999"'
+        header = self._set_cookie(hostile, secret="")
+        assert "Domain" not in header
+        assert "evil.example" not in header
+        assert "Max-Age" not in header
+
+    def test_a_reflected_value_is_replaced_by_a_fresh_token(self):
+        hostile = b'pyxle-csrf="x\\073 Domain\\075evil.example"'
+        header = self._set_cookie(hostile, secret="")
+        value = header.split(";", 1)[0].split("=", 1)[1]
+        assert value != "x"
+        assert _verify_token_integrity(value, "")
+
+    def test_a_genuine_token_is_still_reused(self):
+        """The anti-race reuse this hardening sits on top of must survive."""
+        token = _generate_token("test-secret")
+        header = self._set_cookie(f"pyxle-csrf={token}".encode(), secret="test-secret")
+        assert header.split(";", 1)[0] == f"pyxle-csrf={token}"
+
+
+class TestTokenIntegrityShape:
+    def test_a_value_we_could_never_have_minted_is_rejected(self):
+        for bogus in ("x; Domain=evil.example", "café", "a b", 'a"b', "a\\073b"):
+            assert _verify_token_integrity(bogus, "") is False
+
+    def test_a_minted_token_passes_with_and_without_a_secret(self):
+        assert _verify_token_integrity(_generate_token(""), "") is True
+        assert _verify_token_integrity(_generate_token("s"), "s") is True

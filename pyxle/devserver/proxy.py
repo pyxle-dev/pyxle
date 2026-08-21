@@ -7,9 +7,11 @@ from typing import AsyncIterator, Iterable, Sequence
 import httpx
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse, Response, StreamingResponse
+from starlette.routing import Match
 
 from pyxle.cli.logger import ConsoleLogger
 
+from .path_utils import url_path_is_under
 from .settings import DevServerSettings
 
 _ASSET_SUFFIXES: tuple[str, ...] = (
@@ -24,8 +26,11 @@ _ASSET_SUFFIXES: tuple[str, ...] = (
 _HOT_MODULE_PREFIXES: tuple[str, ...] = ("/@vite", "/@react-refresh")
 # Framework-internal namespaces (Pyxle Studio, the overlay WebSocket) serve
 # their own assets from the wheel; their ``.js``/``.css`` URLs must never be
-# forwarded to the user's Vite instance, which knows nothing about them.
-_RESERVED_INTERNAL_PREFIXES: tuple[str, ...] = ("/__pyxle",)
+# forwarded to the user's Vite instance, which knows nothing about them. Each
+# is matched a whole segment at a time, so both are named here rather than
+# leaving ``/__pyxle__`` to fall out of a leading-character comparison that
+# would also swallow an app module called ``__pyxle-widget.js``.
+_RESERVED_INTERNAL_PREFIXES: tuple[str, ...] = ("/__pyxle", "/__pyxle__")
 _HOP_BY_HOP_HEADERS: frozenset[str] = frozenset(
     {
         "connection",
@@ -39,6 +44,33 @@ _HOP_BY_HOP_HEADERS: frozenset[str] = frozenset(
     }
 )
 _SKIP_REQUEST_HEADERS: frozenset[str] = frozenset({"host", "content-length"})
+
+
+#: Marks the Starlette routes built from ``pages/**/api/**`` so the proxy can
+#: tell an endpoint apart from an asset without re-deriving either.
+API_ROUTE_MARKER = "pyxle_api_route"
+
+
+def _matches_api_route(request: Request) -> bool:
+    """Whether one of the app's API routes claims this request.
+
+    Asked of the live router rather than a snapshot: the dev server swaps its
+    route list in place when a file appears, and a stale copy here would send a
+    brand-new endpoint to Vite until the next restart.
+    """
+    app = request.scope.get("app")
+    router = getattr(app, "router", None)
+    if router is None:
+        return False
+
+    for route in getattr(router, "routes", ()):
+        if not getattr(route, API_ROUTE_MARKER, False):
+            continue
+        # PARTIAL is a path match with the wrong method — still this route's
+        # request, and its 405 is more useful than Vite's index page.
+        if route.matches(request.scope)[0] is not Match.NONE:
+            return True
+    return False
 
 
 class ViteProxy:
@@ -69,12 +101,19 @@ class ViteProxy:
             return False
 
         path = request.url.path
-        if path.startswith(_RESERVED_INTERNAL_PREFIXES):
+        if any(url_path_is_under(path, prefix) for prefix in _RESERVED_INTERNAL_PREFIXES):
             return False
         if any(path.startswith(prefix) for prefix in self._asset_prefixes):
             return True
 
-        return path.endswith(self._asset_suffixes)
+        if not path.endswith(self._asset_suffixes):
+            return False
+        # An API route may legitimately end in an asset suffix — an embeddable
+        # widget served as ``/api/widget.js``, a generated stylesheet. Vite
+        # knows nothing about it and answers with the index HTML, so the
+        # endpoint works in production and silently does not in dev. The app's
+        # own routes win.
+        return not _matches_api_route(request)
 
     async def handle(self, request: Request) -> Response:
         """Forward the given request to Vite and stream the response back."""

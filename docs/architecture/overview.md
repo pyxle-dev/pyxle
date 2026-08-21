@@ -210,8 +210,11 @@ Details: [SSR § Error handling](ssr.md#error-handling).
 While the loader's data is the **body** of the page, the **`<head>`** is
 assembled from up to four sources, in order of increasing priority:
 
-1. **Layout `<Head>` blocks.** If `pages/layout.pyxl` (or any ancestor
-   layout) has a `<Head>` JSX block, its contents go in first.
+1. **Layout head.** If `pages/layout.pyxl` (or any ancestor layout) has
+   a `<Head>` JSX block or its own `HEAD` variable, those go in first.
+   The two travel as separate channels: `<Head>` JSX is compile-time
+   source and is filtered for unevaluated `{expressions}`, while a
+   layout's `HEAD` variable is finished HTML and is emitted verbatim.
 2. **The page's `HEAD` Python variable.** Static or callable. If it's a
    callable, Pyxle invokes it with the loader data: `HEAD(data)`.
 3. **The page's `<Head>` JSX blocks.** If the React component renders a

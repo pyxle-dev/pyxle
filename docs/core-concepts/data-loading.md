@@ -106,6 +106,8 @@ When `LoaderError` is raised:
 2. If found, it renders the error boundary, passing the error context on the **`error`** prop (not `data`)
 3. If not found, a default error page is shown
 
+The same three steps run for **any** exception your loader raises — a `KeyError`, a driver timeout — as a `500`. `LoaderError` is what lets you choose the status code and write the message the visitor reads; you do not need it to reach the boundary.
+
 The boundary therefore destructures `error`, and the context keys are `error.message`, `error.statusCode` (camelCase), `error.type`, and optional `error.data` (present only when the `LoaderError` carried non-empty `data`):
 
 ```jsx

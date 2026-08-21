@@ -115,17 +115,59 @@ In development, Pyxle surfaces errors in three places at once:
 
 - **The browser error overlay** — a full-screen panel with the message, the file
   and line, and a breadcrumb of what the framework was doing (loading, rendering,
-  head evaluation). This is the fastest signal for a broken page.
+  head evaluation). This is the fastest signal for a broken page, and it survives
+  a reload: the current error is replayed when the page reconnects.
 - **The terminal** running `pyxle dev` — the same error, plus the Python
-  traceback for loader/action failures.
+  traceback for loader/action failures. A file that will not compile is reported
+  as `pages/about.pyxl:7:9: unexpected indent`, and that URL serves the compile
+  error rather than the last version that built.
 - **The browser devtools console** — your server-side `logging` output is
   forwarded here during `pyxle dev`, prefixed `[pyxle:server]`, so you can watch
-  server logs without leaving the page. `pyxle -v dev` also forwards `DEBUG`
-  records and framework-internal logs.
+  server logs without leaving the page. The same records also print in the
+  terminal. A page's own `log = logging.getLogger(__name__)` is labelled by its
+  source file — `[pyxle:server pages/about.pyxl] loading` — while a logger you
+  name yourself keeps that name. `pyxle -v dev` also forwards `DEBUG` records
+  and framework-internal logs to the console.
 
 In production (`debug=false`) error responses are intentionally generic — no
 stack traces or file paths in the body. The full detail goes to the **server
 log** instead. Check your process manager's logs (e.g. `journalctl -u myapp`).
+
+### Your own `log.info` is silent in production until you configure it
+
+`pyxle dev` installs a logging bridge for you: it lowers the root logger to
+`INFO` so your records reach both the terminal and the browser console.
+`pyxle serve` installs nothing — the process is yours, and Python's defaults
+apply. So a `log.info(...)` you watched work all through development is
+**silent** once you deploy, while `log.warning` and above still reach stderr
+(unformatted, through Python's last-resort handler). Nothing is broken and
+nothing warns you; the level was never configured.
+
+Configure it once, at import time, in a module the server loads — a page, or a
+module your pages import:
+
+```python
+import logging
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s %(message)s")
+
+log = logging.getLogger(__name__)
+```
+
+Two things this is **not**:
+
+- It is not the [observability](observability.md) `accessLog` option. That
+  configures the `pyxle.access` logger only and leaves the level of your own
+  loggers untouched — turning it on will not make your `log.info` appear.
+- It is not something a layout can reliably do for the whole app. A layout is
+  not a startup hook: its module is imported lazily during a render, so
+  configuration written at the top of `layout.pyxl` can land *after* the first
+  page loader has already logged. Put it where the pages that log will import
+  it.
+
+Framework errors do not depend on any of this: an uncaught exception in a
+`@server` loader or an `@action` is logged with its full traceback at `ERROR`
+regardless of what you configure.
 
 ---
 
@@ -374,6 +416,8 @@ editable install whose recorded version is stale still launches normally.
 | Symptom | Likely cause | Where to look |
 |---------|--------------|---------------|
 | Blank page, overlay shows a Python traceback | Loader/action raised | `pyxle dev` terminal; set a breakpoint in the loader |
+| Page shows "Build failed" | The `.pyxl` (or a layout wrapping it) has a syntax error | The file, line and column named on the page and in the `pyxle dev` terminal |
+| A new page 404s in dev | Almost never routing — a page that has never compiled registers no route | The page itself: in dev its URL answers "Build failed" with the file, line and message. A plain 404 means no source claims that address |
 | `window is not defined` | Browser global at render scope | The named `.pyxl`; use `useEffect`/`<ClientOnly>` |
 | `'State' object has no attribute 'db'` | Missing plugin | `plugins` in `pyxle.config.json` |
 | Component data is `undefined` | Loader key ≠ component prop | Compare the loader's return dict to the component's `data` usage |

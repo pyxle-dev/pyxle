@@ -199,6 +199,27 @@ shared across every worker and host, so an invalidation fans out to all of them
 > never cached and never served a cached entry. A page whose content varies by
 > query is therefore never collapsed onto one shared render.
 
+### Don't put a `<Form>` on a shared-cached page
+
+A cacheable response is stored once and served to many people, so it must not
+carry anything belonging to one of them — including a CSRF token. On a page made
+cacheable with `revalidate`, Pyxle therefore suppresses the per-user token, and
+[`<Form>`](../reference/client-api.md#form) renders without its hidden
+`_csrf_token` field. The client then reads the token from the cookie and adds
+the field on its first render.
+
+The visible effect is a React hydration warning on first load and one subtree
+re-rendered on the client. **With JavaScript the form still works** — JS
+submissions authenticate with the `x-csrf-token` header rather than the hidden
+field. **Without JavaScript, on a shared-cached page, the submission is
+rejected**, because there is no token to send. Embedding one would defeat the
+suppression that makes the page safe to cache at all.
+
+Keep the form on an uncached route: cache the page people read, leave the page
+they submit from on a plain loader (or `revalidate: 0`). Static pre-rendering is
+unaffected — `pyxle build --static` never runs the CSRF middleware, so a
+prerendered page contains no token, stale or otherwise.
+
 ## Next steps
 
 - Load data: [Data Loading](../core-concepts/data-loading.md)

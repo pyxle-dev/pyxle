@@ -327,11 +327,11 @@ top-level position where Python *could* legitimately resume.
 Source: `compiler/parser.py:261-345`.
 
 > **Why not use Babel?** Babel would be a complete JS parser, and we
-> already use it for JSX validation in `validate_jsx=True` mode. The
-> reason we don't use it here is performance: Babel is a Node.js
-> subprocess (~200ms per call), and we'd have to call it inside the
-> walker's inner loop. The state machine is ~80 lines of Python and
-> runs in microseconds.
+> already run it once per parse to extract JSX metadata. The reason we
+> don't use it *here* is performance: it is a Node.js subprocess
+> (~135 ms per call, measured) and the walker would have to call it
+> inside its inner loop, once per candidate boundary. The state machine
+> is ~80 lines of Python and runs in microseconds.
 
 ---
 
@@ -714,29 +714,46 @@ contract is:
   `diagnostics` populated.
 - **`tolerant=True`** — Don't raise; collect diagnostics. Used by
   `pyxle check` and any future LSP integration.
-- **`validate_jsx=True`** — In addition to the Python validation,
-  run Babel on the JSX section and surface its parse errors as
-  `[jsx]` diagnostics. Off by default because Babel is a Node.js
-  subprocess (~200ms/call) and the typical dev/build path doesn't
-  need it (Vite catches JSX errors at bundle time).
+- **`report_jsx_syntax=True`** — Surface a JSX section Babel could not
+  parse as a `[jsx]` error located in the `.pyxl`. Free: the extractor
+  pass that reads `<Head>`/`<Script>`/`<Image>`/`<Suspense>` runs on
+  every parse anyway and has to parse the section to find them, so this
+  only stops the result being discarded. A flag rather than always-on
+  purely so the production build path keeps its existing behaviour —
+  `pyxle dev` sets it, `pyxle build` and `pyxle serve` do not.
+- **`validate_jsx=True`** — Re-run Babel over the JSX section explicitly.
+  Now largely redundant with `report_jsx_syntax`, and skipped entirely
+  when that already reported a syntax error, so it no longer spawns a
+  second subprocess to rediscover the same failure.
 
-The four combinations:
+The combinations that matter:
 
-| `tolerant` | `validate_jsx` | Behaviour |
+| `tolerant` | `report_jsx_syntax` | Behaviour |
 |---|---|---|
-| `False` | `False` | Strict Python parse. Raises on first Python error. JSX not checked. (Used by `pyxle dev`, `pyxle build`.) |
-| `False` | `True` | Strict Python parse + strict Babel parse. Raises on first error from either side. |
-| `True` | `False` | Tolerant Python parse. Returns all Python diagnostics. JSX not checked. |
-| `True` | `True` | Tolerant Python parse + tolerant Babel parse, with cascade suppression. (Used by `pyxle check`.) |
+| `False` | `False` | Strict Python parse. Raises on the first Python error. A JSX parse failure yields empty JSX metadata and no error. (Used by `pyxle build`, `pyxle serve`.) |
+| `False` | `True` | Strict parse of both halves. Raises on the first error from either side. (Used by `pyxle dev`.) |
+| `True` | `True` | Tolerant parse of both halves, with cascade suppression. (Used by `pyxle check`.) |
+
+A JSX error is suppressed when the Python half already has one: broken
+Python is absorbed into the JSX section by the walker, so the JSX
+complaint would be a symptom rather than the cause.
 
 ---
 
 ## Performance characteristics
 
+**One Node.js subprocess dominates every parse.** `_detect_jsx_metadata`
+spawns the Babel extractor on every parse of a file with a JSX half, to
+read `<Head>`, `<Script>`, `<Image>` and `<Suspense>` — unconditionally,
+whether or not the page declares any of them. Measured on a 68-line
+scaffold page: ~136 ms per parse, of which ~135 ms is that spawn. A full
+incremental rebuild of one changed page measures ~136-150 ms, so the
+Python-side work below is a rounding error against it.
+
 For a **typical 200-line page** with one or two segments:
 - 1-3 `ast.parse` calls
-- 5-15 milliseconds total
-- Dominated by Python's `ast.parse` itself
+- 5-15 milliseconds of Python parsing
+- plus the ~135 ms extractor spawn, which is the real cost
 
 For a **complex 1500-line page** like the playground:
 - 1-2 `ast.parse` calls (single Python section)
@@ -752,10 +769,13 @@ lineno, so it doesn't degrade to O(n²) in practice. The state machine
 in `_JsState.advance` is character-by-character but only runs on
 lines that the walker visits — typically less than half of a file.
 
-Babel validation (`validate_jsx=True`) adds a fixed ~200ms per file
-because of the Node.js subprocess startup. This is why it's opt-in:
-the dev server and build pipeline don't need it (Vite catches the
-same errors), so they don't pay the cost.
+Reporting JSX syntax errors (`report_jsx_syntax=True`) adds nothing
+measurable: the extractor spawn it reads from already happens. What
+*would* cost is a second spawn, which is what `validate_jsx=True` used
+to do on top of it — now skipped when the first pass already reported
+the error. Counted directly: one spawn per compile in dev, in
+production, and under `pyxle check`; two only on the old
+`validate_jsx`-without-`report_jsx_syntax` path.
 
 ---
 

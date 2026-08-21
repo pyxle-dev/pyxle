@@ -6,8 +6,20 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Sequence
 
+from .dev_origins import resolve_vite_bind_host
 from .scripts import GlobalScript, resolve_global_scripts
 from .styles import GlobalStylesheet, resolve_global_stylesheets
+
+#: Subdirectory of the client build tree that Vite writes its bundle into.
+#:
+#: The client tree holds two very different things. Its root is the build
+#: *input* — generated page JSX, Pyxle's own client components, the generated
+#: ``vite.config.js`` and ``tsconfig.json`` — none of which a browser ever
+#: requests. Everything the browser does load is what Vite emitted into this
+#: subdirectory. It is therefore the boundary between private and public: the
+#: production asset mount, the ``--analyze`` walk, and the base URL handed to
+#: Vite are all rooted here.
+CLIENT_BUNDLE_DIR_NAME = "dist"
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,6 +87,23 @@ class DevServerSettings:
     # (strings or dicts), resolved to PluginSpec/PyxlePlugin instances
     # by the starlette app at startup. Empty tuple = no plugins.
     plugins: tuple[Any, ...] = ()
+    # The app's display name (``name`` in pyxle.config.json). Empty means
+    # "unset" — ``document_title_default`` then falls back to the project
+    # directory name. Read only when a page renders with no <title> from the
+    # page or any layout.
+    app_name: str = ""
+
+    @property
+    def document_title_default(self) -> str:
+        """The ``<title>`` to use when nothing else supplies one.
+
+        Resolution order: the configured ``name``, then the project directory
+        name. Deliberately never the framework's own name — a page with no
+        title should read as the developer's app in the browser tab, not as
+        Pyxle.
+        """
+
+        return self.app_name.strip() or self.project_root.name
 
     @classmethod
     def from_project_root(
@@ -108,6 +137,7 @@ class DevServerSettings:
         llms: Any = None,
         studio: Any = None,
         plugins: Sequence[Any] | None = None,
+        app_name: str = "",
     ) -> "DevServerSettings":
         """Create settings derived from a project root directory."""
 
@@ -154,6 +184,12 @@ class DevServerSettings:
                 continue
             if resolved_dir not in dev_watch_paths:
                 dev_watch_paths.append(resolved_dir)
+        # A dev server told to answer off-box hands out documents whose scripts
+        # come from Vite; a Vite still on the default loopback address can serve
+        # nobody but this machine, so those documents render and never hydrate.
+        # Only the untouched default follows — a host the developer named is
+        # left alone and warned about instead (see ``dev_origins``).
+        vite_host = resolve_vite_bind_host(starlette_host, vite_host)
         return cls(
             project_root=root,
             build_root=build_root_path,
@@ -186,6 +222,7 @@ class DevServerSettings:
             llms=llms,
             studio=studio,
             plugins=tuple(plugins) if plugins else (),
+            app_name=app_name.strip(),
         )
 
     def to_dict(self) -> Dict[str, Any]:

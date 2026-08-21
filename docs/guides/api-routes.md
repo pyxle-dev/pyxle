@@ -167,6 +167,150 @@ Use the same bracket syntax as page routes:
 pages/api/users/[id].py  -->  /api/users/:id
 ```
 
+## Where API routes can live
+
+An `api` directory can sit anywhere under `pages/`, not only at the top. A
+`.py` file is an endpoint whenever the URL it maps to has an `api` segment:
+
+```
+pages/api/health.py                     -->  /api/health
+pages/s/[slug]/api/v2/summary.json.py   -->  /s/:slug/api/v2/summary.json
+```
+
+The second form is what a compatibility API needs — a shape another vendor's
+clients already expect, served per tenant. The path is derived from the file
+path in full, so dynamic segments and a file extension in the URL both work.
+
+Everywhere else, `.py` files are ignored by routing. That is deliberate: it
+lets you colocate helpers with the pages that use them without publishing them
+by accident.
+
+```
+pages/s/[slug]/queries.py   -->  not a route, importable by neighbours
+```
+
+### An `api` directory holds no pages
+
+A directory named `api` is **server ground**, all the way through. One rule
+decides everything about it, so you can predict all of it from the name:
+
+| In an `api` directory | What happens |
+|---|---|
+| `.py` files | Endpoints — they serve URLs |
+| `.jsx`, `.css`, `.json`, … | Never copied into the client build |
+| `.pyxl` files | Refused: an `api` directory holds no pages |
+| Links to its URLs | Left to the browser, never client-side navigations |
+
+So a `.pyxl` page inside one is reported when your project is scanned, by
+`pyxle dev` and `pyxle build` alike:
+
+```
+A directory named 'api' holds endpoints, not pages, but this page sits inside one:
+  pages/docs/api/overview.pyxl
+An 'api' directory is server ground throughout: its .py files serve URLs, its
+client assets (.jsx, .css, .json) are never shipped to the browser, and links to
+its URLs are never client-side navigations — so a page there loads without the
+components beside it. Rename the directory (for example 'reference/' or
+'api-docs/'), or move the page out of it.
+```
+
+Rename the directory — `pages/docs/reference/overview.pyxl` — and the page and
+the components beside it work as they do anywhere else.
+
+Only directories count, as everywhere else in this rule: `pages/api.pyxl` is an
+ordinary page serving `/api`.
+
+#### A page URL may still contain `api`
+
+The reserved thing is the directory, not the URL shape. A dynamic route fills
+its segments in from the request, so `pages/docs/[...slug].pyxl` serves
+`/docs/api/config` and `pages/s/[slug]/index.pyxl` serves `/s/api` — both are
+ordinary pages and both render normally.
+
+What such a page gives up is the client router. It reads the rule off the URL,
+where a page is indistinguishable from an endpoint, and resolves the ambiguity
+towards safety: a link to an `api` path is never prefetched on hover — a
+prefetch would issue a `GET` at what may be your endpoint, from a mouse
+movement — and a click performs an ordinary navigation rather than a
+client-side one. The page loads the way it would with JavaScript disabled. The
+same rule governs the `.md` renditions in [AI accessibility](llms.md): links to
+`api` paths are left pointing at the endpoint.
+
+### Private modules inside an `api` directory
+
+Inside an `api` directory the same colocation is available, marked the way
+Python already marks it: **a leading underscore means private**. A file or
+directory whose name starts with `_` is never a route.
+
+```
+pages/api/orders.py            -->  /api/orders
+pages/api/_shared.py           -->  not a route
+pages/api/__init__.py          -->  not a route
+pages/api/_internal/db.py      -->  not a route (the whole directory is private)
+```
+
+A private module is an ordinary Python module — import it from the endpoints
+beside it exactly as you would any other module in your project:
+
+```python
+# pages/api/_shared.py
+DEFAULT_LIMIT = 50
+
+def serialise(order):
+    return {"id": order.id, "total": order.total}
+```
+
+```python
+# pages/api/orders.py
+from starlette.responses import JSONResponse
+
+from pages.api._shared import DEFAULT_LIMIT, serialise
+
+async def endpoint(request):
+    orders = await fetch_orders(limit=DEFAULT_LIMIT)
+    return JSONResponse({"orders": [serialise(order) for order in orders]})
+```
+
+Only the segments at or below the `api` directory are read this way. Above it
+the path is a URL, where an underscore is just a character:
+`pages/_admin/api/health.py` still serves `/_admin/api/health`.
+
+Private modules are not routes, so nothing compiles them — `pyxle build` copies
+them into `dist/` instead, and they deploy with the endpoints that import them
+([what to ship](deployment.md#what-to-ship)).
+
+Under `pyxle dev` they still hot-reload. Saving one prints
+
+```
+✅ Reloaded pages/api/_shared.py in 9 ms
+```
+
+— "reloaded" rather than "rebuilt", because nothing was compiled: the module is
+dropped from Python's import cache and every endpoint that imports it is
+re-imported, so the next request runs your new code. If the endpoint cannot be
+imported afterwards (the helper has a syntax error, or the name it exports was
+renamed), the previous route table keeps serving and the terminal says so; fix
+the file and save again.
+
+The rule applies to `.py` modules in an `api` directory, not to pages: a
+`.pyxl` file named with a leading underscore is a normal route.
+
+A route may end in an extension the browser reads as an asset — `.js`, `.css`,
+`.json` — and it is still your endpoint. `pages/api/embed.js.py` serves
+`/api/embed.js`, which is how an embeddable widget is usually shipped:
+
+```python
+# pages/api/embed.js.py
+from starlette.responses import Response
+
+async def endpoint(request):
+    return Response(
+        "console.log('hello from your app');",
+        media_type="application/javascript; charset=utf-8",
+        headers={"access-control-allow-origin": "*"},
+    )
+```
+
 ```python
 from starlette.requests import Request
 from starlette.responses import JSONResponse

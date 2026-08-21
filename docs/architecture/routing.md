@@ -470,6 +470,13 @@ pages/
         └── [id].py              →  /api/users/{id}
 ```
 
+The `api` directory may sit at any depth: a `.py` file is an endpoint
+whenever the URL it maps to contains an `api` segment, so
+`pages/s/[slug]/api/v2/summary.json.py` serves
+`/s/{slug}/api/v2/summary.json`. Anywhere else a `.py` file is ignored by
+routing, which is what makes it safe to colocate helper modules beside the
+pages that import them.
+
 An API route module exports an `endpoint` callable. A single
 `endpoint` serves **all** HTTP methods — branch on `request.method`
 inside it. It receives a Starlette `Request` and must return a

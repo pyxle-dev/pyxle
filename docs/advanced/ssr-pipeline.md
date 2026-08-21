@@ -108,12 +108,20 @@ Errors at each stage are handled differently:
 
 | Stage | Error type | Behaviour |
 |-------|-----------|-----------|
-| Loader | `LoaderError` | Renders nearest `error.pyxl` with error context |
-| Loader | Other exceptions | Renders `error.pyxl` or default error document |
+| Loader | `LoaderError` | Renders nearest `error.pyxl` with error context, at the error's own status |
+| Loader | Other exceptions | Classified at the invocation site as `LoaderCrashError` (chaining the original as `__cause__`), then renders `error.pyxl` or the default error document, status 500 |
 | HEAD evaluation | `HeadEvaluationError` | Renders `error.pyxl` or default error document |
 | Component render | `ComponentRenderError` | Renders `error.pyxl` or default error document |
+| Render pipeline | Anything else | Default error document only — the boundary is **not** consulted, so a framework fault is not handled by running more application code |
 
-In dev mode, the error overlay shows the error with breadcrumbs indicating which stage failed.
+Classifying loader exceptions where they are raised, rather than inferring them
+at the end of the pipeline, is what keeps that last row narrow: it holds only
+faults in Pyxle's own machinery, not ordinary application bugs.
+
+Whichever branch runs, a `>= 500` failure is logged once — before the boundary
+is attempted, so a successfully rendered `error.pyxl` does not hide it. In dev
+mode, the error overlay shows the error with breadcrumbs indicating which stage
+failed.
 
 ## Client-side navigation
 

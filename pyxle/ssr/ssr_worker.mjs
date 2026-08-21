@@ -239,6 +239,23 @@ const _bundleCache = createLruCache(100);
 // promise. Entries are cleared once the resolution settles.
 const _bundleInFlight = new Map();
 
+// Inline-style descriptors keyed by the *module URL* a bundle was imported
+// under (path + content hash), NOT by component path.
+//
+// A component registers its stylesheets as a side effect of module evaluation,
+// and Node's ESM loader evaluates a given URL exactly once per process. An
+// identical bundle re-imported after a hot-reload rebuild therefore resolves
+// from Node's module cache without re-running that side effect, leaving the
+// fresh registry empty — which is how editing only the Python half of a
+// ``.pyxl`` file (its ``@server`` loader) used to strip every inline
+// stylesheet from the page: the loader changed, the client bundle did not, so
+// the re-import was a cache hit and the styles were lost until the dev server
+// restarted. Keying on the content hash keeps this correct in the other
+// direction too: a bundle whose CSS imports actually changed hashes
+// differently, evaluates for real, and records its own descriptors.
+// Bounded like ``_bundleCache`` — one entry per distinct bundle content.
+const _moduleStyleCache = createLruCache(100);
+
 // Cache postcss.config.* presence per project root so we don't stat the
 // filesystem on every render.  Bounded to 5 — effectively 1 per project.
 const _postcssCache = createLruCache(5);
@@ -470,7 +487,7 @@ async function handleRequest(request) {
     const result = await renderRequest(request);
     writeFrame({ id, ok: true, ...result });
   } catch (error) {
-    writeFrame({ id, ok: false, message: String(error.message || error) });
+    writeFrame({ id, ok: false, message: String(error.message || error), stack: String(error.stack || '') });
   }
 }
 
@@ -741,7 +758,18 @@ export default entry.contents;
     const moduleUrl = `${pathToFileURL(outfile).href}?v=${cacheBuster}`;
     const moduleExports = await import(moduleUrl);
 
-    const entry = { moduleExports, styleDescriptors: registry.list() };
+    // Node evaluates each module URL once per process, so a re-import of an
+    // unchanged bundle skips the style-registration side effect and leaves
+    // ``registry`` empty. Fall back to the descriptors this exact bundle
+    // recorded the first time it was evaluated (see ``_moduleStyleCache``).
+    let styleDescriptors = registry.list();
+    if (styleDescriptors.length === 0 && _moduleStyleCache.has(moduleUrl)) {
+      styleDescriptors = _moduleStyleCache.get(moduleUrl);
+    } else {
+      _moduleStyleCache.set(moduleUrl, styleDescriptors);
+    }
+
+    const entry = { moduleExports, styleDescriptors };
     _bundleCache.set(resolvedPath, entry);
     return entry;
   });
@@ -784,6 +812,7 @@ async function loadComponentForRender({
   requestPathname,
   csrfToken,
   fallbackPath,
+  viteOwnsCss,
 }) {
   if (!componentPath) {
     throw new Error('Missing componentPath in render request.');
@@ -800,8 +829,23 @@ async function loadComponentForRender({
 
   // Fresh registries for each render (head/style depend on props/render).
   const styleRegistry = createStyleRegistry(projectRoot);
+  // Skip inlining when the document already delivers this CSS.
+  //
+  // ``viteOwnsCss`` is the direct answer, sent by the Python side: a
+  // manifest-backed (production) render emits a render-blocking
+  // ``<link rel="stylesheet">`` for every asset Vite compiled for the page, so
+  // an inline copy is the same bytes a second time and cannot even buy a
+  // faster paint. See ``pyxle.ssr.template.vite_owns_stylesheets``.
+  //
+  // The PostCSS/Tailwind probes stay as a second, independent reason: under
+  // ``pyxle dev`` there is no manifest, but a Tailwind project's raw
+  // ``@tailwind`` directives are unparseable by a browser and must never be
+  // dumped into a <style> block. Keeping both means the dev behaviour of a
+  // Tailwind project is exactly what it was.
   const skipInlineCss =
-    detectPostcssConfig(projectRoot) !== null || detectTailwindVite(projectRoot);
+    viteOwnsCss === true ||
+    detectPostcssConfig(projectRoot) !== null ||
+    detectTailwindVite(projectRoot);
 
   const headRegistry = createHeadRegistry();
 

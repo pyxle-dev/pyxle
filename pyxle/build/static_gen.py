@@ -179,10 +179,14 @@ def generate_static_site(
         return []
 
     async def _run() -> list[str]:
+        from pyxle.ssr.template import vite_owns_stylesheets  # noqa: PLC0415
+
         pool = SsrWorkerPool(
             size=max(1, _resolve_pool_size(dist_settings.ssr_workers)),
             project_root=dist_settings.project_root,
             client_root=dist_settings.client_build_dir,
+            pages_root=dist_settings.pages_dir,
+            vite_owns_css=vite_owns_stylesheets(dist_settings),
         )
         await pool.start()
         try:

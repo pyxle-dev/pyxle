@@ -2,15 +2,82 @@
 
 from __future__ import annotations
 
+import logging
+from dataclasses import replace
 from pathlib import Path
-from textwrap import dedent
+from textwrap import dedent, indent
 
+from .dev_origins import (
+    VITE_DEFAULT_ORIGIN_PATTERN,
+    active_dev_session,
+    allowed_hostnames,
+    allowed_origins,
+    browser_vite_host,
+    is_off_box_host,
+)
 from .settings import DevServerSettings
+
+_logger = logging.getLogger(__name__)
 
 CLIENT_ENTRY_FILENAME = "client-entry.js"
 CLIENT_HTML_FILENAME = "index.html"
 VITE_CONFIG_FILENAME = "vite.config.js"
 TSCONFIG_FILENAME = "tsconfig.json"
+
+# Placeholder replaced by ``IS_API_PATH_JS`` in every generated module that
+# needs the rule. Kept as a placeholder rather than an f-string so the JS
+# templates stay literal (they are full of braces).
+_IS_API_PATH_PLACEHOLDER = "__PYXLE_IS_API_PATH__"
+
+#: The client's copy of the server's API-route rule.
+#:
+#: The server decides in :func:`pyxle.devserver.scanner._in_api_directory`:
+#: a ``.py`` file is an endpoint whenever the URL it maps to contains an
+#: ``api`` segment, at any depth. ``pages/s/[slug]/api/v2/summary.json.py``
+#: serves ``/s/{slug}/api/v2/summary.json``, so testing the literal prefix
+#: ``/api/`` recognises only the top-level endpoints and treats every nested
+#: one as an ordinary page.
+#:
+#: Emitted verbatim into both generated client modules — the ``pyxle/client``
+#: runtime and the router entry — so the two copies cannot drift from each
+#: other, and a future change to the server rule has one place to land.
+IS_API_PATH_JS = dedent(
+    """\
+    // Mirrors pyxle/devserver/scanner.py::_in_api_directory — a URL addresses
+    // an API endpoint when any of its path segments is exactly `api`, at any
+    // depth. Keep the two in step: this is the client half of one rule.
+    //
+    // The path is percent-decoded first because the server matches on the
+    // decoded path, so `/%61pi/x` is the same route to it. A malformed escape
+    // cannot be decoded; the raw path is then the best available answer.
+    function isApiPath(pathname) {
+      let decoded = pathname;
+      try {
+        decoded = decodeURIComponent(pathname);
+      } catch (error) {
+        decoded = pathname;
+      }
+      return decoded.split('/').includes('api');
+    }"""
+)
+
+
+def _inject_api_path_helper(content: str) -> str:
+    """Replace the ``isApiPath`` placeholder with the shared helper.
+
+    The placeholder sits on a line of its own; the helper inherits that line's
+    indentation so the generated module stays readable regardless of how far
+    each template is indented after :func:`~textwrap.dedent`.
+    """
+
+    lines: list[str] = []
+    for line in content.split("\n"):
+        if line.strip() != _IS_API_PATH_PLACEHOLDER:
+            lines.append(line)
+            continue
+        prefix = line[: len(line) - len(line.lstrip())]
+        lines.append(indent(IS_API_PATH_JS, prefix))
+    return "\n".join(lines)
 
 
 def _write_text_if_changed(path: Path, contents: str) -> None:
@@ -21,7 +88,50 @@ def _write_text_if_changed(path: Path, contents: str) -> None:
     path.write_text(contents, encoding="utf-8")
 
 
+def dev_server_network_in_effect(settings: DevServerSettings) -> DevServerSettings:
+    """``settings`` with the running dev server's addresses, when one is running.
+
+    The generated ``vite.config.js`` is a description of a *server*: which
+    address Vite binds, which origin it declares, which browsers it serves
+    modules to. Every command that builds regenerates it — but only ``pyxle
+    dev`` was told the addresses. ``pyxle routes`` in a project whose dev server
+    is on ``0.0.0.0`` would otherwise rewrite that description from the config
+    file's loopback default, and Vite, which watches its own config, restarts
+    onto it. Nothing fails: the page still renders, every module request from a
+    remote browser is now refused, and no console message, overlay or log line
+    says so.
+
+    So the addresses come from the one process that knows them (see
+    :func:`~pyxle.devserver.dev_origins.active_dev_session`). Everything else in
+    the regenerated config — aliases, plugins, env defines — is rewritten
+    normally, which is what the command was called for.
+    """
+
+    session = active_dev_session(settings.build_root)
+    if session is None:
+        return settings
+    adopted = replace(
+        settings,
+        starlette_host=session.starlette_host,
+        starlette_port=session.starlette_port,
+        vite_host=session.vite_host,
+        vite_port=session.vite_port,
+    )
+    if adopted != settings:
+        _logger.debug(
+            "Keeping the client config for the dev server running as pid %s "
+            "(%s:%s, vite %s:%s)",
+            session.pid,
+            session.starlette_host,
+            session.starlette_port,
+            session.vite_host,
+            session.vite_port,
+        )
+    return adopted
+
+
 def write_client_bootstrap_files(settings: DevServerSettings) -> None:
+    settings = dev_server_network_in_effect(settings)
     client_root = settings.client_build_dir
     client_root.mkdir(parents=True, exist_ok=True)
 
@@ -85,7 +195,7 @@ def _render_client_index() -> str:
 
 
 def _render_client_runtime_index() -> str:
-    return (
+    module = (
         dedent(
             """
             import React from 'react';
@@ -179,6 +289,8 @@ def _render_client_runtime_index() -> str:
               }
             }
 
+            __PYXLE_IS_API_PATH__
+
             function normalizeHref(candidate) {
               if (candidate == null) {
                 return null;
@@ -189,12 +301,19 @@ def _render_client_runtime_index() -> str:
                 return null;
               }
               try {
-                const url = new URL(candidate, window.location.origin);
+                // Resolved against the current URL, not the origin. A
+                // relative reference is defined against the document's own
+                // address (RFC 3986 §5): `?days=7` means "this page, with a
+                // different query", and `../x` means one level up. Resolving
+                // against the origin turns every one of those into a link to
+                // the site root — so a query-only filter or tab control
+                // silently navigates home, which is exactly what it did.
+                const url = new URL(candidate, window.location.href);
                 if (url.origin !== window.location.origin) {
                   return null;
                 }
                 // API routes and static files are not navigable pages.
-                if (url.pathname.startsWith('/api/') || /[.][a-zA-Z0-9]+$/.test(url.pathname)) {
+                if (isApiPath(url.pathname) || /[.][a-zA-Z0-9]+$/.test(url.pathname)) {
                   return null;
                 }
                 // Same-page hash change — let browser handle scroll.
@@ -389,6 +508,7 @@ def _render_client_runtime_index() -> str:
         ).strip()
         + "\n"
     )
+    return _inject_api_path_helper(module)
 
 
 def _project_uses_tailwind(project_root: Path) -> bool:
@@ -453,9 +573,92 @@ def _project_import_aliases(project_root: Path) -> list[tuple[str, str]]:
     return aliases
 
 
+def _js_regex_literal(pattern: str) -> str:
+    """Render a regex source as a JavaScript regex literal.
+
+    Only ``/`` needs escaping: :mod:`pyxle.devserver.dev_origins` emits patterns
+    whose syntax is common to Python and JavaScript, but an unescaped slash
+    would close the literal early.
+    """
+
+    return "/" + pattern.replace("/", r"\/") + "/"
+
+
+def _render_vite_server_access(settings: DevServerSettings) -> str:
+    """Render Vite's ``cors``/``allowedHosts`` for this dev server, or nothing.
+
+    Vite 6.0.9 and later answer cross-origin asset requests only for loopback
+    origins. Pyxle serves the document from its own port, so *every* script on
+    the page is a cross-origin request — and on a dev server reachable off-box
+    (``--host 0.0.0.0``, ``--host 192.168.1.11``) the document's origin is not
+    loopback, so Vite sends no ``Access-Control-Allow-Origin`` and the browser
+    drops every module. The page renders completely and never hydrates.
+
+    So a dev server that answers off-box declares the origins it is itself
+    served from. A loopback-only dev server declares nothing and keeps Vite's
+    defaults untouched — the overwhelmingly common ``pyxle dev`` is byte-for-byte
+    the config it always was.
+    """
+
+    starlette_host = settings.starlette_host
+    if not is_off_box_host(starlette_host):
+        return ""
+
+    exact, pattern = allowed_origins(starlette_host, settings.starlette_port)
+    entries = [
+        # Setting `origin` REPLACES Vite's default allow-list, so restate it:
+        # loopback on any port, which is how the developer's own browser reaches
+        # this server.
+        _js_regex_literal(VITE_DEFAULT_ORIGIN_PATTERN),
+    ]
+    entries.extend(
+        f"'{origin}'"
+        for origin in exact
+        if "localhost" not in origin and "127.0.0.1" not in origin
+    )
+    if pattern is not None:
+        entries.append(_js_regex_literal(pattern))
+    origin_lines = "\n".join(f"                    {entry}," for entry in entries)
+
+    hostnames = allowed_hostnames(starlette_host, settings.vite_host)
+    allowed_hosts_block = ""
+    if hostnames:
+        rendered = ", ".join(f"'{name}'" for name in hostnames)
+        allowed_hosts_block = (
+            "\n                // Vite rejects a Host header it does not know "
+            "(DNS-rebinding defence).\n"
+            "                // IP literals and localhost are always accepted; a "
+            "NAMED host is not,\n"
+            "                // so every name this dev server was told to answer "
+            "to is declared here.\n"
+            f"                allowedHosts: [{rendered}],"
+        )
+
+    return (
+        "\n                // Which browser origins may read this dev server's "
+        "modules. Deliberately\n"
+        "                // NOT `cors: true`: that would let any page the "
+        "developer has open — an ad\n"
+        "                // iframe, a stray tab — read the source of the project "
+        "they are working on.\n"
+        "                // Listed instead are the origins this dev server is "
+        "itself served from.\n"
+        "                cors: {\n"
+        "                  origin: [\n"
+        f"{origin_lines}\n"
+        "                  ],\n"
+        "                },"
+        f"{allowed_hosts_block}"
+    )
+
+
 def _render_vite_config(settings: DevServerSettings) -> str:
     vite_host = settings.vite_host
     vite_port = settings.vite_port
+    browser_host = browser_vite_host(
+        vite_host=vite_host, starlette_host=settings.starlette_host
+    )
+    server_access_block = _render_vite_server_access(settings)
     define_block = _build_public_env_defines()
 
     uses_tailwind = _project_uses_tailwind(settings.project_root)
@@ -501,13 +704,11 @@ def _render_vite_config(settings: DevServerSettings) -> str:
             // origin (Pyxle) — not Vite — so they 404. Declaring Vite's public
             // `server.origin` makes it emit ABSOLUTE asset URLs against its own
             // origin instead. The bind host is normalised to a
-            // browser-connectable host the same way `ssr/template.py` does for
-            // the <script> origin, so assets and scripts always share one origin.
+            // browser-connectable host by `devserver/dev_origins.py`, the same
+            // module `ssr/template.py` asks for the <script> origin, so assets
+            // and scripts always share one origin.
             const viteHost = '{vite_host}';
-            const browserHost =
-              viteHost === '0.0.0.0' || viteHost === '::' || viteHost === ''
-                ? 'localhost'
-                : viteHost;
+            const browserHost = '{browser_host}';
             const vitePort = Number(process.env.PYXLE_VITE_PORT ?? {vite_port});
 
             __PYXLE_CSS_MODULE_HELPER__
@@ -550,7 +751,7 @@ def _render_vite_config(settings: DevServerSettings) -> str:
                 host: viteHost,
                 port: vitePort,
                 strictPort: false,
-                origin: `http://${{browserHost}}:${{vitePort}}`,
+                origin: `http://${{browserHost}}:${{vitePort}}`,{server_access_block}
                 fs: {{
                   allow: [projectRoot],
                 }},
@@ -1078,7 +1279,10 @@ def _render_client_entry(settings: DevServerSettings) -> str:
                   return true;
                 }
                 try {
-                  const target = new URL(href, window.location.origin);
+                  // Same base as navigation uses, or the cache key for a
+                  // relative href would name a different page than the one the
+                  // click actually loads.
+                  const target = new URL(href, window.location.href);
                   const key = getCacheKey(target);
                   const removed =
                     navigationCache.delete(key) ||
@@ -1475,6 +1679,14 @@ def _render_client_entry(settings: DevServerSettings) -> str:
               updatePropsTag(props);
             }
 
+            __PYXLE_IS_API_PATH__
+
+            // ``normalizeUrl`` deliberately stays a pure coercion — string or
+            // anchor to URL — with no policy in it. ``handlePopState`` runs
+            // every history entry through it, so a guard here would break
+            // back/forward; the API rule belongs at the two places that decide
+            // to *start* a navigation, ``shouldHandleClick`` and
+            // ``handleLinkHover``.
             function normalizeUrl(target) {
               if (target instanceof URL) {
                 return target;
@@ -1521,6 +1733,18 @@ def _render_client_entry(settings: DevServerSettings) -> str:
               }
               const url = normalizeUrl(anchor.href);
               if (!url || url.origin !== window.location.origin) {
+                return null;
+              }
+              // An API route is not a page. Without this the delegated click
+              // listener intercepts the link, calls preventDefault(), and
+              // hands the endpoint's own JSON to the navigation cache: the
+              // address bar changes to the endpoint while the page that is
+              // already on screen re-renders with empty props. Declining the
+              // click lets the browser follow the link, which is what a link
+              // to an endpoint should do — and is already what a <Link> to one
+              // expects, since normalizeHref() refuses it on the component
+              // side and relies on this listener not picking it back up.
+              if (isApiPath(url.pathname)) {
                 return null;
               }
               const href = anchor.getAttribute('href') || '';
@@ -2067,11 +2291,14 @@ def _render_client_entry(settings: DevServerSettings) -> str:
                 return;
               }
               // Skip API routes and static files — only prefetch page routes.
+              // Prefetching an endpoint issues an unsolicited GET from a mouse
+              // movement, which for a non-idempotent or expensive endpoint is a
+              // real side effect the user never asked for.
               // (The dot is written [.], not backslash-escaped: this JS lives
               // in a non-raw Python string, where a backslash escape here is
               // a SyntaxWarning on every compile and an error in future Python.)
               const p = url.pathname;
-              if (p.startsWith('/api/') || /[.][a-zA-Z0-9]+$/.test(p)) {
+              if (isApiPath(p) || /[.][a-zA-Z0-9]+$/.test(p)) {
                 return;
               }
               prefetchNavigation(url).catch(() => {});
@@ -2511,7 +2738,7 @@ def _render_client_entry(settings: DevServerSettings) -> str:
       style_lines = [f"import '{sheet.import_specifier}';" for sheet in settings.global_stylesheets]
       style_block = "\n".join(style_lines) + "\n"
     content = content.replace("__PYXLE_GLOBAL_STYLE_IMPORTS__\n", style_block, 1)
-    return content
+    return _inject_api_path_helper(content)
 
 
 def _render_tsconfig() -> str:
@@ -4257,6 +4484,7 @@ __all__ = [
     "CLIENT_HTML_FILENAME",
     "VITE_CONFIG_FILENAME",
     "TSCONFIG_FILENAME",
+    "dev_server_network_in_effect",
     "write_client_bootstrap_files",
     "_render_client_entry",
   "_render_client_runtime_index",

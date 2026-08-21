@@ -18,8 +18,14 @@ def compile_file(
     build_root: Path,
     client_root: Path | None = None,
     server_root: Path | None = None,
+    report_jsx_syntax: bool = False,
 ) -> CompilationResult:
-    """Compile a single `.pyxl` file into client/server artifacts."""
+    """Compile a single `.pyxl` file into client/server artifacts.
+
+    ``report_jsx_syntax`` makes a JSX section Babel cannot parse a compile
+    error rather than silently-empty JSX metadata. The dev server turns it on;
+    the production build path leaves it off, so its behaviour is unchanged.
+    """
 
     if source_path.suffix != ".pyxl":
         raise CompilationError("Only `.pyxl` files can be compiled", None)
@@ -39,7 +45,7 @@ def compile_file(
     route_spec = route_path_variants_from_relative(page_relative)
 
     parser = PyxParser()
-    parse_result = parser.parse(source_path)
+    parse_result = parser.parse(source_path, report_jsx_syntax=report_jsx_syntax)
 
     writer = ArtifactWriter(
         build_root=build_root,

@@ -138,9 +138,13 @@ def test_install_rejects_file_path() -> None:
 
 
 def test_install_dependencies_executes_commands(monkeypatch, tmp_path) -> None:
+    # Python deps are only installed when there is something to install;
+    # these tests assert on the pip command, so give them a reason to run one.
+    (tmp_path / "requirements.txt").write_text("pyxle-framework\n", encoding="utf-8")
+
     calls: list[tuple[list[str], Path]] = []
 
-    def fake_run(command, *, cwd, check):
+    def fake_run(command, *, cwd, check, stdout=None, stderr=None, text=False):
         calls.append((command, cwd))
 
     monkeypatch.setattr(cli.subprocess, "run", fake_run)
@@ -305,11 +309,17 @@ def test_in_virtualenv_detects_environments(monkeypatch) -> None:
 def test_install_dependencies_warns_outside_virtualenv(monkeypatch, tmp_path) -> None:
     """Outside a venv, install warns about PEP 668 with venv guidance instead of
     letting pip throw its raw 'externally-managed-environment' wall."""
+    # Python deps are only installed when there is something to install;
+    # these tests assert on the pip command, so give them a reason to run one.
+    (tmp_path / "requirements.txt").write_text("pyxle-framework\n", encoding="utf-8")
+
     monkeypatch.setattr(cli, "_in_virtualenv", lambda: False)
     monkeypatch.setattr(cli.subprocess, "run", lambda *a, **k: None)
     warnings: list[str] = []
 
     class _Logger:
+        verbosity = cli.Verbosity.NORMAL
+
         def step(self, *a, **k) -> None: ...
         def warning(self, msg) -> None:
             warnings.append(msg)
@@ -397,7 +407,8 @@ def test_serve_command_runs_build_and_uvicorn(monkeypatch) -> None:
         (project / "public").mkdir(parents=True)
 
         dist_root = project / "dist"
-        client_dir = dist_root / "client"
+        # Vite's bundle directory — the only part of dist/client/ that is served.
+        client_dir = dist_root / "client" / "dist"
         public_dir = dist_root / "public"
         client_dir.mkdir(parents=True, exist_ok=True)
         public_dir.mkdir(parents=True, exist_ok=True)
@@ -417,7 +428,8 @@ def test_serve_command_runs_build_and_uvicorn(monkeypatch) -> None:
         registry_sentinel = object()
         route_table_sentinel = object()
 
-        monkeypatch.setattr("pyxle.build.production.build_metadata_registry",lambda settings: registry_sentinel)
+        monkeypatch.setattr("pyxle.build.production.build_metadata_registry",
+            lambda settings, metadata=None: registry_sentinel)
         monkeypatch.setattr("pyxle.build.production.build_route_table",lambda registry: route_table_sentinel)
 
         app_instance = SimpleNamespace(state=SimpleNamespace(pyxle_ready=False))
@@ -482,7 +494,8 @@ def test_serve_command_can_disable_static_mounts(monkeypatch) -> None:
         (dist_root / "page-manifest.json").write_text('{}', encoding="utf-8")
 
         monkeypatch.setattr(cli, "run_build", lambda *_, **__: None)
-        monkeypatch.setattr("pyxle.build.production.build_metadata_registry",lambda settings: object())
+        monkeypatch.setattr("pyxle.build.production.build_metadata_registry",
+            lambda settings, metadata=None: object())
         monkeypatch.setattr("pyxle.build.production.build_route_table",lambda registry: object())
 
         captured: dict[str, object] = {}
@@ -542,9 +555,13 @@ def test_serve_command_requires_manifest_when_skipping_build(monkeypatch) -> Non
 
 
 def test_install_dependencies_flag_skips(monkeypatch, tmp_path) -> None:
+    # Python deps are only installed when there is something to install;
+    # these tests assert on the pip command, so give them a reason to run one.
+    (tmp_path / "requirements.txt").write_text("pyxle-framework\n", encoding="utf-8")
+
     calls: list[list[str]] = []
 
-    def fake_run(command, *, cwd, check):
+    def fake_run(command, *, cwd, check, stdout=None, stderr=None, text=False):
         calls.append(command)
 
     monkeypatch.setattr(cli.subprocess, "run", fake_run)
@@ -572,7 +589,7 @@ def test_install_dependencies_warns_when_disabled(monkeypatch, tmp_path) -> None
 
 
 def test_run_subprocess_handles_failed_exit(monkeypatch, tmp_path) -> None:
-    def fake_run(command, *, cwd, check):
+    def fake_run(command, *, cwd, check, stdout=None, stderr=None, text=False):
         raise subprocess.CalledProcessError(returncode=2, cmd=command)
 
     monkeypatch.setattr(cli.subprocess, "run", fake_run)
@@ -580,6 +597,82 @@ def test_run_subprocess_handles_failed_exit(monkeypatch, tmp_path) -> None:
 
     with pytest.raises(typer.Exit):
         cli._run_subprocess(["npm", "install"], cwd=tmp_path, label="Node", logger=logger)
+
+
+_NOISY_CHILD = (
+    "import sys\n"
+    "print('Requirement already satisfied: certifi in /some/site-packages')\n"
+    "print('[notice] A new release of pip is available: 26.1.2 -> 26.2.1')\n"
+    "sys.stderr.write('npm warn deprecated something@1.0.0\\n')\n"
+    "sys.exit(int(sys.argv[1]))\n"
+)
+
+
+def _noisy_installer(tmp_path, exit_code: int) -> list[str]:
+    """A stand-in installer that chatters like pip/npm, then exits *exit_code*.
+
+    Written to a file (rather than passed with ``-c``) so the echoed step line
+    can't accidentally satisfy assertions about the child's own output.
+    """
+    script = tmp_path / "noisy_installer.py"
+    script.write_text(_NOISY_CHILD, encoding="utf-8")
+    return [sys.executable, str(script), str(exit_code)]
+
+
+def test_run_subprocess_hides_tool_chatter_on_success(tmp_path, capfd, uninstrumented_child) -> None:
+    """A successful installer prints the step line and nothing of pip/npm's own noise.
+
+    Runs a REAL child process (not a mock) so this test fails if the output is
+    merely redirected rather than captured.
+    """
+    cli._run_subprocess(
+        _noisy_installer(tmp_path, 0),
+        cwd=tmp_path,
+        label="Python dependencies",
+        logger=cli.ConsoleLogger(),
+    )
+
+    output = capfd.readouterr()
+    combined = output.out + output.err
+    assert "Python dependencies" in combined  # the step line still shows
+    assert "Requirement already satisfied" not in combined
+    assert "A new release of pip is available" not in combined
+    assert "npm warn deprecated" not in combined
+
+
+def test_run_subprocess_shows_tool_output_on_failure(tmp_path, capfd, uninstrumented_child) -> None:
+    """A failing installer must still show the user everything the tool said."""
+    with pytest.raises(typer.Exit):
+        cli._run_subprocess(
+            _noisy_installer(tmp_path, 1),
+            cwd=tmp_path,
+            label="Python dependencies",
+            logger=cli.ConsoleLogger(),
+        )
+
+    output = capfd.readouterr()
+    combined = output.out + output.err
+    assert "Requirement already satisfied" in combined
+    assert "npm warn deprecated" in combined
+    assert "Python dependencies failed with exit code 1." in combined
+
+
+def test_run_subprocess_streams_live_when_verbose(tmp_path, capfd, uninstrumented_child) -> None:
+    """`pyxle -v install` streams the child's output instead of capturing it."""
+    logger = cli.ConsoleLogger()
+    logger.set_verbosity(cli.Verbosity.VERBOSE)
+
+    cli._run_subprocess(
+        _noisy_installer(tmp_path, 0),
+        cwd=tmp_path,
+        label="Python dependencies",
+        logger=logger,
+    )
+
+    output = capfd.readouterr()
+    combined = output.out + output.err
+    assert "Requirement already satisfied" in combined
+    assert "npm warn deprecated" in combined
 
 
 def test_resolve_run_build_prefers_overridden_callable(monkeypatch) -> None:
@@ -1081,6 +1174,58 @@ def test_build_command_supports_incremental_flag(monkeypatch) -> None:
         assert captured.get("force_rebuild") is False
 
 
+def test_build_command_analyze_counts_only_the_bundle(monkeypatch) -> None:
+    """``--analyze`` must report what the browser downloads, nothing else.
+
+    Walking ``dist/client/`` instead of ``dist/client/dist/`` swept in the
+    generated ``vite.config.js``, ``client-entry.js`` and the CSS sources Vite
+    consumed — build inputs no browser fetches — and inflated the total.
+    """
+    with runner.isolated_filesystem():
+        project = Path("demo")
+        (project / "pages").mkdir(parents=True)
+        (project / "public").mkdir(parents=True)
+
+        def fake_run_build(settings, *, logger, dist_dir=None, force_rebuild=True):
+            from pyxle.build.pipeline import BuildResult
+            from pyxle.devserver.builder import BuildSummary
+            from pyxle.devserver.registry import MetadataRegistry
+
+            result_dist = settings.project_root / "dist"
+            client = result_dist / "client"
+            (client / "dist" / "assets").mkdir(parents=True, exist_ok=True)
+            (client / "dist" / "assets" / "index-a1b2c3d4.js").write_bytes(b"a" * 1000)
+            # Build inputs beside the bundle.
+            (client / "vite.config.js").write_bytes(b"b" * 6000)
+            (client / "client-entry.js").write_bytes(b"c" * 46000)
+            for name in ("server", "metadata", "public"):
+                (result_dist / name).mkdir(parents=True, exist_ok=True)
+            page_manifest_path = result_dist / "page-manifest.json"
+            page_manifest_path.write_text("{}", encoding="utf-8")
+            return BuildResult(
+                dist_dir=result_dist,
+                client_dir=client,
+                server_dir=result_dist / "server",
+                metadata_dir=result_dist / "metadata",
+                public_dir=result_dist / "public",
+                client_manifest_path=None,
+                page_manifest={},
+                page_manifest_path=page_manifest_path,
+                summary=BuildSummary(),
+                registry=MetadataRegistry(pages=[], apis=[]),
+            )
+
+        monkeypatch.setattr("pyxle.cli.run_build", fake_run_build)
+
+        result = runner.invoke(app, ["build", "demo", "--analyze"], catch_exceptions=False)
+
+        assert result.exit_code == 0, result.stdout
+        assert "assets/index-a1b2c3d4.js" in result.stdout
+        assert "vite.config.js" not in result.stdout
+        assert "client-entry.js" not in result.stdout
+        assert "(1 file(s))" in result.stdout
+
+
 def test_build_command_logs_missing_public_assets(monkeypatch) -> None:
     with runner.isolated_filesystem():
         project = Path("demo")
@@ -1504,7 +1649,7 @@ def test_serve_command_ssr_workers_flag(monkeypatch) -> None:
 
         monkeypatch.setattr("pyxle.build.production.create_starlette_app", fake_create_app)
         monkeypatch.setattr("pyxle.build.production.load_manifest", lambda p: {"pages": {}, "generated_at": "2024-01-01"})
-        monkeypatch.setattr("pyxle.build.production.build_metadata_registry", lambda s: {})
+        monkeypatch.setattr("pyxle.build.production.build_metadata_registry", lambda s, metadata=None: {})
         monkeypatch.setattr("pyxle.build.production.build_route_table", lambda r: [])
         monkeypatch.setattr("pyxle.cli.asyncio.run", lambda coro: coro.close())
 
@@ -1549,7 +1694,7 @@ def test_serve_command_defaults_ssr_workers_to_auto(monkeypatch) -> None:
 
         monkeypatch.setattr("pyxle.build.production.create_starlette_app", fake_create_app)
         monkeypatch.setattr("pyxle.build.production.load_manifest", lambda p: {"pages": {}, "generated_at": "2024-01-01"})
-        monkeypatch.setattr("pyxle.build.production.build_metadata_registry", lambda s: {})
+        monkeypatch.setattr("pyxle.build.production.build_metadata_registry", lambda s, metadata=None: {})
         monkeypatch.setattr("pyxle.build.production.build_route_table", lambda r: [])
         monkeypatch.setattr("pyxle.cli.asyncio.run", lambda coro: coro.close())
 
@@ -1659,6 +1804,58 @@ def test_check_command_succeeds_on_valid_project() -> None:
         assert result.exit_code == 0
         assert "1 .pyxl" in result.stdout
         assert "passed" in result.stdout
+
+
+def test_check_passes_with_an_unused_import() -> None:
+    """An unused import is a warning, not an error.
+
+    `docs/guides/deployment.md` gates the deploy checklist on "`pyxle check`
+    passes with no errors" — a leftover `import json` must not block a release.
+    """
+    with runner.isolated_filesystem():
+        project = Path("demo")
+        (project / "pages").mkdir(parents=True)
+        (project / "public").mkdir()
+        (project / "pages" / "index.pyxl").write_text(
+            "import json\n\n"
+            "import React from 'react';\n\n"
+            "export default function Page() {\n"
+            "    return <div>Hello</div>;\n"
+            "}\n",
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(app, ["check", "demo"], catch_exceptions=False)
+
+        assert result.exit_code == 0
+        assert "'json' imported but unused" in result.stdout
+        assert "warning: [python]" in result.stdout
+        assert "All checks passed" in result.stdout
+        assert "Check failed" not in result.stdout
+
+
+def test_check_fails_on_an_undefined_name() -> None:
+    """Genuine breakage — an unresolved reference — still fails the command."""
+    with runner.isolated_filesystem():
+        project = Path("demo")
+        (project / "pages").mkdir(parents=True)
+        (project / "public").mkdir()
+        (project / "pages" / "index.pyxl").write_text(
+            "@server\n"
+            "async def load(request):\n"
+            "    return {'x': compute_total(request)}\n\n"
+            "import React from 'react';\n\n"
+            "export default function Page() {\n"
+            "    return <div>Hello</div>;\n"
+            "}\n",
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(app, ["check", "demo"], catch_exceptions=False)
+
+        assert result.exit_code == 1
+        assert "undefined name 'compute_total'" in result.stdout
+        assert "Check failed with 1 error(s)" in result.stdout
 
 
 def test_check_command_reports_compilation_error() -> None:
@@ -2092,6 +2289,47 @@ def test_routes_command_with_actions_and_error_boundary() -> None:
         api_routes = [r for r in data if r.get("type") == "api"]
         assert len(page_routes) >= 1
         assert len(api_routes) >= 1
+
+
+def test_routes_labels_special_files_not_as_paths() -> None:
+    """`error.pyxl` / `not-found.pyxl` / `loading.pyxl` serve no URL, so the
+    routes table must not print them under a path-shaped label like `/error` —
+    that invites the reader to go and visit an address that always 404s."""
+    with runner.isolated_filesystem():
+        project = Path("demo")
+        (project / "pages" / "dashboard").mkdir(parents=True)
+        (project / "public").mkdir()
+        (project / "pages" / "index.pyxl").write_text(
+            "import React from 'react';\nexport default function P() { return <div />; }\n",
+            encoding="utf-8",
+        )
+        for rel, component in (
+            ("error.pyxl", "ErrorPage"),
+            ("not-found.pyxl", "NotFound"),
+            ("loading.pyxl", "Loading"),
+            ("dashboard/error.pyxl", "DashError"),
+        ):
+            (project / "pages" / rel).write_text(
+                f"import React from 'react';\n"
+                f"export default function {component}() {{ return <div />; }}\n",
+                encoding="utf-8",
+            )
+
+        result = runner.invoke(app, ["routes", "demo"], catch_exceptions=False)
+        assert result.exit_code == 0
+
+        # Named for what they are...
+        assert "error boundary" in result.stdout
+        assert "404 page" in result.stdout
+        assert "loading fallback" in result.stdout
+        # ...with the subtree each one covers.
+        assert "[covers /]" in result.stdout
+        assert "[covers /dashboard/*]" in result.stdout
+        # ...and never as a visitable URL.
+        for fake_path in ("▶️  /error", "▶️  /not-found", "▶️  /loading"):
+            assert fake_path not in result.stdout
+        # The routable pages are still counted; the special files are not.
+        assert "1 route(s) found" in result.stdout
 
 
 def test_routes_command_config_error() -> None:
@@ -2853,7 +3091,7 @@ def _serve_with_stubbed_runtime(monkeypatch, captured: dict) -> None:
         return app_obj
 
     monkeypatch.setattr("pyxle.build.production.create_starlette_app", fake_create_app)
-    monkeypatch.setattr("pyxle.build.production.build_metadata_registry", lambda s: {})
+    monkeypatch.setattr("pyxle.build.production.build_metadata_registry", lambda s, metadata=None: {})
     monkeypatch.setattr("pyxle.build.production.build_route_table", lambda r: [])
     monkeypatch.setattr("pyxle.build.production.load_manifest", lambda p: {"pages": {}})
 
@@ -2890,7 +3128,7 @@ def test_serve_command_falls_back_when_dist_public_and_client_missing(monkeypatc
         assert result.exit_code == 0, result.stdout
         assert "Public assets directory" in result.stdout
         assert "does not exist" in result.stdout
-        assert "Client asset directory" in result.stdout
+        assert "Client bundle directory" in result.stdout
         assert "/client requests will 404" in result.stdout
         # Fallback: public served from source dir, client disabled.
         kwargs = captured["create_kwargs"]
@@ -2914,8 +3152,9 @@ def test_serve_command_zero_ssr_workers_uses_cpu_count(monkeypatch) -> None:
         pool_args: dict[str, object] = {}
 
         class StubPool:
-            def __init__(self, *, size, project_root, client_root):
+            def __init__(self, *, size, project_root, client_root, **kwargs):
                 pool_args["size"] = size
+                pool_args.update(kwargs)
 
         monkeypatch.setattr("pyxle.ssr.worker_pool.SsrWorkerPool", StubPool)
 
@@ -3257,8 +3496,18 @@ def test_dist_has_websocket_pages(tmp_path: Path) -> None:
 
 def test_install_dependencies_break_system_packages(monkeypatch, tmp_path) -> None:
     """--break-system-packages threads through to the pip command for PEP-668."""
+    # Python deps are only installed when there is something to install;
+    # these tests assert on the pip command, so give them a reason to run one.
+    (tmp_path / "requirements.txt").write_text("pyxle-framework\n", encoding="utf-8")
+
     calls: list[list[str]] = []
-    monkeypatch.setattr(cli.subprocess, "run", lambda command, *, cwd, check: calls.append(command))
+    monkeypatch.setattr(
+        cli.subprocess,
+        "run",
+        lambda command, *, cwd, check, stdout=None, stderr=None, text=False: calls.append(
+            command
+        ),
+    )
     monkeypatch.setattr(cli, "_in_virtualenv", lambda: False)
     cli._install_dependencies(
         tmp_path,
@@ -3270,8 +3519,16 @@ def test_install_dependencies_break_system_packages(monkeypatch, tmp_path) -> No
 
 
 def test_install_no_break_flag_by_default(monkeypatch, tmp_path) -> None:
+    (tmp_path / "requirements.txt").write_text("pyxle-framework\n", encoding="utf-8")
+
     calls: list[list[str]] = []
-    monkeypatch.setattr(cli.subprocess, "run", lambda command, *, cwd, check: calls.append(command))
+    monkeypatch.setattr(
+        cli.subprocess,
+        "run",
+        lambda command, *, cwd, check, stdout=None, stderr=None, text=False: calls.append(
+            command
+        ),
+    )
     monkeypatch.setattr(cli, "_in_virtualenv", lambda: True)
     cli._install_dependencies(tmp_path, logger=cli.ConsoleLogger(), install_node=False)
     assert "--break-system-packages" not in calls[0]
@@ -3532,3 +3789,75 @@ def test_start_debug_server_handles_missing_debugpy(monkeypatch, _no_pydevd_env)
     assert excinfo.value.exit_code == 1
     # The error points at reinstalling the framework, not an extra.
     assert any("reinstall" in m.lower() for m in messages)
+
+
+def test_build_command_prints_client_build_error_verbatim(monkeypatch) -> None:
+    """A missing Node toolchain must reach the user as *its own* message.
+
+    The build error already names the prerequisite, the consequence, and the
+    fix; wrapping it in a generic "Build failed:" prefix would bury the one line
+    the user needs. Exit status must be non-zero so CI and Docker builds stop.
+    """
+    from pyxle.build.pipeline import ClientBuildError
+
+    with runner.isolated_filesystem():
+        project = Path("demo")
+        (project / "pages").mkdir(parents=True)
+
+        def fake_run_build(settings, *, logger, dist_dir=None, force_rebuild=True):
+            raise ClientBuildError(
+                "npx was not found on your PATH — cannot build the client bundle.\n"
+                "  install Node.js 20.19+ from https://nodejs.org"
+            )
+
+        monkeypatch.setattr("pyxle.cli.run_build", fake_run_build)
+
+        result = runner.invoke(app, ["build", "demo"], catch_exceptions=False)
+
+    assert result.exit_code == 1, result.stdout
+    assert "npx was not found on your PATH" in result.stdout
+    assert "https://nodejs.org" in result.stdout
+    assert "Build failed:" not in result.stdout
+    assert "Build completed" not in result.stdout
+
+
+def test_serve_command_stops_when_the_client_build_cannot_run(monkeypatch) -> None:
+    """``pyxle serve`` builds before serving unless ``--skip-build``; that build
+    failing must abort the serve rather than boot on a stale/absent dist."""
+    from pyxle.build.pipeline import ClientBuildError
+
+    with runner.isolated_filesystem():
+        project = Path("demo")
+        (project / "pages").mkdir(parents=True)
+
+        def fake_run_build(settings, *, logger, dist_dir=None, force_rebuild=True):
+            raise ClientBuildError("npx was not found on your PATH — cannot build.")
+
+        monkeypatch.setattr("pyxle.cli.run_build", fake_run_build)
+
+        result = runner.invoke(app, ["serve", "demo"], catch_exceptions=False)
+
+    assert result.exit_code == 1, result.stdout
+    assert "npx was not found on your PATH" in result.stdout
+
+
+def test_install_dependencies_skips_python_without_requirements(monkeypatch, tmp_path) -> None:
+    """No requirements.txt is a normal shape — skip pip, still install node.
+
+    `pip install -r` exits 1 on a missing target, which used to abort the whole
+    command before `npm install` ever ran. Our own charts example has no
+    requirements file, so its documented first command failed.
+    """
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        cli.subprocess,
+        "run",
+        lambda command, *, cwd, check, stdout=None, stderr=None, text=False: calls.append(
+            command
+        ),
+    )
+
+    cli._install_dependencies(tmp_path, logger=cli.ConsoleLogger())
+
+    assert not any("pip" in part for command in calls for part in command)
+    assert ["npm", "install"] in calls

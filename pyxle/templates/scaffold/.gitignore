@@ -18,8 +18,11 @@ ENV/
 node_modules/
 .pnp/
 .pnp.js
-yarn.lock
-package-lock.json
+
+# Lockfiles are NOT ignored. This is an application, not a library: committing
+# the lockfile is what makes an install reproducible, and it is what `npm ci`
+# requires. Ignoring it broke the Dockerfile in our own deployment guide —
+# a cloned repo had no lockfile, so `npm ci` exited with EUSAGE. See P1-29.
 
 # Pyxle build artifacts
 .pyxle-build/

@@ -226,12 +226,18 @@ The checker also:
   scan, so the agent gets a complete picture of project health
   after every edit.
 - **Reports both Python and JSX errors** in the same pass.
+- **Marks each finding `error:` or `warning:`** — an error is code
+  that will break when it runs (unresolved reference, syntax
+  error); a warning is code that runs fine but wants tidying (an
+  unused import). Only errors affect the exit code, so an agent
+  can gate on the exit code and still see the tidy-ups. See
+  [errors vs warnings](../reference/cli.md#errors-vs-warnings).
 - **Suppresses cascade noise** — fix Python first, and the
   downstream JSX errors that came from the broken Python vanish
   automatically. The agent isn't chasing ghosts.
-- **Has an exit code** — `0` if clean, `1` if errors. Shell-friendly
-  for agent workflows that gate subsequent commands on check
-  success.
+- **Has an exit code** — `0` if no error (warnings alone still exit
+  `0`), `1` if any error. Shell-friendly for agent workflows that
+  gate subsequent commands on check success.
 
 ### 6. Tiny CLI surface
 
@@ -449,9 +455,14 @@ on the actual problem.
 
 Pyxle's dev server watches `pages/`, incrementally rebuilds only
 the changed files, purges stale `sys.modules` entries so Python
-changes take effect on the next request, and invalidates the
-relevant Vite HMR modules so the browser updates without a full
-reload.
+changes take effect on the next request, and then reloads every
+connected browser.
+
+It is a full page reload, not a React Fast Refresh hot update:
+component state does not survive a rebuild. That is the trade for
+a `.pyxl` file whose Python half and JSX half change together —
+the server data behind the page may have changed too, so the page
+is refetched rather than patched in place.
 
 For an agent working in a tight edit-check-edit loop, this means
 **every change is immediately reflected** without the agent having

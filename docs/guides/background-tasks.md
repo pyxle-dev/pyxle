@@ -62,6 +62,39 @@ shorthand passes **positional args only** — there's no way to express keyword
 args in the flat list. For keyword args or more than one task, use
 `request.state.background.add_task(...)`.
 
+### When the action refuses
+
+A task you scheduled **before** raising [`ActionError`](../reference/runtime-api.md#actionerror)
+still runs. `add_task` is a statement that executed, and a later `raise` no more
+undoes it than it rolls back a database write on the line above — so the rule is
+simply **where you scheduled it**:
+
+```python
+@action
+async def transfer(request, body: Transfer):
+    # Runs either way: scheduled before the check that can refuse.
+    request.state.background.add_task(audit, request.state.user.id, body.amount)
+
+    if await balance_of(request.state.user) < body.amount:
+        raise ActionError("Insufficient funds", status_code=400)
+
+    await do_transfer(body)
+    # Only on success: never scheduled if the check above refused.
+    request.state.background.add_task(send_receipt, request.state.user.email)
+    return {"ok": True}
+```
+
+So an audit record that must exist whether or not the transfer went through goes
+above the check, and a receipt that must not be sent for a refused transfer goes
+below it. There is no flag to remember, and the failure mode you can see in the
+code is the one you get. (If you scheduled something and then decided against
+it, `request.state.background.tasks.clear()` discards what is pending.)
+
+An **unhandled** exception is different. `ActionError` is an answer you wrote;
+an unexpected exception is a bug, and the action's intent is unknown — so
+nothing it staged is applied, neither its tasks nor its cookies, and the request
+fails with a `500`.
+
 ## Fire-and-forget work — `pyxle.tasks`
 
 When the work isn't tied to a particular response — a loader that wants to

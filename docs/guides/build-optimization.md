@@ -42,12 +42,17 @@ a total:
 
 ```
 Bundle analysis (raw / gzip):
-  dist/assets/use-auth-BoNlCwWb.js     76.2KB /   25.2KB gzip
-  dist/assets/layout-B_QEnH4f.css      65.3KB /   12.7KB gzip
-  client-entry.js                      40.1KB /   10.8KB gzip
+  assets/use-auth-BoNlCwWb.js          76.2KB /   25.2KB gzip
+  assets/layout-B_QEnH4f.css           65.3KB /   12.7KB gzip
+  assets/index-D27bdBTk.js             40.1KB /   10.8KB gzip
   ...
   ─ total                             675.1KB /  202.5KB gzip (35 file(s))
 ```
+
+Paths are relative to Vite's bundle directory (`dist/client/dist/`), and only
+what the browser downloads is counted — the build *inputs* beside it
+(`vite.config.js`, `client-entry.js`, the per-page JSX and CSS sources Vite
+consumed) are neither served nor measured.
 
 Use it to catch a dependency that ballooned a chunk, or to confirm a refactor
 shrank the bundle. (It's dependency-free — no extra tooling to install.)

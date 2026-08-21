@@ -24,12 +24,12 @@ def load_manifest(path: Path | str) -> Dict[str, Any]:
             f"got {type(data).__name__}"
         )
 
-    _validate_asset_paths(data, manifest_path)
+    validate_asset_paths(data, manifest_path)
 
     return data
 
 
-def _validate_asset_paths(data: Dict[str, Any], manifest_path: Path) -> None:
+def validate_asset_paths(data: Dict[str, Any], manifest_path: Path) -> None:
     """Ensure no asset file path escapes the expected build directory.
 
     Rejects paths containing ``../`` (path traversal) or starting with ``/``
@@ -37,6 +37,11 @@ def _validate_asset_paths(data: Dict[str, Any], manifest_path: Path) -> None:
     locations.  Note: we check for ``../`` rather than ``..`` because Vite
     may produce filenames like ``__...slug__-hash.js`` for catch-all routes,
     which legitimately contain ``..`` as a substring.
+
+    Public because the production build applies the *same* rule to the manifest
+    it is about to write: a ``dist/`` that ``pyxle serve`` would reject must
+    never be reported as a successful build. See
+    :func:`pyxle.build.pipeline.run_build`.
     """
     for route_key, entry in data.items():
         if not isinstance(entry, dict):

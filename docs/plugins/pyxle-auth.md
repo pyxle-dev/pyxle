@@ -160,6 +160,24 @@ The middleware also serves the endpoints the client [`useAuth()`](../reference/c
 
 In **username mode** (`identifier: "username"`, see [Identity model](#identity-model-email-or-username)) these endpoints take `{ username, password }` instead of `{ email, password }`, and a third endpoint — `GET /auth/username-available?u=<name>` — is served for live availability checks. The SSR seed publishes the active `identifier` so `useAuth()` and your form know which field to render.
 
+### Closing self-registration
+
+Plenty of apps need sign-in but not sign-up: an internal dashboard, an invite-only tool, a status page whose only accounts belong to the people who publish incidents. Set `enableSignup: false` and `POST /auth/signup` stops being served — the request falls through to your app and gets whatever your app returns for a path it doesn't route, exactly as if the endpoint had never been registered:
+
+```json
+{
+  "plugins": [
+    { "name": "pyxle-auth", "settings": { "enableSignup": false } }
+  ]
+}
+```
+
+Sign-in, `/me` and `/logout` are untouched. In username mode `GET /auth/username-available` closes with it — it exists to serve a signup form, and leaving it open would answer "does this account exist?" for an app that offers no way to create one. The SSR seed drops both endpoints too, so a client that builds its form from the endpoint map won't render a signup box that cannot work.
+
+Create the accounts yourself: call `AuthService.sign_up` from a management script, a one-off `@action` behind `require_permission_action`, or a bootstrap step in your own plugin's `on_startup`.
+
+> Do this in the app, not in front of it. Closing signup at a reverse proxy leaves the endpoint live for anything that reaches the origin directly, and the rule is easy to lose in the next deploy.
+
 `useAuth()` returns the full auth surface:
 
 | Field | Type | Description |
@@ -359,6 +377,7 @@ Configure in `pyxle.config.json` (camelCase), override per environment with `PYX
 | `cookieDomain` | `PYXLE_AUTH_COOKIE_DOMAIN` | unset |
 | `authPathPrefix` | `PYXLE_AUTH_PATH_PREFIX` | `"/auth"` |
 | `enableCredentialsApi` | `PYXLE_AUTH_ENABLE_CREDENTIALS_API` | `true` |
+| `enableSignup` | `PYXLE_AUTH_ENABLE_SIGNUP` | `true` |
 | `passwordResetTtlSeconds` | `PYXLE_AUTH_PASSWORD_RESET_TTL_SECONDS` | `1800` (30 min) |
 | `emailVerifyTtlSeconds` | `PYXLE_AUTH_EMAIL_VERIFY_TTL_SECONDS` | `86400` (24 h) |
 | `rateLimitSignInPerHour` | `PYXLE_AUTH_RL_SIGN_IN_PER_HOUR` | `10` |

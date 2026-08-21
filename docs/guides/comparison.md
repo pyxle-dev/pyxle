@@ -17,6 +17,8 @@ The short version: Pyxle's niche is **real React UI plus real Python server logi
 
 "Real React ecosystem" means you can `npm install` any React library and use it directly, rather than through a framework-specific wrapper.
 
+Worked example: [`examples/charts`](https://github.com/pyxle-dev/pyxle/tree/main/examples/charts) is a [Recharts](https://recharts.org) chart rendered from data a Python `@server` loader aggregated — one `.pyxl` file, `npm install recharts`, no wrapper and no API route in between. It server-renders to SVG and is a live React tree after hydration. See [Third-party packages](third-party-packages.md#charts-and-other-libraries-that-measure-the-dom).
+
 ## Pyxle vs. Next.js + FastAPI
 
 This is the stack Pyxle most directly replaces: a Next.js (React/TypeScript) frontend talking to a FastAPI (Python) backend over an API.

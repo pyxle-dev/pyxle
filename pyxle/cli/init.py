@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import secrets
 from pathlib import Path
@@ -237,9 +238,13 @@ def run_init(
     writer.touch_directory("pages/styles")
     writer.touch_directory("public/branding")
 
+    display_name = project_name if not in_place else project_slug
     context = {
         "package_name": project_slug,
-        "project_name": project_name if not in_place else project_slug,
+        "project_name": display_name,
+        # JSON-encoded (quotes included) so a name with a quote or backslash in
+        # it can't produce an unparseable pyxle.config.json.
+        "project_name_json": json.dumps(display_name),
         "pyxle_version": __version__,
         "pyxle_framework_requirement": framework_requirement(__version__),
         "runtime_dependencies": _SHADCN_RUNTIME_DEPENDENCIES if shadcn else "",

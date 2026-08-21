@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pyxle-framework"
-version = "0.8.0"
+version = "0.9.0"
 description = "Python-first full-stack framework with an intelligent CLI."
 readme = "README.md"
 authors = [
@@ -136,6 +136,45 @@ allow-direct-references = true
 [tool.hatch.build.targets.wheel]
 packages = ["pyxle"]
 
+[tool.ruff.lint]
+# Pin the rule set explicitly.
+#
+# Until now this project declared no ``select`` at all, so its lint contract was
+# implicitly "whatever ruff happens to default to". Ruff 0.16 expanded that
+# default from four prefixes (E4, E7, E9, F) to roughly thirty-seven rule
+# families — pyupgrade, isort, bugbear, flake8-bandit, pylint and more — which
+# turned 853 pre-existing findings into a CI failure overnight without a single
+# line of this codebase changing. Declaring ``select`` here makes the contract
+# explicit and version-independent, so a future ruff bump can no longer
+# silently redefine what "green" means.
+#
+# The pinned set is exactly what this codebase has been written and reviewed
+# against since day one (ruff's pre-0.16 default), and it passes clean.
+# Broadening it is worth doing, but as a deliberate, reviewable change of its
+# own: all 853 findings were triaged and none was a defect — they are style and
+# idiom modernisation (annotation syntax, import ordering, comprehensions),
+# which does not belong in a dependency bump.
+select = ["E4", "E7", "E9", "F", "ASYNC"]
+
+# ``ASYNC`` is the one family added beyond ruff's pre-0.16 default, and it is
+# added deliberately rather than as a step toward broadening (see D-014, which
+# defers that to its own reviewable PR). It costs **zero** findings across
+# ``pyxle/`` today and it guards CLAUDE.md §8 — blocking HTTP calls, ``open()``,
+# ``time.sleep()`` and subprocesses inside ``async`` functions — a class that has
+# already bitten us once on the SSR hot path.
+#
+# It does *not* catch that specific defect: ``ASYNC240`` (blocking ``Path``
+# methods) does not exist in ruff 0.6.9. Catching it needs the version bump, which
+# is P2-12. The regression tests asserting zero ``Path.resolve()`` calls per warm
+# render are the version-independent guard in the meantime.
+
+[tool.ruff.lint.per-file-ignores]
+# Bounded poll loops already wrapped in ``asyncio.wait_for``. ASYNC110 suggests
+# an ``anyio.Event``, which does not apply to waiting on a subprocess this test
+# controls. Scoped to the one file rather than exempting ``tests/`` wholesale, so
+# the rule still guards test code everywhere else.
+"tests/devserver/test_vite.py" = ["ASYNC110"]
+
 [tool.coverage.run]
 branch = true
 source = ["pyxle/cli", "pyxle/compiler", "pyxle/devserver", "pyxle/ssr", "pyxle/security.py"]
@@ -146,7 +185,7 @@ show_missing = true
 skip_covered = true
 
 [tool.pytest.ini_options]
-addopts = "--strict-markers --strict-config --cov=pyxle.cli --cov=pyxle.compiler --cov=pyxle.devserver --cov=pyxle.ssr --cov=pyxle.security --cov=pyxle.cache --cov=pyxle.realtime --cov=pyxle.observability --cov=pyxle.tasks --cov=pyxle.middleware --cov-report=term-missing"
+addopts = "--strict-markers --strict-config --cov=pyxle.build --cov=pyxle.cli --cov=pyxle.compiler --cov=pyxle.devserver --cov=pyxle.ssr --cov=pyxle.security --cov=pyxle.cache --cov=pyxle.realtime --cov=pyxle.observability --cov=pyxle.tasks --cov=pyxle.middleware --cov-report=term-missing"
 testpaths = ["tests"]
 pythonpath = ["."]
 # pytest's default ``norecursedirs`` skips any directory literally named

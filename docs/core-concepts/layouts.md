@@ -176,11 +176,60 @@ The layout component receives its loader's result on the **`data`** prop -- exac
 - A layout **without** a loader receives the wrapped page's `data` instead, so existing JSX-only layouts are unchanged.
 - The merged layout data is also exposed to the **page** component as a `layoutData` prop, if a page ever needs to read what its layouts loaded.
 
+## Sections that are not part of the app: `STANDALONE`
+
+Layouts **chain** — every one from the page up to the root wraps it. Sometimes
+that is exactly wrong. A public status page inside an admin console, a print
+view, an embedded widget: these are not the app, and they should not carry its
+navigation, its stylesheet, its analytics tag, or the cost of its layout loader.
+
+A layout can declare itself the root of its own chain:
+
+```python
+@server
+async def load(request):
+    return {}
+
+
+STANDALONE = True
+
+
+import React from 'react';
+
+export default function PublicLayout({ children }) {
+    return <>{children}</>;
+}
+```
+
+Pages beneath it get **this** layout and nothing above it. Specifically:
+
+- ancestor layouts and templates do not wrap them,
+- ancestor layout **loaders do not run** for them,
+- ancestor head contributions — `<Head>` blocks *and* `HEAD` variables — do not
+  land on them.
+
+All three, because any one on its own is a trap. Stopping the wrapper but not
+the loader means an outer layout's query running on every request to a section
+that never renders it. Stopping the loader but not the head means a page that
+opted out of the app shell still inheriting its analytics snippet.
+
+### Why not just branch in the outer layout
+
+You can write `if (isPublicSection) return <>{children}</>` in your root layout,
+and its loader can return early on a path check. That works, and it puts
+knowledge of every public section into the parent — a conditional that grows a
+branch each time one is added, and a loader that has to know which paths it is
+not for. `STANDALONE` lets the section declare its own independence instead.
+
+`STANDALONE` must be `True` or `False`. Anything else is a compile error rather
+than a guess, because `STANDALONE = 0` silently meaning "yes" would make a
+section lose the app shell for no visible reason.
+
 ## How it works
 
 When Pyxle compiles your pages, it:
 
-1. Walks up from each page to the root, collecting `layout.pyxl` and `template.pyxl` files
+1. Walks up from each page to the root, collecting `layout.pyxl` and `template.pyxl` files — stopping at any layout that declares `STANDALONE = True`
 2. Generates a composed wrapper module that nests them in the correct order
 3. At render time, the page component is passed as `children` to the innermost layout
 

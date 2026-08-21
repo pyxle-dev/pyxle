@@ -1,5 +1,8 @@
 """Tests for head element merging and deduplication."""
 
+import pytest
+
+from pyxle.compiler.parser import PyxParser
 from pyxle.ssr.head_merger import merge_head_elements
 
 
@@ -306,16 +309,22 @@ def test_empty_strings_filtered():
     assert "<title>Title</title>" in result
 
 
-def test_jsx_expressions_preserved():
-    """JSX expressions in head blocks should be preserved as-is."""
-    jsx_with_expression = '<title>{data.title || "Default"}</title>'
+def test_jsx_expressions_are_not_preserved():
+    """A statically-extracted `<title>` still holding an expression is dropped.
+
+    This test previously asserted the opposite — that the expression was
+    "preserved as-is" — which described the bug rather than a requirement.
+    Nothing downstream evaluates it, so preserving it puts the literal text
+    `{data.title || "Default"}` in the browser tab, and on a streamed page
+    (where the head is flushed before the component renders) that is the only
+    title the page ever gets. The render supplies the real one.
+    """
     result = merge_head_elements(
         head_variable=(),
-        head_jsx_blocks=(jsx_with_expression,),
+        head_jsx_blocks=('<title>{data.title || "Default"}</title>',),
         layout_head_jsx_blocks=(),
     )
-    assert len(result) == 1
-    assert result[0] == jsx_with_expression
+    assert result == ()
 
 
 def test_charset_meta_deduplication():
@@ -549,3 +558,350 @@ def test_runtime_non_keyed_element_appears_in_output():
 
 
 
+
+
+# ---------------------------------------------------------------------------
+# Statically-extracted tags that never got evaluated
+# ---------------------------------------------------------------------------
+
+
+# What arrives in ``head_jsx_blocks`` is the raw JSX *source* between
+# ``<Head>`` and ``</Head>``, sliced by the compiler's Babel pass — so an
+# expression attribute is unquoted (``href={faviconUrl}``), exactly as it was
+# written. Every shape below was taken from a real compile; see
+# ``test_extracted_block_shapes_match_the_compiler`` for the proof that this is
+# the shape the compiler actually emits.
+
+
+def test_a_static_tag_holding_a_jsx_expression_is_dropped():
+    """`<Head>` blocks are harvested from `.pyxl` source at compile time,
+    before any of it has run, so a tag whose attributes reference props arrives
+    as literal source text.
+
+    Emitting it puts `href="{faviconUrl}"` into the document. The browser reads
+    that as a *relative URL*, requests it, and gets a 404 — one wasted round
+    trip per tag per page view — while `og:image` unfurls as a broken picture
+    in every chat client that reads it.
+
+    Found on every public status page in Plimsoll: the served head carried
+    `content="{brandColour}"`, `href="{faviconUrl}"` and `content="{ogImageUrl}"`
+    beside the correctly rendered versions of all three.
+    """
+    result = merge_head_elements(
+        head_variable=(),
+        head_jsx_blocks=("<link rel=\"icon\" href={faviconUrl} />",),
+        layout_head_jsx_blocks=(),
+    )
+
+    assert result == ()
+
+
+def test_the_runtime_rendered_tag_survives_beside_it():
+    """Dropping the static copy loses nothing: the component render produces
+    the same tag with its values filled in.
+
+    Dedupe could never have suppressed the broken one — a link's key is `rel`
+    plus `href`, and `href="{faviconUrl}"` never matches a real href, so the
+    two coexisted.
+    """
+    result = merge_head_elements(
+        head_variable=(),
+        head_jsx_blocks=("<link rel=\"icon\" href={faviconUrl} />",),
+        layout_head_jsx_blocks=(),
+        runtime_head_blocks=('<link rel="icon" href="/brand/favicon.png" />',),
+    )
+
+    assert len(result) == 1
+    assert "/brand/favicon.png" in result[0]
+    assert "faviconUrl" not in result[0]
+
+
+def test_a_layout_tag_with_an_expression_is_dropped_too():
+    result = merge_head_elements(
+        head_variable=(),
+        head_jsx_blocks=(),
+        layout_head_jsx_blocks=(
+            "<meta property=\"og:image\" content={ogImageUrl} />",
+        ),
+    )
+
+    assert result == ()
+
+
+@pytest.mark.parametrize(
+    "block",
+    [
+        # An expression containing a space. The HTML parser the merger used to
+        # rely on tokenises the value at the first space, so these arrived as
+        # the attribute `content="{a"` plus junk attributes — and slipped
+        # through a filter that only looked at whole attribute values.
+        '<meta property="og:title" content={`${title} — Acme`} />',
+        '<link rel="canonical" href={base + path} />',
+        '<meta name="theme-color" content={dark ? "#000" : "#fff"} />',
+        # A `>` inside the expression, which also ends the tag early for a
+        # parser that does not track braces.
+        '<meta name="x" content={a > b ? "y" : "z"} />',
+        # An expression in child position, not attribute position. The literal
+        # `{name}` is what the browser shows in the tab.
+        "<title>{name}</title>",
+        "<title>Acme {name} Status</title>",
+        # `<Script>`'s sibling shape inside a `<Head>`.
+        "<script src={analyticsUrl} />",
+        # A spread, which has no attribute name at all.
+        "<meta {...metaProps} />",
+        # A whole element behind a condition. Emitting it regardless is how a
+        # `noindex` lands on a page whose condition said otherwise.
+        '{isPremium && <meta name="robots" content="noindex" />}',
+    ],
+)
+def test_every_unevaluated_shape_is_dropped(block):
+    """The rule is about the *element*, not one attribute syntax: if any part
+    of a statically-extracted element still holds a JSX expression — attribute
+    value, child text, or the position the element occupies — the element is
+    source text, not markup, and cannot be emitted."""
+    assert (
+        merge_head_elements(
+            head_variable=(),
+            head_jsx_blocks=(block,),
+            layout_head_jsx_blocks=(),
+        )
+        == ()
+    )
+
+
+def test_a_static_sibling_survives_a_dropped_tag():
+    """Dropping is per element. A block mixes evaluated and unevaluated tags —
+    the head of a real page usually does — and the evaluated ones must still
+    reach the document, which is the only head a streamed page ever gets."""
+    result = merge_head_elements(
+        head_variable=(),
+        head_jsx_blocks=(
+            "<title>{name}</title>"
+            '<meta charset="utf-8" />'
+            '<link rel="icon" href="/favicon.ico" />',
+        ),
+        layout_head_jsx_blocks=(),
+    )
+
+    joined = " ".join(result)
+    assert "{name}" not in joined
+    assert 'charset="utf-8"' in joined
+    assert "/favicon.ico" in joined
+
+
+def test_ordinary_static_tags_are_untouched():
+    """The filter must not eat a real head."""
+    result = merge_head_elements(
+        head_variable=(),
+        head_jsx_blocks=(
+            '<title>Acme Status</title>',
+            '<link rel="icon" href="/favicon.ico" />',
+            '<meta name="description" content="How Acme is doing" />',
+        ),
+        layout_head_jsx_blocks=(),
+    )
+
+    joined = " ".join(result)
+    assert "Acme Status" in joined
+    assert "/favicon.ico" in joined
+    assert "How Acme is doing" in joined
+
+
+# ---------------------------------------------------------------------------
+# The other direction: literal braces are content and must survive
+# ---------------------------------------------------------------------------
+
+
+def test_a_literal_brace_in_a_quoted_attribute_survives():
+    """A quoted attribute value is a string, whatever it contains. Dropping
+    this tag would delete a page's description because its prose mentions
+    braces — the over-filtering failure, which is worse than the bug."""
+    result = merge_head_elements(
+        head_variable=(),
+        head_jsx_blocks=(
+            '<meta name="description" content="Use {braces} in prose" />',
+        ),
+        layout_head_jsx_blocks=(),
+    )
+
+    assert result == ('<meta name="description" content="Use {braces} in prose"/>',)
+
+
+_ORGANIZATION_JSON_LD = (
+    '<script type="application/ld+json">'
+    '{"@context":"https://schema.org","@type":"Organization","name":"Acme"}'
+    "</script>"
+)
+
+
+def test_json_ld_from_the_page_head_variable_is_emitted_intact():
+    """JSON-LD is *all* braces. It reaches the document through the **page's**
+    `HEAD` variable — Python that has already run — which the rule never
+    filters, because its braces are content, not source. Silently deleting a
+    page's structured data is worse than the bug being fixed.
+
+    Its layout-channel twin is the test directly below; the two channels are
+    separate parameters and each needs its own coverage.
+    """
+    result = merge_head_elements(
+        head_variable=(_ORGANIZATION_JSON_LD, "<style>.hero{color:red}</style>"),
+        head_jsx_blocks=(),
+        layout_head_jsx_blocks=(),
+    )
+
+    joined = " ".join(result)
+    assert '{"@context":"https://schema.org","@type":"Organization","name":"Acme"}' in joined
+    assert ".hero{color:red}" in joined
+
+
+def test_json_ld_from_the_layout_head_variable_is_emitted_intact():
+    """The same guarantee, one level up — and the one that actually broke.
+
+    A root `layout.pyxl` holding site-wide JSON-LD and critical CSS in its
+    `HEAD` variable is the normal way to put structured data on *every* page.
+    That variable is Python that has already run, exactly like the page's, so
+    its braces are content and it must never meet the unevaluated-expression
+    filter.
+
+    Nothing supplies a fallback here: a Python `HEAD` variable is never
+    rendered by React, so unlike the page-JSX case there is no evaluated twin
+    arriving in `runtime_head_blocks`. Filtered, it is simply gone — silently,
+    from every page in the site.
+    """
+    result = merge_head_elements(
+        head_variable=(),
+        head_jsx_blocks=(),
+        layout_head_variable=(_ORGANIZATION_JSON_LD, "<style>.hero{color:red}</style>"),
+    )
+
+    joined = " ".join(result)
+    assert '{"@context":"https://schema.org","@type":"Organization","name":"Acme"}' in joined
+    assert ".hero{color:red}" in joined
+
+
+def test_the_two_layout_channels_are_judged_separately():
+    """The defect was one collection carrying two kinds of thing.
+
+    In a single layout both arrive: `<Head>` JSX, which is unevaluated source
+    and *must* be filtered, and a `HEAD` variable, which is finished HTML and
+    must not be. Judging them by one rule loses one of them either way.
+    """
+    result = merge_head_elements(
+        head_variable=(),
+        head_jsx_blocks=(),
+        layout_head_jsx_blocks=('<link rel="icon" href={faviconUrl} />',),
+        layout_head_variable=(_ORGANIZATION_JSON_LD,),
+    )
+
+    joined = " ".join(result)
+    assert "faviconUrl" not in joined, "unevaluated layout JSX reached the document"
+    assert '"@context":"https://schema.org"' in joined, "the layout's JSON-LD was deleted"
+
+
+def test_a_literal_brace_in_the_layout_head_variable_survives():
+    """A `HEAD` variable is a Python string list, so a brace in it is a brace —
+    not an expression container. There is no JSX syntax in this channel to
+    interpret, and no render-time twin to fall back on."""
+    result = merge_head_elements(
+        head_variable=(),
+        head_jsx_blocks=(),
+        layout_head_variable=("<title>Braces {like this} are text</title>",),
+    )
+
+    assert result == ("<title>Braces {like this} are text</title>",)
+
+
+def test_the_layout_head_variable_stays_below_the_page():
+    """Splitting the channel must not promote it: a layout still loses to the
+    page on a shared key, whichever page channel supplies it."""
+    from_variable = merge_head_elements(
+        head_variable=("<title>Page</title>",),
+        head_jsx_blocks=(),
+        layout_head_variable=("<title>Site</title>",),
+    )
+    from_page_jsx = merge_head_elements(
+        head_variable=(),
+        head_jsx_blocks=("<title>Page</title>",),
+        layout_head_variable=("<title>Site</title>",),
+    )
+    from_runtime = merge_head_elements(
+        head_variable=(),
+        head_jsx_blocks=(),
+        layout_head_variable=("<title>Site</title>",),
+        runtime_head_blocks=("<title>Page</title>",),
+    )
+
+    assert from_variable == ("<title>Page</title>",)
+    assert from_page_jsx == ("<title>Page</title>",)
+    assert from_runtime == ("<title>Page</title>",)
+
+
+def test_a_layouts_head_jsx_still_beats_its_own_head_variable():
+    """Within the layout tier the ordering is unchanged by the split: `<Head>`
+    is examined first and wins, mirroring page JSX outranking the page's
+    `HEAD` variable."""
+    result = merge_head_elements(
+        head_variable=(),
+        head_jsx_blocks=(),
+        layout_head_jsx_blocks=("<title>From Head</title>",),
+        layout_head_variable=("<title>From HEAD variable</title>",),
+    )
+
+    assert result == ("<title>From Head</title>",)
+
+
+def test_json_ld_from_the_render_is_emitted_intact():
+    """The other unfiltered source: React's rendered output holds finished
+    values, so `<script type="application/ld+json">{JSON.stringify(schema)}`
+    arrives here as real JSON and must be passed through untouched."""
+    json_ld = (
+        '<script type="application/ld+json">'
+        '{"@context":"https://schema.org","@type":"Article"}'
+        "</script>"
+    )
+    result = merge_head_elements(
+        head_variable=(),
+        head_jsx_blocks=(),
+        layout_head_jsx_blocks=(),
+        runtime_head_blocks=(json_ld,),
+    )
+
+    assert result == (json_ld,)
+
+
+def test_extracted_block_shapes_match_the_compiler():
+    """Guards the assumption every test above rests on: the compiler hands the
+    merger raw JSX source, so an expression attribute is *unquoted*.
+
+    The first version of this fix was written against the re-serialised output
+    shape (`href="{faviconUrl}"`) rather than the input shape, which is why it
+    matched only expressions with no spaces in them. If the extractor ever
+    starts quoting, this fails and the rule above needs revisiting.
+    """
+    source = """
+export default function Page({ data }) {
+    return (
+        <Head>
+            <title>{data.title}</title>
+            <link rel="icon" href={data.faviconUrl} />
+            <meta name="description" content="Uses {braces} in prose" />
+        </Head>
+    )
+}
+"""
+    blocks = PyxParser().parse_text(source).head_jsx_blocks
+
+    assert len(blocks) == 1
+    block = blocks[0]
+    assert "href={data.faviconUrl}" in block
+    assert 'href="{data.faviconUrl}"' not in block
+    assert "<title>{data.title}</title>" in block
+    # ...and the literal-brace attribute keeps its quotes, which is why it is
+    # distinguishable from an expression at all.
+    assert 'content="Uses {braces} in prose"' in block
+
+    assert merge_head_elements(
+        head_variable=(),
+        head_jsx_blocks=blocks,
+        layout_head_jsx_blocks=(),
+    ) == ('<meta name="description" content="Uses {braces} in prose"/>',)

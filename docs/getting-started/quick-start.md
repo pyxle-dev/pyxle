@@ -76,11 +76,16 @@ The console prints a short summary — the local URL, the Vite URL, the route co
 ℹ️    Local:   http://127.0.0.1:8000
 ℹ️    Vite:    http://127.0.0.1:5173
 ℹ️    Routes:  1 page(s), 1 API route(s)
+ℹ️    Studio:  http://127.0.0.1:8000/__pyxle/studio
 ```
 
-Open [http://localhost:8000](http://localhost:8000) in your browser. You should see the Pyxle starter page — a centered card showing the framework version, server time, and a link to edit `pages/index.pyxl`.
+The last line is [Pyxle Studio](../guides/studio.md), the dev-only dashboard for your routes, requests, and diagnostics. It appears whenever Studio is enabled (the default in `pyxle dev`).
 
-Each edit you save prints one concise `Rebuilt … in X ms` line. Your server-side `logging` output also streams to the **browser** devtools console (prefixed `[pyxle:server]`) so you can follow loaders and actions without switching windows. Need the full picture — raw Vite logs and debug internals? Run `pyxle dev --verbose`. See the [CLI reference](../reference/cli.md#pyxle-dev) for details.
+Open [http://localhost:8000](http://localhost:8000) in your browser. You should see the Pyxle starter page — a centered card showing the framework version, server time, and the file to edit first, `pages/index.pyxl`.
+
+The card also has a **Clicked 0 times** button, and it is there to be pressed. The version and the time above it were produced by Python on the server; the button is React running in your browser, from the same file. If the count goes up when you click, your page hydrated — the server HTML was handed to React and React took over. That is worth checking once on a new machine, because a page that renders perfectly and does nothing is exactly what a hydration failure looks like, and nothing else on a starter page would tell you.
+
+Each edit you save prints one concise `Rebuilt … in X ms` line. Your server-side `logging` output — including the usual `log = logging.getLogger(__name__)` at the top of a page — streams to the **browser** devtools console (prefixed `[pyxle:server pages/index.pyxl]`) as well as the terminal, so you can follow loaders and actions without switching windows. Need the full picture — raw Vite logs and debug internals? Run `pyxle dev --verbose`. See the [CLI reference](../reference/cli.md#pyxle-dev) for details.
 
 CSS just works: Vite compiles every stylesheet you import — plain CSS, CSS Modules, and (if you enabled it) Tailwind v4 via the `@tailwindcss/vite` plugin — with hot reload. There's nothing separate to start. See the [Styling guide](../guides/styling.md).
 
@@ -140,7 +145,7 @@ Paths are shown relative to `pages/`.
 pyxle check
 ```
 
-This validates your `.pyxl` files — Python syntax, JSX, and semantic issues like undefined names — plus your config file, and reports any problems it finds. Everything Python-side ships with `pip install pyxle-framework`, and the JSX pass runs on the Node.js install you already have from step 1 — so on a fresh project you should see:
+This validates your `.pyxl` files — Python syntax and semantics (including undefined names), JSX **syntax**, and your config file — and reports any problems it finds. Note the asymmetry: an undefined name in the Python half is reported, an undefined identifier in the JSX half is not, because the JSX pass checks that the markup parses rather than resolving what its identifiers refer to. Everything Python-side ships with `pip install pyxle-framework`, and the JSX pass runs on the Node.js install you already have from step 1 — so on a fresh project you should see:
 
 ```
 ℹ️  Checked 2 .pyxl file(s) in my-app/

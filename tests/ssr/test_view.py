@@ -6,6 +6,7 @@ import sys
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 from starlette.requests import Request
@@ -193,6 +194,152 @@ async def test_build_page_response_without_loader(settings: DevServerSettings, t
     # usePathname) sees the real pathname and hydrates without a mismatch.
     assert renderer.request_pathnames[-1] == "/"
     assert overlay.events == [("clear", "/")]
+
+
+def _request_from(host: str, *, path: str = "/") -> Request:
+    """A request as it arrives from a browser that reached this server at *host*."""
+
+    return Request(
+        {
+            "type": "http",
+            "http_version": "1.1",
+            "method": "GET",
+            "path": path,
+            "root_path": "",
+            "headers": [(b"host", host.encode())],
+        }
+    )
+
+
+@pytest.mark.anyio
+async def test_page_served_to_an_unreachable_origin_says_so(
+    settings: DevServerSettings, tmp_path: Path, caplog
+) -> None:
+    """The framework's most silent failure gets exactly one line, and it is here.
+
+    A browser whose origin Vite refuses receives a whole, correct document and
+    no modules: the page renders and never becomes interactive. Vite answered
+    ``200`` and logs nothing; the browser reports it to nothing a page can see.
+    Pyxle holds both facts — the origin it served, and the allow-list it wrote —
+    so it is the only party that can name the failure.
+    """
+
+    ssr_view._warn_once.cache_clear()
+    renderer = StubRenderer()
+    renderer.responses.append(RenderResult(html="<main>hi</main>"))
+    dev_settings = replace(settings, starlette_host="0.0.0.0", starlette_port=3000)
+    page = _page_route(tmp_path, loader_name=None)
+
+    with caplog.at_level(logging.WARNING, logger="pyxle.ssr.view"):
+        await build_page_response(
+            request=_request_from("dev.internal:3000"),
+            settings=dev_settings,
+            page=page,
+            renderer=renderer,
+        )
+
+    warnings = [record.getMessage() for record in caplog.records]
+    assert any("http://dev.internal:3000" in message for message in warnings)
+    assert any("never become interactive" in message for message in warnings)
+
+
+@pytest.mark.anyio
+async def test_page_served_to_a_reachable_origin_stays_quiet(
+    settings: DevServerSettings, tmp_path: Path, caplog
+) -> None:
+    """The addresses the startup banner printed are not worth warning about."""
+
+    ssr_view._warn_once.cache_clear()
+    renderer = StubRenderer()
+    renderer.responses.append(RenderResult(html="<main>hi</main>"))
+    renderer.responses.append(RenderResult(html="<main>hi</main>"))
+    dev_settings = replace(settings, starlette_host="0.0.0.0", starlette_port=3000)
+    page = _page_route(tmp_path, loader_name=None)
+
+    with caplog.at_level(logging.WARNING, logger="pyxle.ssr.view"):
+        for host in ("192.168.1.11:3000", "localhost:3000"):
+            await build_page_response(
+                request=_request_from(host),
+                settings=dev_settings,
+                page=page,
+                renderer=renderer,
+            )
+
+    assert [record.getMessage() for record in caplog.records] == []
+
+
+@pytest.mark.anyio
+async def test_unreachable_origin_warning_is_not_repeated(
+    settings: DevServerSettings, tmp_path: Path, caplog
+) -> None:
+    """A browser reloading a dead page must not reprint the paragraph."""
+
+    ssr_view._warn_once.cache_clear()
+    renderer = StubRenderer()
+    renderer.responses.extend(RenderResult(html="<main>hi</main>") for _ in range(3))
+    dev_settings = replace(settings, starlette_host="0.0.0.0", starlette_port=3000)
+    page = _page_route(tmp_path, loader_name=None)
+
+    with caplog.at_level(logging.WARNING, logger="pyxle.ssr.view"):
+        for host in ("dev.internal:3000", "dev.internal:3000", "other.internal:3000"):
+            await build_page_response(
+                request=_request_from(host),
+                settings=dev_settings,
+                page=page,
+                renderer=renderer,
+            )
+
+    # Once per origin: repeats are silenced, a *different* origin is not.
+    assert len(caplog.records) == 2
+
+
+@pytest.mark.anyio
+async def test_production_never_warns_about_origins(
+    settings: DevServerSettings, tmp_path: Path, caplog
+) -> None:
+    ssr_view._warn_once.cache_clear()
+    renderer = StubRenderer()
+    renderer.responses.append(RenderResult(html="<main>hi</main>"))
+    prod_settings = replace(
+        settings,
+        debug=False,
+        starlette_host="0.0.0.0",
+        starlette_port=3000,
+        page_manifest={"pages/index.jsx": {"file": "assets/index.js"}},
+    )
+    page = _page_route(tmp_path, loader_name=None)
+
+    with caplog.at_level(logging.WARNING, logger="pyxle.ssr.view"):
+        await build_page_response(
+            request=_request_from("app.example.com"),
+            settings=prod_settings,
+            page=page,
+            renderer=renderer,
+        )
+
+    assert [record.getMessage() for record in caplog.records] == []
+
+
+def test_document_origin_always_carries_an_explicit_port() -> None:
+    """The allow-list is written with ports, so the comparison needs one."""
+
+    assert (
+        ssr_view._document_origin(_request_from("192.168.1.11:3000"))
+        == "http://192.168.1.11:3000"
+    )
+    assert ssr_view._document_origin(_request_from("dev.internal")) == (
+        "http://dev.internal:80"
+    )
+    # An IPv6 literal needs its brackets back before it meets a port separator.
+    assert ssr_view._document_origin(_request_from("[::1]:3000")) == "http://[::1]:3000"
+    assert ssr_view._document_origin(Request({
+        "type": "http",
+        "http_version": "1.1",
+        "method": "GET",
+        "path": "/",
+        "root_path": "",
+        "headers": [],
+    })) is None
 
 
 @pytest.mark.anyio
@@ -1204,6 +1351,88 @@ async def test_build_page_response_merges_layout_head_blocks(settings: DevServer
     assert "<title>Home</title>" in html
     # Layout head block should be in the output
     assert "layout-meta" in html or "from-layout" in html or "from-page" in html
+
+
+@pytest.mark.anyio
+async def test_a_layouts_head_variable_reaches_the_document(
+    settings: DevServerSettings, tmp_path: Path
+) -> None:
+    """A root layout's Python ``HEAD`` variable must survive the whole pipeline.
+
+    This exercises the seam the unit tests each see only one side of: the
+    registry splits a layout's contribution into two channels and the merger
+    filters only one of them. Wire the evaluated ``HEAD`` channel into the
+    filtered one and both sides still pass their own tests, while every page in
+    the site silently loses its structured data — there is no rendered twin to
+    restore it, because a Python ``HEAD`` variable is never rendered by React.
+
+    JSON-LD and an inline ``<style>`` are the payloads that matter here: they
+    are *all* braces, so they are exactly what a JSX-expression filter eats.
+    """
+    layout_path = settings.pages_dir / "layout.pyxl"
+    layout_path.write_text(
+        "HEAD = [\n"
+        "    '<script type=\"application/ld+json\">"
+        '{"@context":"https://schema.org","@type":"Organization","name":"Acme"}'
+        "</script>',\n"
+        "    '<style>.hero{color:red}</style>',\n"
+        "]\n"
+        "\n"
+        "import React from 'react';\n"
+        "\n"
+        "export default function Layout({ children }) {\n"
+        "    return <div>{children}</div>;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    page_path = settings.pages_dir / "index.pyxl"
+    page_path.write_text(
+        "import React from 'react';\n"
+        "\n"
+        "export default function Home() {\n"
+        "    return <div>home</div>;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    from pyxle.devserver.builder import build_once
+
+    build_once(settings)
+
+    from pyxle.devserver.registry import load_metadata_registry
+    from pyxle.devserver.routes import build_route_table
+
+    registry = load_metadata_registry(settings)
+    page = build_route_table(registry).find_page("/")
+    assert page is not None
+
+    renderer = StubRenderer()
+    renderer.responses.append(RenderResult(html="<div>home</div>"))
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/",
+            "query_string": b"",
+            "headers": [],
+            "server": ("localhost", 8000),
+        }
+    )
+
+    response = await build_page_response(
+        request=request,
+        settings=settings,
+        page=page,
+        renderer=renderer,
+        overlay=None,
+    )
+    assert response.status_code == 200
+
+    html = (await _read_response_body(response)).decode("utf-8")
+    assert '{"@context":"https://schema.org","@type":"Organization","name":"Acme"}' in html
+    assert ".hero{color:red}" in html
 
 
 # ---------------------------------------------------------------------------
@@ -2393,7 +2622,7 @@ async def test_execute_layout_loaders_merges_tuple_and_skips_missing(
     request = Request({"type": "http", "method": "GET", "path": "/", "query_string": b"", "headers": []})
 
     try:
-        layout_data = await _execute_layout_loaders(
+        layout_results = await _execute_layout_loaders(
             settings=replace(settings, debug=True),
             page=page,
             request=request,
@@ -2408,7 +2637,12 @@ async def test_execute_layout_loaders_merges_tuple_and_skips_missing(
 
     # Only the tuple loader contributed mapping data; the missing-loader module
     # was skipped and the non-mapping return was ignored.
-    assert layout_data == {"banner": "tuple-data"}
+    assert layout_results.merged == {"banner": "tuple-data"}
+    # ...and that data is also filed under its own layout, which is what a
+    # callable HEAD in that layout is handed.
+    assert layout_results.per_layout == {
+        Path("tuple_layout.pyxl"): {"banner": "tuple-data"}
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -2751,16 +2985,26 @@ async def test_execute_loader_wraps_missing_state_with_guidance(tmp_path: Path) 
 
 
 @pytest.mark.anyio
-async def test_execute_loader_other_attribute_error_flows_through(tmp_path: Path) -> None:
-    """Any other AttributeError is re-raised untouched (no wrapping)."""
+async def test_execute_loader_other_attribute_error_gets_no_state_guidance(
+    tmp_path: Path,
+) -> None:
+    """An unrelated AttributeError must not get the request.state guidance.
+
+    It is still a loader crash (so ``error.pyxl`` renders), but it is *not* a
+    :class:`MissingRequestStateError` — telling a developer to install the
+    pyxle-db plugin because their own object lacks an attribute would send them
+    somewhere with nothing to fix.
+    """
     page = _state_page(tmp_path, "raise AttributeError('boom')")
     request = Request({"type": "http", "method": "GET", "path": "/", "headers": []})
 
-    with pytest.raises(AttributeError) as excinfo:
+    with pytest.raises(ssr_view.LoaderCrashError) as excinfo:
         await ssr_view._execute_loader(page, request, module=None, debug=True)
 
     assert not isinstance(excinfo.value, ssr_view.MissingRequestStateError)
-    assert str(excinfo.value) == "boom"
+    assert isinstance(excinfo.value.__cause__, AttributeError)
+    assert str(excinfo.value.__cause__) == "boom"
+    assert "AttributeError: boom" in str(excinfo.value)
 
 
 @pytest.mark.anyio
@@ -2817,6 +3061,363 @@ async def test_build_page_response_missing_state_stays_generic_in_production(
     assert "pyxle-db" not in body
     assert "request.state" not in body
     assert "MissingRequestStateError" not in body
+
+
+# ---------------------------------------------------------------------------
+# A loader whose own body raises — the ordinary bug reaches error.pyxl
+# ---------------------------------------------------------------------------
+
+
+def _boundary_registry(tmp_path: Path):
+    """A registry whose root error.pyxl is a renderable stub boundary page."""
+    from pyxle.devserver.error_pages import ErrorBoundaryRegistry
+
+    boundary = _boundary_page(
+        tmp_path, filename="error.pyxl", module_key="pyxle.server.pages.crash_boundary"
+    )
+    return ErrorBoundaryRegistry(error_pages={".": boundary}, not_found_pages={})
+
+
+def _http_request(path: str = "/") -> Request:
+    return Request(
+        {
+            "type": "http",
+            "http_version": "1.1",
+            "method": "GET",
+            "path": path,
+            "root_path": "",
+            "headers": [],
+        }
+    )
+
+
+@pytest.mark.anyio
+async def test_execute_loader_wraps_body_exception_as_loader_crash(tmp_path: Path) -> None:
+    """A plain KeyError in a loader body becomes a classified loader failure.
+
+    This is the regression: it used to propagate bare, so the render pipeline
+    could not tell it from an unexpected framework fault and never consulted
+    the application's error.pyxl.
+    """
+    page = _state_page(tmp_path, "return {'id': {'name': 'ada'}['user_id']}")
+    request = _http_request()
+
+    with pytest.raises(ssr_view.LoaderCrashError) as excinfo:
+        await ssr_view._execute_loader(page, request, module=None, debug=True)
+
+    # A loader-stage failure, so every page pipeline recognises it...
+    assert isinstance(excinfo.value, ssr_view.LoaderExecutionError)
+    # ...the original exception survives for the traceback...
+    assert isinstance(excinfo.value.__cause__, KeyError)
+    # ...and the message names the loader, the route, and the real exception.
+    assert "load_home" in str(excinfo.value)
+    assert "/" in str(excinfo.value)
+    assert "KeyError" in str(excinfo.value)
+    assert "user_id" in str(excinfo.value)
+
+
+@pytest.mark.anyio
+async def test_execute_loader_wraps_exception_with_empty_message(tmp_path: Path) -> None:
+    """An exception with no message still yields a readable classification."""
+    page = _state_page(tmp_path, "raise ValueError()")
+
+    with pytest.raises(ssr_view.LoaderCrashError) as excinfo:
+        await ssr_view._execute_loader(page, _http_request(), module=None, debug=True)
+
+    assert str(excinfo.value).endswith("raised ValueError")
+
+
+@pytest.mark.anyio
+async def test_execute_loader_passes_author_loader_error_through(tmp_path: Path) -> None:
+    """LoaderError is the author's deliberate signal and is never wrapped.
+
+    Wrapping it would cost the status code and replace intentional, user-facing
+    copy with a generic message in production.
+    """
+    from pyxle.runtime import LoaderError
+
+    page = _state_page(
+        tmp_path,
+        "from pyxle.runtime import LoaderError; raise LoaderError('Gone', status_code=410)",
+    )
+
+    with pytest.raises(LoaderError) as excinfo:
+        await ssr_view._execute_loader(page, _http_request(), module=None, debug=True)
+
+    assert not isinstance(excinfo.value, ssr_view.LoaderExecutionError)
+    assert excinfo.value.status_code == 410
+    assert excinfo.value.message == "Gone"
+
+
+@pytest.mark.anyio
+async def test_build_page_response_loader_crash_renders_error_boundary(
+    settings: DevServerSettings, tmp_path: Path
+) -> None:
+    """The headline fix: an ordinary loader bug renders the app's error.pyxl."""
+    page = _state_page(tmp_path, "return {'id': {'name': 'ada'}['user_id']}")
+    renderer = StubRenderer()
+    renderer.responses.append(RenderResult(html="<main>our own error page</main>"))
+    overlay = StubOverlay()
+    boundaries = _boundary_registry(tmp_path)
+
+    response = await build_page_response(
+        request=_http_request(),
+        settings=settings,
+        page=page,
+        renderer=renderer,
+        overlay=overlay,
+        error_boundaries=boundaries,
+    )
+
+    assert response.status_code == 500
+    body = (await _read_response_body(response)).decode()
+    assert "our own error page" in body
+
+    # The boundary component — not the page — was rendered, with error props.
+    component_path, props = renderer.calls[-1]
+    assert component_path == boundaries.error_pages["."].client_module_path
+    assert props["error"]["statusCode"] == 500
+
+    # The overlay reports it as a loader-stage failure, so the dev breadcrumbs
+    # say the renderer was blocked rather than "outcome unknown".
+    assert overlay.events and overlay.events[0][0] == "error"
+    breadcrumbs = overlay.events[0][2]
+    assert breadcrumbs[0]["status"] == "failed"
+    assert breadcrumbs[1]["status"] == "blocked"
+
+
+@pytest.mark.anyio
+async def test_build_page_response_loader_crash_shows_detail_in_dev(
+    settings: DevServerSettings, tmp_path: Path
+) -> None:
+    """In dev the boundary receives the real exception detail."""
+    page = _state_page(tmp_path, "return {'id': {'name': 'ada'}['user_id']}")
+    renderer = StubRenderer()
+    renderer.responses.append(RenderResult(html="<main>err</main>"))
+
+    await build_page_response(
+        request=_http_request(),
+        settings=settings,
+        page=page,
+        renderer=renderer,
+        error_boundaries=_boundary_registry(tmp_path),
+    )
+
+    message = renderer.calls[-1][1]["error"]["message"]
+    assert "KeyError" in message
+    assert "user_id" in message
+
+
+@pytest.mark.anyio
+async def test_build_page_response_loader_crash_hides_internals_in_production(
+    settings: DevServerSettings, tmp_path: Path
+) -> None:
+    """In production the visitor gets the app's error page, not the internals.
+
+    The boundary renders (the visitor stays inside the application's design),
+    but the exception message and class name never reach it — CLAUDE.md rule 18.
+    """
+    prod_settings = replace(settings, debug=False)
+    page = _state_page(
+        tmp_path,
+        "raise RuntimeError('connect failed: postgres://u:hunter2@db/app row 4711')",
+    )
+    renderer = StubRenderer()
+    renderer.responses.append(RenderResult(html="<main>our own error page</main>"))
+
+    response = await build_page_response(
+        request=_http_request(),
+        settings=prod_settings,
+        page=page,
+        renderer=renderer,
+        error_boundaries=_boundary_registry(tmp_path),
+    )
+
+    assert response.status_code == 500
+    body = (await _read_response_body(response)).decode()
+    assert "our own error page" in body
+    for secret in ("hunter2", "4711", "postgres://", "RuntimeError", "LoaderCrashError"):
+        assert secret not in body
+
+    error_props = renderer.calls[-1][1]["error"]
+    assert error_props["message"] == "An unexpected error occurred."
+    assert error_props["type"] == "ServerError"
+
+
+@pytest.mark.anyio
+async def test_loader_crash_is_logged_even_when_the_boundary_renders(
+    settings: DevServerSettings, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A rendered error.pyxl must not make the failure vanish from the logs.
+
+    The production response is sanitized on purpose, so the server log is the
+    only record of what broke. Logging only on the fallback path would mean
+    every application that ships an error.pyxl silently swallows its own
+    500s — the boundary would hide exactly what it is there to survive.
+    """
+    prod_settings = replace(settings, debug=False)
+    page = _state_page(tmp_path, "return {'id': {'name': 'ada'}['user_id']}")
+    renderer = StubRenderer()
+    renderer.responses.append(RenderResult(html="<main>our own error page</main>"))
+
+    with caplog.at_level(logging.ERROR, logger="pyxle.ssr.view"):
+        response = await build_page_response(
+            request=_http_request(),
+            settings=prod_settings,
+            page=page,
+            renderer=renderer,
+            error_boundaries=_boundary_registry(tmp_path),
+        )
+
+    assert "our own error page" in (await _read_response_body(response)).decode()
+    records = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert len(records) == 1, "the failure must be logged exactly once"
+    assert "KeyError" in records[0].exc_text
+    assert "user_id" in records[0].exc_text
+
+
+@pytest.mark.anyio
+async def test_loader_crash_without_boundary_is_logged_once(
+    settings: DevServerSettings, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The fallback path logs the same failure exactly once, not twice."""
+    prod_settings = replace(settings, debug=False)
+    page = _state_page(tmp_path, "return {'id': {'name': 'ada'}['user_id']}")
+
+    with caplog.at_level(logging.ERROR, logger="pyxle.ssr.view"):
+        await build_page_response(
+            request=_http_request(),
+            settings=prod_settings,
+            page=page,
+            renderer=StubRenderer(),
+        )
+
+    assert len([r for r in caplog.records if r.levelno >= logging.ERROR]) == 1
+
+
+@pytest.mark.anyio
+async def test_build_page_navigation_response_loader_crash_reports_loader_stage(
+    settings: DevServerSettings, tmp_path: Path
+) -> None:
+    """A client-side navigation reports the crash as a loader-stage failure."""
+    page = _state_page(tmp_path, "return {'id': {'name': 'ada'}['user_id']}")
+
+    response = await build_page_navigation_response(
+        request=_http_request(),
+        settings=settings,
+        page=page,
+        renderer=StubRenderer(),
+    )
+
+    assert response.status_code == 500
+    payload = json.loads(await _read_response_body(response))
+    assert payload["ok"] is False
+    assert payload["stage"] == "loader"
+    assert "KeyError" in payload["error"]
+
+
+@pytest.mark.anyio
+async def test_layout_loader_crash_renders_error_boundary(
+    settings: DevServerSettings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A crash in a *layout* loader is classified the same way."""
+    from pyxle.devserver.registry import LayoutLoaderInfo
+
+    layout_module = tmp_path / "server" / "layout.py"
+    layout_module.parent.mkdir(parents=True, exist_ok=True)
+    layout_module.write_text(
+        "async def load_shell(request):\n    raise TypeError('layout blew up')\n",
+        encoding="utf-8",
+    )
+    info = LayoutLoaderInfo(
+        relative_path=Path("layout.pyxl"),
+        server_module_path=layout_module,
+        module_key="pyxle.server.pages.layout_crash",
+        loader_name="load_shell",
+    )
+    monkeypatch.setattr(
+        "pyxle.devserver.registry.find_layout_loaders", lambda settings, path: (info,)
+    )
+
+    renderer = StubRenderer()
+    renderer.responses.append(RenderResult(html="<main>our own error page</main>"))
+
+    response = await build_page_response(
+        request=_http_request(),
+        settings=settings,
+        page=_page_route(tmp_path, loader_name=None),
+        renderer=renderer,
+        error_boundaries=_boundary_registry(tmp_path),
+    )
+
+    assert response.status_code == 500
+    assert "our own error page" in (await _read_response_body(response)).decode()
+    message = renderer.calls[-1][1]["error"]["message"]
+    assert "Layout loader 'load_shell' in layout.pyxl" in message
+    assert "TypeError: layout blew up" in message
+
+
+@pytest.mark.anyio
+async def test_framework_fault_does_not_run_the_error_boundary(
+    settings: DevServerSettings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fault in Pyxle's own pipeline returns the fallback, not error.pyxl.
+
+    This is the deliberate other half of the contract: application failures are
+    classified where they happen and reach the boundary; anything left is a
+    framework fault, and running more application code to handle it can
+    compound the failure.
+    """
+    monkeypatch.setattr(
+        ssr_view,
+        "build_document_shell",
+        MagicMock(side_effect=ValueError("document assembly is broken")),
+    )
+    renderer = StubRenderer()
+    overlay = StubOverlay()
+
+    response = await build_page_response(
+        request=_http_request(),
+        settings=settings,
+        page=_page_route(tmp_path, loader_name=None),
+        renderer=renderer,
+        overlay=overlay,
+        error_boundaries=_boundary_registry(tmp_path),
+    )
+
+    assert response.status_code == 500
+    # Only the page render happened — the boundary component was never rendered.
+    assert [call[0] for call in renderer.calls] == [
+        _page_route(tmp_path, loader_name=None).client_module_path
+    ]
+    body = (await _read_response_body(response)).decode()
+    assert "Server Render Failed" in body
+    # Reported as a server-stage fault, not a loader or renderer one.
+    assert overlay.events[-1][2][1]["status"] == "unknown"
+
+
+@pytest.mark.anyio
+async def test_navigation_framework_fault_reports_server_stage(
+    settings: DevServerSettings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The JSON navigation path has the same framework-fault guardrail."""
+    monkeypatch.setattr(
+        ssr_view,
+        "_resolve_nav_cache_ttl",
+        MagicMock(side_effect=ValueError("cache lookup is broken")),
+    )
+
+    response = await build_page_navigation_response(
+        request=_http_request(),
+        settings=settings,
+        page=_page_route(tmp_path, loader_name=None),
+        renderer=StubRenderer(),
+    )
+
+    assert response.status_code == 500
+    payload = json.loads(await _read_response_body(response))
+    assert payload["ok"] is False
+    assert payload["stage"] == "server"
 
 
 # ---------------------------------------------------------------------------
@@ -3296,3 +3897,171 @@ async def test_error_boundary_failure_is_logged(
 
     assert response.status_code == 500
     assert "failed to render; serving the default error document" in caplog.text
+
+
+@pytest.mark.anyio
+async def test_error_boundary_head_merges_every_source(
+    settings: DevServerSettings, tmp_path: Path
+) -> None:
+    """A page rendered through an error boundary gets a fully merged head.
+
+    The boundary used to take its ``HEAD`` variable verbatim and nothing else,
+    so the error page — the page a confused visitor is most likely to see —
+    was served without the site's stylesheet, favicon, description or title,
+    and without its own ``<Head>``. It now goes through the same merge every
+    other page uses, over all four sources: the layout's two channels
+    (``<Head>`` JSX and its already-evaluated ``HEAD`` variable), the
+    boundary's own ``HEAD`` variable, and the ``<Head>`` elements the render
+    produced.
+    """
+    (settings.pages_dir / "layout.pyxl").write_text(
+        "HEAD = [\n"
+        "    '<link rel=\"stylesheet\" href=\"/site.css\" />',\n"
+        "    '<style>body{margin:0}</style>',\n"
+        "]\n"
+        "\n"
+        "import React from 'react';\n"
+        "import { Head } from 'pyxle/client';\n"
+        "export default function Layout({ children }) {\n"
+        "    return (<><Head><title>Site</title>"
+        "<link rel=\"icon\" href=\"/favicon.svg\" /></Head>{children}</>);\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    (settings.pages_dir / "error.pyxl").write_text(
+        "HEAD = ['<meta name=\"robots\" content=\"noindex\" />']\n"
+        "\n"
+        "import React from 'react';\n"
+        "export default function ErrorPage({ error }) {\n"
+        "    return <h1>{error.message}</h1>;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    (settings.pages_dir / "index.pyxl").write_text(
+        "from pyxle.runtime import server\n"
+        "\n"
+        "@server\n"
+        "async def load(request):\n"
+        "    raise LoaderError('gone', status_code=410)\n"
+        "\n"
+        "import React from 'react';\n"
+        "export default function Home({ data }) {\n"
+        "    return <div>home</div>;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    from pyxle.devserver.builder import build_once
+    from pyxle.devserver.error_pages import build_error_boundary_registry
+    from pyxle.devserver.registry import load_metadata_registry
+    from pyxle.devserver.routes import build_route_table
+
+    build_once(settings)
+    registry = load_metadata_registry(settings)
+    routes = build_route_table(registry)
+    page = routes.find_page("/")
+    assert page is not None
+    boundaries = build_error_boundary_registry(list(routes.error_boundary_pages))
+
+    renderer = StubRenderer()
+    renderer.responses.append(
+        RenderResult(
+            html="<h1>gone</h1>",
+            head_elements=("<title>Something went wrong</title>",),
+        )
+    )
+    request = Request(
+        {"type": "http", "method": "GET", "path": "/", "query_string": b"", "headers": []}
+    )
+
+    response = await build_page_response(
+        request=request,
+        settings=settings,
+        page=page,
+        renderer=renderer,
+        error_boundaries=boundaries,
+    )
+
+    assert response.status_code == 410
+    body = (await _read_response_body(response)).decode()
+    assert "<h1>gone</h1>" in body  # the boundary rendered, not the default doc
+    # The layout's <Head> JSX channel.
+    assert '<link rel="icon" href="/favicon.svg"' in body
+    # The layout's HEAD variable channel — brace-heavy content that the JSX
+    # expression filter would drop if the two channels were merged into one.
+    assert '<link rel="stylesheet" href="/site.css"' in body
+    assert "<style>body{margin:0}</style>" in body
+    # The boundary's own HEAD variable.
+    assert '<meta name="robots" content="noindex"' in body
+    # The render's <Head> wins the title over the layout's.
+    assert "<title>Something went wrong</title>" in body
+    assert "<title>Site</title>" not in body
+    # The framework's placeholder title only appears when there is no title.
+    assert "<title>Pyxle</title>" not in body
+
+
+@pytest.mark.anyio
+async def test_error_boundary_survives_failing_head_evaluation(
+    settings: DevServerSettings, tmp_path: Path, caplog
+) -> None:
+    """A boundary ``HEAD`` callable that raises costs the head, not the page.
+
+    A callable ``HEAD`` is handed the error context rather than loader data —
+    a shape it has never run against — so it can raise exactly here. The
+    boundary must still reach the visitor.
+    """
+    (settings.pages_dir / "error.pyxl").write_text(
+        "def HEAD(data):\n"
+        "    raise RuntimeError('head boom')\n"
+        "\n"
+        "import React from 'react';\n"
+        "export default function ErrorPage({ error }) {\n"
+        "    return <h1>{error.message}</h1>;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    (settings.pages_dir / "index.pyxl").write_text(
+        "from pyxle.runtime import server\n"
+        "\n"
+        "@server\n"
+        "async def load(request):\n"
+        "    raise LoaderError('nope', status_code=500)\n"
+        "\n"
+        "import React from 'react';\n"
+        "export default function Home({ data }) {\n"
+        "    return <div>home</div>;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    from pyxle.devserver.builder import build_once
+    from pyxle.devserver.error_pages import build_error_boundary_registry
+    from pyxle.devserver.registry import load_metadata_registry
+    from pyxle.devserver.routes import build_route_table
+
+    build_once(settings)
+    registry = load_metadata_registry(settings)
+    routes = build_route_table(registry)
+    page = routes.find_page("/")
+    assert page is not None
+    boundaries = build_error_boundary_registry(list(routes.error_boundary_pages))
+
+    renderer = StubRenderer()
+    renderer.responses.append(RenderResult(html="<h1>nope</h1>"))
+    request = Request(
+        {"type": "http", "method": "GET", "path": "/", "query_string": b"", "headers": []}
+    )
+
+    with caplog.at_level("WARNING"):
+        response = await build_page_response(
+            request=request,
+            settings=settings,
+            page=page,
+            renderer=renderer,
+            error_boundaries=boundaries,
+        )
+
+    assert response.status_code == 500
+    body = (await _read_response_body(response)).decode()
+    assert "<h1>nope</h1>" in body
+    assert "HEAD evaluation failed for error boundary error.pyxl" in caplog.text

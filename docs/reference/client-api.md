@@ -163,6 +163,26 @@ Progressive-enhancement form component for calling server actions.
 - Automatically resolves the action endpoint URL
 - All additional props are forwarded to the `<form>` element
 
+> **`<Form>` and shared-cached pages don't mix.** On a page made publicly
+> cacheable with `revalidate` (see [Caching](../guides/caching.md)), the server
+> deliberately omits the per-user CSRF token — a token baked into a body that
+> is stored once and served to many people would hand every visitor the same
+> one. `<Form>` therefore renders **without** its hidden `_csrf_token` field on
+> the server, then emits one on the client as soon as it can read the cookie.
+>
+> What you see: a React hydration warning in the console on first load, and
+> that one subtree re-rendered on the client.
+>
+> **The form still works with JavaScript** — JS submissions authenticate with
+> the `x-csrf-token` header, not the hidden field. **Without JavaScript it does
+> not**: a no-JS POST from a shared-cached page carries no token and the CSRF
+> middleware rejects it. That is not a bug to be fixed by embedding the token —
+> a shared cached body has no per-user token it could honestly carry.
+>
+> **Do this instead:** keep `<Form>` on routes that are not shared-cached (a
+> plain loader, or `revalidate: 0`). Cache the reading page; leave the page
+> that submits uncached.
+
 ---
 
 ### `<Link>`
@@ -368,7 +388,9 @@ function LoginForm() {
 > The login/signup endpoints are on by default. Apps that own their sign-in flow
 > set `enableCredentialsApi: false` on the plugin and call their own `@action`,
 > then `refresh()` — `useAuth` still manages shared user state, `/me`, and
-> `logout`.
+> `logout`. To keep sign-in but close self-registration, set `enableSignup: false`
+> instead; `signup` disappears from the endpoint map, so read it from `useAuth()`
+> rather than assuming the route exists.
 
 ---
 

@@ -130,7 +130,8 @@ During `pyxle dev`, the file watcher triggers recompilation only for changed fil
 1. The watcher detects a file change in `pages/`
 2. Only the changed `.pyxl` file is recompiled
 3. The server module is re-imported (with module cache invalidation)
-4. Vite's HMR picks up the client-side changes automatically
+4. Connected browsers are told to reload, and pick up the rebuilt
+   client bundle (a full page reload, not a hot update)
 
 ## Build artifacts
 

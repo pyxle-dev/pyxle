@@ -170,7 +170,7 @@ for durable/cross-worker jobs, hand off to Celery/ARQ/Dramatiq (see the Backgrou
 
 - `useAction(name)` — bind to an `@action`; returns a callable with `.pending`, `.error`, `.fields`, and `.data` (the last successful return's fields). The value you `await` is the flat `{ ok, ...return }` — read fields off it directly (`res.x`), not off `res.data`.
 - `<Form action="name" onSuccess onError>` — submit named inputs to an `@action`.
-- `<Head>` — set per-page `<title>`/`<meta>`/`<link>` (deduped + merged with layouts).
+- `<Head>` — set per-page `<title>`/`<meta>`/`<link>` (deduped + merged with layouts). A page with no `<title>` anywhere falls back to `name` in `pyxle.config.json`.
 - `<Link href="/path">` — client-side navigation; `navigate('/path')` to do it imperatively.
 - `prefetch('/path')` · `refresh()` · `usePathname()`.
 - `<Image>` · `<Script>` · `<ClientOnly>` — optimized image, third-party scripts, client-only render.
@@ -200,6 +200,8 @@ pages/             routes (.pyxl) + pages/api/*.py endpoints
   components/       shared JSX + CSS Modules (only when Tailwind is off, by default)
 public/            static files served at /
 db.py              (you add this) — e.g. SQLite helpers; import with `from db import ...`
+                   Code outside pages/ is NOT copied into dist/ — deploy it
+                   alongside dist/ the way you deploy the rest of your source.
 jsconfig.json      import alias (default `@/*`) + editor hints
 vite.config.js     re-exports Pyxle's generated Vite config (for shadcn/editor tooling)
 pyxle.config.json  project config

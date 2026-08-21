@@ -5,6 +5,8 @@ from __future__ import annotations
 import re
 from html.parser import HTMLParser
 
+from pyxle.ssr.jsx_expressions import block_holds_expression, iter_static_elements
+
 
 class HeadElementAttributeParser(HTMLParser):
     """Parse HTML elements to extract attributes for deduplication."""
@@ -118,6 +120,32 @@ def _split_head_block_into_elements(html_block: str) -> list[str]:
     """
     splitter = HeadElementSplitter()
     return splitter.split(html_block)
+
+
+def _split_static_block_into_elements(html_block: str) -> list[str]:
+    """Split a *compile-time-extracted* head block, dropping unevaluated tags.
+
+    ``<Head>`` blocks are harvested from ``.pyxl`` source before any of it has
+    run, so a tag whose attributes or children reference props arrives here as
+    JSX source text. Emitting it puts ``href="{faviconUrl}"`` — a relative URL
+    the browser will request and fail to find — or a literal ``{name}`` page
+    title into the document, and deduplication cannot suppress either, because
+    neither matches the rendered tag it duplicates.
+
+    Such tags are dropped, not repaired: the component render produces the same
+    tags with their values in them (see :func:`merge_head_elements`). A block
+    with no braces at all cannot hold an expression and takes the plain path
+    unchanged.
+    """
+    if not block_holds_expression(html_block):
+        return _split_head_block_into_elements(html_block)
+
+    elements: list[str] = []
+    for source, unevaluated in iter_static_elements(html_block):
+        if unevaluated:
+            continue
+        elements.extend(_split_head_block_into_elements(source))
+    return elements
 
 
 def _extract_dedupe_key(html: str) -> str | None:
@@ -421,14 +449,22 @@ def merge_head_elements(
     head_variable: tuple[str, ...],
     head_jsx_blocks: tuple[str, ...],
     layout_head_jsx_blocks: tuple[str, ...] = (),
+    layout_head_variable: tuple[str, ...] = (),
     runtime_head_blocks: tuple[str, ...] = (),
 ) -> tuple[str, ...]:
     """Merge HEAD elements from every source with deduplication.
 
+    Each level contributes through the same two channels: a ``HEAD`` variable
+    (Python that has already run — finished HTML) and ``<Head>`` JSX blocks
+    (compile-time-extracted source, filtered for unevaluated expressions).
+    Layout contributions are lower priority than the page's.
+
     Precedence order (higher priority overrides lower):
 
-    1. Layout JSX blocks — static extraction from ancestor ``layout.pyxl``
-       and ``template.pyxl`` files.
+    1. Layout contributions — from ancestor ``layout.pyxl`` and
+       ``template.pyxl`` files. Their JSX blocks are examined first, so a
+       layout's ``<Head>`` beats its own ``HEAD`` variable on a shared key,
+       mirroring the page-level ordering below.
     2. Page ``HEAD`` variable — server-side declaration in the page module.
     3. Page JSX blocks — static extraction of ``<Head>`` blocks in the
        page file at compile time.
@@ -469,16 +505,25 @@ def merge_head_elements(
     seen_keys: dict[str | None, tuple[str, int]] = {}
 
     # Split head blocks into individual elements, then sanitise each one.
+    # The two JSX sources are compile-time extractions, so they are filtered
+    # for unevaluated expressions. The two ``HEAD`` variables are Python that
+    # has already run and ``runtime_head_blocks`` is React's rendered output —
+    # all three hold finished values, and braces in them are literal content (a
+    # JSON-LD payload, a CSS rule) that must reach the document intact.
     layout_elements = []
     for block in layout_head_jsx_blocks:
-        for el in _split_head_block_into_elements(block):
+        for el in _split_static_block_into_elements(block):
             layout_elements.append(sanitize_head_element(el))
+    # The layout's ``HEAD`` variable shares the layout's priority tier but not
+    # its filtering: it is finished HTML, exactly like the page-level
+    # ``head_variable`` below.
+    layout_elements.extend(sanitize_head_element(el) for el in layout_head_variable)
 
     head_var_elements = [sanitize_head_element(el) for el in head_variable]
 
     page_elements = []
     for block in head_jsx_blocks:
-        for el in _split_head_block_into_elements(block):
+        for el in _split_static_block_into_elements(block):
             page_elements.append(sanitize_head_element(el))
 
     # Runtime blocks: reversed so the deepest (page) registration is
@@ -489,7 +534,7 @@ def merge_head_elements(
         for el in _split_head_block_into_elements(block):
             runtime_elements.append(sanitize_head_element(el))
 
-    # Priority 1: Layout JSX blocks (lowest priority)
+    # Priority 1: Layout contributions — JSX blocks then HEAD variable (lowest priority)
     for element in layout_elements:
         element = element.strip()
         if element:

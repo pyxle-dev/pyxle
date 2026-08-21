@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Callable
@@ -19,7 +19,12 @@ def _strip_ansi(text: str) -> str:
     return _ANSI_RE.sub("", text)
 
 
-_LogFunction = Callable[[str], None]
+_LogFunction = Callable[..., None]
+
+
+def _secho_stderr(message: str, **kwargs: object) -> None:
+    """:func:`typer.secho`, writing to stderr instead of stdout."""
+    typer.secho(message, err=True, **kwargs)  # type: ignore[arg-type]
 
 
 class LogFormat(str, Enum):
@@ -71,6 +76,22 @@ class ConsoleLogger:
 
         self.verbosity = verbosity
 
+    def to_stderr(self) -> "ConsoleLogger":
+        """Return a copy of this logger that writes to stderr.
+
+        For a command whose **stdout is a data channel** — a document meant to
+        be piped or redirected, as in ``pyxle openapi > openapi.json`` — every
+        message has to leave by the other door. Logging to stdout there writes
+        the message *into the artifact*: the redirect captures it, the file is
+        corrupt, and the terminal stays silent, so a failure looks like a
+        successful run that produced a strange file.
+
+        Verbosity and formatter are carried over, so ``--quiet`` and
+        ``--log-format json`` behave the same on the error channel.
+        """
+
+        return replace(self, secho=_secho_stderr)
+
     # Console emitters -------------------------------------------------
 
     def _emit_console(self, message: str, style: str, bold: bool = False) -> None:
@@ -100,11 +121,19 @@ class ConsoleLogger:
         self._emit(level="debug", console_message=f"🔍 {message}", style="white")
 
     def info(self, message: str) -> None:
-        """Emit an informational message (suppressed in quiet mode)."""
+        """Emit an informational message (suppressed in quiet mode).
+
+        An empty message is a deliberate blank spacer — commands like
+        ``pyxle routes`` use one to separate sections — so it is emitted as a
+        genuinely blank line rather than a bare ``ℹ️`` prefix floating in the
+        output. Decorating a separator with an icon made our own documented
+        sample output wrong.
+        """
 
         if self.verbosity == Verbosity.QUIET:
             return
-        self._emit(level="info", console_message=f"ℹ️  {message}", style="cyan")
+        console_message = f"ℹ️  {message}" if message.strip() else ""
+        self._emit(level="info", console_message=console_message, style="cyan")
 
     def success(self, message: str) -> None:
         """Emit a success message."""

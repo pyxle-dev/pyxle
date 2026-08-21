@@ -90,6 +90,16 @@ sys.modules[page.module_key] = module
 spec.loader.exec_module(module)
 ```
 
+`module_key` is derived from the page's path relative to `pages/`, and it is
+**unique per source file**. That matters because a cached module is reused
+without re-checking which file it came from, so two pages sharing a key would
+mean one silently serving the other's loader and component. The readable form
+strips route syntax — `posts/[id].pyxl` reads as `…pages.posts.id` — and
+because stripping is lossy (`[id]` and `id`, `(marketing)` and `marketing`,
+`my-page` and `my_page` all reduce to one name), a segment that the stripping
+altered also carries a short digest of its original text. Ordinary names are
+untouched.
+
 In **dev mode**, the module is likewise imported once and reused across
 requests — so its module-level globals persist exactly like production.
 A rebuild advances a process-wide *reload generation*; the importer
@@ -175,9 +185,14 @@ Source: `ssr/view.py:341-485`.
 The `<head>` of the HTML response is assembled from up to **four**
 sources, in order of increasing priority:
 
-1. **Layout `<Head>` JSX blocks** — collected at registry-build time
-   from `layout.pyxl` (and `template.pyxl`) ancestors of the current
-   page.
+1. **Layout contributions** — collected at registry-build time from
+   `layout.pyxl` (and `template.pyxl`) ancestors of the current page,
+   in two channels: the layout's `<Head>` JSX blocks and the layout's
+   own `HEAD` variable. The JSX channel is compile-time source and is
+   filtered for unevaluated `{expressions}`; the `HEAD` channel is
+   finished HTML and is never filtered, so a layout's site-wide
+   JSON-LD or inline `<style>` reaches every page verbatim. Within
+   this tier the layout's `<Head>` wins over its `HEAD` variable.
 2. **The page's `HEAD` variable** — Python string, list of strings,
    or callable returning either. If it's a callable, Pyxle invokes
    it with the loader's data.
@@ -327,6 +342,19 @@ The reply:
 The `id` field lets the worker pool match responses to in-flight
 requests, since multiple requests may be in flight simultaneously
 against a single worker.
+
+`inlineStyles` carries the stylesheets a component imported, read raw and
+returned for embedding as `<style>` blocks. It is populated under `pyxle dev`,
+where Vite injects CSS through the client bundle only after hydration, so the
+inline copy is the only thing that styles the server-rendered paint. It is
+**empty for a production render**: a manifest-backed document links every
+stylesheet Vite compiled for the page (`<link rel="stylesheet">`, render
+blocking), so inlining the same rules would ship every byte twice without
+buying a faster paint. The pool tells the worker which case it is in via
+`viteOwnsCss`, computed once from `pyxle.ssr.template.vite_owns_stylesheets` —
+the same function that decides whether to emit the links, so the two can never
+disagree. CSS Modules are unaffected in both modes: the worker always returns
+the local→hashed class-name map so `styles.foo` matches what Vite emits.
 
 ### Subprocess mode
 

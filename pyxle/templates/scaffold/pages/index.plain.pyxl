@@ -16,17 +16,19 @@ async def load_home(request):
     }
 
 
-import './styles/app.css';
-import React from 'react';
+import React, { useState } from 'react';
 import { Head } from 'pyxle/client';
 
 import Badge from './components/Badge.jsx';
 
 export default function HomePage({ data }) {
+    // Client state, in the same file as the Python loader above. If this
+    // counter moves when you click it, the page hydrated on your machine.
+    const [clicks, setClicks] = useState(0);
+
     return (
         <main className="page">
             <Head>
-                <title>Pyxle App</title>
                 <meta name="description" content="A fresh Pyxle project." />
                 <link rel="icon" href="/favicon.ico" />
             </Head>
@@ -46,6 +48,20 @@ export default function HomePage({ data }) {
                 <div className="code">
                     <p className="code-comment">{"// Get started by editing"}</p>
                     <p className="code-path">pages/index.pyxl</p>
+                </div>
+
+                <div className="live">
+                    <button
+                        type="button"
+                        className="live-button"
+                        onClick={() => setClicks(clicks + 1)}
+                    >
+                        Clicked {clicks} {clicks === 1 ? 'time' : 'times'}
+                    </button>
+                    <p className="live-note">
+                        This button is React running in your browser. The text
+                        above came from Python. Same file.
+                    </p>
                 </div>
 
                 <nav className="nav">

@@ -14,6 +14,15 @@ This:
 2. Runs a Vite production build — bundling JS and compiling every imported stylesheet (plain CSS, CSS Modules, and Tailwind v4 via the `@tailwindcss/vite` plugin when enabled) into content-hashed assets
 3. Outputs production artifacts to the `dist/` directory
 
+> **`pyxle build` requires Node.js 20.19+ *and* npm**, plus the project's
+> `package.json` and its installed dependencies — step 2 runs Vite through
+> `npx`. This bites most often in a container or CI image: Debian and Ubuntu's
+> `nodejs` package does **not** include npm (`apt install npm` as well), and
+> some slim base images ship `node` alone. Without them the build stops with a
+> non-zero exit rather than producing a `dist/` that `pyxle serve` cannot start
+> on. Serving the result needs Node.js too, but not npm or Vite — see
+> [What to ship](#what-to-ship).
+
 ### Build options
 
 ```bash
@@ -21,6 +30,83 @@ pyxle build --out-dir ./output     # Custom output directory
 pyxle build --incremental          # Reuse cached artifacts
 pyxle build --config ./custom.json # Custom config file
 ```
+
+### What to ship
+
+`dist/` is self-contained: it holds every compiled module, every bundled asset,
+the routing metadata `pyxle serve` needs, and a copy of the source files the
+running server reads. Ship it alongside your `pyxle.config.json`, your
+`node_modules` (server-side rendering runs React on Node) and your Python
+dependencies, and `pyxle serve --skip-build` will run it.
+
+A minimal deployment is therefore:
+
+```
+dist/                 # everything pyxle build produced
+pyxle.config.json     # your configuration
+package.json          # so Node resolves react / react-dom
+node_modules/         # server-side rendering runs React on Node — and esbuild
+```
+
+> **Installing with `--omit=dev` is not enough on its own.** Server rendering
+> loads **esbuild** from your project at request time. Before 0.9.0 the scaffold
+> did not declare it — it arrived only transitively through Vite, a
+> devDependency — so a production-only install produced a server that started
+> cleanly and then returned a 500 for *every* page, with the real cause visible
+> only in the log. 0.9.0's scaffold lists `esbuild` under `dependencies`; if you
+> generated your project with an earlier version, add it.
+
+
+plus your Python dependencies and your environment variables — including
+`PYXLE_SECRET_KEY`, which `pyxle serve` requires. `.env` files are **not** part
+of `dist/`: secrets belong in the environment, not in a build artifact.
+
+Inside `dist/`:
+
+| Path | What it holds |
+|------|---------------|
+| `server/` | Compiled Python for every page and API route |
+| `client/dist/` | Vite output — hashed JS and CSS, served under `/client/dist`. It is the only part of `client/` that is served; the rest is the input Vite bundled |
+| `metadata/`, `meta.json`, `page-manifest.json` | Routing metadata |
+| `public/` | A copy of your `public/` directory |
+| `app/` | A copy of the source files the server reads at runtime |
+| `prerendered/` | Pre-rendered pages, when you build with `--static` |
+
+`dist/app/` is there because compiling `pages/` produces one module per route
+and nothing else, while a running server still reads plain source files:
+
+- **Colocated Python helpers.** `pages/api/_shared.py`, `pages/api/__init__.py`,
+  anything under `pages/api/_internal/`, and non-route modules beside your pages
+  such as `pages/s/[slug]/queries.py` are deliberately
+  [not routes](api-routes.md#private-modules-inside-an-api-directory) — so
+  nothing compiles them, and the compiled route that says
+  `from pages.api._shared import …` needs the module itself at import time.
+- **AI-accessibility files.** `pages/**/llms.py` handlers and colocated
+  `pages/**/*.md` files are read per request — see [AI accessibility](llms.md).
+- **Global stylesheets.** `styling.globalStyles` entries are read and inlined
+  into every rendered document.
+
+Because they travel with the build, a deployment that ships only `dist/` — a
+Docker `COPY --from=build /app/dist ./dist`, a CI artifact, an rsync of the
+build output — boots and serves exactly like one that carries the whole
+repository. When your source tree *is* deployed it stays authoritative; the copy
+is only a fallback, so editing a helper and rebuilding never picks up a stale
+one.
+
+What `dist/` cannot carry is application code **outside** `pages/`: a
+project-root `db.py`, a `middleware.py` named in `pyxle.config.json`, a local
+package your loaders import. Where that import graph ends is your application's
+business, not the framework's, so deploy those files the way you deploy the rest
+of your code (in a Dockerfile, copy your Python sources alongside `dist/`).
+Third-party packages come from your Python dependencies as usual.
+
+`.pyxle-build/` is an **intermediate** directory — a build cache for
+`pyxle dev` and for the next `pyxle build`. It is not part of a deployment, and
+`pyxle serve` does not read routing from it. That matters beyond disk space: it
+is a cache, so anything that recompiles a page into it — a test helper, an
+editor tool, an interrupted dev server — leaves it disagreeing with the `dist/`
+you built. Serving reads `dist/`, so those disagreements cannot reach
+production.
 
 ## Serve in production
 
@@ -271,8 +357,9 @@ server {
         proxy_read_timeout 3600s;   # keep long-lived WebSockets from idling out
     }
 
-    # Cache static assets
-    location /client/ {
+    # Cache static assets. Everything Pyxle serves here is a content-hashed
+    # bundle, so a one-year immutable cache is safe.
+    location /client/dist/ {
         proxy_pass http://127.0.0.1:8000;
         expires 1y;
         add_header Cache-Control "public, immutable";
@@ -338,7 +425,7 @@ Two things to know before relying on it:
    - **Nginx / Caddy / Varnish** — enable `proxy_cache` (or the equivalent) for
      those routes; they respect `s-maxage` out of the box.
 
-Content-hashed client bundles (under `/client/.../dist/assets/`) are already sent
+Content-hashed client bundles (under `/client/dist/assets/`) are already sent
 `Cache-Control: public, max-age=31536000, immutable`, and other static files get
 `public, max-age=3600` -- independent of the `cache` block above, which governs
 *page* responses.
@@ -382,6 +469,22 @@ Match `--workers` to the container's CPU allocation — e.g.
 `CMD ["pyxle", "serve", "--host", "0.0.0.0", "--skip-build", "--workers", "4"]`
 for a 4-vCPU container. If you scale by running more single-worker containers
 behind a load balancer instead, keep the default.
+
+### Multi-stage builds
+
+Building in one stage and copying the result into a clean runtime image works
+too, because `dist/` carries everything the server reads (see
+[What to ship](#what-to-ship)):
+
+```dockerfile
+COPY --from=build /app/dist ./dist
+COPY --from=build /app/node_modules ./node_modules
+COPY pyxle.config.json package.json ./
+CMD ["pyxle", "serve", "--host", "0.0.0.0", "--skip-build"]
+```
+
+Add your own Python modules that live outside `pages/` — a `db.py`, a
+`middleware.py` referenced from `pyxle.config.json` — to that copy list.
 
 ## Health checks
 
@@ -457,9 +560,17 @@ migration tool per app. See [pyxle-db → Migrations](../plugins/pyxle-db.md#mig
 
 Before deploying:
 
-- [ ] `pyxle check` passes with no errors
-- [ ] `pyxle build` completes successfully
+- [ ] `pyxle check` passes with no errors (it exits `0` on warnings alone — an unused import will not block you; an unresolved reference **in the Python half** will). It does not resolve identifiers in the JSX half, so it is not a substitute for opening the page — do that too.
+- [ ] `pyxle build` completes successfully (it exits non-zero if it cannot run Vite — never ship a `dist/` from a build that failed)
+- [ ] Node.js `>= 20.19` **and npm** are on the build machine's `PATH`
 - [ ] Node.js is `>= 20.19` on the server's `PATH`
+- [ ] **`node_modules` is installed on the server too** — copy `package.json` and
+      `package-lock.json` next to `dist/` and run `npm ci` there. Server-side
+      rendering runs React through Node at request time and loads `esbuild` from
+      your project, so a `dist/` deployed without them answers **500 on every
+      page**. The errors name one missing package at a time, so installing them
+      individually goes in circles; `npm ci` is the fix. (The Dockerfile below
+      already does this.)
 - [ ] Set `PYXLE_DEBUG=false` in production
 - [ ] Set `PYXLE_SECRET_KEY` to a long random value (**required** — `pyxle serve` won't start without it)
 - [ ] Apply database migrations, if you use `pyxle-db` (see below)
@@ -470,6 +581,7 @@ Before deploying:
 - [ ] Set up a reverse proxy for TLS
 - [ ] Declare publicly-cacheable routes in the `cache` block (and opt your CDN in)
 - [ ] Configure health check monitoring on `/api/pulse`
+- [ ] Configure Python logging if you rely on your own `log.info` calls — `pyxle serve` does not, so `INFO` records are dropped while `WARNING` and above still reach stderr ([Debugging](debugging.md#your-own-loginfo-is-silent-in-production-until-you-configure-it))
 - [ ] Add `.env.local` to `.gitignore`
 
 ## Next steps

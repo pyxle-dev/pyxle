@@ -11,6 +11,7 @@ from pyxle.devserver import validation
 from pyxle.devserver.validation import (
     PydanticNotInstalledError,
     ResolvedBody,
+    UnannotatedActionBodyError,
     get_cached_body_model,
     resolve_body_model,
     translate_validation_error,
@@ -62,6 +63,10 @@ async def act_unannotated_body(request, body):  # noqa: ANN001
     return {}
 
 
+async def act_unannotated_optional_body(request, body=None):  # noqa: ANN001
+    return {}
+
+
 async def act_no_body(request):  # noqa: ANN001
     return {}
 
@@ -98,9 +103,27 @@ def test_multi_type_union_is_not_a_body_model() -> None:
     assert resolve_body_model(act_multi_union) is None
 
 
-def test_unannotated_body_param_returns_none() -> None:
-    # A present-but-unannotated extra parameter isn't a body model.
-    assert resolve_body_model(act_unannotated_body) is None
+def test_required_unannotated_body_param_names_itself_not_pydantic() -> None:
+    # ``async def act(request, body)`` asks Pyxle to supply ``body`` from the
+    # request while saying nothing about its shape. Returning None here is what
+    # used to let the call proceed and die with "missing 1 required positional
+    # argument"; blaming Pydantic instead sent the reader to install a package
+    # that does not fix it. The message has to name the parameter and both ways
+    # out, and must not claim the action validates with a model.
+    with pytest.raises(UnannotatedActionBodyError) as excinfo:
+        resolve_body_model(act_unannotated_body)
+    message = str(excinfo.value)
+    assert "'body'" in message
+    assert "await request.json()" in message
+    assert "Pydantic model" in message
+    assert "validates its request body" not in message
+
+
+def test_optional_unannotated_body_param_still_returns_none() -> None:
+    # The parameter has a default, so nothing has to be injected and the action
+    # runs. This is the line between the two: required means we cannot fill it,
+    # optional means we do not have to.
+    assert resolve_body_model(act_unannotated_optional_body) is None
 
 
 async def act_unresolvable_hint(request, body: "NotARealType"):  # noqa: ANN001, F821

@@ -215,8 +215,9 @@ in [Build and serve](build-and-serve.md).
    uses — `pyxle build` reuses 100% of the dev server's settings
    structure).
 3. Lazily imports `pyxle.build.pipeline.run_build` (lazy because
-   importing the build pipeline pulls in `vite.py`, `manifest.py`,
-   etc., and we want `pyxle init` and `pyxle check` to start fast).
+   importing the build pipeline pulls in `build/manifest.py` and most
+   of `devserver/` — the builder, the registry, the settings — and we
+   want `pyxle init` and `pyxle check` to start fast).
 4. Calls `run_build(settings, dist_dir=...)`.
 5. Prints a summary: pages, API routes, client assets.
 
@@ -258,7 +259,7 @@ for the full walkthrough.
 | `--config <path>` | `pyxle.config.json` | Config file path |
 | `--dist-dir <path>` | `./dist` | Where to read the build from |
 | `--skip-build / --no-skip-build` | `false` | Skip the implicit `pyxle build` |
-| `--serve-static / --no-serve-static` | `true` | Serve `dist/client/` and `dist/public/` |
+| `--serve-static / --no-serve-static` | `true` | Serve `dist/client/dist/` and `dist/public/` |
 | `--ssr-workers <n>` | from config | Override SSR worker count |
 
 ### What it does
@@ -341,6 +342,20 @@ Tolerant mode means the parser collects every diagnostic in every
 file in **a single pass** instead of stopping at the first error.
 This is the right behaviour for a linter — you want to see all your
 errors at once, not one error at a time.
+
+### Severity
+
+Each `PyxDiagnostic` carries a `severity` of `"error"` or
+`"warning"`, and only errors affect the exit code. Syntax,
+structural and JSX diagnostics are always errors. Semantic
+(pyflakes) findings are classified by
+`_pyflakes_severity` in `compiler/parser.py` against an explicit
+table of message classes that fail **at runtime** — unresolved
+references, unbound locals, malformed format strings,
+`raise NotImplemented`. Everything else, including any rule a
+future pyflakes adds, is a warning: `pyxle check` is a deploy gate,
+and a new hygiene rule arriving with a dependency upgrade must
+never become a surprise release blocker.
 
 `validate_jsx=True` adds Babel-backed JSX validation on top, so
 JSX syntax errors (unclosed tags, mismatched braces, invalid

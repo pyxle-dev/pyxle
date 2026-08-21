@@ -678,3 +678,55 @@ def test_cjs_dependency_render_error_message_and_attributes() -> None:
     assert "pages/index.pyxl" in message
     assert "ES module" in message
     assert "<ClientOnly>" in message
+
+
+class TestNamingTheComponentThatRaised:
+    """A runtime SSR failure used to name a variable and nothing else.
+
+    ``NoSuchThing is not defined`` carries no position, so the location remap
+    that handles build errors has nothing to work on. The Node stack does know
+    which component was executing — but it points into a content-hashed bundle
+    under ``.pyxle-build/.ssr-tmp/`` that has no source map, so the line number
+    is not recoverable. The function name is, and it survives bundling.
+    """
+
+    # A real stack, captured from a failing render rather than invented.
+    REAL_STACK = (
+        "ReferenceError: NoSuchThing is not defined\n"
+        "    at JsxErr (file:///app/.pyxle-build/.ssr-tmp/worker-RFdpNf/"
+        "a2b51051edb22a59d06b4b50df262f262699c7b2.mjs?v=e96352:68:120)\n"
+        "    at Object.react_stack_bottom_frame (/app/node_modules/react-dom/cjs/"
+        "react-dom-server-legacy.node.development.js:9808:18)\n"
+        "    at renderWithHooks (/app/node_modules/react-dom/cjs/"
+        "react-dom-server-legacy.node.development.js:5062:19)"
+    )
+
+    def test_it_names_the_authors_component(self):
+        from pyxle.ssr.renderer import _authored_frame_name
+
+        assert _authored_frame_name(self.REAL_STACK) == "JsxErr"
+
+    def test_react_internals_are_never_named(self):
+        """The failure happens *inside* React, so the first frames after the
+        author's are always react-dom. Naming one of those would point the
+        reader at a file in node_modules they cannot fix."""
+        from pyxle.ssr.renderer import _authored_frame_name
+
+        react_only = (
+            "ReferenceError: boom\n"
+            "    at renderWithHooks (/app/node_modules/react-dom/cjs/x.js:1:1)\n"
+            "    at renderElement (/app/node_modules/react-dom/cjs/x.js:2:2)"
+        )
+        assert _authored_frame_name(react_only) is None
+
+    def test_node_internals_are_never_named(self):
+        from pyxle.ssr.renderer import _authored_frame_name
+
+        assert _authored_frame_name("    at run (node:internal/modules/x:1:1)") is None
+
+    def test_an_unparseable_stack_gives_no_answer(self):
+        """An absent answer beats a confident wrong one."""
+        from pyxle.ssr.renderer import _authored_frame_name
+
+        assert _authored_frame_name("") is None
+        assert _authored_frame_name("ReferenceError: boom") is None

@@ -18,11 +18,13 @@ per file at once instead of stopping at the first.
 from __future__ import annotations
 
 import ast
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Literal, Sequence
+from typing import Callable, Iterable, Literal, Sequence
 
 from .exceptions import CompilationError
+from .head_elements import find_discarded_head_content
 
 # ---------------------------------------------------------------------------
 # Public dataclasses
@@ -113,6 +115,7 @@ class PyxParseResult:
     actions: tuple[ActionDetails, ...] = ()
     websocket: WebsocketDetails | None = None
     cache_revalidate: float | None = None
+    standalone: bool = False
     uses_suspense: bool = False
     diagnostics: tuple[PyxDiagnostic, ...] = ()
 
@@ -153,19 +156,20 @@ class _DiagnosticCollector:
         *,
         section: Literal["python", "jsx"] = "python",
         column: int | None = None,
+        severity: Literal["error", "warning"] = "error",
     ) -> None:
         if self.tolerant:
             self.diagnostics.append(
                 PyxDiagnostic(
                     section=section,
-                    severity="error",
+                    severity=severity,
                     message=message,
                     line=line,
                     column=column,
                 )
             )
             return
-        raise CompilationError(message, line)
+        raise CompilationError(message, line, column)
 
 
 def _normalize_newlines(text: str) -> list[str]:
@@ -550,6 +554,92 @@ def _looks_like_jsx_toplevel(line: str) -> bool:
     return _contains_jsx_element_marker(stripped)
 
 
+# ---------------------------------------------------------------------------
+# Coordinate translation for line numbers *inside* an error message
+# ---------------------------------------------------------------------------
+
+#: Phrases after which a compiler-facing tool writes a *second* line number into
+#: the body of its own message. Every tool the parser calls is handed one
+#: extracted block — a segment, the joined Python stream, the joined JSX stream —
+#: so any line number it names is numbered from the start of that block, not the
+#: start of the ``.pyxl`` file. The known producers:
+#:
+#: * CPython — ``closing parenthesis ')' does not match opening parenthesis '['
+#:   on line 3`` and ``unterminated string literal (detected at line 9)``.
+#: * pyflakes — ``redefinition of unused 'os' from line 1``, ``import 'os' from
+#:   line 1 shadowed by loop variable``, ``local variable 'x' defined in
+#:   enclosing scope on line 4 referenced before assignment``.
+#:
+#: The pattern is anchored to these three prepositions rather than any ``line
+#: N``, which narrows it to the shapes a tool actually writes.
+_MESSAGE_LINE_REFERENCE = re.compile(r"\b(on|from|at) line (\d+)\b")
+
+
+def _reference_is_quoted(message: str, index: int) -> bool:
+    """Whether the reference at *index* sits inside a quoted span of *message*.
+
+    Every producer above writes its coordinate as plain prose and quotes only
+    the *name* it is talking about — ``redefinition of unused 'os' from line
+    1``. So a ``line N`` that falls inside quotes is not a coordinate at all: it
+    is the developer's own text echoed back. ``__all__ = ["ghost on line 999"]``
+    yields ``undefined name 'ghost on line 999' in __all__``, where 999 is part
+    of a string they wrote, names no line, and must survive untouched — the one
+    fragment of the message they would otherwise recognise.
+
+    An odd number of either quote character before the match means the match is
+    inside one. When that heuristic is wrong the reference is left raw, which is
+    the same fallback an unmappable number gets.
+    """
+    prefix = message[:index]
+    return prefix.count("'") % 2 == 1 or prefix.count('"') % 2 == 1
+
+
+def _remap_message_line_refs(
+    message: str, to_source_line: Callable[[int], int | None]
+) -> str:
+    """Rewrite block-relative line numbers *inside* ``message`` to file lines.
+
+    The position a diagnostic carries structurally is already translated by the
+    caller. This handles the other one — the line number a tool wrote into its
+    own prose — which is otherwise reported raw, in the coordinates of an
+    extracted block the developer never sees. An error pointing at the wrong
+    line of the right file is worse than one that points nowhere: it sends the
+    developer to read innocent code and costs them their trust in the compiler.
+
+    ``to_source_line`` maps one block-relative line to its ``.pyxl`` line;
+    returning ``None`` (no mapping possible) leaves that reference untouched
+    rather than inventing a number. Callers must supply a mapper that answers
+    ``None`` outside its block rather than clamping to an edge — a clamped
+    number is exactly the confident wrong answer this is here to avoid.
+    """
+
+    def _replace(match: re.Match[str]) -> str:
+        if _reference_is_quoted(message, match.start()):
+            return match.group(0)
+        mapped = to_source_line(int(match.group(2)))
+        if mapped is None:
+            return match.group(0)
+        return f"{match.group(1)} line {mapped}"
+
+    return _MESSAGE_LINE_REFERENCE.sub(_replace, message)
+
+
+def _exact_source_line(relative: int, line_numbers: Sequence[int]) -> int | None:
+    """The ``.pyxl`` line for block-relative line *relative*, or ``None``.
+
+    Deliberately unlike :func:`_map_lineno`, which clamps an out-of-range
+    number to the block's last line. Clamping is right for a diagnostic's
+    structural position — some line has to be reported, and the last one is the
+    closest true statement available. It is wrong for a number embedded in
+    prose, where "no answer" is representable: a reference the block cannot
+    account for is not a line of the developer's file, and answering with the
+    nearest one would present a fabricated location as a real one.
+    """
+    if 1 <= relative <= len(line_numbers):
+        return line_numbers[relative - 1]
+    return None
+
+
 def _detect_broken_python_in_jsx_segments(
     segments: Sequence[_Segment],
     lines: Sequence[str],
@@ -584,7 +674,7 @@ def _detect_broken_python_in_jsx_segments(
     # ``_segment_has_content`` filtering upstream guarantees every
     # segment has at least one non-blank line, so the empty-segment
     # defensive branch that earlier revisions had is unreachable.
-    for segment in segments:
+    for index, segment in enumerate(segments):
         if segment.kind != "jsx":
             continue
 
@@ -621,13 +711,73 @@ def _detect_broken_python_in_jsx_segments(
         try:
             ast.parse(segment_text)
         except SyntaxError as exc:
+            base = segment.start
+            if isinstance(exc, IndentationError):
+                # The narrow error is about the tear, not the fault — see
+                # ``_reparse_with_python_context``. Only this class is
+                # overridden: any other message is genuinely about the segment.
+                widened = _reparse_with_python_context(segments, index, lines)
+                if widened is not None:
+                    exc, base = widened
             relative_line = exc.lineno or 1
-            absolute_line = segment.start + relative_line
+            absolute_line = base + relative_line
+            # The segment's own lines, in ``.pyxl`` coordinates: it is a
+            # contiguous run, so line N of it is file line ``start + N``. A
+            # number outside that run is not a line of this segment and gets no
+            # answer rather than one extrapolated past its end.
+            segment_lines = range(base + 1, segment.end + 1)
             collector.emit(
-                exc.msg or "invalid syntax",
+                # ``exc.msg`` is CPython's, written against the isolated
+                # segment: "does not match opening parenthesis '[' on line 3"
+                # means the third line *of the segment*. Translate it the same
+                # way the position above is translated, or the message sends
+                # the developer to a line that is perfectly fine.
+                _remap_message_line_refs(
+                    exc.msg or "invalid syntax",
+                    lambda relative: _exact_source_line(relative, segment_lines),
+                ),
                 absolute_line,
                 section="python",
+                # ``SyntaxError.offset`` is already 1-indexed within its line
+                # and needs no segment adjustment (segments only shift lines).
+                # Passing it through is what lets the rebuild print a
+                # ``pages/about.pyxl:7:5`` location an editor can jump to.
+                column=exc.offset,
             )
+
+
+def _reparse_with_python_context(
+    segments: Sequence[_Segment],
+    index: int,
+    lines: Sequence[str],
+) -> tuple[SyntaxError, int] | None:
+    """Re-parse a torn segment together with the Python it was torn from.
+
+    A segment whose first line is *indented* is not a statement anyone wrote at
+    top level — it is the tail of a Python block that ``_find_largest_python_at``
+    could not finish. That walker stops at the largest prefix which parses, so an
+    unclosed bracket makes it stop on the line *before* the bracket's line and
+    hand the remainder over as JSX. Parsing that remainder alone then reports
+    ``unexpected indent``: a true description of the fragment, and a useless one
+    about the file, because the indent is not the mistake — the unclosed bracket
+    two lines up is.
+
+    So widen back over the Python segment this one was torn from and report what
+    CPython says about *that*, which is the text the developer actually wrote.
+    Returns the error and the file line its line numbers are relative to, or
+    ``None`` when there is no preceding Python to widen into or the wider text
+    parses cleanly (in which case the narrow error is still the best available).
+    """
+    previous = segments[index - 1] if index > 0 else None
+    if previous is None or previous.kind == "jsx":
+        return None
+
+    widened = "\n".join(lines[previous.start : segments[index].end])
+    try:
+        ast.parse(widened)
+    except SyntaxError as exc:
+        return exc, previous.start
+    return None
 
 
 def _concat_segments(
@@ -931,6 +1081,38 @@ def _detect_websocket(
     )
 
 
+def _preview_discarded(discarded: str) -> str:
+    """Shorten dropped markup for an error message without losing its shape."""
+    collapsed = " ".join(discarded.split())
+    if len(collapsed) > 80:
+        collapsed = collapsed[:77] + "..."
+    return collapsed
+
+
+def _check_head_entries(
+    entries: Sequence[str], line: int | None, collector: _DiagnosticCollector
+) -> None:
+    """Refuse a ``HEAD`` entry that holds more than one element.
+
+    Only the first element of an entry survives sanitisation — the pass that
+    also discards markup injected after an attribute quote breakout, so it is a
+    security boundary rather than a limitation to work around. An entry with a
+    second element is therefore content the author wrote and no visitor will
+    ever receive. Caught here, while it is a literal in front of them, rather
+    than months later in a rich-results report.
+    """
+    for entry in entries:
+        discarded = find_discarded_head_content(entry)
+        if discarded is None:
+            continue
+        collector.emit(
+            "A HEAD entry may contain only one element; everything after the "
+            "first is dropped. Split it into separate list entries. "
+            f"Dropped: {_preview_discarded(discarded)}",
+            line,
+        )
+
+
 def _extract_head_literal(
     value: ast.AST, line: int | None, collector: _DiagnosticCollector
 ) -> list[str] | None:
@@ -940,6 +1122,7 @@ def _extract_head_literal(
         if literal is None:
             return []
         if isinstance(literal, str):
+            _check_head_entries([literal], line, collector)
             return [literal]
         collector.emit(
             "HEAD must be assigned a string or list of strings", line
@@ -954,6 +1137,7 @@ def _extract_head_literal(
             ):
                 return None
             normalized.append(element.value)
+        _check_head_entries(normalized, line, collector)
         return normalized
 
     return None
@@ -1064,6 +1248,48 @@ def _detect_cache_directive(
     return revalidate
 
 
+def _extract_standalone(
+    tree: ast.Module | None,
+    python_line_numbers: Sequence[int],
+    *,
+    collector: _DiagnosticCollector,
+) -> bool:
+    """Extract a module-level ``STANDALONE = True`` directive.
+
+    Only meaningful on a ``layout.pyxl``. It means "this layout is the root of
+    its own chain" — layouts in ancestor directories are not applied to pages
+    beneath it, and neither are their loaders.
+
+    The case it exists for is a section of a site that is not part of the app
+    around it: a public status page inside an admin console, a print view, an
+    embedded widget. Without it the only options are to wrap that section in
+    the app's chrome, or to teach the root layout to recognise the section and
+    render nothing — a conditional that grows a branch per section and puts
+    knowledge of every child in the parent.
+    """
+    if tree is None:
+        return False
+
+    standalone = False
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(
+            isinstance(target, ast.Name) and target.id == "STANDALONE"
+            for target in node.targets
+        ):
+            continue
+        line = _map_lineno(node.lineno, python_line_numbers)
+        value = node.value
+        if isinstance(value, ast.Constant) and isinstance(value.value, bool):
+            standalone = value.value
+        else:
+            collector.emit(
+                "STANDALONE must be True or False, e.g. STANDALONE = True", line
+            )
+    return standalone
+
+
 # ---------------------------------------------------------------------------
 # JSX metadata extraction (Babel-backed)
 # ---------------------------------------------------------------------------
@@ -1081,6 +1307,12 @@ class _JsxMetadata:
     #: syntax in the client block, else ``None``. Surfaced by ``parse_text`` as a
     #: source-located diagnostic once the Python section is confirmed clean.
     ts_violation: tuple[str, int | None] | None = None
+    #: ``(message, jsx_relative_line)`` when Babel could not parse the JSX at
+    #: all, else ``None``. Costs nothing to know: the extractor pass that reads
+    #: ``<Head>``/``<Script>``/``<Image>``/``<Suspense>`` runs on every compile
+    #: and has to parse the section to do it, so a failure here is a judgement
+    #: it has already made and used to return empty metadata.
+    syntax_error: tuple[str, int | None] | None = None
 
 
 # Element names that opt a page into streaming SSR. ``React.Suspense`` is the
@@ -1106,14 +1338,24 @@ def _detect_jsx_metadata(jsx_code: str) -> _JsxMetadata:
     if result.error:
         # TypeScript syntax in the client block is a real, surfaceable user
         # error (Babel accepts it but esbuild later fails opaquely). Carry it
-        # out so ``parse_text`` can emit a source-located diagnostic. Every
-        # other extractor failure (unavailable toolchain, genuine JSX syntax
-        # error already surfaced elsewhere) keeps degrading silently here.
+        # out so ``parse_text`` can emit a source-located diagnostic.
         if result.error_code == "ts_in_client_block":
             return _JsxMetadata(
                 (), (), (), False, ts_violation=(result.error, result.error_line)
             )
-        return _JsxMetadata((), (), (), False)
+        if not result.toolchain_available:
+            # The *checker* failed, not the page. Degrade silently: turning a
+            # missing Node install into a compile error would fail every file
+            # in the project on a machine that has no Node at all.
+            return _JsxMetadata((), (), (), False)
+        # Babel ran and could not parse the section. Carry it out the same way:
+        # the alternative is what shipped before — returning empty metadata, so
+        # the page's <Head>, <Script>, <Image> and <Suspense> were all silently
+        # dropped and the failure only appeared later, from the bundler, against
+        # the generated .jsx.
+        return _JsxMetadata(
+            (), (), (), False, syntax_error=(result.error, result.error_line)
+        )
 
     components = result.components
     scripts = tuple(
@@ -1137,6 +1379,42 @@ def _detect_jsx_metadata(jsx_code: str) -> _JsxMetadata:
         component.name in _SUSPENSE_ELEMENT_NAMES for component in components
     )
     return _JsxMetadata(scripts, images, head_blocks, uses_suspense)
+
+
+def _map_jsx_line(
+    jsx_relative_line: int | None, jsx_line_numbers: Sequence[int]
+) -> int | None:
+    """Translate a line within the extracted JSX section to a ``.pyxl`` line.
+
+    Every JSX-side tool — Babel here, esbuild later — numbers lines from the
+    start of the *section* it was handed, not from the start of the file the
+    developer is editing. Reporting that number unmapped points at the wrong
+    line of the right file. Falls back to the section's first line when there
+    is no line or it is out of range, so a diagnostic never points nowhere.
+    """
+
+    if (
+        jsx_relative_line is not None
+        and 0 <= jsx_relative_line - 1 < len(jsx_line_numbers)
+    ):
+        return jsx_line_numbers[jsx_relative_line - 1]
+    return jsx_line_numbers[0] if jsx_line_numbers else None
+
+
+def _remap_jsx_message(message: str, jsx_line_numbers: Sequence[int]) -> str:
+    """Translate any line number written into a JSX tool's own message.
+
+    The extractor already strips Babel's trailing ``(line:column)`` — that
+    coordinate is section-relative and the compiler reports the real one
+    separately. This covers the rest: any message that names a line in prose
+    (its own, or one a future extractor rule adds) gets the same section →
+    file translation the structural position gets. A reference outside the
+    section is left alone rather than clamped to its first line, so a stray
+    number can never masquerade as a real location.
+    """
+    return _remap_message_line_refs(
+        message, lambda relative: _exact_source_line(relative, jsx_line_numbers)
+    )
 
 
 def _validate_jsx_syntax(
@@ -1170,7 +1448,9 @@ def _validate_jsx_syntax(
     ):
         line = jsx_line_numbers[result.error_line - 1]
     collector.emit(
-        f"JSX syntax error: {result.error}", line, section="jsx"
+        f"JSX syntax error: {_remap_jsx_message(result.error, jsx_line_numbers)}",
+        line,
+        section="jsx",
     )
 
 
@@ -1178,7 +1458,10 @@ def _validate_jsx_syntax(
 #: ``compiler/writers.py``). pyflakes must treat them as defined so ``@server`` /
 #: ``@action`` / ``raise ActionError(...)`` / ``raise LoaderError(...)`` never
 #: read as undefined even when the user hasn't written an import.
-_INJECTED_RUNTIME_NAMES = frozenset(
+#:
+#: Public so editor tooling (pyxle-langkit) whitelists exactly the same names
+#: the compiler injects, instead of keeping a copy that can drift.
+INJECTED_RUNTIME_NAMES = frozenset(
     {
         "server",
         "action",
@@ -1188,6 +1471,71 @@ _INJECTED_RUNTIME_NAMES = frozenset(
         "invalidate_routes",
     }
 )
+
+
+#: pyflakes message classes that describe code which will **fail when it runs**
+#: — a NameError, an UnboundLocalError, a TypeError from a bad format string, or
+#: a construct CPython rejects outright. These are the only semantic findings
+#: reported as ``severity="error"``.
+#:
+#: Everything pyflakes can report that is *not* listed here is a warning: the
+#: code runs correctly, it is merely untidy (an unused import, a dead local, a
+#: duplicate dict key, an f-string with no placeholders). That split is what
+#: lets ``pyxle check`` gate a deploy on real breakage without a leftover
+#: ``import json`` blocking a release.
+#:
+#: An unrecognised message class — a rule added by a future pyflakes — is
+#: treated as a **warning**, deliberately. A new hygiene rule must never turn
+#: into a surprise deploy blocker on a dependency upgrade; the finding is still
+#: printed, it just doesn't fail the run.
+_PYFLAKES_ERROR_MESSAGES: frozenset[str] = frozenset(
+    {
+        # Unresolved references — NameError / UnboundLocalError at runtime.
+        "UndefinedName",
+        "UndefinedLocal",
+        "UndefinedExport",
+        # Constructs CPython itself rejects (normally caught by ast.parse
+        # first; listed so they stay errors on any path that reaches here).
+        "BreakOutsideLoop",
+        "ContinueOutsideLoop",
+        "ReturnOutsideFunction",
+        "YieldOutsideFunction",
+        "DefaultExceptNotLast",
+        "DuplicateArgument",
+        "FutureFeatureNotDefined",
+        "LateFutureImport",
+        "ImportStarNotPermitted",
+        "TooManyExpressionsInStarredAssignment",
+        "TwoStarredExpressions",
+        "ForwardAnnotationSyntaxError",
+        "DoctestSyntaxError",
+        # Raises the moment the line executes.
+        "RaiseNotImplemented",
+        "InvalidPrintSyntax",
+        "PercentFormatInvalidFormat",
+        "PercentFormatExpectedMapping",
+        "PercentFormatExpectedSequence",
+        "PercentFormatExtraNamedArguments",
+        "PercentFormatMissingArgument",
+        "PercentFormatMixedPositionalAndNamed",
+        "PercentFormatPositionalCountMismatch",
+        "PercentFormatStarRequiresSequence",
+        "PercentFormatUnsupportedFormatCharacter",
+        "StringDotFormatInvalidFormat",
+        "StringDotFormatMissingArgument",
+        "StringDotFormatMixingAutomatic",
+    }
+)
+
+
+def _pyflakes_severity(message: object) -> Literal["error", "warning"]:
+    """Classify one pyflakes message as an error or a warning.
+
+    See :data:`_PYFLAKES_ERROR_MESSAGES` for the rule and its rationale.
+    """
+    if type(message).__name__ in _PYFLAKES_ERROR_MESSAGES:
+        return "error"
+    return "warning"
 
 
 def _validate_python_semantics(
@@ -1216,7 +1564,7 @@ def _validate_python_semantics(
         return
 
     try:
-        checker = Checker(tree, filename="<pyxl>", builtins=_INJECTED_RUNTIME_NAMES)
+        checker = Checker(tree, filename="<pyxl>", builtins=INJECTED_RUNTIME_NAMES)
     except Exception:  # noqa: BLE001 — never let a linter crash the parse
         return
 
@@ -1225,8 +1573,16 @@ def _validate_python_semantics(
             text = message.message % message.message_args
         except (TypeError, ValueError):  # pragma: no cover - defensive
             text = str(message.message)
+        # Several pyflakes findings name a *second* location in their prose
+        # ("redefinition of unused 'os' from line 1"), taken from the joined
+        # Python stream this checker was handed — not from the ``.pyxl``.
+        text = _remap_message_line_refs(
+            text, lambda relative: _exact_source_line(relative, python_line_numbers)
+        )
         line = _map_lineno(getattr(message, "lineno", None), python_line_numbers)
-        collector.emit(text, line, section="python")
+        collector.emit(
+            text, line, section="python", severity=_pyflakes_severity(message)
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1244,6 +1600,7 @@ class PyxParser:
         tolerant: bool = False,
         validate_jsx: bool = False,
         validate_semantics: bool = False,
+        report_jsx_syntax: bool = False,
     ) -> PyxParseResult:
         """Parse a ``.pyxl`` file from disk into a :class:`PyxParseResult`.
 
@@ -1271,6 +1628,7 @@ class PyxParser:
             tolerant=tolerant,
             validate_jsx=validate_jsx,
             validate_semantics=validate_semantics,
+            report_jsx_syntax=report_jsx_syntax,
         )
 
     def parse_text(
@@ -1280,8 +1638,15 @@ class PyxParser:
         tolerant: bool = False,
         validate_jsx: bool = False,
         validate_semantics: bool = False,
+        report_jsx_syntax: bool = False,
     ) -> PyxParseResult:
-        """Parse a ``.pyxl`` source string into a :class:`PyxParseResult`."""
+        """Parse a ``.pyxl`` source string into a :class:`PyxParseResult`.
+
+        ``report_jsx_syntax`` turns a JSX section Babel cannot parse into a
+        source-located error instead of silently-empty JSX metadata. It reuses
+        the extractor pass that already runs, so it spawns nothing extra; it is
+        a flag only so the production build path keeps its current behaviour.
+        """
         lines = _normalize_newlines(text)
         collector = _DiagnosticCollector(tolerant=tolerant)
 
@@ -1349,6 +1714,9 @@ class PyxParser:
         cache_revalidate = _detect_cache_directive(
             tree, python_line_numbers, collector=collector
         )
+        standalone = _extract_standalone(
+            tree, python_line_numbers, collector=collector
+        )
 
         # Layer 5: JSX metadata + optional Babel validation.
         jsx_metadata = _detect_jsx_metadata(jsx_code)
@@ -1374,15 +1742,40 @@ class PyxParser:
         # as a type annotation.
         if jsx_metadata.ts_violation is not None and not has_python_errors:
             ts_message, ts_jsx_line = jsx_metadata.ts_violation
-            if (
-                ts_jsx_line is not None
-                and 0 <= ts_jsx_line - 1 < len(jsx_line_numbers)
-            ):
-                mapped_line: int | None = jsx_line_numbers[ts_jsx_line - 1]
-            else:
-                mapped_line = jsx_line_numbers[0] if jsx_line_numbers else None
-            collector.emit(ts_message, mapped_line, section="jsx")
-        if validate_jsx and jsx_code.strip() and not has_python_errors:
+            collector.emit(
+                _remap_jsx_message(ts_message, jsx_line_numbers),
+                _map_jsx_line(ts_jsx_line, jsx_line_numbers),
+                section="jsx",
+            )
+        # A JSX section Babel could not parse. Reported from the metadata pass
+        # that already parsed it, so this costs no extra Node subprocess — the
+        # spawn happens on every compile regardless, to read <Head>/<Script>/
+        # <Image>/<Suspense>. Opt-in (``report_jsx_syntax``) purely so the
+        # production build path keeps its existing behaviour and cannot be
+        # newly broken by a parser disagreement between Babel and esbuild.
+        reported_jsx_syntax = False
+        if (
+            report_jsx_syntax
+            and jsx_metadata.syntax_error is not None
+            and not has_python_errors
+        ):
+            jsx_message, jsx_error_line = jsx_metadata.syntax_error
+            located_jsx_message = _remap_jsx_message(jsx_message, jsx_line_numbers)
+            collector.emit(
+                f"JSX syntax error: {located_jsx_message}",
+                _map_jsx_line(jsx_error_line, jsx_line_numbers),
+                section="jsx",
+            )
+            reported_jsx_syntax = True
+        if (
+            validate_jsx
+            and jsx_code.strip()
+            and not has_python_errors
+            and not reported_jsx_syntax
+        ):
+            # Skipped when the metadata pass already reported the same failure:
+            # it would spawn Babel a second time to rediscover it and emit a
+            # duplicate diagnostic for one error.
             _validate_jsx_syntax(
                 jsx_code, jsx_line_numbers, collector=collector
             )
@@ -1415,6 +1808,7 @@ class PyxParser:
             actions=actions,
             websocket=websocket,
             cache_revalidate=cache_revalidate,
+            standalone=standalone,
             uses_suspense=jsx_metadata.uses_suspense,
             diagnostics=diagnostics,
         )
