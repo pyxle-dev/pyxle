@@ -9,7 +9,7 @@ import socket
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import uvicorn
 
@@ -25,7 +25,6 @@ from .dev_origins import (
 from .registry import build_metadata_registry
 from .routes import RouteTable, build_route_table
 from .settings import DevServerSettings
-from .starlette_app import create_starlette_app
 from .tailwind import TailwindProcess, detect_postcss_config, detect_tailwind_config
 from .vite import ViteProcess
 from .watcher import ProjectWatcher, WatcherStatistics
@@ -169,7 +168,19 @@ class DevServer:
                     vite_owns_css=vite_owns_stylesheets(settings),
                 )
 
-            app = create_starlette_app(settings, route_table, logger=logger, pool=_pool)
+            # Resolved through the package object, not a direct submodule
+            # import, for two reasons at once. Deferring it is what breaks the
+            # import cycle (see ``__getattr__`` at the bottom of this module).
+            # Reading it as an *attribute of this package* is what keeps
+            # ``monkeypatch.setattr("pyxle.devserver.create_starlette_app", ...)``
+            # working: a patched attribute lives in the module ``__dict__`` and
+            # is found before ``__getattr__`` is ever consulted, so the seam the
+            # tests use survives the fix.
+            from pyxle import devserver as _package  # noqa: PLC0415
+
+            app = _package.create_starlette_app(
+                settings, route_table, logger=logger, pool=_pool
+            )
             # Seed the gate from the startup build, so a page that was already
             # broken before the server started is refused from the first
             # request rather than only after the next save.
@@ -893,3 +904,22 @@ def _maybe_schedule_reload(overlay, loop, stats: WatcherStatistics) -> bool:
 
 
 __all__ = ["DevServer", "DevServerSettings", "ProjectWatcher"]
+
+
+def __getattr__(name: str) -> Any:
+    """Lazily expose ``create_starlette_app`` without importing it at module scope.
+
+    ``starlette_app`` imports ``pyxle.ssr``, which imports back into this
+    package for ``dev_origins`` and ``error_pages``. Importing it eagerly here
+    made that cycle real: ``import pyxle.ssr.view`` from a cold interpreter
+    found a partially initialised module and raised. Resolving it on first
+    attribute access breaks the edge while leaving the name exactly where every
+    existing caller and test expects to find it.
+
+    Same pattern as :mod:`pyxle.ssr`, which defers its own heavy submodules.
+    """
+    if name == "create_starlette_app":
+        from .starlette_app import create_starlette_app  # noqa: PLC0415
+
+        return create_starlette_app
+    raise AttributeError(f"module '{__name__}' has no attribute '{name}'")

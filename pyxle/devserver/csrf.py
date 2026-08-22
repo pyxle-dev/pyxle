@@ -77,16 +77,14 @@ _logger = logging.getLogger(__name__)
 def _is_https(scope: Scope) -> bool:
     """Whether this request reached us over TLS.
 
-    Reads ``X-Forwarded-Proto`` first, because the overwhelmingly common
-    production shape is a TLS-terminating proxy speaking plain HTTP to the app
-    — where the ASGI scheme says ``http`` and the *browser's* connection was
-    HTTPS all along. Falls back to the scheme the server itself sees.
+    Delegates to :func:`pyxle.devserver.dev_origins.request_is_https` so the
+    forwarded-proto rule lives in exactly one place. ``/llms.txt`` needs the
+    same answer to build absolute URLs, and a second copy of this logic is how
+    two surfaces end up disagreeing about whether the client used HTTPS.
     """
-    for name, value in scope.get("headers", ()):
-        if name == b"x-forwarded-proto":
-            first = value.decode("latin-1").split(",")[0].strip().lower()
-            return first == "https"
-    return str(scope.get("scheme", "")).lower() in ("https", "wss")
+    from pyxle.devserver.dev_origins import request_is_https  # noqa: PLC0415
+
+    return request_is_https(scope)
 
 
 class CsrfMiddleware:
@@ -141,6 +139,7 @@ class CsrfMiddleware:
         self._cookie_secure = cookie_secure
         self._cookie_samesite = cookie_samesite
         self._exempt_paths: tuple[str, ...] = tuple(exempt_paths)
+        self._warned_samesite_none = False
 
         if not self._secret:
             _logger.warning(
@@ -262,17 +261,51 @@ class CsrfMiddleware:
                 # public`; those routes render no per-user data and any
                 # state-changing actions on them must be CSRF-exempt.
                 if not _is_public_cacheable(headers):
+                    https = _is_https(scope)
+                    samesite_none = self._cookie_samesite.lower() == "none"
                     cookie_value = (
                         f"{cookie_name}={token}; Path=/"
                         f"; SameSite={self._cookie_samesite}"
                     )
-                    if self._cookie_secure and _is_https(scope):
+                    # ``SameSite=None`` *must* carry ``Secure``: the spec
+                    # requires the pair, and every current browser rejects the
+                    # cookie without it. The ``_is_https`` guard below exists
+                    # because withholding ``Secure`` keeps a plain-HTTP cookie
+                    # alive — true for ``lax``/``strict``, and impossible for
+                    # ``none``, which the browser drops either way. Sending the
+                    # spec-correct header at least makes devtools say why.
+                    if samesite_none or (self._cookie_secure and https):
                         cookie_value += "; Secure"
+                    if samesite_none and not https:
+                        self._warn_samesite_none_over_http()
                     headers.append((b"set-cookie", cookie_value.encode("latin-1")))
                     message = {**message, "headers": headers}
             await send(message)
 
         await self.app(scope, downstream_receive, send_with_cookie)
+
+    def _warn_samesite_none_over_http(self) -> None:
+        """Say, once, that this cookie is being thrown away by the browser.
+
+        ``cookieSameSite: "none"`` on a plain-HTTP origin is not a weaker
+        setting — it is a *broken* one. The browser discards the cookie, the
+        double-submit token never reaches the client, and every ``@action``
+        fails its CSRF check while the page itself renders perfectly. That is
+        the same shape as the ``Secure``-over-HTTP bug this middleware already
+        guards against: nothing errors, so there is nothing to search for.
+        """
+        if self._warned_samesite_none:
+            return
+        self._warned_samesite_none = True
+        _logger.warning(
+            "CsrfMiddleware: csrf.cookieSameSite is 'none' but this request "
+            "did not arrive over HTTPS. A SameSite=None cookie must also be "
+            "Secure, and a Secure cookie is dropped over plain HTTP — so the "
+            "CSRF cookie is being discarded by the browser and every @action "
+            "will fail its CSRF check with no error of its own. Serve over "
+            "HTTPS (or set X-Forwarded-Proto on your TLS-terminating proxy), "
+            "or use csrf.cookieSameSite 'lax'."
+        )
 
     def _is_exempt(self, path: str) -> bool:
         """Return ``True`` when ``path`` is CSRF-exempt.

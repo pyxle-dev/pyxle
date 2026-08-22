@@ -741,6 +741,62 @@ class TestCookieAndScopeBehavior:
         assert downstream_called == ["lifespan"]
 
 
+def _build_app_with_samesite(value: str) -> Starlette:
+    async def get_handler(request: Request) -> PlainTextResponse:
+        return PlainTextResponse("ok")
+
+    return Starlette(
+        routes=[Route("/page", get_handler, methods=["GET"])],
+        middleware=[
+            Middleware(CsrfMiddleware, secret="s", cookie_samesite=value),
+        ],
+    )
+
+
+class TestSameSiteNoneIsAlwaysPairedWithSecure:
+    """``SameSite=None`` without ``Secure`` is a cookie the browser throws away.
+
+    Verified in a real headless Firefox before the fix: with
+    ``cookieSameSite: "none"`` on a plain-HTTP dev server the browser kept
+    **zero** cookies while the page rendered perfectly — and with ``lax`` on the
+    same server it kept the CSRF cookie. So the token never reaches the client
+    and every ``@action`` fails its CSRF check, with nothing in the terminal or
+    the console to say why.
+
+    The fix cannot make ``None`` *work* over HTTP — nothing can. It makes the
+    header spec-correct so devtools names the reason, and warns once.
+    """
+
+    def test_samesite_none_carries_secure_even_without_tls(self):
+        client = TestClient(_build_app_with_samesite("none"), base_url="http://testserver")
+        set_cookie = client.get("/page").headers.get("set-cookie", "")
+        assert "SameSite=none" in set_cookie
+        assert "Secure" in set_cookie
+
+    def test_samesite_none_over_plain_http_warns_once(self, caplog):
+        client = TestClient(_build_app_with_samesite("none"), base_url="http://testserver")
+        with caplog.at_level("WARNING", logger="pyxle.devserver.csrf"):
+            for _ in range(4):
+                client.get("/page")
+        hits = [r for r in caplog.records if "cookieSameSite is 'none'" in r.getMessage()]
+        assert len(hits) == 1, f"expected exactly one warning, got {len(hits)}"
+        assert "@action" in hits[0].getMessage()
+
+    def test_lax_over_plain_http_is_untouched(self, caplog):
+        """The guard: the existing ``Secure``-withholding behaviour must stand.
+
+        Withholding ``Secure`` over HTTP is deliberate and load-bearing for
+        ``lax``/``strict`` — it is what keeps a plain-HTTP production server's
+        forms working. Widening the ``None`` fix into those must fail here.
+        """
+        client = TestClient(_build_app_with_samesite("lax"), base_url="http://testserver")
+        with caplog.at_level("WARNING", logger="pyxle.devserver.csrf"):
+            set_cookie = client.get("/page").headers.get("set-cookie", "")
+        assert "SameSite=lax" in set_cookie
+        assert "Secure" not in set_cookie
+        assert not [r for r in caplog.records if "cookieSameSite" in r.getMessage()]
+
+
 def _build_app_with_secure_cookie() -> Starlette:
     async def get_handler(request: Request) -> PlainTextResponse:
         return PlainTextResponse("ok")
