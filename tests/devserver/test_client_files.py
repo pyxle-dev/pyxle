@@ -1748,3 +1748,70 @@ class TestApiRoutesAreNotNavigablePages:
         # Declining the click is what makes the fallback work: the browser
         # follows the link itself and the page renders from the server.
         assert page["clickIntercepted"] is False
+
+
+class TestOverlayPageScoping:
+    """The overlay's page-scoping decision, executed rather than asserted on.
+
+    The overlay belongs to the page whose render failed: a broken ``/reports``
+    must not cover a working ``/``. That decision is made in the browser, so a
+    string match on the generated source would keep passing if the comparison
+    were inverted or dropped. These run the emitted function under Node and
+    check what it actually returns.
+    """
+
+    @staticmethod
+    def _applies_here(tmp_path: Path, *, request_path: str | None, pathname: str) -> bool:
+        entry = _render_client_entry(create_project(tmp_path))
+        function_text = _extract_js_function(entry, "overlayAppliesHere")
+        event: dict[str, str] = {}
+        if request_path is not None:
+            event["requestPath"] = request_path
+
+        script = tmp_path / "overlay-scope.mjs"
+        script.write_text(
+            "globalThis.window = { location: { pathname: "
+            + json.dumps(pathname)
+            + " } };\n"
+            + function_text
+            + "\nconsole.log(JSON.stringify(overlayAppliesHere("
+            + json.dumps(event)
+            + ")));\n",
+            encoding="utf-8",
+        )
+        completed = subprocess.run(
+            [str(shutil.which("node")), str(script)],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=30,
+        )
+        return json.loads(completed.stdout.strip())
+
+    @pytest.mark.skipif(
+        shutil.which("node") is None,
+        reason="Node.js is required to execute the generated client runtime",
+    )
+    def test_overlay_stays_off_a_page_that_did_not_fail(self, tmp_path: Path) -> None:
+        """The case the fix exists for. A render that failed on ``/reports``
+        must not put an overlay over ``/``, which renders fine."""
+        assert self._applies_here(tmp_path, request_path="/reports", pathname="/") is False
+
+    @pytest.mark.skipif(
+        shutil.which("node") is None,
+        reason="Node.js is required to execute the generated client runtime",
+    )
+    def test_overlay_shows_on_the_page_that_failed(self, tmp_path: Path) -> None:
+        """Scoping must not go so far that the error hides on its own page."""
+        assert (
+            self._applies_here(tmp_path, request_path="/reports", pathname="/reports") is True
+        )
+
+    @pytest.mark.skipif(
+        shutil.which("node") is None,
+        reason="Node.js is required to execute the generated client runtime",
+    )
+    def test_an_error_bound_to_no_url_still_shows_everywhere(self, tmp_path: Path) -> None:
+        """A failed rebuild breaks every page, so it carries no ``requestPath``
+        and must keep showing wherever the developer happens to be."""
+        assert self._applies_here(tmp_path, request_path=None, pathname="/") is True
