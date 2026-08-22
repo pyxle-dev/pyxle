@@ -336,11 +336,16 @@ class _NodeComponentRuntime:
                 f"Unable to serialize props for component '{self._component_path.name}'"
             ) from exc
 
+        # Props travel over stdin, never argv. On Linux ``/proc/<pid>/cmdline``
+        # is world-readable, so a command-line argument publishes whatever the
+        # page's loader returned to every local user for the life of the render.
+        # Large props also used to blow ARG_MAX and fail the spawn outright with
+        # a bare ``OSError`` instead of rendering. ``SsrWorkerPool`` already
+        # frames its requests over a pipe for the same reason.
         command = [
             self._node_executable,
             str(self._runtime_script),
             str(self._component_path),
-            serialized_props,
             str(self._client_root),
             str(self._project_root),
         ]
@@ -362,6 +367,7 @@ class _NodeComponentRuntime:
             process = subprocess.run(  # noqa: S603 - controlled command invocation
                 command,
                 cwd=str(self._project_root),
+                input=serialized_props,
                 capture_output=True,
                 text=True,
                 # Pin UTF-8 so the SSR transport never depends on the system

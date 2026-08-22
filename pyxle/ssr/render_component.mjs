@@ -215,8 +215,24 @@ function buildCssModuleExports(css, filename) {
   return exportsMap;
 }
 
+/**
+ * Read the serialized props from stdin.
+ *
+ * Props are *not* an argv slot: ``/proc/<pid>/cmdline`` is world-readable on
+ * Linux, so passing loader output on the command line publishes it to every
+ * local user, and props larger than ARG_MAX fail the spawn outright. The
+ * ``isTTY`` guard keeps a hand-run of this script from hanging on a terminal
+ * that will never send EOF.
+ */
+async function readPropsFromStdin() {
+  if (process.stdin.isTTY) return '';
+  const chunks = [];
+  for await (const chunk of process.stdin) chunks.push(chunk);
+  return Buffer.concat(chunks).toString('utf-8').trim();
+}
+
 async function render() {
-  const [, , componentPath, propsJson, clientRoot, projectRootArg] = process.argv;
+  const [, , componentPath, clientRoot, projectRootArg] = process.argv;
 
   if (!componentPath) {
     throw new Error('Missing component path argument.');
@@ -224,6 +240,7 @@ async function render() {
 
   redirectConsoleToStderr();
 
+  const propsJson = await readPropsFromStdin();
   const props = propsJson ? JSON.parse(propsJson) : {};
   const workingDir = clientRoot ? path.resolve(clientRoot) : path.dirname(componentPath);
   const projectRoot = resolveProjectRoot(projectRootArg, workingDir, componentPath);
@@ -385,8 +402,9 @@ export default entry.contents;
 
     // Expose the request pathname / CSRF token to SSR code (e.g.
     // usePathname, <Form>'s hidden field). The subprocess renderer
-    // receives both via env vars because the argv signature is stable
-    // and argv already carries large JSON props.
+    // receives both via env vars, which keeps the argv signature stable
+    // and — like the props now travelling over stdin — keeps a CSRF
+    // token out of the world-readable /proc/<pid>/cmdline.
     const requestPathname = process.env.PYXLE_REQUEST_PATHNAME;
     const csrfToken = process.env.PYXLE_CSRF_TOKEN;
     const previousPathname = globalThis.__PYXLE_CURRENT_PATHNAME__;

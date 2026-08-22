@@ -2,6 +2,20 @@
 
 Release notes for Pyxle. While we're in beta (`0.x`), minor versions may include breaking changes — those are called out explicitly. To upgrade, run `pip install --upgrade pyxle-framework`.
 
+## Unreleased
+
+- **Fix: per-request SSR mode no longer puts loader data on the Node command
+  line.** In per-request subprocess mode (`--ssr-workers 0`) a page's loader
+  output was handed to the SSR runtime as a command-line argument. On Linux
+  `/proc/<pid>/cmdline` is world-readable, so any other local user could read
+  whatever that loader returned for as long as the render lived, and props
+  larger than the operating system's argument limit — 2 MiB on a typical Linux
+  box — failed the spawn outright with a raw `OSError` instead of rendering.
+  Props now travel over stdin: the transport the architecture guide already
+  described, and the one the default worker pool has always used. The default
+  mode (`--ssr-workers 1` and above) and `pyxle serve` were never affected —
+  both frame their requests over a pipe.
+
 ## 0.9.3
 
 - **Fix: the root `vite.config.js` now loads *after* a build too.** 0.9.2 stopped

@@ -730,3 +730,80 @@ class TestNamingTheComponentThatRaised:
 
         assert _authored_frame_name("") is None
         assert _authored_frame_name("ReferenceError: boom") is None
+
+
+def test_node_runtime_sends_props_over_stdin_not_argv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Loader output must never reach the subprocess command line.
+
+    ``/proc/<pid>/cmdline`` is world-readable on Linux, so props in argv publish
+    whatever the page's loader returned - session tokens, user records - to every
+    local user for the life of the render. Asserting on the *transport* rather
+    than on a rendered string is what makes this bite: a regression that moves
+    props back into argv still renders perfectly.
+    """
+    component = tmp_path / "project" / ".pyxle-build" / "client" / "pages" / "stdin.jsx"
+    component.parent.mkdir(parents=True, exist_ok=True)
+    component.write_text("export default () => null;\n", encoding="utf-8")
+
+    monkeypatch.setattr(renderer_module, "_resolve_node_executable", lambda: "node")
+    monkeypatch.setattr(renderer_module, "_resolve_runtime_script", lambda: component)
+
+    captured: dict[str, object] = {}
+
+    class DummyProcess:
+        returncode = 0
+        stdout = '{"ok": true, "html": "<p>ok</p>"}'
+        stderr = ""
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        captured["input"] = kwargs.get("input")
+        return DummyProcess()
+
+    monkeypatch.setattr(renderer_module.subprocess, "run", fake_run)
+
+    secret = "session-token-do-not-leak"
+    renderer_module._NodeComponentRuntime(component).render({"session": secret})
+
+    command = captured["command"]
+    assert isinstance(command, list)
+    assert not any(secret in part for part in command), (
+        f"props leaked onto the command line: {command!r}"
+    )
+    assert secret in (captured["input"] or ""), "props were not delivered over stdin"
+
+
+@pytest.mark.anyio
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is required for SSR rendering tests")
+async def test_renderer_handles_props_larger_than_arg_max(tmp_path: Path) -> None:
+    """Props above ARG_MAX used to fail the spawn with a bare ``OSError``.
+
+    ``getconf ARG_MAX`` is 2 MiB on a typical Linux box, so a page whose loader
+    returns a few megabytes - a large query result - could not render at all.
+    Over stdin there is no such ceiling.
+    """
+    project_root = tmp_path / "project"
+    component = project_root / ".pyxle-build" / "client" / "pages" / "big.jsx"
+    component.parent.mkdir(parents=True, exist_ok=True)
+    component.write_text(
+        dedent(
+            """
+            import React from 'react';
+
+            export default function Big({ blob }) {
+                return <section data-size={String(blob.length)}>ok</section>;
+            }
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    ensure_test_node_modules(project_root)
+
+    blob = "x" * (3 * 1024 * 1024)
+    result = await ComponentRenderer().render(component, {"blob": blob})
+
+    assert f'data-size="{len(blob)}"' in result.html
