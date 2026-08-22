@@ -690,9 +690,18 @@ def _render_vite_config(settings: DevServerSettings) -> str:
             import react from '@vitejs/plugin-react';{tailwind_import}
             import fs from 'node:fs';
             import path from 'node:path';
-            import {{ pathToFileURL }} from 'node:url';
+            import {{ fileURLToPath, pathToFileURL }} from 'node:url';
 
-            const clientRoot = __dirname;
+            // ESM, not CommonJS: the project's package.json says
+            // "type": "module", so `__dirname` is not defined here. Vite
+            // happens to inject it when it bundles this file as the config it
+            // was handed directly — which is how `pyxle dev` and `pyxle build`
+            // load it, and why the gap stayed invisible. The root
+            // `vite.config.js` reaches this file through a runtime dynamic
+            // `import()` instead, which no bundler rewrites, so `__dirname`
+            // was genuinely undefined for every ecosystem tool that loads the
+            // project's config — the exact audience that file exists for.
+            const clientRoot = path.dirname(fileURLToPath(import.meta.url));
             const projectRoot = path.resolve(clientRoot, '..', '..');
             const pyxleClientDir = path.resolve(clientRoot, 'pyxle');
             const base = process.env.PYXLE_VITE_BASE ?? '/';

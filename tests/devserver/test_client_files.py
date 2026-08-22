@@ -565,6 +565,34 @@ def test_vite_config_aliases_cover_client_runtime(tmp_path: Path) -> None:
     assert "find: 'pyxle/client'" not in vite_config
 
 
+def test_vite_config_is_valid_esm_and_never_uses_dirname(tmp_path: Path) -> None:
+    """The generated config must not rely on `__dirname`.
+
+    A scaffolded project's package.json declares ``"type": "module"``, so this
+    ``.js`` file is ESM and ``__dirname`` does not exist in it. Vite injects one
+    when it *bundles* the file as the config it was handed directly — which is
+    how ``pyxle dev`` and ``pyxle build`` load it, and why this stayed invisible
+    for so long. The project's root ``vite.config.js`` reaches it through a
+    runtime dynamic ``import()``, which nothing rewrites, so every ecosystem
+    tool that loads the project config (``shadcn`` framework detection, editor
+    integrations — the audience that file exists to serve) got
+    ``__dirname is not defined in ES module scope``.
+
+    Assert on code, not on the whole text, so the explanatory comment naming
+    ``__dirname`` cannot make this test vacuous.
+    """
+    vite_config = _render_vite_config(tmp_path and create_project(tmp_path))
+
+    code = "\n".join(
+        line
+        for line in vite_config.splitlines()
+        if not line.lstrip().startswith("//")
+    )
+    assert "__dirname" not in code
+    assert "fileURLToPath" in code
+    assert "const clientRoot = path.dirname(fileURLToPath(import.meta.url));" in code
+
+
 def _write_package_json(root: Path, *, tailwind: bool) -> None:
     dev = {"vite": "^7"}
     if tailwind:
@@ -1357,7 +1385,10 @@ def test_vite_config_embeds_pyxl_sourcemap_plugin(tmp_path: Path) -> None:
     assert "if (!mappedLines.has(i + 1)) srcLines[i] = '';" in config
     # The plugin's runtime imports are part of the config prelude.
     assert "import fs from 'node:fs';" in config
-    assert "import { pathToFileURL } from 'node:url';" in config
+    # `fileURLToPath` joined this import when the config stopped using
+    # `__dirname` (see test_vite_config_is_valid_esm_and_never_uses_dirname).
+    # What matters here is that the sourcemap plugin's dependency is imported.
+    assert "import { fileURLToPath, pathToFileURL } from 'node:url';" in config
 
 
 @pytest.mark.skipif(
