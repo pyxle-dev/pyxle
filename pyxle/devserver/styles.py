@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -89,6 +92,78 @@ def resolve_global_stylesheets(
         )
 
     return tuple(resolved)
+
+
+
+#: Where a project's own source lives when ``jsconfig.json`` does not say.
+#: ``pages`` is deliberately absent: it is compiled into the Vite root, so
+#: Tailwind already finds it.
+_DEFAULT_SOURCE_DIRS: tuple[str, ...] = ("components", "lib")
+
+_TAILWIND_IMPORT = re.compile(r"""^[ \t]*@import[ \t]+["']tailwindcss["'][^\n]*$""", re.M)
+
+#: Marks our injected block so a second copy does not stack another one.
+_SOURCE_MARKER = "/* pyxle: Tailwind source roots (generated) */"
+
+
+def _jsconfig_include(project_root: Path) -> list[str]:
+    """Directory names listed in ``jsconfig.json``'s ``include``."""
+    try:
+        data = json.loads((project_root / "jsconfig.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    include = data.get("include")
+    if not isinstance(include, list):
+        return []
+    return [entry for entry in include if isinstance(entry, str)]
+
+
+def project_source_dirs(project_root: Path) -> list[Path]:
+    """Existing directories holding the project's own source files.
+
+    Taken from ``jsconfig.json``'s ``include`` — the same declaration the editor
+    and shadcn/ui read — falling back to a conventional default. ``pages`` is
+    dropped: its compiled output already sits under the Vite root.
+    """
+    names = _jsconfig_include(project_root) or list(_DEFAULT_SOURCE_DIRS)
+    dirs: list[Path] = []
+    for name in names:
+        if name == "pages":
+            continue
+        candidate = project_root / name
+        if candidate.is_dir() and candidate not in dirs:
+            dirs.append(candidate)
+    return dirs
+
+
+def inject_tailwind_sources(css: str, *, destination: Path, project_root: Path) -> str:
+    """Point Tailwind at the project's own source directories.
+
+    Vite's root is the generated client directory, which holds the *compiled*
+    pages and nothing else. Tailwind v4 auto-detects its sources from that root,
+    so a utility class used only in the project's own ``components/`` — which is
+    exactly where ``shadcn/ui`` puts every component it installs — is never
+    generated, and the component renders unstyled with no error anywhere.
+
+    The stylesheet is copied into the build directory, so a hand-written
+    ``@source "../../components"`` in the project's CSS resolves *inside* that
+    directory and silently matches nothing. The paths therefore have to be
+    rewritten at copy time, which is what this does. Returns *css* unchanged
+    when it does not import Tailwind.
+    """
+    if _SOURCE_MARKER in css:
+        return css
+    match = _TAILWIND_IMPORT.search(css)
+    if match is None:
+        return css
+    dirs = project_source_dirs(project_root)
+    if not dirs:
+        return css
+    block = [_SOURCE_MARKER]
+    for directory in dirs:
+        relative = os.path.relpath(directory, destination.parent).replace(os.sep, "/")
+        block.append(f'@source "{relative}";')
+    return css[: match.end()] + "\n" + "\n".join(block) + css[match.end() :]
 
 
 def sync_global_stylesheets(
@@ -178,5 +253,7 @@ __all__ = [
     "GlobalStylesheet",
     "resolve_global_stylesheets",
     "sync_global_stylesheets",
+    "inject_tailwind_sources",
+    "project_source_dirs",
     "load_inline_stylesheets",
 ]

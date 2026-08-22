@@ -24,6 +24,23 @@ Release notes for Pyxle. While we're in beta (`0.x`), minor versions may include
   from `import.meta.url`, and a test asserts the generated config contains no
   `__dirname` in code.
 
+- **Fix: `shadcn/ui` components are styled. Tailwind now scans your own source
+  directories.** Vite's root is the generated client directory, which holds the
+  *compiled* pages and nothing else, and Tailwind v4 auto-detects its sources
+  from that root. So a utility class used only in your own `components/` — which
+  is exactly where `shadcn/ui` puts every component it installs — was never
+  generated, and the component rendered **unstyled, with no error anywhere**:
+  `npx shadcn@latest add button` reported success and the button came out with
+  no background. Adding `@source "../../components"` to your stylesheet did not
+  help either, because the stylesheet is copied into the build directory, so
+  that path resolved inside it and silently matched nothing. Pyxle now rewrites
+  the directives at copy time, pointing Tailwind at the directories your
+  `jsconfig.json` declares (`pages` excluded — it is already under the Vite
+  root). Verified in a browser on a scaffolded shadcn project: a class present
+  only in `components/ui/button.jsx` now generates, in `pyxle dev` and in the
+  production bundle. Plain-CSS projects are untouched — nothing is injected into
+  a stylesheet that does not import Tailwind.
+
 ## 0.9.2
 
 - **Internal: API modules are imported with the real `debug` flag, not a
