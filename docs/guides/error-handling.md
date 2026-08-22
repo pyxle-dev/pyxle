@@ -321,16 +321,30 @@ Like error boundaries, not-found pages follow directory scoping -- a `not-found.
 
 ## Dev mode error overlay
 
-During development (`pyxle dev`), errors also appear in a browser overlay with:
+During development (`pyxle dev`), a **fault** also appears in a browser overlay
+with:
 
 - The error message and stack trace
 - Breadcrumbs showing which stage failed (loader, renderer, hydration)
 - File path and line number
 
-The overlay communicates via WebSocket and updates in real time as you fix errors.
-It also **survives a reload**: the current error is replayed to the page when it
-reconnects, so an error raised while no tab was open — or one you reloaded past —
-still shows.
+An error you raised on purpose does **not** open it. A `LoaderError` with a
+status below 500 — a 404 for a post that does not exist, a 403 for a page the
+visitor may not see — is a response you wrote, so the overlay stays out of the
+way and your `error.pyxl` renders, which is the whole point of raising it. The
+same rule the server log already follows: an intentional sub-500 is not a server
+error.
+
+The overlay belongs to the page that failed. It is shown only while you are on
+the URL whose render failed, so a broken `/reports` never covers a working `/` —
+it renders full-screen, and an overlay on the wrong page would swallow that
+page's clicks. A failure that is not tied to one URL, such as a failed rebuild,
+does break every page and still shows on all of them.
+
+It communicates via WebSocket and updates in real time as you fix errors. It also
+**survives a reload**: unresolved errors are replayed when the page reconnects,
+so a fault raised while no tab was open — or one you reloaded past — still shows.
+Navigating away from the broken page clears it.
 
 ## A page that will not compile
 
