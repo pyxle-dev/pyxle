@@ -2,7 +2,7 @@
 
 Release notes for Pyxle. While we're in beta (`0.x`), minor versions may include breaking changes — those are called out explicitly. To upgrade, run `pip install --upgrade pyxle-framework`.
 
-## Unreleased
+## 0.9.2
 
 - **Internal: API modules are imported with the real `debug` flag, not a
   hardcoded one.** `build_api_router` passed `debug=True` unconditionally, so a
