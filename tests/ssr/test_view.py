@@ -1600,7 +1600,7 @@ async def _nav_payload(page: PageRoute, settings: DevServerSettings) -> dict:
     return json.loads(await _read_response_body(response)), response.status_code
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_navigation_delivers_an_author_raised_message_in_production(
     settings: DevServerSettings, tmp_path: Path
 ) -> None:
@@ -1626,7 +1626,7 @@ async def test_navigation_delivers_an_author_raised_message_in_production(
     assert payload["errorType"] == "LoaderError"
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_navigation_carries_an_author_raised_data_payload(
     settings: DevServerSettings, tmp_path: Path
 ) -> None:
@@ -1642,7 +1642,7 @@ async def test_navigation_carries_an_author_raised_data_payload(
     assert payload["data"] == {"slug": "hello"}
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_navigation_still_hides_a_non_author_exception_in_production(
     settings: DevServerSettings, tmp_path: Path
 ) -> None:
