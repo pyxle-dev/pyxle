@@ -9,6 +9,8 @@ from pyxle.devserver.styles import (
     GlobalStylesheet,
     _make_identifier,
     _normalize_relative_path,
+    inject_tailwind_sources,
+    project_source_dirs,
     load_inline_stylesheets,
     resolve_global_stylesheets,
     sync_global_stylesheets,
@@ -149,3 +151,98 @@ def test_load_inline_stylesheets_skips_missing_files(tmp_path: Path) -> None:
     payloads = load_inline_stylesheets([existing, missing])
 
     assert payloads == [(existing, "body {}")]
+
+
+# ---------------------------------------------------------------------------
+# Tailwind source roots
+# ---------------------------------------------------------------------------
+
+
+def _tailwind_project(tmp_path: Path) -> tuple[Path, Path]:
+    """A project whose stylesheet is copied into the generated client dir."""
+    (tmp_path / "components" / "ui").mkdir(parents=True)
+    (tmp_path / "lib").mkdir()
+    (tmp_path / "pages" / "styles").mkdir(parents=True)
+    destination = tmp_path / ".pyxle-build" / "client" / "pages" / "styles" / "app.css"
+    destination.parent.mkdir(parents=True)
+    return tmp_path, destination
+
+
+def test_tailwind_sources_point_back_at_the_project(tmp_path: Path) -> None:
+    """Without this, every shadcn/ui component renders unstyled.
+
+    Vite's root is the generated client directory, which holds the compiled
+    pages and nothing else, and Tailwind v4 auto-detects its sources from that
+    root. A class used only in the project's own ``components/`` — where shadcn
+    puts everything it installs — is therefore never generated, and the
+    component renders with no styling and no error anywhere.
+
+    The paths must be relative to where the copy *landed*, not to the file the
+    developer wrote: a hand-written ``@source "../../components"`` resolves
+    inside ``.pyxle-build/`` and silently matches nothing.
+    """
+    project_root, destination = _tailwind_project(tmp_path)
+
+    result = inject_tailwind_sources(
+        '@import "tailwindcss";\nbody { margin: 0; }\n',
+        destination=destination,
+        project_root=project_root,
+    )
+
+    assert '@source "../../../../components";' in result
+    assert '@source "../../../../lib";' in result
+    # the original content survives, and the import still comes first
+    assert result.index("@import") < result.index("@source")
+    assert "body { margin: 0; }" in result
+
+
+def test_a_stylesheet_without_tailwind_is_untouched(tmp_path: Path) -> None:
+    """Plain CSS projects get no injected directives."""
+    project_root, destination = _tailwind_project(tmp_path)
+    css = "body { margin: 0; }\n"
+
+    assert (
+        inject_tailwind_sources(css, destination=destination, project_root=project_root)
+        == css
+    )
+
+
+def test_injecting_twice_does_not_stack_directives(tmp_path: Path) -> None:
+    """Rebuilds re-copy the stylesheet; the block must not accumulate."""
+    project_root, destination = _tailwind_project(tmp_path)
+    once = inject_tailwind_sources(
+        '@import "tailwindcss";\n', destination=destination, project_root=project_root
+    )
+    twice = inject_tailwind_sources(
+        once, destination=destination, project_root=project_root
+    )
+
+    assert once == twice
+    assert twice.count("@source") == 2
+
+
+def test_source_dirs_follow_jsconfig_and_skip_pages(tmp_path: Path) -> None:
+    """``jsconfig.json`` is the project's own declaration of where source lives.
+
+    ``pages`` is excluded deliberately — it is compiled into the Vite root, so
+    Tailwind already sees it — and a listed directory that does not exist is
+    skipped rather than emitted as a dead path.
+    """
+    (tmp_path / "components").mkdir()
+    (tmp_path / "widgets").mkdir()
+    (tmp_path / "pages").mkdir()
+    (tmp_path / "jsconfig.json").write_text(
+        '{"include": ["pages", "components", "widgets", "absent"]}', encoding="utf-8"
+    )
+
+    names = [directory.name for directory in project_source_dirs(tmp_path)]
+
+    assert names == ["components", "widgets"]
+    assert "pages" not in names
+    assert "absent" not in names
+
+
+def test_source_dirs_fall_back_when_jsconfig_is_missing(tmp_path: Path) -> None:
+    (tmp_path / "components").mkdir()
+
+    assert [d.name for d in project_source_dirs(tmp_path)] == ["components"]

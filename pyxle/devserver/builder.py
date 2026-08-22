@@ -26,7 +26,7 @@ from .layouts import compose_layout_templates
 from .scanner import SourceFile, SourceKind, scan_source_tree
 from .scripts import sync_global_scripts
 from .settings import DevServerSettings
-from .styles import sync_global_stylesheets
+from .styles import inject_tailwind_sources, sync_global_stylesheets
 
 
 @dataclass(slots=True)
@@ -165,7 +165,21 @@ def _build_once_locked(settings: DevServerSettings, *, force_rebuild: bool) -> B
             destination = paths.client_root / "pages" / source.relative_path
             if changed:
                 destination.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(source.absolute_path, destination)
+                if destination.suffix == ".css":
+                    # Rewritten rather than copied: a Tailwind stylesheet needs
+                    # `@source` paths that point back at the project's own
+                    # directories, which only makes sense once we know where the
+                    # copy landed. See styles.inject_tailwind_sources.
+                    destination.write_text(
+                        inject_tailwind_sources(
+                            source.absolute_path.read_text(encoding="utf-8"),
+                            destination=destination,
+                            project_root=settings.project_root,
+                        ),
+                        encoding="utf-8",
+                    )
+                else:
+                    shutil.copy2(source.absolute_path, destination)
                 summary.copied_client_assets.append(relative_key)
             else:
                 summary.skipped.append(relative_key)
