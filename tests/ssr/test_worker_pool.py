@@ -1086,8 +1086,17 @@ async def test_pool_invalidate_tolerates_dead_workers() -> None:
     for w in pool._workers:
         w.alive = False
 
-    # Should not raise.
+    proc.stdin.write.reset_mock()
     await pool.invalidate()
+
+    # "Tolerates" is not the claim worth pinning — not raising would also be
+    # true of an invalidate that wrote to a dead worker's closed pipe and
+    # swallowed the error. The behaviour is that it *skips* it, so nothing is
+    # written at all.
+    assert proc.stdin.write.call_count == 0, (
+        "invalidate() wrote to a worker it had been told was dead"
+    )
+
     await pool.stop()
 
 
@@ -1099,8 +1108,22 @@ async def test_pool_invalidate_before_start_is_noop() -> None:
         project_root=Path("/tmp/proj"),
         client_root=Path("/tmp/proj/client"),
     )
-    # Should not raise.
-    await pool.invalidate()
+
+    # A no-op has to be observable as one: the interesting failure is not an
+    # exception, it is an invalidate that quietly *starts* the pool — spawning
+    # Node processes from a call that is supposed to do nothing.
+    #
+    # Honest label: this is a GUARD, not a proof. Deleting the ``_started``
+    # check does not fail it, and cannot — with no workers to iterate, the
+    # unguarded loop writes nothing either. It bites only on a change that
+    # makes invalidate *spawn*, which is the regression worth naming. Said
+    # plainly so nobody reads a passing run here as evidence the guard is
+    # covered.
+    with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as spawn:
+        await pool.invalidate()
+
+    assert spawn.call_count == 0, "invalidate() on an unstarted pool spawned a worker"
+    assert pool._workers == []
 
 
 def _setup_dynamic_invalidation_response(

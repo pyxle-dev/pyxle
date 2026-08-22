@@ -2,6 +2,145 @@
 
 Release notes for Pyxle. While we're in beta (`0.x`), minor versions may include breaking changes — those are called out explicitly. To upgrade, run `pip install --upgrade pyxle-framework`.
 
+## Unreleased
+
+- **Internal: API modules are imported with the real `debug` flag, not a
+  hardcoded one.** `build_api_router` passed `debug=True` unconditionally, so a
+  production app went through the development module loader. It was inert —
+  only the dev file watcher advances the reload generation and production runs
+  no watcher — but the code described a dev path in a production one, and the
+  next change to make that generation mean something in production would have
+  inherited a silent re-import of every API module. Verified both ways by
+  running: a dev server still picks up an edited `pages/api/*.py` on the next
+  request, and a production `pyxle serve` still answers its API routes.
+
+- **Fix: `/llms.txt` links stay `https://` behind a TLS-terminating proxy.** The
+  absolute URLs were built from the socket's scheme, so an app behind a proxy
+  that speaks plain HTTP to it published a list of `http://` links on an HTTPS
+  site — handed to the one audience that follows them literally. The previous
+  note that "uvicorn's proxy-header support keeps these correct" was true only
+  when the proxy shares the host: uvicorn honours `X-Forwarded-Proto` only from
+  peers in `forwarded_allow_ips` (`127.0.0.1` by default), so an nginx, load
+  balancer or ingress on another host or container sent the header and had it
+  ignored. Measured both ways on one server: from loopback the links came out
+  `https://`, from a non-loopback peer the identical request produced `http://`.
+  Pyxle now reads the header itself. The rule lives in one place and the CSRF
+  cookie's `Secure` decision uses the same function, so the two surfaces cannot
+  drift into disagreeing about whether the client used TLS. A proxy that
+  reports `http` is still taken at its word — the scheme is never guessed
+  upwards.
+
+- **Fix: a freshly scaffolded project's root `vite.config.js` no longer throws.**
+  The scaffold writes one so `shadcn/ui` framework detection, editor
+  integrations and other tools that expect a config at the project root can find
+  it — and it re-exported `.pyxle-build/client/vite.config.js`, which does not
+  exist until the first `pyxle dev` or `pyxle build`. So on a brand-new project
+  the file existed and raised `ERR_MODULE_NOT_FOUND`: the tools it was written
+  for found a config that crashes. It now resolves lazily, returning the
+  generated config once there is one and an empty config before that. A failure
+  *inside* the generated config — a plugin that is not installed — still
+  propagates rather than being flattened into an empty config, which is a
+  distinction the first version of this fix got wrong and a test now pins.
+
+- **Fix: `cookieSameSite: "none"` no longer fails silently on a plain-HTTP
+  origin.** A `SameSite=None` cookie must also be `Secure` — the specification
+  requires the pair, and every current browser rejects the cookie without it.
+  Pyxle deliberately withholds `Secure` over plain HTTP (a `Secure` cookie is
+  dropped there, which would break the form and protect nothing), and that
+  reasoning was applied to `SameSite=None` too — where it cannot work, because
+  the browser drops the cookie either way. Measured in a real browser: on a
+  plain-HTTP dev server with `"none"`, the browser kept **zero** cookies while
+  the page rendered perfectly; with `"lax"` on the same server it kept the CSRF
+  cookie. So the token never reached the client and every `@action` failed its
+  CSRF check, with nothing in the terminal or the console to say why. The
+  header is now spec-correct — `SameSite=None; Secure` always travel together,
+  so devtools names the reason — and the server logs a warning, once, the first
+  time it emits that pair without TLS, saying what will break and how to fix it.
+  `"lax"` and `"strict"` are untouched. [Configuration](reference/configuration.md).
+
+- **Docs fix: the `pyxle routes` sample output did not match what the command
+  prints.** Both the quick-start and the CLI reference reproduced it with the
+  section headers unprefixed and hand-indented, and the CLI reference also wrote
+  page paths as `pages/index.pyxl` where the command prints them relative to
+  `pages/` — contradicting the quick-start's own sentence saying so. Both samples
+  are now the command's real output, captured by running it, and the `routes`
+  test pins the shape instead of only checking that the command said anything.
+
+- **Docs fix: the multi-method API example refused `HEAD`.** The API-routes
+  guide's primary shape — an `endpoint` function branching on `request.method` —
+  tested `== "GET"` and fell through to its own `405` for anything else, so a
+  route copied from our own documentation answered *405 Method Not Allowed* to
+  `curl -I`, uptime monitors, health probers and link checkers. The framework
+  was not at fault and is unchanged: it deliberately lets `HEAD` through to your
+  handler wherever the route accepts `GET`, and the class-based `HTTPEndpoint`
+  alternative in the same guide got this right, which is what made the gap easy
+  to miss. The example now handles `GET` and `HEAD` together and says why, and
+  the note on `enforce_allowed_methods` states the rule. If you copied the old
+  shape, widen that first branch to `if request.method in ("GET", "HEAD")`.
+  [API routes](guides/api-routes.md#http-methods).
+
+- **Fix: a client-side navigation no longer calls your `LoaderError` a server
+  error.** An author-raised `LoaderError` or `ActionError` is deliberate,
+  user-facing copy, and it reaches the visitor verbatim in every environment —
+  that is the point of raising it, and a full page load has always honoured it.
+  A client-side navigation to the same page did not: its JSON payload replaced
+  the message with a generic string and the type with `ServerError`, in
+  production, for *every* failure. So one visitor pasted the URL and read *"That
+  post was deleted in 2019."* while another clicked a link to the same page and
+  read *"The server encountered an error."* — and only the second was wrong. The
+  navigation payload is now built by the same function the HTML boundary uses,
+  rather than a second copy of the rule that had drifted from it, so an
+  author-raised message, its `data`, and its status all arrive intact. Nothing
+  loosened for anything else: a non-author exception is still replaced with a
+  generic string and `ServerError` in production, with the exception's own class
+  name withheld. [Error handling](guides/error-handling.md#what-the-visitor-sees-and-what-you-see).
+
+- **Fix: every module imports on its own again.** `import pyxle.ssr.view` and
+  `import pyxle.ssr.template` raised `ImportError: ... most likely due to a
+  circular import` from a cold interpreter. `pyxle/devserver/__init__.py`
+  imported `starlette_app` at module scope, `starlette_app` imports `pyxle.ssr`,
+  and `pyxle.ssr` imports back into `pyxle.devserver` for `dev_origins` and
+  `error_pages` — so entering the cycle from the SSR side found a half-built
+  module. It never affected a running app, because `import pyxle` and the CLI
+  both enter from the other side; what it broke was reading one module on its
+  own, which is what a contributor, an editor, or a documentation tool does
+  first. The one import that closed the loop is now made where it is used.
+
+- **An occupied port now explains itself, before anything expensive happens.**
+  A port already in use is the most common way a dev server fails to start, and
+  it was the least legible failure we shipped: uvicorn's own
+  `[Errno 98] error while attempting to bind ... address already in use`, with
+  no remedy and no suggestion of a port that would work. It also arrived at the
+  wrong moment in both commands. `pyxle dev` had already started Vite, so the
+  **last** line on screen was `[vite] process exited with code 143` — the
+  shutdown of an innocent child — and the eye lands on the last line. `pyxle
+  serve` had already rebuilt the whole project, and had already printed
+  `Serving Pyxle build on http://host:port`, a success line with a clickable
+  URL, for a server that never bound. Both commands now check the port first —
+  before Vite, before `npm install`, before any build — and say which port is
+  taken, what usually holds it, a free port to use instead, and the command that
+  names the process squatting on it. `pyxle serve` on a taken port now fails in
+  well under a second instead of after a full build. The port you asked for is
+  still never silently changed; only Vite's own port moves on its own.
+  [CLI reference](reference/cli.md#pyxle-dev).
+
+- **Fix: the dev error document no longer calls a deliberate 404 a crash.**
+  `LoaderError` and `ActionError` take a `status_code` precisely so your code
+  can *decline* a request — a missing post is a `404`, a signed-out visitor a
+  `401` — and the response Pyxle sent carried that status correctly. The page
+  the **developer** saw did not: it was headed **Server Render Failed** under
+  the title *Pyxle • Error* whatever the status, so the person building a
+  deliberate 404 was told the server had broken while their visitor was told
+  the truth — the inverse of the audience each message suits. The dev document
+  now reads by status, the way the production one already did: a sub-500 is
+  headed with the wording a visitor would get and says the response was one
+  your code chose, and only a 5xx is still headed *Server Render Failed*. The
+  class decides rather than a table, so a 4xx nobody has written specific
+  wording for is still never described as a server fault. Everything a
+  developer needs is unchanged — exception type, message, the file and line of
+  the `raise`, and the Vite client tag that reloads the page when you fix it.
+  [Error handling](guides/error-handling.md#what-the-visitor-sees-and-what-you-see).
+
 ## 0.9.1
 
 - **Fix: `STANDALONE` on a `template.pyxl` now stops the wrapper chain, not just
