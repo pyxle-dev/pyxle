@@ -627,9 +627,14 @@ connected client.
 Event types:
 
 - `"error"` — sent when a build fails or a runtime error occurs.
-  Includes the error message, stack, and "breadcrumbs" describing
-  which stage of the request pipeline failed (loader, render, head
-  evaluation, etc.).
+  Includes the error message, stack, "breadcrumbs" describing which
+  stage of the request pipeline failed (loader, render, head
+  evaluation, etc.), and the URL whose render failed. An error the
+  author *chose* — a loader raising `LoaderError` with a status below
+  500 — is not sent at all: it is a response, not a crash, and the
+  overlay is a crash reporter. The route is cleared instead, so a route
+  that used to fail for real and now answers a deliberate 404 stops
+  replaying its old error.
 - `"clear"` — sent when a previously-failing route succeeds. The
   client uses this to dismiss any visible error overlay.
 - `"reload"` — sent after a successful rebuild — including a rebuild
@@ -638,10 +643,22 @@ Event types:
 
 An error is not a one-off broadcast: the manager keeps the current
 error for each route (keyed by route path, plus `(rebuild)` for build
-failures) and replays the most recent one to every client that connects
-afterwards. A reload closes the socket that was told about the error and
-opens a new one, so without the replay a reload made the error vanish
-while the fault remained. `"clear"` for a route drops that route's entry
+failures) and replays **every** unresolved one, oldest first, to each
+client that connects afterwards. A reload closes the socket that was
+told about the error and opens a new one, so without the replay a reload
+made the error vanish while the fault remained. Replaying all of them
+rather than only the newest is what stops a broken route being hidden
+whenever some *other* route breaks after it.
+
+The client shows at most one overlay: the most recent error that applies
+to the page it is actually on. An error carries the concrete URL that
+failed, and is displayed only while the browser is at that URL — so a
+broken `/reports` cannot cover `/`, which matters because the overlay
+renders full-screen at the top layer and would otherwise swallow that
+page's clicks. A payload with no URL is not tied to one page — a failed
+rebuild really does break every page — and still shows everywhere. The
+client re-evaluates on client-side navigation, so navigating away from a
+broken page clears it. `"clear"` for a route drops that route's entry
 and only that one, so a healthy render of `/` never silences a build
 failure in `pages/about.pyxl`.
 The socket accepts the origins in
