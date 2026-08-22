@@ -103,3 +103,69 @@ def test_validate_project_name_rejects_a_path() -> None:
 
     # A plain name is untouched, and `.` still means "scaffold in place".
     assert validate_project_name("my-app") == "my-app"
+
+
+# ---------------------------------------------------------------------------
+# The root vite.config.js — it exists to be found by other people's tools, so
+# it has to survive being imported before anything has been built.
+# ---------------------------------------------------------------------------
+
+
+def _node() -> str | None:
+    import shutil
+
+    return shutil.which("node")
+
+
+@pytest.mark.skipif(_node() is None, reason="needs Node.js to import an ES module")
+def test_scaffolded_root_vite_config_imports_before_any_build(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fresh project's root Vite config must not throw.
+
+    The scaffold writes it so ``shadcn/ui`` framework detection, editor
+    integrations and other tools that expect a config at the project root can
+    find one. It re-exports ``.pyxle-build/client/vite.config.js`` — which does
+    not exist until the first ``pyxle dev`` / ``pyxle build``. A static
+    re-export therefore threw ``ERR_MODULE_NOT_FOUND`` on every freshly
+    scaffolded project, so the tools it exists to satisfy found a config that
+    crashes.
+    """
+    import json
+    import subprocess
+
+    from typer.testing import CliRunner
+
+    from pyxle.cli import app
+
+    runner = CliRunner()
+    # `pyxle init` takes a *name* and creates it in the cwd — passing a path is
+    # refused with a message saying exactly that.
+    monkeypatch.chdir(tmp_path)
+    project = tmp_path / "demo"
+    result = runner.invoke(app, ["init", "demo", "--yes"], catch_exceptions=False)
+    assert result.exit_code == 0, result.stdout
+
+    config = project / "vite.config.js"
+    assert config.exists()
+    assert not (project / ".pyxle-build").exists(), "nothing should be built yet"
+
+    proc = subprocess.run(
+        [
+            _node(),
+            "-e",
+            "import('./vite.config.js')"
+            ".then(async (m) => { const c = await m.default();"
+            " process.stdout.write(JSON.stringify(c)); })"
+            ".catch((e) => { process.stderr.write(String(e.code || e.message));"
+            " process.exit(1); })",
+        ],
+        cwd=project,
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, (
+        f"a freshly scaffolded root vite.config.js failed to import: {proc.stderr}"
+    )
+    # Nothing is built, so it resolves to an empty config rather than throwing.
+    assert json.loads(proc.stdout or "{}") == {}

@@ -435,3 +435,59 @@ def test_vite_reachability_warning_names_a_pinned_host_it_can_see() -> None:
 
     assert message is not None
     assert "http://192.168.1.11:3000/" in message
+
+
+# ---------------------------------------------------------------------------
+# The client's scheme vs the socket's. One rule, used by both the CSRF cookie
+# and the absolute URLs in /llms.txt.
+# ---------------------------------------------------------------------------
+
+
+def _scope(*, scheme: str = "http", forwarded: str | None = None) -> dict:
+    headers = []
+    if forwarded is not None:
+        headers.append((b"x-forwarded-proto", forwarded.encode()))
+    return {"type": "http", "scheme": scheme, "headers": headers}
+
+
+class TestForwardedScheme:
+    """Measured before this existed: with a proxy on *another* host, uvicorn
+    ignores ``X-Forwarded-Proto`` (the peer is not in ``forwarded_allow_ips``,
+    ``127.0.0.1`` by default) and ``/llms.txt`` emitted ``http://`` links on an
+    HTTPS site. Reading the header ourselves is what makes the answer the same
+    wherever the proxy runs."""
+
+    def test_forwarded_https_wins_over_a_plain_socket(self):
+        from pyxle.devserver.dev_origins import forwarded_scheme
+
+        assert forwarded_scheme(_scope(scheme="http", forwarded="https")) == "https"
+
+    def test_forwarded_http_is_not_upgraded(self):
+        """A proxy that says http means http — never guess upwards."""
+        from pyxle.devserver.dev_origins import forwarded_scheme
+
+        assert forwarded_scheme(_scope(scheme="http", forwarded="http")) == "http"
+
+    def test_first_hop_wins_in_a_comma_list(self):
+        from pyxle.devserver.dev_origins import forwarded_scheme
+
+        assert forwarded_scheme(_scope(forwarded="https, http")) == "https"
+
+    def test_falls_back_to_the_socket_scheme(self):
+        from pyxle.devserver.dev_origins import forwarded_scheme
+
+        assert forwarded_scheme(_scope(scheme="https")) == "https"
+        assert forwarded_scheme(_scope(scheme="http")) == "http"
+
+    def test_csrf_uses_the_same_rule(self):
+        """The two surfaces must never disagree about whether this was TLS."""
+        from pyxle.devserver.csrf import _is_https
+        from pyxle.devserver.dev_origins import request_is_https
+
+        for scope in (
+            _scope(scheme="http", forwarded="https"),
+            _scope(scheme="http", forwarded="http"),
+            _scope(scheme="https"),
+            _scope(scheme="http"),
+        ):
+            assert _is_https(scope) is request_is_https(scope)

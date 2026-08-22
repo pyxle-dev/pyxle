@@ -1,5 +1,6 @@
 import asyncio
 import json
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -398,6 +399,83 @@ def test_run_subprocess_handles_missing_binary(monkeypatch, tmp_path) -> None:
 
     with pytest.raises(typer.Exit):
         cli._run_subprocess(["npm", "install"], cwd=tmp_path, label="Node", logger=logger)
+
+
+def test_serve_refuses_an_occupied_port_before_building_anything(monkeypatch) -> None:
+    """The check has to come *before* the build, or it costs a build to learn.
+
+    ``pyxle serve`` rebuilds the project on the way up. Discovering the port is
+    taken on the far side of that made the developer pay a full build for a
+    failure that was knowable in milliseconds — and printed
+    ``Serving Pyxle build on http://host:port``, a success line with a clickable
+    URL, for a server that then failed to bind.
+    """
+    built: list[str] = []
+    monkeypatch.setattr(cli, "run_build", lambda *a, **k: built.append("built"))
+
+    with runner.isolated_filesystem():
+        project = Path("demo")
+        (project / "pages").mkdir(parents=True)
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            sock.bind(("127.0.0.1", 0))
+            sock.listen(1)
+            port = sock.getsockname()[1]
+
+            result = runner.invoke(
+                app,
+                ["serve", "demo", "--host", "127.0.0.1", "--port", str(port)],
+            )
+        finally:
+            sock.close()
+
+    assert result.exit_code == 1
+    assert "already in use" in result.stdout
+    assert str(port) in result.stdout
+    # The whole point: nothing was built, and no URL was advertised.
+    assert built == []
+    assert "Serving Pyxle build on" not in result.stdout
+
+
+def test_dev_refuses_an_occupied_port_before_starting_anything(monkeypatch) -> None:
+    """Same, one step earlier: before Vite, npm install and the first build.
+
+    With Vite already spawned, the *last* line on screen was
+    ``[vite] process exited with code 143`` — the SIGTERM of an innocent child
+    during teardown — so the most prominent message named the one component
+    that had done nothing wrong.
+    """
+    started: list[str] = []
+
+    class ExplodingDevServer:
+        def __init__(self, *a, **k):
+            started.append("constructed")
+
+    monkeypatch.setattr(cli, "DevServer", ExplodingDevServer)
+
+    with runner.isolated_filesystem():
+        project = Path("demo")
+        (project / "pages").mkdir(parents=True)
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            sock.bind(("127.0.0.1", 0))
+            sock.listen(1)
+            port = sock.getsockname()[1]
+
+            result = runner.invoke(
+                app,
+                ["dev", "demo", "--host", "127.0.0.1", "--port", str(port)],
+            )
+        finally:
+            sock.close()
+
+    assert result.exit_code == 1
+    assert "already in use" in result.stdout
+    assert started == []
+    # uvicorn's raw errno is what this replaced; it must not survive alongside.
+    assert "Errno 98" not in result.stdout
 
 
 def test_serve_command_runs_build_and_uvicorn(monkeypatch) -> None:
@@ -2151,6 +2229,17 @@ def test_routes_command_shows_page_routes() -> None:
 
         assert result.exit_code == 0
         assert "route(s) found" in result.stdout
+        # Pin the shape the docs print verbatim. Both `quick-start.md` and
+        # `reference/cli.md` reproduce this output as a sample, and both had
+        # drifted from it: they showed the section headers unprefixed and
+        # hand-indented, and `cli.md` additionally wrote page paths as
+        # `pages/index.pyxl` while the command prints them relative to
+        # `pages/` — which quick-start's own prose already said. Nothing
+        # compared the samples to reality, so asserting only "route(s) found"
+        # let every one of those drift silently.
+        assert "\u2139\ufe0f    Pages:" in result.stdout
+        assert "\u25b6\ufe0f  /about \u2014 about.pyxl" in result.stdout
+        assert "pages/about.pyxl" not in result.stdout
 
 
 def test_routes_command_json_output() -> None:

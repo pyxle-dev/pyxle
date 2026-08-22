@@ -46,15 +46,25 @@ def _iter_page_metadata(metadata_dir: Path) -> Iterable[tuple[Path, Path]]:
 
 
 def _discover_wrappers(relative_dir: Path, settings: DevServerSettings) -> List[WrapperSpec]:
-    """Every layout and template that wraps a page, closest first.
+    """Every layout and template that wraps a page, **outermost first**.
 
-    Stops at a layout declaring ``STANDALONE = True``: that layout is the root
-    of its own chain, so nothing above it applies. The case is a section of a
-    site that is not part of the app around it — a public status page inside an
-    admin console, a print view, an embedded widget — where the alternative is
-    teaching the outer layout to recognise each such section and render
-    nothing, a conditional that grows a branch per child and puts knowledge of
-    every one of them in the parent.
+    That is the order they nest in, and the order the caller composes them in:
+    the root ``layout.pyxl`` comes first and the page's own directory last. (It
+    used to say "closest first", which is backwards — ``_ancestor_dirs`` walks
+    root-downwards and each wrapper is appended as it is found.)
+
+    A wrapper declaring ``STANDALONE = True`` — a ``layout.pyxl`` **or** a
+    ``template.pyxl`` — becomes the root of its own chain, so nothing above it
+    applies. Mechanically it *discards* what has been collected rather than
+    stopping the walk: everything found before it is an ancestor it has declared
+    it does not want, and the walk still has to continue downwards to collect
+    the wrappers between it and the page.
+
+    The case is a section of a site that is not part of the app around it — a
+    public status page inside an admin console, a print view, an embedded widget
+    — where the alternative is teaching the outer layout to recognise each such
+    section and render nothing, a conditional that grows a branch per child and
+    puts knowledge of every one of them in the parent.
     """
     client_pages_root = settings.client_build_dir / "pages"
     ancestors = _ancestor_dirs(relative_dir)

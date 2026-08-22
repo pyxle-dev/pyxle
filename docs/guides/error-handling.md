@@ -173,6 +173,27 @@ So it is split:
 Design `error.pyxl` for the production wording. Rendering `{error.message}` is
 fine, but do not build the page around it saying something specific.
 
+This holds however the visitor arrived. A client-side navigation fetches the
+page as JSON rather than HTML, and that payload is built from the same rule —
+so clicking a link to a failing page and pasting its URL give the boundary the
+same `message`, `type`, `statusCode` and `data`. (They did not always: the
+navigation path carried its own copy of the rule and had lost the author-raised
+exemption, so a clicked link reported `ServerError` for a `LoaderError` a pasted
+URL reported correctly.)
+
+#### The fallback document reads by status, in dev as well as production
+
+When no `error.pyxl` answers, Pyxle serves its own fallback document, and what
+it says is decided by the **status** — because a `LoaderError(status_code=404)`
+is your code stating a fact about the request, not a fault. A sub-500 fallback
+is headed with the same wording a visitor would get (*Not found*, *Sign in
+required*, *Too many requests*), and says in as many words that the response
+was one your code chose. Only a 5xx is headed *Server Render Failed*.
+
+In `pyxle dev` that document still carries everything you need to find the
+`raise` — the exception type, its message, and the file and line in your
+`.pyxl` — so nothing is lost by it no longer calling a deliberate 404 a crash.
+
 ### An `error.pyxl` does not run a loader
 
 Unlike `not-found.pyxl`, an error page has **no** `@server` loader: it receives

@@ -123,6 +123,27 @@ pyxle dev ./my-app --print-config
 pyxle dev --verbose             # troubleshoot: full Vite + debug output
 ```
 
+**If the port is taken.** `pyxle dev` and `pyxle serve` check the port before
+they start anything — before Vite, before `npm install`, and before a build — so
+an occupied port costs you a message rather than a build:
+
+```
+❌ Port 8000 is already in use, so pyxle dev cannot start.
+
+Something is already listening on 127.0.0.1:8000 — most often a pyxle dev from
+an earlier session that is still running, or another application using the same
+port.
+
+Start on a free port:   pyxle dev --port 8001
+See what is holding it: lsof -i :8000
+```
+
+The suggested port is one that was free when the message was written; nothing is
+reserved. Note that only the **Vite** port moves on its own (`Vite port 5173 in
+use; retrying on 5174`) — the port you asked for is never silently changed,
+because a server quietly listening somewhere other than where you pointed your
+browser is worse than one that did not start.
+
 **What it does:**
 
 1. Loads configuration from `pyxle.config.json` + environment variables + CLI flags
@@ -389,18 +410,18 @@ pyxle routes [directory] [options]
 ```
 ℹ️  Routes for my-app/
 
-  Pages:
-  ▶️  /  — pages/index.pyxl  [loader=load_home]
-  ▶️  /about  — pages/about.pyxl
-  ▶️  /blog/{slug}  — pages/blog/[slug].pyxl  [loader=load_post]
+ℹ️    Pages:
+▶️  / — index.pyxl  [loader=load_home]
+▶️  /about — about.pyxl
+▶️  /blog/{slug} — blog/[slug].pyxl  [loader=load_post]
 
-  API Routes:
-  ▶️  /api/pulse  — pages/api/pulse.py
+ℹ️    API Routes:
+▶️  /api/pulse — api/pulse.py
 
-  Special Files (no URL of their own):
-  ▶️  error boundary — error.pyxl  [covers /]
-  ▶️  404 page — not-found.pyxl  [covers /]
-  ▶️  loading fallback — blog/loading.pyxl  [covers /blog/*]
+ℹ️    Special Files (no URL of their own):
+▶️  error boundary — error.pyxl  [covers /]
+▶️  404 page — not-found.pyxl  [covers /]
+▶️  loading fallback — blog/loading.pyxl  [covers /blog/*]
 
 ✅ 4 route(s) found
 ```

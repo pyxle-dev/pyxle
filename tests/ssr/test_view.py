@@ -1553,6 +1553,121 @@ async def test_build_page_navigation_response_loader_error_uses_status_code(
     assert "Forbidden" in payload["error"]
 
 
+def _nav_page_raising(tmp_path: Path, raise_source: str, module_stem: str) -> PageRoute:
+    """A page whose loader raises whatever *raise_source* says."""
+    server_module = tmp_path / "server" / f"{module_stem}.py"
+    server_module.parent.mkdir(parents=True, exist_ok=True)
+    server_module.write_text(
+        "from pyxle.runtime import ActionError, LoaderError\n"
+        "async def my_loader(request):\n"
+        f"    {raise_source}\n",
+        encoding="utf-8",
+    )
+    return PageRoute(
+        path="/nav",
+        source_relative_path=Path("nav.pyxl"),
+        source_absolute_path=tmp_path / "pages" / "nav.pyxl",
+        server_module_path=server_module,
+        client_module_path=tmp_path / "client" / "nav.jsx",
+        metadata_path=tmp_path / "metadata" / "nav.json",
+        module_key=f"pyxle.server.pages.{module_stem}",
+        client_asset_path="/pages/nav.jsx",
+        server_asset_path="/pages/nav.py",
+        content_hash="hash",
+        loader_name="my_loader",
+        loader_line=2,
+        head_elements=(),
+        head_is_dynamic=False,
+    )
+
+
+async def _nav_payload(page: PageRoute, settings: DevServerSettings) -> dict:
+    response = await build_page_navigation_response(
+        request=Request(
+            {
+                "type": "http",
+                "method": "GET",
+                "path": "/nav",
+                "query_string": b"",
+                "headers": [],
+            }
+        ),
+        settings=settings,
+        page=page,
+        renderer=StubRenderer(),
+        overlay=StubOverlay(),
+    )
+    return json.loads(await _read_response_body(response)), response.status_code
+
+
+@pytest.mark.anyio
+async def test_navigation_delivers_an_author_raised_message_in_production(
+    settings: DevServerSettings, tmp_path: Path
+) -> None:
+    """Clicking a link must answer the same as pasting the URL.
+
+    An author-raised ``LoaderError`` is deliberate, user-facing copy, and the
+    error-handling guide promises it reaches the visitor *verbatim in every
+    environment*. A full page load honoured that. A client-side navigation to
+    the same page replaced it with ``"ServerError"`` and a generic string — so
+    the identical 404 read one way when the URL was pasted and another when the
+    link was clicked, and only the clicked one was wrong.
+    """
+    page = _nav_page_raising(
+        tmp_path,
+        "raise LoaderError('That post was deleted in 2019.', status_code=404)",
+        "nav_author_prod",
+    )
+
+    payload, status = await _nav_payload(page, replace(settings, debug=False))
+
+    assert status == 404
+    assert payload["error"] == "That post was deleted in 2019."
+    assert payload["errorType"] == "LoaderError"
+
+
+@pytest.mark.anyio
+async def test_navigation_carries_an_author_raised_data_payload(
+    settings: DevServerSettings, tmp_path: Path
+) -> None:
+    """``LoaderError(data=...)`` is written for the boundary to render."""
+    page = _nav_page_raising(
+        tmp_path,
+        "raise LoaderError('Gone', status_code=410, data={'slug': 'hello'})",
+        "nav_author_data",
+    )
+
+    payload, _ = await _nav_payload(page, replace(settings, debug=False))
+
+    assert payload["data"] == {"slug": "hello"}
+
+
+@pytest.mark.anyio
+async def test_navigation_still_hides_a_non_author_exception_in_production(
+    settings: DevServerSettings, tmp_path: Path
+) -> None:
+    """The reason the sanitization exists, and it must survive the fix.
+
+    A guard, not a proof — this passed before the change too. It is here so
+    that widening the author-raised exemption can never quietly widen to
+    everything (CLAUDE.md rule 18).
+    """
+    page = _nav_page_raising(
+        tmp_path,
+        "raise RuntimeError('row 4471 at /srv/secrets/app.db key=sk_live_ABC')",
+        "nav_leak_prod",
+    )
+
+    payload, status = await _nav_payload(page, replace(settings, debug=False))
+    raw = json.dumps(payload)
+
+    assert status == 500
+    assert payload["errorType"] == "ServerError"
+    assert payload["error"] == "An unexpected error occurred."
+    for secret in ("sk_live_ABC", "srv/secrets", "row 4471", "RuntimeError"):
+        assert secret not in raw
+
+
 def test_normalize_head_entries_none_returns_empty(tmp_path: Path) -> None:
     """_normalize_head_entries(page, None) returns an empty tuple."""
     from pyxle.ssr.view import _normalize_head_entries
@@ -3595,7 +3710,15 @@ async def test_build_page_navigation_response_enriches_browser_global_error(
 async def test_build_page_navigation_response_browser_global_error_generic_in_production(
     settings: DevServerSettings, tmp_path: Path
 ) -> None:
-    """The production nav-error JSON leaks neither the global nor the file."""
+    """The production nav-error JSON leaks neither the global nor the file.
+
+    The expected string changed when the nav path started building its payload
+    with ``_build_error_context``, the same function the HTML boundary uses.
+    This path had its own generic wording; the shared one is what the
+    error-handling guide documents as the production value. What this test is
+    actually for — that nothing internal escapes — is unchanged, and still
+    asserted below.
+    """
     prod_settings = replace(settings, debug=False)
     page = _page_route(tmp_path, loader_name=None)
     renderer = _failing_renderer("localStorage is not defined")
@@ -3612,7 +3735,7 @@ async def test_build_page_navigation_response_browser_global_error_generic_in_pr
     payload = json.loads(raw)
     assert response.status_code == 500
     assert payload["errorType"] == "ServerError"
-    assert payload["error"] == "The server encountered an error while processing this request."
+    assert payload["error"] == "An unexpected error occurred."
     assert "localStorage" not in raw
     assert "pyxl" not in raw
     assert "useEffect" not in raw

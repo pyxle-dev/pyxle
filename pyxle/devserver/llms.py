@@ -954,14 +954,21 @@ def make_llms_txt_route(routes: RouteTable, *, settings: Any) -> Route:
     Resolution order: a static ``public/llms.txt`` (served by the static-asset
     middleware before this route ever runs) → a ``llms_txt`` hook in the root
     ``pages/llms.py`` → a generated index of the app's pages. Generated links
-    are absolute, derived from the request's scheme and host (uvicorn's
-    proxy-header support keeps these correct behind a reverse proxy).
+    are absolute, derived from the client's scheme (``X-Forwarded-Proto``
+    where present) and host, so they stay ``https://`` behind a TLS-terminating
+    proxy on any host -- not only one uvicorn happens to trust.
     """
     config = getattr(settings, "llms", None)
 
     async def handler(request: Request) -> Response:
         debug = bool(getattr(settings, "debug", False))
-        base_url = f"{request.url.scheme}://{request.url.netloc}"
+        # The client's scheme, not the socket's: behind a TLS-terminating
+        # proxy on another host these links were emitted as ``http://`` on an
+        # HTTPS site -- a downgrade handed to the exact audience, agents, that
+        # follows them literally.
+        from pyxle.devserver.dev_origins import forwarded_scheme  # noqa: PLC0415
+
+        base_url = f"{forwarded_scheme(request.scope)}://{request.url.netloc}"
 
         def render_default() -> str:
             return build_llms_txt(

@@ -216,7 +216,18 @@ Route-level hooks applied to specific route types.
 | `csrf.cookieName` | `string` | auto: `"pyxle-csrf-<port>"` | CSRF cookie name; unset → namespaced by the app's bind port |
 | `csrf.headerName` | `string` | `"x-csrf-token"` | CSRF header name |
 | `csrf.cookieSecure` | `boolean` | `false` | Set `Secure` flag on cookie |
-| `csrf.cookieSameSite` | `string` | `"lax"` | `SameSite` attribute (`"strict"`, `"lax"`, `"none"`) |
+| `csrf.cookieSameSite` | `string` | `"lax"` | `SameSite` attribute (`"strict"`, `"lax"`, `"none"`). **`"none"` requires HTTPS** — see the note below. |
+
+> **`cookieSameSite: "none"` only works over HTTPS.** The cookie specification
+> requires a `SameSite=None` cookie to also be `Secure`, and every current
+> browser drops a `Secure` cookie delivered over plain HTTP — so on an HTTP
+> origin the CSRF cookie is discarded before your code ever sees it. The page
+> still renders perfectly; every `@action` then fails its CSRF check, which is
+> exactly the failure that leaves nothing to search for. Pyxle now sends the
+> spec-correct `SameSite=None; Secure` pair and logs a warning the first time it
+> does so without TLS, naming the consequence. If you are behind a
+> TLS-terminating proxy, make sure it sets `X-Forwarded-Proto: https` — that is
+> what Pyxle reads to know the connection was secure. Otherwise use `"lax"`.
 | `csrf.exemptPaths` | `string[]` | `[]` | Paths exempt from CSRF checks (matched on segment boundaries) |
 
 **Cookie naming.** Browsers scope cookies to a host, ignoring the port, so a fixed cookie name would collide between two Pyxle apps on the same host (e.g. two dev servers on `127.0.0.1`) — each would overwrite the other's token and every action in the other app would fail with `403`. When `cookieName` is unset, Pyxle namespaces the cookie with the app's bind port (`pyxle-csrf-8000`), which is stable per app in development and behind a production reverse proxy. Set `cookieName` to pin an explicit name instead. Full details and the upgrade note: [Security → CSRF protection](../guides/security.md#csrf-protection).

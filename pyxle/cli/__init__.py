@@ -884,6 +884,17 @@ def _dev_impl(
         f" with Vite proxy at http://{settings.vite_host}:{settings.vite_port}"
     )
 
+    # Before debugpy, before Vite, before npm install and before the first
+    # build: an occupied port is the most common way this command fails, and
+    # every one of those steps makes the eventual message harder to read (see
+    # pyxle.devserver.ports).
+    _require_free_port(
+        logger,
+        settings.starlette_host,
+        settings.starlette_port,
+        command="pyxle dev",
+    )
+
     # debugpy setup is synchronous (~0.4s, spawns the adapter subprocess) and
     # must happen before the event loop starts — never inside a coroutine. The
     # optional wait-for-attach is deferred into the server run so it happens
@@ -923,6 +934,25 @@ def _dev_impl(
         raise typer.Exit(code=1) from exc
     finally:
         _restore_sigterm_handler(previous_sigterm)
+
+
+def _require_free_port(logger, host: str, port: int, *, command: str) -> None:
+    """Stop with a legible message when ``host:port`` is already listening.
+
+    Called before anything expensive or anything that spawns a child, so the
+    explanation is the only thing on screen — see :mod:`pyxle.devserver.ports`
+    for why the position in the sequence is half the fix.
+    """
+    from pyxle.devserver.ports import (  # noqa: PLC0415 - startup path, keep it lazy
+        is_port_available,
+        port_in_use_message,
+    )
+
+    if is_port_available(host, port):
+        return
+
+    logger.error(port_in_use_message(host, port, command=command))
+    raise typer.Exit(code=1)
 
 
 def _start_debug_server(logger, *, port: int) -> tuple:
@@ -1357,6 +1387,19 @@ def serve(
     except (GlobalStyleConfigError, GlobalScriptConfigError) as exc:
         logger.error(str(exc))
         raise typer.Exit(code=1) from exc
+
+    # Checked before the build and before the multi-worker branch below: this
+    # command rebuilds the project on the way up, and discovering the port is
+    # taken on the far side of that costs the developer the whole build for a
+    # failure that was knowable immediately. It also keeps the "Serving Pyxle
+    # build on ..." line honest — that line used to print, with a clickable
+    # URL, for a server that then failed to bind.
+    _require_free_port(
+        logger,
+        settings.starlette_host,
+        settings.starlette_port,
+        command="pyxle serve",
+    )
 
     if not skip_build:
         # A fresh build runs Vite and requires the supported Node.js floor.

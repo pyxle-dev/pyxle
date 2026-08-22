@@ -1601,8 +1601,14 @@ def _build_error_context(
     path, row ID, or secret. In production (``debug=False``) such messages are
     replaced with a generic string so an ``error.pyxl`` boundary never leaks
     internals (CLAUDE.md rule 18); in development they are surfaced (redacted
-    for obvious secrets, mirroring the dev error overlay and
-    :func:`_navigation_error_response`).
+    for obvious secrets, mirroring the dev error overlay).
+
+    :func:`_navigation_error_response` builds its JSON payload from this same
+    function. It used to carry its own copy of the rule, and the copy had lost
+    the author-raised exemption — so a client-side navigation to a page whose
+    loader raised ``LoaderError("...", status_code=404)`` received
+    ``"ServerError"`` while a full load of the same page rendered the author's
+    own copy. One rule, one place, so they cannot drift again.
     """
     from pyxle.runtime import ActionError, LoaderError
 
@@ -1655,25 +1661,30 @@ async def _navigation_error_response(
     # Navigation errors return JSON, so they need the same production
     # sanitization the HTML error document applies (CLAUDE.md rule 18): an
     # exception message may carry file paths, row IDs, or secrets, and a
-    # client must never receive them. In dev we surface the detail (redacted
-    # for obvious secrets, mirroring the dev error overlay) to aid debugging.
-    if settings.debug:
-        from pyxle.devserver._security import redact_sensitive_patterns  # noqa: PLC0415
-
-        error_message = redact_sensitive_patterns(str(error) or error.__class__.__name__)
-        error_type = error.__class__.__name__
-    else:
-        error_message = "The server encountered an error while processing this request."
-        error_type = "ServerError"
+    # client must never receive them.
+    #
+    # Built by the *same* function the HTML boundary uses, rather than a second
+    # copy of the rule. The two had drifted: ``_build_error_context`` passes an
+    # author-raised LoaderError/ActionError through verbatim in every
+    # environment — which is what the error-handling guide promises and what a
+    # full page load did — while this path replaced it with "ServerError" and a
+    # generic string. So the same 404 answered one way when the visitor pasted
+    # the URL and another way when they clicked a link to it, and only the
+    # clicked one was wrong.
+    error_context = _build_error_context(error, status_code, debug=settings.debug)
 
     payload = {
         "ok": False,
         "routePath": page.path,
         "requestedPath": request.url.path,
         "stage": stage,
-        "error": error_message,
-        "errorType": error_type,
+        "error": error_context["message"],
+        "errorType": error_context["type"],
     }
+    # An author-raised error may carry a ``data`` payload written for the
+    # boundary to render; the HTML path already delivers it.
+    if "data" in error_context:
+        payload["data"] = error_context["data"]
     return JSONResponse(payload, status_code=status_code)
 
 

@@ -128,11 +128,11 @@ This prints the route table derived from your `pages/` directory:
 ```
 ℹ️  Routes for my-app/
 
-  Pages:
-  ▶️  / — index.pyxl  [loader=load_home]
+ℹ️    Pages:
+▶️  / — index.pyxl  [loader=load_home]
 
-  API Routes:
-  ▶️  /api/pulse — api/pulse.py
+ℹ️    API Routes:
+▶️  /api/pulse — api/pulse.py
 
 ✅ 2 route(s) found
 ```

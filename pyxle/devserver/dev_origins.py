@@ -89,6 +89,34 @@ VITE_DEFAULT_ORIGIN_PATTERN: Final[str] = (
 DEV_SESSION_FILENAME: Final[str] = "dev-server.json"
 
 
+def forwarded_scheme(scope: Any) -> str:
+    """The scheme the *client* used, not the one our socket saw.
+
+    Reads ``X-Forwarded-Proto`` first, because the overwhelmingly common
+    production shape is a TLS-terminating proxy speaking plain HTTP to the app:
+    the ASGI scheme says ``http`` while the browser's connection was HTTPS all
+    along.
+
+    We do this ourselves rather than leaning on uvicorn's proxy-header support,
+    which only rewrites the scheme when the peer address is in
+    ``forwarded_allow_ips`` -- ``127.0.0.1`` by default. That covers a proxy on
+    the same host and silently does nothing for the equally ordinary shape of
+    an nginx / load balancer / ingress on a different host or container, where
+    the header arrives and is ignored.
+    """
+    for name, value in scope.get("headers", ()):
+        if name == b"x-forwarded-proto":
+            first = value.decode("latin-1").split(",")[0].strip().lower()
+            return "https" if first == "https" else "http"
+    scheme = str(scope.get("scheme", "")).lower()
+    return "https" if scheme in ("https", "wss") else "http"
+
+
+def request_is_https(scope: Any) -> bool:
+    """Whether the client's connection was TLS -- see :func:`forwarded_scheme`."""
+    return forwarded_scheme(scope) == "https"
+
+
 def is_wildcard_host(host: str) -> bool:
     """Whether ``host`` binds every interface rather than a named address."""
 

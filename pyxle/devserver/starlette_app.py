@@ -570,14 +570,25 @@ def build_api_router(
     routes: Iterable[ApiRoute],
     *,
     route_hooks: Sequence[RouteHookCallable] | None = None,
+    debug: bool = False,
 ) -> Router:
-    """Create a Starlette ``Router`` populated from compiled API artifacts."""
+    """Create a Starlette ``Router`` populated from compiled API artifacts.
+
+    ``debug`` selects the module loader's dev behaviour — re-importing a module
+    once a rebuild has advanced the reload generation. It used to be hardcoded
+    ``True`` here, which was inert in production (only the dev file watcher ever
+    calls ``mark_rebuild``, and production runs no watcher) but described the
+    wrong thing to anyone reading it. Passing the real flag costs nothing and
+    stops the code claiming a dev path in a production one.
+    """
 
     router = Router()
     hooks = list(route_hooks or [])
 
     for route in routes:
-        module = _import_module(route.module_key, route.server_module_path, debug=True)
+        module = _import_module(
+            route.module_key, route.server_module_path, debug=debug
+        )
         http_handler, ws_handler = _resolve_api_handlers(module)
         context = RouteContext(
             target="api",
@@ -1772,6 +1783,7 @@ def _build_app_routes(
     api_router = build_api_router(
         routes.apis,
         route_hooks=[*DEFAULT_API_POLICIES, *api_route_hooks],
+        debug=settings.debug,
     )
     page_router = build_page_router(
         routes.pages,

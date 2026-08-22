@@ -18,6 +18,7 @@ from pyxle.cli.logger import ConsoleLogger
 from pyxle.devserver.build_errors import BuildFailure
 from pyxle.devserver.builder import build_once
 from pyxle.devserver.registry import load_metadata_registry
+from pyxle.devserver.route_hooks import DEFAULT_API_POLICIES
 from pyxle.devserver.routes import build_route_table
 from pyxle.devserver.settings import DevServerSettings
 from pyxle.devserver.starlette_app import (
@@ -102,6 +103,88 @@ def test_build_api_router_registers_function_and_class(project: DevServerSetting
     response = client.get("/api/posts/42")
     assert response.status_code == 200
     assert response.json() == {"id": "42"}
+
+
+def test_api_modules_are_imported_with_the_real_debug_flag(
+    project: DevServerSettings, monkeypatch
+) -> None:
+    """Production must not import API modules through the dev loader.
+
+    ``build_api_router`` hardcoded ``debug=True``. It was inert — only the dev
+    file watcher advances the reload generation and production runs no watcher —
+    but the code claimed a dev path in a production one, and the next person to
+    make the generation mean something in production would have inherited a
+    silent re-import of every API module.
+    """
+    from pyxle.devserver import starlette_app as sa
+
+    seen: list[bool] = []
+    real = sa._import_module
+
+    def spy(module_key, module_path, *, debug=False):
+        seen.append(debug)
+        return real(module_key, module_path, debug=debug)
+
+    monkeypatch.setattr(sa, "_import_module", spy)
+
+    write_file(
+        project.pages_dir / "api/ping.py",
+        "from starlette.responses import JSONResponse\n\n"
+        "async def endpoint(request):\n"
+        "    return JSONResponse({'ok': True})\n",
+    )
+    build_once(project)
+    table = build_route_table(load_metadata_registry(project))
+
+    seen.clear()
+    sa.build_api_router(table.apis, debug=False)
+    assert seen and not any(seen), f"production import used debug={seen}"
+
+    seen.clear()
+    sa.build_api_router(table.apis, debug=True)
+    assert all(seen), f"dev import lost its debug flag: {seen}"
+
+
+def test_head_reaches_a_function_endpoint_instead_of_405(
+    project: DevServerSettings,
+) -> None:
+    """The whole chain has to deliver HEAD, not just the hook that permits it.
+
+    Three separate things must agree: ``_API_HTTP_METHODS`` has to contain
+    ``GET`` so Starlette adds ``HEAD`` to the route, the route has to match,
+    and ``enforce_allowed_methods`` has to let it past. The hook is unit-tested
+    on its own; this pins the chain, because the failure mode is somebody
+    editing the method tuple and every hook test still passing.
+
+    It matters because ``curl -I``, uptime monitors, health probers and link
+    checkers all send ``HEAD`` — answering 405 refuses them on a route
+    advertised as ``GET``.
+    """
+    write_file(
+        project.pages_dir / "api/widgets.py",
+        "from starlette.responses import JSONResponse\n\n"
+        "async def endpoint(request):\n"
+        "    return JSONResponse({'method': request.method})\n",
+    )
+    build_once(project)
+    registry = load_metadata_registry(project)
+    table = build_route_table(registry)
+
+    # DEFAULT_API_POLICIES, not a bare router: enforce_allowed_methods is the
+    # hook that decides HEAD, and a router built without hooks never runs it —
+    # which is exactly the hole this test existed to close on its first draft.
+    app = Starlette()
+    app.router.routes.extend(
+        build_api_router(table.apis, route_hooks=DEFAULT_API_POLICIES).routes
+    )
+    client = TestClient(app)
+
+    assert client.get("/api/widgets").status_code == 200
+    head = client.head("/api/widgets")
+    assert head.status_code == 200, "HEAD was refused on a route that accepts GET"
+    # The handler really ran and saw HEAD — it is not GET in disguise, so a
+    # handler branching on request.method must test for it (docs/guides/api-routes.md).
+    assert client.get("/api/widgets").json() == {"method": "GET"}
 
 
 def test_private_module_beside_an_endpoint_boots_and_stays_importable(
