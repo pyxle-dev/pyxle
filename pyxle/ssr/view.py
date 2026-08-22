@@ -587,6 +587,7 @@ async def _handle_render_exception(
                 route_path=page.path,
                 error=exc,
                 breadcrumbs=_compose_breadcrumbs(loader_breadcrumb, stage="server", message=str(exc)),
+                request_path=request.url.path,
             )
         return _error_response(
             settings=settings,
@@ -598,11 +599,24 @@ async def _handle_render_exception(
         )
 
     if overlay is not None:
-        await overlay.notify_error(
-            route_path=page.path,
-            error=exc,
-            breadcrumbs=_compose_breadcrumbs(loader_breadcrumb, stage=stage, message=str(exc)),
-        )
+        if status_code < 500:
+            # An author-raised sub-500 — a loader choosing to answer 404 — is a
+            # response the developer wrote on purpose, not a crash. The dev
+            # overlay is a crash reporter, so it stays out of the way and lets
+            # the error boundary render, which is the whole point of raising it.
+            # `_log_render_failure` already draws this exact line; the overlay
+            # is the surface that never got the same rule. Clearing rather than
+            # doing nothing matters: a route that used to raise a real 500 and
+            # now answers a deliberate 404 has been fixed, and its old error
+            # must stop replaying.
+            await overlay.notify_clear(route_path=page.path)
+        else:
+            await overlay.notify_error(
+                route_path=page.path,
+                error=exc,
+                breadcrumbs=_compose_breadcrumbs(loader_breadcrumb, stage=stage, message=str(exc)),
+                request_path=request.url.path,
+            )
     # Log *before* the boundary attempt. A production response is deliberately
     # sanitized, so this log is the only record of what actually failed — and a
     # successfully rendered error.pyxl must not make the failure disappear from
@@ -1654,7 +1668,17 @@ async def _navigation_error_response(
 ) -> JSONResponse:
     breadcrumbs = _compose_breadcrumbs(loader_breadcrumb, stage=stage, message=str(error))
     if overlay is not None:
-        await overlay.notify_error(route_path=page.path, error=error, breadcrumbs=breadcrumbs)
+        if status_code < 500:
+            # Same rule as the document path: an author-chosen sub-500 is not a
+            # crash, so it does not raise the overlay.
+            await overlay.notify_clear(route_path=page.path)
+        else:
+            await overlay.notify_error(
+                route_path=page.path,
+                error=error,
+                breadcrumbs=breadcrumbs,
+                request_path=request.url.path,
+            )
 
     _log_render_failure(page, stage=stage, error=error, status_code=status_code)
 
