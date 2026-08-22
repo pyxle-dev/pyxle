@@ -94,6 +94,7 @@ class StubRenderer:
 class StubOverlay:
     def __init__(self) -> None:
         self.events: list[tuple[str, str] | tuple[str, str, list[dict[str, str]]]] = []
+        self.request_paths: list[str | None] = []
 
     async def notify_clear(self, route_path: str) -> None:
         self.events.append(("clear", route_path))
@@ -104,8 +105,10 @@ class StubOverlay:
         error: BaseException,
         *,
         breadcrumbs: list[dict[str, str]] | None = None,
+        request_path: str | None = None,
     ) -> None:
         self.events.append(("error", route_path, breadcrumbs or []))
+        self.request_paths.append(request_path)
 
 
 async def _read_response_body(response) -> bytes:
@@ -1493,8 +1496,12 @@ async def test_build_page_response_loader_error_hits_error_boundary(
     assert response.status_code == 403
     body = (await _read_response_body(response)).decode()
     assert "Not allowed" in body
-    # Overlay should have received an error event
-    assert any(ev[0] == "error" for ev in overlay.events)
+    # A 403 the author raised on purpose is a response, not a crash, so the dev
+    # overlay stays down and the boundary above is what the developer sees. The
+    # route is cleared rather than left alone, so an earlier real fault on the
+    # same route stops replaying once the author starts answering deliberately.
+    assert not any(ev[0] == "error" for ev in overlay.events)
+    assert ("clear", "/") in overlay.events
 
 
 @pytest.mark.anyio
@@ -1598,6 +1605,85 @@ async def _nav_payload(page: PageRoute, settings: DevServerSettings) -> dict:
         overlay=StubOverlay(),
     )
     return json.loads(await _read_response_body(response)), response.status_code
+
+
+@pytest.mark.anyio
+async def test_a_deliberate_404_does_not_raise_the_dev_overlay(
+    settings: DevServerSettings, tmp_path: Path
+) -> None:
+    """A loader answering 404 on purpose must not be reported as a crash.
+
+    The dev overlay is a crash reporter. A ``LoaderError(..., status_code=404)``
+    is a response the author wrote — the error boundary renders it, which is the
+    entire point of raising it — so covering the screen with
+    *"Loader FAILED / Renderer BLOCKED"* and a traceback describes the developer's
+    own deliberate code as a failure. ``_log_render_failure`` already draws this
+    line for the server log; this is the same rule on the surface that missed it.
+    """
+    page = _nav_page_raising(
+        tmp_path,
+        "raise LoaderError('That post was deleted in 2019.', status_code=404)",
+        "overlay_deliberate_404",
+    )
+    overlay = StubOverlay()
+
+    await build_page_navigation_response(
+        request=Request(
+            {
+                "type": "http",
+                "method": "GET",
+                "path": "/nav",
+                "query_string": b"",
+                "headers": [],
+            }
+        ),
+        settings=settings,
+        page=page,
+        renderer=StubRenderer(),
+        overlay=overlay,
+    )
+
+    assert not any(ev[0] == "error" for ev in overlay.events)
+    assert ("clear", "/nav") in overlay.events
+
+
+@pytest.mark.anyio
+async def test_a_genuine_fault_still_raises_the_dev_overlay_and_names_its_url(
+    settings: DevServerSettings, tmp_path: Path
+) -> None:
+    """The overlay must keep doing its job for real crashes.
+
+    Two things at once: a 500 still reports, and it carries the URL that broke.
+    The client shows the overlay only while it is on that URL, so without
+    ``request_path`` one broken route covers every other page — a working page
+    is then not merely obscured but unusable, because the full-screen overlay
+    swallows its clicks.
+    """
+    page = _nav_page_raising(
+        tmp_path,
+        "raise RuntimeError('genuine server fault')",
+        "overlay_real_fault",
+    )
+    overlay = StubOverlay()
+
+    await build_page_navigation_response(
+        request=Request(
+            {
+                "type": "http",
+                "method": "GET",
+                "path": "/nav",
+                "query_string": b"",
+                "headers": [],
+            }
+        ),
+        settings=settings,
+        page=page,
+        renderer=StubRenderer(),
+        overlay=overlay,
+    )
+
+    assert any(ev[0] == "error" for ev in overlay.events)
+    assert overlay.request_paths == ["/nav"]
 
 
 @pytest.mark.anyio

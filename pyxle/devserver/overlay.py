@@ -132,18 +132,22 @@ class OverlayManager:
         await websocket.accept()
         async with self._lock:
             self._connections.add(websocket)
-            replay = next(reversed(self._active_errors.values()), None)
-        if replay is not None:
-            # Most recent first: the client renders one overlay, and the error
-            # the developer just caused is the one they are looking for.
+            replay = list(self._active_errors.values())
+        # Every unresolved error, oldest first. The client keeps only the ones
+        # that apply to the page it is actually on, so it has to be told about
+        # all of them: sending just the newest would hide a broken route
+        # whenever some *other* route broke more recently. Oldest first means
+        # the most recent applicable error is the one left showing.
+        for entry in replay:
             try:
                 await websocket.send_text(
-                    json.dumps({"type": "error", "payload": replay})
+                    json.dumps({"type": "error", "payload": entry})
                 )
             except Exception:
                 # The client went away between accept and the first send; drop
                 # it here rather than leaving a dead socket in the broadcast set.
                 await self.unregister(websocket)
+                break
 
     async def unregister(self, websocket: WebSocket) -> None:
         async with self._lock:
@@ -173,6 +177,7 @@ class OverlayManager:
         error: BaseException,
         stack: Optional[str] = None,
         breadcrumbs: Optional[List[Dict[str, str]]] = None,
+        request_path: Optional[str] = None,
     ) -> None:
         """Show an error for *route_path*, now and to clients that connect later.
 
@@ -180,9 +185,17 @@ class OverlayManager:
         called for the same route, which is what makes it survive a page
         reload: the reload drops the socket that was told about it, and the new
         socket is told on connect.
+
+        *request_path* is the concrete URL whose render failed (``/posts/3``,
+        where ``route_path`` is the pattern ``/posts/[id]``). The client renders
+        the overlay only while it is on that URL, so one broken route cannot
+        cover an unrelated working page. Omit it — as the rebuild pseudo-route
+        does — for a failure that really does affect every page; those still
+        show everywhere.
         """
         payload = {
             "routePath": route_path,
+            "requestPath": request_path,
             "message": str(error),
             "stack": stack or _format_stacktrace(error),
             "breadcrumbs": breadcrumbs or [],

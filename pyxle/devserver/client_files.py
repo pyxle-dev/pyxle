@@ -2543,7 +2543,7 @@ def _render_client_entry(settings: DevServerSettings) -> str:
                             border: '1px solid rgba(148, 163, 184, 0.6)',
                             cursor: 'pointer',
                           },
-                          onClick: clearOverlay,
+                          onClick: () => dismissOverlayError(event.routePath),
                         },
                         'Dismiss',
                       ),
@@ -2654,6 +2654,37 @@ def _render_client_entry(settings: DevServerSettings) -> str:
           );
         }
 
+        // Unresolved errors, keyed by route pattern, insertion-ordered so the
+        // newest is last. At most one overlay is ever shown: the newest error
+        // that applies to the page the developer is actually looking at.
+        const activeOverlayErrors = new Map();
+
+        function overlayAppliesHere(event) {
+          // A payload with no requestPath is not tied to one URL — a failed
+          // rebuild breaks every page — so it shows everywhere, as before.
+          if (!event || !event.requestPath) {
+            return true;
+          }
+          return event.requestPath === window.location.pathname;
+        }
+
+        // Render the applicable error, or nothing. Called whenever either half
+        // of the decision changes: a new socket message, or a client-side
+        // navigation that moved the developer to a different page.
+        function syncOverlay() {
+          let applicable = null;
+          activeOverlayErrors.forEach((event) => {
+            if (overlayAppliesHere(event)) {
+              applicable = event;
+            }
+          });
+          if (applicable) {
+            renderOverlay(applicable);
+          } else {
+            clearOverlay();
+          }
+        }
+
         function renderOverlay(event) {
           const root = ensureOverlayRoot();
           const stackLines = (event.stack ?? '').split('\\n').filter(Boolean);
@@ -2671,6 +2702,11 @@ def _render_client_entry(settings: DevServerSettings) -> str:
           container.__pyxle_overlay_root.render(null);
         }
 
+        function dismissOverlayError(routePath) {
+          activeOverlayErrors.delete(routePath);
+          syncOverlay();
+        }
+
         function connectOverlayChannel() {
           const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
           const url = `${protocol}//${window.location.host}/__pyxle__/overlay`;
@@ -2680,9 +2716,14 @@ def _render_client_entry(settings: DevServerSettings) -> str:
             try {
               const payload = JSON.parse(event.data);
               if (payload.type === 'error') {
-                renderOverlay(payload.payload ?? {});
+                const data = payload.payload ?? {};
+                // Re-insert so the newest failure sorts last.
+                activeOverlayErrors.delete(data.routePath);
+                activeOverlayErrors.set(data.routePath, data);
+                syncOverlay();
               } else if (payload.type === 'clear') {
-                clearOverlay();
+                activeOverlayErrors.delete((payload.payload ?? {}).routePath);
+                syncOverlay();
               } else if (payload.type === 'reload') {
                 const changed = Array.isArray(payload.payload?.changedPaths)
                   ? payload.payload.changedPaths
@@ -2717,7 +2758,10 @@ def _render_client_entry(settings: DevServerSettings) -> str:
         }
         """
     ).strip()
-    overlay_bootstrap_call = "connectOverlayChannel();\n"
+    overlay_bootstrap_call = (
+        "connectOverlayChannel();\n"
+        "window.addEventListener('pyxle:routechange', syncOverlay);\n"
+    )
 
     if settings.debug:
         overlay_injection = overlay_block + "\n\n" if overlay_block else ""

@@ -393,7 +393,14 @@ class TestErrorSurvivesReload:
         assert json.loads(socket.sent[0])["payload"]["routePath"] == "(rebuild)"
 
     @pytest.mark.anyio
-    async def test_the_most_recent_error_is_the_one_replayed(self) -> None:
+    async def test_every_unresolved_error_is_replayed_newest_last(self) -> None:
+        """A reconnecting client is told about all of them, not just the newest.
+
+        The client keeps only the errors that apply to the page it is on, so it
+        has to hear about every one: replaying only the most recent would hide a
+        broken route whenever some *other* route broke after it. Newest last,
+        because the client shows the last applicable error it was told about.
+        """
         manager = OverlayManager(logger=StubLogger())
         await manager.notify_error(route_path="/first", error=RuntimeError("older"))
         await manager.notify_error(route_path="/second", error=RuntimeError("newer"))
@@ -401,7 +408,41 @@ class TestErrorSurvivesReload:
         socket = StubWebSocket()
         await manager.register(socket)
 
-        assert json.loads(socket.sent[0])["payload"]["routePath"] == "/second"
+        replayed = [json.loads(m)["payload"]["routePath"] for m in socket.sent]
+        assert replayed == ["/first", "/second"]
+
+    @pytest.mark.anyio
+    async def test_notify_error_carries_the_url_that_failed(self) -> None:
+        """The concrete URL, so the client can tell whose page is broken.
+
+        ``routePath`` is the pattern (``/posts/[id]``); ``requestPath`` is the
+        URL the developer actually asked for. Without it the client cannot tell
+        an error on the page it is showing from an error on some other page.
+        """
+        manager = OverlayManager(logger=StubLogger())
+        socket = StubWebSocket()
+        await manager.register(socket)
+
+        await manager.notify_error(
+            route_path="/posts/[id]",
+            error=RuntimeError("boom"),
+            request_path="/posts/3",
+        )
+
+        payload = json.loads(socket.sent[0])["payload"]
+        assert payload["routePath"] == "/posts/[id]"
+        assert payload["requestPath"] == "/posts/3"
+
+    @pytest.mark.anyio
+    async def test_an_error_with_no_url_still_applies_everywhere(self) -> None:
+        """A failed rebuild breaks every page, so it is not scoped to one URL."""
+        manager = OverlayManager(logger=StubLogger())
+        socket = StubWebSocket()
+        await manager.register(socket)
+
+        await manager.notify_error(route_path="(rebuild)", error=RuntimeError("boom"))
+
+        assert json.loads(socket.sent[0])["payload"]["requestPath"] is None
 
     @pytest.mark.anyio
     async def test_repeating_an_error_keeps_one_entry_per_route(self) -> None:
