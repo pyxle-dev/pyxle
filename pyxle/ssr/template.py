@@ -621,6 +621,47 @@ def _origin_in_user_source(
     return None
 
 
+def _dev_error_copy(
+    status_code: int, *, page_path: str, error_type: str
+) -> tuple[str, str, str, str]:
+    """Title, heading, lead and hint for the dev error document.
+
+    A 5xx is a crash and reads as one. A sub-500 is not: ``LoaderError`` and
+    ``ActionError`` take a ``status_code`` precisely so a loader can *decline* a
+    request — a missing post is a 404, a signed-out visitor a 401 — and the
+    response Pyxle sends carries that status correctly. The developer's own page
+    said ``Server Render Failed`` anyway, so the person building a deliberate
+    404 was told the server had broken while their visitor was told the truth:
+    the inverse of the audience each message suits.
+
+    The heading is the one production would show for the same status, so dev and
+    prod agree on *what happened*; everything a crash page carries — exception
+    type, message, file and line, the Vite client tag — stays, because the
+    developer still needs to find the ``raise``.
+    """
+    if status_code >= 500:
+        return (
+            "Pyxle • Error",
+            "Server Render Failed",
+            f"While rendering <code>{page_path}</code>, Pyxle encountered a "
+            f"<strong>{error_type}</strong>.",
+            "Check your loader or component implementation. The server terminal "
+            "carries the full traceback.",
+        )
+
+    heading, detail = _status_document(status_code)
+    return (
+        f"Pyxle • {status_code} {heading}",
+        heading,
+        f"<code>{page_path}</code> raised <strong>{error_type}</strong> with "
+        f"status <strong>{status_code}</strong>. Pyxle answered with that "
+        "status — this is a response your code chose, not a crash.",
+        f"A visitor sees “{detail}” To answer this with your own "
+        "page instead, add an <code>error.pyxl</code> beside the route or "
+        "anywhere up its directory tree.",
+    )
+
+
 def render_error_document(
     *,
     settings: DevServerSettings,
@@ -682,21 +723,25 @@ def render_error_document(
             f"line {origin_line}</span>{source_markup}</div>"
         )
 
+    title, heading, lead, hint = _dev_error_copy(
+        status_code, page_path=page_path, error_type=error_type
+    )
+
     return f"""<!DOCTYPE html>
 <html lang=\"en\">
   <head>
     <meta charset=\"utf-8\" />
     <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
-    <title>Pyxle • Error</title>
+    <title>{title}</title>
     <script type=\"module\" src=\"{vite_origin}/@vite/client\"></script>
 {_ERROR_DOCUMENT_STYLES}
   </head>
   <body>
     <main class=\"pyxle-error\">
-      <h1>Server Render Failed</h1>
-      <p>While rendering <code>{page_path}</code>, Pyxle encountered a <strong>{error_type}</strong>.</p>
+      <h1>{heading}</h1>
+      <p>{lead}</p>
       <pre>{message}</pre>{origin_markup}
-      <p>Check your loader or component implementation. The server terminal carries the full traceback.</p>
+      <p>{hint}</p>
     </main>
   </body>
 </html>

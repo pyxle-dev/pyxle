@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from pyxle.devserver.routes import PageRoute
+from pyxle.runtime import LoaderError
 from pyxle.devserver.settings import DevServerSettings
 from pyxle.ssr.renderer import InlineStyleFragment
 from pyxle.ssr.template import render_document, render_error_document, render_head_markup
@@ -795,6 +796,73 @@ def test_render_error_document_dev_mode_includes_details(
     assert "[REDACTED_SECRET]" in html
     assert page_route.path in html
     assert "@vite/client" in html
+
+
+def test_dev_error_document_does_not_call_a_declined_request_a_crash(
+    page_route: PageRoute, tmp_path: Path
+) -> None:
+    """A sub-500 is a response the author chose, and must not read as a crash.
+
+    ``LoaderError`` takes a ``status_code`` so a loader can decline a request —
+    a missing post is a 404. The response carried that status correctly while
+    the developer's own page was headed *Server Render Failed*, so the person
+    building a deliberate 404 was told the server had broken while their
+    visitor was told the truth.
+    """
+    settings = DevServerSettings.from_project_root(tmp_path)  # debug=True
+    error = LoaderError("No such post", status_code=404)
+
+    html = render_error_document(
+        settings=settings, page=page_route, error=error, status_code=404
+    )
+
+    assert "Server Render Failed" not in html
+    assert "<h1>Not found</h1>" in html
+    assert "not a crash" in html
+    # Everything the developer needs to find the raise is still here.
+    assert "LoaderError" in html
+    assert "No such post" in html
+    assert page_route.path in html
+    assert "@vite/client" in html
+
+
+def test_dev_error_document_still_calls_a_real_failure_a_crash(
+    page_route: PageRoute, tmp_path: Path
+) -> None:
+    """The 5xx document is unchanged — a crash is still reported as one."""
+    settings = DevServerSettings.from_project_root(tmp_path)  # debug=True
+
+    html = render_error_document(
+        settings=settings,
+        page=page_route,
+        error=RuntimeError("genuinely broken"),
+        status_code=500,
+    )
+
+    assert "<h1>Server Render Failed</h1>" in html
+    assert "<title>Pyxle \u2022 Error</title>" in html
+    assert "genuinely broken" in html
+
+
+def test_dev_error_document_never_blames_the_server_for_an_unmapped_4xx(
+    page_route: PageRoute, tmp_path: Path
+) -> None:
+    """A 4xx with no specific wording is still not described as a server fault.
+
+    The *class* decides, not the table — so adding wording for a status is a
+    refinement rather than a bug fix nobody remembers to make.
+    """
+    settings = DevServerSettings.from_project_root(tmp_path)  # debug=True
+
+    html = render_error_document(
+        settings=settings,
+        page=page_route,
+        error=LoaderError("teapot", status_code=418),
+        status_code=418,
+    )
+
+    assert "Server Render Failed" not in html
+    assert "<h1>Request not accepted</h1>" in html
 
 
 def test_render_error_document_production_mode_redacts_internals(
