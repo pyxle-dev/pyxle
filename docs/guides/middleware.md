@@ -163,7 +163,7 @@ for downstream middleware.
 Pyxle applies two default hooks:
 
 - **`attach_route_metadata`** -- adds route info to `request.scope["pyxle"]["route"]`
-- **`enforce_allowed_methods`** -- returns 405 for disallowed API methods
+- **`enforce_allowed_methods`** -- returns 405 for disallowed API methods. `HEAD` is allowed wherever `GET` is, per [RFC 9110](https://www.rfc-editor.org/rfc/rfc9110#name-head), so health probers and `curl -I` are never refused by this hook.
 
 ## Rate limiting
 

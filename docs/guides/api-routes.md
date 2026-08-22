@@ -30,7 +30,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 async def endpoint(request: Request) -> JSONResponse:
-    if request.method == "GET":
+    if request.method in ("GET", "HEAD"):
         users = await fetch_all_users()
         return JSONResponse({"users": users})
 
@@ -42,7 +42,9 @@ async def endpoint(request: Request) -> JSONResponse:
     return JSONResponse({"error": "Method not allowed"}, status_code=405)
 ```
 
-For multi-method endpoints with automatic `405 Method Not Allowed` handling, use an `HTTPEndpoint` class (below) — Starlette dispatches each request to the matching `get`/`post`/… method and rejects the rest.
+**Handle `HEAD` wherever you handle `GET`.** [RFC 9110](https://www.rfc-editor.org/rfc/rfc9110#name-head) defines `HEAD` as identical to `GET` without a response body, and it is what `curl -I`, uptime monitors, health probers and link checkers send. Pyxle deliberately lets `HEAD` through to your handler whenever the route accepts `GET` — so if your own branch only tests `== "GET"`, the request falls past it to your `405`, and the route you advertise as a `GET` endpoint refuses half the clients that would use it. The server strips the body from a `HEAD` response for you; returning the full `JSONResponse` is correct.
+
+For multi-method endpoints with automatic `405 Method Not Allowed` handling, use an `HTTPEndpoint` class (below) — Starlette dispatches each request to the matching `get`/`post`/… method and rejects the rest. A class-based endpoint gets the `HEAD` behaviour above for free: Starlette dispatches `HEAD` to `get` unless you define a `head` method.
 
 ## Using HTTPEndpoint classes
 
