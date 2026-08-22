@@ -2,6 +2,28 @@
 
 Release notes for Pyxle. While we're in beta (`0.x`), minor versions may include breaking changes — those are called out explicitly. To upgrade, run `pip install --upgrade pyxle-framework`.
 
+## Unreleased
+
+- **Fix: the root `vite.config.js` now loads *after* a build too.** 0.9.2 stopped
+  a freshly scaffolded project's root config from throwing
+  `ERR_MODULE_NOT_FOUND` before the first build, and it did — but it left a
+  second failure in its place. The generated config it defers to sets
+  `const clientRoot = __dirname`, and a scaffolded project's `package.json`
+  declares `"type": "module"`, so that identifier does not exist there. Nothing
+  caught it because Vite injects `__dirname` when it *bundles* the config it is
+  handed directly, which is exactly how `pyxle dev` and `pyxle build` load it;
+  the root config instead reaches the generated one through a runtime dynamic
+  `import()`, which no bundler rewrites. So from 0.9.2 any tool that reads the
+  project's Vite config got `__dirname is not defined in ES module scope` on a
+  project that had been built. **Vitest could not start at all** — the failure
+  surfaces as a stack trace pointing inside `.pyxle-build/`, a directory you did
+  not write. Measured with Vite's own `loadConfigFromFile`: 0.9.1 failed before a
+  build and worked after; 0.9.2 was the exact inverse. Both states now work, and
+  `vitest run` goes from unable to start to passing. (`shadcn` is unaffected by *this*
+  bug — it does not read the Vite config at all.) `clientRoot` is derived
+  from `import.meta.url`, and a test asserts the generated config contains no
+  `__dirname` in code.
+
 ## 0.9.2
 
 - **Internal: API modules are imported with the real `debug` flag, not a
