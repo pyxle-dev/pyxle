@@ -2,7 +2,7 @@
 
 Release notes for Pyxle. While we're in beta (`0.x`), minor versions may include breaking changes — those are called out explicitly. To upgrade, run `pip install --upgrade pyxle-framework`.
 
-## Unreleased
+## 0.9.3
 
 - **Fix: the root `vite.config.js` now loads *after* a build too.** 0.9.2 stopped
   a freshly scaffolded project's root config from throwing
