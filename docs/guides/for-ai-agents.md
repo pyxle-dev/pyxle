@@ -247,17 +247,23 @@ The CLI is small and single-purpose:
 pyxle init <name>    # scaffold a new project
 pyxle install        # install Python + Node dependencies
 pyxle dev            # run the dev server
+pyxle studio         # dev server plus the Studio dashboard
 pyxle check          # validate the project without serving
 pyxle build          # compile + bundle for production
 pyxle serve          # serve a production build
 pyxle routes         # print the file-based route table
+pyxle openapi        # export an OpenAPI 3.1 schema for @action models
 ```
 
-(plus `pyxle typecheck` for TypeScript-checking compiled JSX — that's
-the whole surface.) There is no `pyxle db migrate`, no
-`pyxle generate component`, no `pyxle admin createsuperuser`. Every
-command has a clear, single-purpose behaviour, and the agent doesn't
-have to search the docs to figure out which command does what.
+(plus `pyxle typecheck` for TypeScript-checking compiled JSX — ten
+commands, and that's the whole surface.) `pyxle openapi` is the one
+worth knowing about first: it writes a machine-readable schema of
+every `@action` request model to stdout, or to a file with `-o`, so
+an agent can learn the app's API without reading the source. There is
+no `pyxle db migrate`, no `pyxle generate component`, no
+`pyxle admin createsuperuser`. Every command has a clear,
+single-purpose behaviour, and the agent doesn't have to search the
+docs to figure out which command does what.
 
 ### 7. Async by default, enforced at compile time
 
