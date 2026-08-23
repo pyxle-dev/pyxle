@@ -87,7 +87,7 @@ def build_template_registry(
     registry.register("README.md", ScaffoldingTemplate("README.md"))
     registry.register("AGENTS.md", ScaffoldingTemplate("AGENTS.md"))
     registry.register("package.json", ScaffoldingTemplate("package.json"))
-    registry.register("requirements.txt", ScaffoldingTemplate("requirements.txt"))
+    registry.register("requirements.txt", ScaffoldingTemplate("requirements.txt.tmpl"))
     registry.register("pyxle.config.json", ScaffoldingTemplate("pyxle.config.json"))
     registry.register("jsconfig.json", ScaffoldingTemplate("jsconfig.json"))
     registry.register("vite.config.js", ScaffoldingTemplate("vite.config.js"))
