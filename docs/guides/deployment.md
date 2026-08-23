@@ -114,6 +114,20 @@ production.
 pyxle serve
 ```
 
+`pyxle serve` **rebuilds before serving** by default, so you can never serve a
+stale `dist/` by accident. On a deploy target that already has a built `dist/` —
+the usual case — skip that step:
+
+```bash
+pyxle serve --skip-build
+```
+
+That skips the Vite build (no `npx` needed on the deploy host) and starts in
+about two seconds instead of rebuilding. **Node.js is still required**:
+server-side rendering runs React on Node, so keep shipping `node_modules` as
+described under [What to ship](#what-to-ship). Without Node on `PATH` the server
+refuses to start rather than serving broken pages.
+
 This starts a production Starlette server without Vite (static assets are served directly):
 
 ```bash

@@ -7,9 +7,17 @@ dict. There is no API route, no `fetch`, no serializer and no client-side data
 layer between the two.
 
 ```
-npm install recharts        →  import { ComposedChart } from 'recharts';
+npm install recharts@^2.15  →  import { ComposedChart } from 'recharts';
 @server def load(request)   →  export default function Latency({ data })
 ```
+
+> **Pin Recharts to 2.x.** Recharts 3.x pulls in a CommonJS-only dependency that
+> calls `require('react')`, which cannot be linked into Pyxle's ES-module server
+> bundle, so the page fails to server-render. This example's `package.json`
+> already caps at `^2.15.0`, so cloning it is safe; the pin above matters when
+> you add Recharts to your own app. To use 3.x anyway, render the chart inside a
+> [`<ClientOnly>`](https://pyxle.dev/docs/guides/client-components.md) boundary so
+> it never runs during the server render.
 
 ## Run it
 

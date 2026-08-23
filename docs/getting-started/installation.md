@@ -78,6 +78,32 @@ python3.12 -m venv venv && source venv/bin/activate
 pip install pyxle-framework
 ```
 
+### `pip install` says "error: externally-managed-environment"
+
+```
+error: externally-managed-environment
+× This environment is externally managed
+```
+
+Debian and Ubuntu (24.04 and newer), and some Homebrew and Linux distribution
+Pythons, mark the system interpreter as **externally managed** ([PEP 668](https://peps.python.org/pep-0668/)),
+so `pip install` outside a virtual environment refuses to run. This is the
+operating system protecting its own Python, not a problem with Pyxle — and every
+Python package hits it, not just this one.
+
+Create a virtual environment, which is the recommended path anyway:
+
+```bash
+python3 -m venv venv && source venv/bin/activate
+pip install pyxle-framework
+```
+
+If `python3 -m venv` itself fails on Debian or Ubuntu, install the venv module
+first with `sudo apt install python3-venv`.
+
+Avoid `pip install --break-system-packages`: it does what it says, and a broken
+system Python is a much worse afternoon than a virtual environment.
+
 ### `pyxle dev` / `pyxle build` stops with a Node.js version error
 
 If `node --version` is **below v20.19**, Pyxle stops with a clear message before starting Vite:

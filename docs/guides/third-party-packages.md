@@ -78,6 +78,12 @@ async def load(request):
     return {"days": days}
 ```
 
+> **Install Recharts as `recharts@^2.15`.** Version 3.x brings in a CommonJS-only
+> dependency that calls `require('react')`, so a page importing it fails to
+> server-render with the error described under
+> [CommonJS packages and SSR](#commonjs-packages-and-ssr) above. Pin 2.x, or keep
+> 3.x and render the chart inside a `<ClientOnly>` boundary.
+
 ```jsx
 import { ComposedChart, Bar, Line, XAxis, YAxis } from 'recharts';
 

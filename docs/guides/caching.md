@@ -42,6 +42,13 @@ The envelope is recognised only in its exact two-key shape (`data` **and**
 `revalidate`, nothing else). A normal loader that happens to return keys named
 `data` or `revalidate` is never mistaken for a cache directive.
 
+> **Testing this? Not under `pyxle dev`.** The page cache is deliberately
+> **disabled in the dev server**, so a cached render can never hide an edit while
+> you work. A page that looks uncached in `pyxle dev` is behaving correctly.
+> Verify caching against a production server — `pyxle build` then `pyxle serve` —
+> and watch the `x-pyxle-cache: MISS` / `HIT` response header. See
+> [Where the cache lives](#where-the-cache-lives).
+
 ### Pages without a loader
 
 A page with no `@server` loader can still opt into caching with a module-level
