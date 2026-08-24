@@ -21,6 +21,7 @@ npm --version      # 10 or later
 Install Pyxle from PyPI:
 
 ```bash
+python3 -m venv venv && source venv/bin/activate   # PEP 668: needed on Debian/Ubuntu
 pip install pyxle-framework
 ```
 
@@ -30,7 +31,7 @@ This installs the `pyxle` CLI and the framework runtime. Confirm it works:
 pyxle --version
 ```
 
-### Installing in a virtual environment (recommended)
+### Virtual environments in detail
 
 ```bash
 python -m venv venv
