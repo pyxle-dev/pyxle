@@ -18,10 +18,10 @@ same way the framework is.
 One `.pyxl` file. A Python `@server` loader reads a 2,316-row request log,
 aggregates it with the standard library's `csv` and `statistics`, and returns a
 dict. A [Recharts](https://recharts.org) chart — an ordinary npm package,
-installed with `npm install recharts` — renders that dict directly.
+installed with `npm install recharts@^2.15` — renders that dict directly.
 
 ```
-npm install recharts        →  import { ComposedChart } from 'recharts';
+npm install recharts@^2.15  →  import { ComposedChart } from 'recharts';
 @server def load(request)   →  export default function Latency({ data })
 ```
 

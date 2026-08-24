@@ -74,6 +74,7 @@ Data loading, a server mutation, and a React UI &mdash; one file, two languages,
 ## Quickstart
 
 ```bash
+python3 -m venv venv && source venv/bin/activate   # PEP 668: needed on Debian/Ubuntu
 pip install pyxle-framework
 pyxle init my-app && cd my-app
 pyxle install
@@ -127,7 +128,7 @@ from the very first prompt — no priming, no setup.
 
 ## Status
 
-Pyxle is **early (0.8.x) but real.** The framework, SSR, routing, CLI, editor tooling, and the
+Pyxle is **early (0.9.x) but real.** The framework, SSR, routing, CLI, editor tooling, and the
 official plugins (auth, database, mail) all work today — [pyxle.dev](https://pyxle.dev) itself is
 built with Pyxle. APIs may still shift before 1.0. Feedback and contributions are very welcome.
 
@@ -151,7 +152,7 @@ Full docs at **[pyxle.dev/docs](https://pyxle.dev/docs/getting-started/installat
 Runnable apps in [`examples/`](examples):
 
 - **[charts](examples/charts)** &mdash; a [Recharts](https://recharts.org) chart rendered from
-  data a Python `@server` loader aggregated, in one `.pyxl` file. `npm install recharts`, import
+  data a Python `@server` loader aggregated, in one `.pyxl` file. `npm install recharts@^2.15`, import
   it, done &mdash; server-rendered SVG and a live React tree after hydration.
 - **[chat](examples/chat)** &mdash; realtime chat over a page WebSocket with `useWebSocket()`.
 

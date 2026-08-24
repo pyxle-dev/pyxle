@@ -17,7 +17,7 @@ The short version: Pyxle's niche is **real React UI plus real Python server logi
 
 "Real React ecosystem" means you can `npm install` any React library and use it directly, rather than through a framework-specific wrapper.
 
-Worked example: [`examples/charts`](https://github.com/pyxle-dev/pyxle/tree/main/examples/charts) is a [Recharts](https://recharts.org) chart rendered from data a Python `@server` loader aggregated — one `.pyxl` file, `npm install recharts`, no wrapper and no API route in between. It server-renders to SVG and is a live React tree after hydration. See [Third-party packages](third-party-packages.md#charts-and-other-libraries-that-measure-the-dom).
+Worked example: [`examples/charts`](https://github.com/pyxle-dev/pyxle/tree/main/examples/charts) is a [Recharts](https://recharts.org) chart rendered from data a Python `@server` loader aggregated — one `.pyxl` file, `npm install recharts@^2.15`, no wrapper and no API route in between. It server-renders to SVG and is a live React tree after hydration. See [Third-party packages](third-party-packages.md#charts-and-other-libraries-that-measure-the-dom).
 
 ## Pyxle vs. Next.js + FastAPI
 
@@ -31,7 +31,7 @@ Pyxle collapses that seam. A `@server` loader's return value *is* your component
 
 ## Pyxle vs. Reflex
 
-Reflex lets you build the entire app — UI included — in pure Python; it compiles your Python components down to a React/Next.js app under the hood. For a team that never wants to write JavaScript, that's a genuinely compelling promise, and Reflex executes it well.
+Reflex lets you build the entire app — UI included — in pure Python; it compiles your Python components down to a React app under the hood. For a team that never wants to write JavaScript, that's a genuinely compelling promise, and Reflex executes it well.
 
 The trade is indirection: you're expressing your UI through Reflex's component abstractions rather than React itself, so reaching for an arbitrary React library or a bit of custom client behavior means going through (or around) that layer.
 
