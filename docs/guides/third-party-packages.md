@@ -4,6 +4,14 @@ A Pyxle project has **two** dependency sets: Python packages (used by your
 `@server` loaders, `@action` mutations, and `pages/api/*.py` endpoints) and Node
 packages (used by your React/JSX components). Add to whichever side you need.
 
+> **After installing a new Node package, restart `pyxle dev`.** Until you do,
+> the page can fail to hydrate, with a misleading React error in the console —
+> `Invalid hook call` or `more than one copy of React` — while the server-side
+> render still looks fine. Nothing is wrong with your React versions: Vite's
+> dependency cache predates the new package, and the restart rebuilds it. This
+> bites hardest right after following an example, because the install is the
+> step you just did.
+
 ## Python packages (pip)
 
 Add the package to `requirements.txt` and install:
