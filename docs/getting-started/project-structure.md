@@ -86,7 +86,7 @@ A `.pyxl` file combines Python server logic with a React component. The scaffold
 - React JSX for the UI
 - The `<Head>` component from `pyxle/client` for document `<head>` elements
 
-```python
+```pyxl
 # Python section
 from datetime import datetime, timezone
 from pyxle import __version__
@@ -99,9 +99,7 @@ async def load_home(request):
         "time": now.strftime("%H:%M:%S UTC"),
         "message": "You're ready to build with Pyxle.",
     }
-```
 
-```jsx
 // JSX section -- receives loader data as props
 import React from 'react';
 import { Head } from 'pyxle/client';

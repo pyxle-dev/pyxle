@@ -79,20 +79,20 @@ import { formatDate } from '@/lib/format';
 A `@server` loader returns a dict; a third-party React component renders it.
 Nothing sits in between — no API route, no `fetch`, no serializer:
 
-```python
-@server
-async def load(request):
-    days = await asyncio.to_thread(summarize, LOG)   # plain Python
-    return {"days": days}
-```
-
 > **Install Recharts as `recharts@^2.15`.** Version 3.x brings in a CommonJS-only
 > dependency that calls `require('react')`, so a page importing it fails to
 > server-render with the error described under
 > [CommonJS packages and SSR](#commonjs-packages-and-ssr) above. Pin 2.x, or keep
 > 3.x and render the chart inside a `<ClientOnly>` boundary.
 
-```jsx
+```pyxl
+import asyncio
+
+@server
+async def load(request):
+    days = await asyncio.to_thread(summarize, LOG)   # plain Python
+    return {"days": days}
+
 import { ComposedChart, Bar, Line, XAxis, YAxis } from 'recharts';
 
 export default function Latency({ data }) {

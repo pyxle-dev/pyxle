@@ -6,16 +6,14 @@ A `.pyxl` file is the fundamental building block of a Pyxle application. It comb
 
 A `.pyxl` file has two sections:
 
-```python
+```pyxl
 # 1. Python section -- runs on the server
 from datetime import datetime
 
 @server
 async def load_page(request):
     return {"now": datetime.now().isoformat()}
-```
 
-```jsx
 // 2. JSX section -- runs on both server (SSR) and client
 import { Head } from 'pyxle/client';
 
@@ -151,14 +149,13 @@ export default function AboutPage({ data }) {
 
 Anything inside `<Head>` is extracted during SSR and inlined into the document `<head>`. It supports dynamic values via normal JSX interpolation:
 
-```jsx
-import { Head } from 'pyxle/client';
-
+```pyxl
 @server
 async def load_post(request):
     post = await fetch_post(request.path_params["slug"])
     return {"post": post}
 
+import { Head } from 'pyxle/client';
 
 export default function BlogPost({ data }) {
   return (
@@ -182,7 +179,7 @@ Head values are automatically sanitised to prevent XSS injection -- angle bracke
 
 ## A complete example
 
-```python
+```pyxl
 from datetime import datetime, timezone
 
 @server
@@ -195,9 +192,7 @@ async def load_home(request):
     else:
         greeting = "Good evening"
     return {"greeting": greeting}
-```
 
-```jsx
 import { Head } from 'pyxle/client';
 
 export default function HomePage({ data }) {

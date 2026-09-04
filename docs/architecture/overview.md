@@ -15,7 +15,7 @@ Pyxle"* heading.
 
 Here's the file we're going to render, simplified slightly:
 
-```python
+```pyxl
 # pages/index.pyxl
 from datetime import datetime, timezone
 
@@ -25,7 +25,6 @@ async def load_home(request):
         "version": "0.1.7",
         "now": datetime.now(timezone.utc).strftime("%H:%M:%S UTC"),
     }
-
 
 import React from 'react';
 import { Head } from 'pyxle/client';

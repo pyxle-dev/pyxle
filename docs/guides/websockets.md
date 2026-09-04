@@ -5,7 +5,7 @@ A Pyxle page can serve a **WebSocket** alongside its HTML. Add a module-level
 WebSocket route at the page's path — the same file serves both the rendered page
 over HTTP and a live connection over WS.
 
-```python
+```pyxl
 # pages/chat/[room].pyxl
 
 from pyxle.realtime import channel
@@ -22,9 +22,6 @@ async def websocket(ws):
     async with channel(ws, f"room:{room}") as live:
         async for message in ws.iter_text():
             await live.publish(message)
-
-
-# --- JavaScript/PSX (Client + Server) ---
 
 import React from 'react';
 import { useWebSocket } from 'pyxle/client';

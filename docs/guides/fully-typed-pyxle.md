@@ -86,7 +86,7 @@ properly than nail a half-answer to a page.
 
 *Illustrative — this is the target ergonomics, not current syntax.*
 
-```python
+```pyxl
 # posts/[slug].pyxl
 
 class Post(BaseModel):
@@ -97,10 +97,8 @@ class Post(BaseModel):
 @server
 async def load(request) -> Post:          # Python defines the shape, once
     return await db.get_post(request.path_params["slug"])
-```
 
-```tsx
-// same file, client half — the type comes from the loader, for free
+// the type comes from the loader, for free
 export default function PostPage({ data }: { data: Post }) {
   //                                          ^^^^ derived from the Python above
   return <article><h1>{data.title}</h1>{/* data.tital → caught before render */}</article>

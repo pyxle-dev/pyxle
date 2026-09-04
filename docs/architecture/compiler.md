@@ -74,14 +74,13 @@ actually `import` and call.
 
 Here's a real example. Source `.pyxl`:
 
-```python
+```pyxl
 # pages/index.pyxl
 import time
 
 @server
 async def load_home(request):
     return {"now": time.time()}
-
 
 import React from 'react';
 

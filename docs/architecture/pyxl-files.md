@@ -42,7 +42,7 @@ Let's start with the simplest one and grow it.
 
 ### A pure-JSX page
 
-```python
+```pyxl
 # pages/about.pyxl
 import React from 'react';
 
@@ -66,14 +66,13 @@ empty, the route is registered but has no `@server` function.
 
 ### A page with a server loader
 
-```python
+```pyxl
 # pages/status.pyxl
 import time
 
 @server
 async def load(request):
     return {"now": time.time(), "version": "0.1.7"}
-
 
 import React from 'react';
 
@@ -105,7 +104,7 @@ A few things to notice in this example:
 
 Here's a more interesting pattern: alternating Python and JSX blocks.
 
-```python
+```pyxl
 # pages/dashboard.pyxl
 from datetime import datetime
 
@@ -171,14 +170,13 @@ syntax. The boundaries are detected by parsing — see [The parser](parser.md).
 Use the `<Head>` component from `pyxle/client` to control what ends up in
 the document head. It's the recommended approach for nearly every page:
 
-```python
+```pyxl
 # pages/blog/[slug].pyxl
 @server
 async def load_post(request):
     slug = request.path_params["slug"]
     post = await fetch_post(slug)
     return {"post": post}
-
 
 import React from 'react';
 import { Head } from 'pyxle/client';

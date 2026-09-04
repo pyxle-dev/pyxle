@@ -341,12 +341,11 @@ A `layout.pyxl` looks like a regular page, but its component receives
 a `children` prop, and a layout loader's data arrives on a separate
 `layoutData` prop (so it never collides with the page's own `data`):
 
-```python
+```pyxl
 # pages/layout.pyxl
 @server
 async def load_root_layout(request):
     return {"appName": "MyApp"}
-
 
 import React from 'react';
 

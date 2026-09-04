@@ -19,7 +19,7 @@ Return a `{"data": ..., "revalidate": <seconds>}` envelope from your loader
 instead of a plain dict. `data` is the props your component receives (exactly
 as before); `revalidate` is how many seconds the cached render stays fresh.
 
-```python
+```pyxl
 @server
 async def load_post(request):
     post = await fetch_post(request.path_params["slug"])
@@ -27,9 +27,7 @@ async def load_post(request):
         "data": {"post": post},
         "revalidate": 60,   # cache this render for 60 seconds
     }
-```
 
-```jsx
 export default function Post({ data }) {
   return <article>{data.post.body}</article>;   // `data` is the inner dict
 }
@@ -54,11 +52,9 @@ The envelope is recognised only in its exact two-key shape (`data` **and**
 A page with no `@server` loader can still opt into caching with a module-level
 `CACHE` directive in its Python section:
 
-```python
+```pyxl
 CACHE = {"revalidate": 3600}   # cache this static page for an hour
-```
 
-```jsx
 export default function About() {
   return <main><h1>About Us</h1></main>;
 }
