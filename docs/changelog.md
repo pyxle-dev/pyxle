@@ -2,6 +2,10 @@
 
 Release notes for Pyxle. While we're in beta (`0.x`), minor versions may include breaking changes — those are called out explicitly. To upgrade, run `pip install --upgrade pyxle-framework`.
 
+## 0.9.4
+
+- **Docs: a whole-file `.pyxl` example is now one `pyxl` code block instead of a `python` fence stacked on a `jsx` fence** — one file in the docs the way it is one file on disk.
+
 ## 0.9.3
 
 - **Fix: the root `vite.config.js` now loads *after* a build too.** 0.9.2 stopped

@@ -46,7 +46,7 @@ Now watch what the same feature looks like in Pyxle.
 
 Here's the entire "list users and delete them" feature in Pyxle:
 
-```python
+```pyxl
 # pages/users.pyxl
 from myapp.db import fetch_users, delete_user
 
@@ -60,7 +60,6 @@ async def remove(request):
     body = await request.json()
     await delete_user(body["id"])
     return {"ok": True}
-
 
 import React from 'react';
 import { Head, useAction } from 'pyxle/client';
@@ -379,7 +378,7 @@ verify the edits across files.
 
 The agent creates **one file**:
 
-```python
+```pyxl
 # pages/posts/[id].pyxl
 from myapp.db import get_post, delete_post
 
@@ -397,7 +396,6 @@ async def remove(request):
     body = await request.json()
     await delete_post(int(body["id"]))
     return {"ok": True}
-
 
 import React from 'react';
 import { Head, useAction, navigate } from 'pyxle/client';

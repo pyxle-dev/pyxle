@@ -148,16 +148,14 @@ Templates are useful for authentication flows, wizards, or any section where you
 
 A layout (or template) can declare its own `@server` loader, just like a page. This is the clean way to load data the layout itself needs on **every** page it wraps -- a nav bar, a signed-in user/session banner, the current theme, the framework version, etc. -- without repeating it in every page's loader.
 
-```python
+```pyxl
 # pages/layout.pyxl
 from pyxle import __version__
 
 @server
 async def load(request):
     return {"version": __version__, "year": 2026}
-```
 
-```jsx
 export default function RootLayout({ children, data }) {
     return (
         <>
@@ -185,14 +183,13 @@ navigation, its stylesheet, its analytics tag, or the cost of its layout loader.
 
 A layout **or a template** can declare itself the root of its own chain:
 
-```python
+```pyxl
 @server
 async def load(request):
     return {}
 
 
 STANDALONE = True
-
 
 import React from 'react';
 

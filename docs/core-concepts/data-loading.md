@@ -4,13 +4,11 @@ Pyxle uses `@server` decorated functions to load data on the server before rende
 
 ## Basic loader
 
-```python
+```pyxl
 @server
 async def load_page(request):
     return {"message": "Hello from the server!"}
-```
 
-```jsx
 export default function MyPage({ data }) {
   return <h1>{data.message}</h1>;
 }
@@ -122,7 +120,7 @@ See [Error Handling](../guides/error-handling.md) for full details.
 
 Loaders can call any Python code -- databases, APIs, file systems:
 
-```python
+```pyxl
 import httpx
 
 @server
@@ -131,9 +129,7 @@ async def load_posts(request):
         resp = await client.get("https://jsonplaceholder.typicode.com/posts")
         resp.raise_for_status()
     return {"posts": resp.json()[:10]}
-```
 
-```jsx
 export default function PostsPage({ data }) {
   return (
     <ul>

@@ -13,7 +13,7 @@ In Pyxle, a route is a single `.pyxl` file with two halves:
 
 Mutations are a third piece — an `@action` function — instead of a second POST view.
 
-```python
+```pyxl
 # pages/posts/[id].pyxl
 
 @server
@@ -21,7 +21,6 @@ async def load(request):
     post = await get_post(request.path_params["id"])
     return {"post": post}          # <-- the loader's return value IS the data prop
 
-# --- the component (JSX) ---
 import React from 'react';
 
 export default function Post({ data }) {

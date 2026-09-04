@@ -31,14 +31,12 @@ Multiple actions can exist in the same `.pyxl` file alongside a `@server` loader
 
 The simplest way to call an action from a form. `<Form>` collects the inputs, posts them to the action, and exposes `onSuccess` / `onError` callbacks:
 
-```python
+```pyxl
 @action
 async def create_post(request):
     body = await request.json()
     return {"id": 1, "title": body["title"]}
-```
 
-```jsx
 import { Form } from 'pyxle/client';
 
 export default function NewPostPage() {

@@ -78,7 +78,7 @@ Python parser, and it's still wrong.
 
 ### Approach 2: explicit fence markers
 
-```python
+```pyxl
 # --- server ---
 @server
 async def loader(request):
@@ -340,7 +340,7 @@ Source: `compiler/parser.py:261-345`.
 With the walker and the helpers in place, here's what happens for a
 real four-section file:
 
-```python
+```pyxl
 # pages/dashboard.pyxl
 from datetime import datetime         # ─┐
                                       #  │ Python segment 1:
@@ -628,7 +628,7 @@ Two specific cases the parser defends against:
 
 A `.pyxl` file containing 200 levels of nested list literals:
 
-```python
+```pyxl
 @server
 async def loader(request):
     return [[[[[[[[[[ ... 200 levels ... ]]]]]]]]]]

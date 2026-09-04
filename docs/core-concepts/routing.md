@@ -32,15 +32,13 @@ Wrap a filename segment in square brackets to create a dynamic route parameter:
 
 Access dynamic parameters in your loader via `request.path_params`:
 
-```python
+```pyxl
 @server
 async def load_post(request):
     slug = request.path_params["slug"]
     post = await fetch_post(slug)
     return {"post": post}
-```
 
-```jsx
 export default function BlogPost({ data }) {
   return <h1>{data.post.title}</h1>;
 }

@@ -10,16 +10,14 @@ Pyxle is a Python-first full-stack web framework that brings the Next.js develop
 
 A `.pyxl` file colocates a Python `@server` loader (and `@action` mutations) with the React component that renders its data. The compiler splits them apart at build time, so the Python runs on the server and the JSX runs in the browser — but you author them as one unit, because they describe one thing: a single route.
 
-```python
+```pyxl
 # pages/index.pyxl
 from pyxle.runtime import server
 
 @server
 async def load(request):
     return {"message": "Hello from Python"}
-```
 
-```jsx
 export default function Home({ data }) {
     return <h1>{data.message}</h1>;
 }
