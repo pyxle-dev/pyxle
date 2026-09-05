@@ -219,6 +219,7 @@ migrations/
 Rules the migrator enforces:
 
 - **Applied exactly once, atomically.** Each migration's statements and its tracking-table insert commit together or not at all.
+- **Concurrency-safe across workers.** When several server workers start with the same pending migration, appliers serialize on a database lock (SQLite `BEGIN IMMEDIATE`, PostgreSQL `pg_advisory_xact_lock`, MySQL `GET_LOCK`): exactly one applies it, and the rest verify the recorded checksum matches their file and continue.
 - **Checksum-tracked.** Editing an already-applied migration is detected and rejected — write a new migration instead.
 - **Per-dialect overrides.** `<NNN>-<slug>.<dialect>.sql` replaces the base file on that backend (the example above uses MySQL-specific DDL while SQLite and PostgreSQL share the base file). An override with no base file is a backend-only migration.
 - **Namespaced tracking.** The default tracking table is `schema_migrations`; libraries that bring their own migrations onto your database (pyxle-auth does) use a private tracking table via `Migrator(db, dir, tracking_table=...)` so two migration histories never see each other as drift.
