@@ -557,8 +557,10 @@ pyxle serve --skip-build
 Guidelines:
 
 - **Run migrations once per deploy, before starting the new server** — not per
-  worker. Each migration is applied exactly once and atomically, so a race is
-  safe, but running it up front keeps the outcome visible in your deploy logs.
+  worker. Workers that do race a pending migration serialize on a database
+  lock — one applies it, the rest verify the recorded checksum and continue —
+  but running migrations up front keeps the outcome visible in your deploy
+  logs instead of spread across worker startups.
 - **Never edit an already-applied migration** — the checksum tracker rejects it.
   Add a new migration file instead.
 - **For zero-downtime (blue-green) deploys, keep migrations backward-compatible**
