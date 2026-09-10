@@ -69,6 +69,10 @@ class DevServerSettings:
     csrf: Any = None
     # Edge-cache policy (CacheConfig). None / empty = no shared caching.
     cache: Any = None
+    # Production asset-delivery policy (AssetsConfig): stylesheet inlining +
+    # public/ static max-age. None = framework defaults (link stylesheets,
+    # 1-hour public cache).
+    assets: Any = None
     # Client navigation/prefetch cache policy (NavigationConfig). None = default.
     navigation: Any = None
     # Token-bucket rate limit (RateLimitConfig). None / disabled = no limit.
@@ -131,6 +135,7 @@ class DevServerSettings:
         cors: Any = None,
         csrf: Any = None,
         cache: Any = None,
+        assets: Any = None,
         navigation: Any = None,
         rate_limit: Any = None,
         observability: Any = None,
@@ -216,6 +221,7 @@ class DevServerSettings:
             cors=cors,
             csrf=csrf,
             cache=cache,
+            assets=assets,
             navigation=navigation,
             rate_limit=rate_limit,
             observability=observability,

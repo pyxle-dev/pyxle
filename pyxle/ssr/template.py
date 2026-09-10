@@ -185,7 +185,30 @@ def build_document_shell(
     if isinstance(css_assets, list):
       for asset in css_assets:
         if isinstance(asset, str):
-          css_links.append(f'<link rel="stylesheet" href="/client/{asset.lstrip("/")}" />')
+          href = f"/client/{asset.lstrip('/')}"
+          inline_contents = _inline_stylesheet_contents(settings, asset)
+          if inline_contents is not None:
+            # ``assets.inlineStylesheets`` — embed the compiled sheet so the
+            # first paint never waits on a stylesheet round-trip. The
+            # data attribute records which asset this replaces (debuggability;
+            # the styles themselves are byte-identical to the linked file).
+            #
+            # The DISABLED link beside it is a dedupe marker, not a
+            # stylesheet: Vite's dynamic-import preload helper decides
+            # whether a chunk's CSS is already present by querying
+            # ``link[href="..."][rel="stylesheet"]`` — it cannot see a
+            # <style> tag, so on hydration it would download and inject the
+            # sheet a second time (wasted bytes, and re-inserting a sheet
+            # can reorder equal-specificity rules mid-session). A disabled
+            # stylesheet link matches the query without fetching or
+            # applying anything.
+            escaped_href = escape(href, quote=True)
+            css_links.append(
+              f'<style data-pyxle-css="{escaped_href}">{inline_contents}</style>'
+              f'<link rel="stylesheet" href="{escaped_href}" disabled data-pyxle-inlined="1" />'
+            )
+          else:
+            css_links.append(f'<link rel="stylesheet" href="{href}" />')
     css_html = "".join(f"\n    {link}" for link in css_links)
     js_src = f"/client/{js_file.lstrip('/')}"
 
@@ -194,13 +217,31 @@ def build_document_shell(
     # (the <script> tag sits at the end of the body). Vite's automatic
     # modulePreload only applies to index.html builds, not our SSR output, so we
     # inject these from the build manifest's import graph.
-    preload_links = [f'<link rel="modulepreload" href="{js_src}" />']
+    #
+    # ``fetchpriority="low"``: these chunks exist to hydrate a page the server
+    # has already painted, so they must never compete with the resources that
+    # produce that first paint (document, inlined/linked CSS, the LCP image).
+    # Without it Chrome requests preloaded modules at High priority, which puts
+    # every chunk on the pre-paint critical path — with idle bandwidth they
+    # still start immediately, so hydration timing is unchanged in practice.
+    #
+    # ``assets.modulePreload: false`` drops the hints entirely: hydration
+    # chunks then download only after the entry module evaluates, keeping
+    # every large chunk out of the pre-paint window — the content-first trade
+    # (see AssetsConfig).
+    emit_preloads = getattr(settings, "assets", None) is None or settings.assets.module_preload
+    preload_links = (
+      [f'<link rel="modulepreload" fetchpriority="low" href="{js_src}" />']
+      if emit_preloads
+      else []
+    )
     js_imports = client_info.get("imports", [])
-    if isinstance(js_imports, list):
+    if emit_preloads and isinstance(js_imports, list):
       for imp in js_imports:
         if isinstance(imp, str) and imp:
           preload_links.append(
-            f'<link rel="modulepreload" href="/client/{imp.lstrip("/")}" />'
+            '<link rel="modulepreload" fetchpriority="low" '
+            f'href="/client/{imp.lstrip("/")}" />'
           )
     preload_html = "".join(f"\n    {link}" for link in preload_links)
 
@@ -230,7 +271,7 @@ def build_document_shell(
   <script{nonce_attr}>window.__PYXLE_LOADING_ASSET__ = {loading_asset_literal};</script>
   <script{nonce_attr}>window.__PYXLE_ERROR_ASSET__ = {error_asset_literal};</script>{nav_stale_script}{csrf_names_script}{auth_seed_script}
   <script{nonce_attr}>window.__PYXLE_SCRIPTS__ = {scripts_metadata};</script>
-  <script type=\"module\" src=\"{js_src}\"></script>
+  {entry_script}
   </body>
 </html>
 """.format(
@@ -244,7 +285,7 @@ def build_document_shell(
       nav_stale_script=nav_stale_script,
       csrf_names_script=csrf_names_script,
       auth_seed_script=auth_seed_script,
-      js_src=js_src,
+      entry_script=_render_entry_script(js_src, nonce_attr, settings),
     )
     return DocumentShell(prefix=prefix, suffix=suffix)
 
@@ -297,6 +338,31 @@ def build_document_shell(
     vite_origin=vite_origin,
   )
   return DocumentShell(prefix=prefix, suffix=suffix)
+
+
+def _render_entry_script(js_src: str, nonce_attr: str, settings: DevServerSettings) -> str:
+  """The tag that starts hydration, per ``assets.hydration``.
+
+  ``eager`` (default): the ordinary module script — the browser fetches the
+  module graph in parallel with parsing. ``after-paint``: a tiny inline
+  bootstrap injects that script only once the first frame has been presented
+  (double rAF puts us at the start of frame two; the extra 32ms clears the
+  first frame's presentation timestamp, which the rAF callback alone can race
+  by a few milliseconds). The document is complete server HTML either way —
+  this changes when interactivity arrives, never what is painted.
+  """
+  policy = getattr(settings, "assets", None)
+  if policy is None or policy.hydration != "after-paint":
+    return f'<script type="module" src="{js_src}"></script>'
+  src_literal = json.dumps(js_src)
+  return (
+    f"<script{nonce_attr}>(function(){{"
+    "var h=function(){var s=document.createElement('script');"
+    f"s.type='module';s.src={src_literal};document.body.appendChild(s);}};"
+    "if(window.requestAnimationFrame){requestAnimationFrame(function(){"
+    "requestAnimationFrame(function(){setTimeout(h,32);});});}"
+    "else{setTimeout(h,0);}})();</script>"
+  )
 
 
 def _render_nav_stale_script(settings: DevServerSettings, nonce_attr: str) -> str:
@@ -868,6 +934,45 @@ def _format_nonce_attr(value: str | None) -> str:
     if not value:
         return ""
     return f' nonce="{escape(value, quote=True)}"'
+
+
+#: Per-process inline-or-link decisions, keyed by absolute stylesheet path:
+#: the escaped contents to inline, or ``None`` for "keep the link". Only
+#: populated in production, where the build output is immutable — bounded by
+#: the (fixed) set of CSS assets the build manifest names, and it keeps the
+#: stat/read off the SSR hot path after each sheet's first render.
+_INLINE_CSS_CACHE: dict[str, str | None] = {}
+
+
+def _inline_stylesheet_contents(settings: DevServerSettings, asset: str) -> str | None:
+  """The escaped contents of a compiled CSS *asset*, if policy says inline it.
+
+  ``None`` means "emit the ordinary ``<link>``": the policy is ``never`` (the
+  default), the sheet is over the ``auto`` limit, the path escapes the client
+  build directory (defence in depth — the manifest is our own build output),
+  or the file cannot be read (a truncated deploy must degrade to a working
+  link, never to an unstyled page).
+  """
+  policy = getattr(settings, "assets", None)
+  if policy is None or policy.inline_stylesheets == "never":
+    return None
+  base = settings.client_build_dir.resolve()
+  path = (base / asset.lstrip("/")).resolve()
+  if not path.is_relative_to(base):
+    return None
+  key = str(path)
+  if key in _INLINE_CSS_CACHE:
+    return _INLINE_CSS_CACHE[key]
+  contents: str | None
+  try:
+    if policy.inline_limit_for(path.stat().st_size):
+      contents = _escape_style_contents(path.read_text(encoding="utf-8"))
+    else:
+      contents = None
+  except OSError:
+    contents = None
+  _INLINE_CSS_CACHE[key] = contents
+  return contents
 
 
 def _render_global_styles_markup(settings: DevServerSettings) -> str:

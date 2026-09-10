@@ -25,9 +25,64 @@ Pyxle's SSR shell injects a `<link rel="modulepreload">` for the page's entry
 module **and every chunk it statically imports**, derived from the build
 manifest's import graph. The browser then fetches those chunks in parallel with
 HTML parsing instead of discovering them only after parsing the entry — a
-meaningful first-load win on multi-chunk pages. It's automatic; there's nothing
-to configure. (Browsers that don't support `modulepreload` simply ignore the
-hints — the page still loads.)
+meaningful first-load win on multi-chunk pages. It's automatic. (Browsers that
+don't support `modulepreload` simply ignore the hints — the page still loads.)
+
+Every hint carries `fetchpriority="low"`: the chunks exist to hydrate a page
+the server has already painted, so they must not compete with the resources
+that produce that paint (the document, its CSS, the LCP image). With idle
+bandwidth — the common case once the shell has arrived — low-priority requests
+still start immediately, so hydration timing is unchanged; on a contended
+connection the paint-critical resources win, which is the order you want.
+
+For content-first pages you can go further:
+[`assets.modulePreload: false`](../reference/configuration.md#asset-delivery)
+drops the hints entirely, and
+[`assets.hydration: "after-paint"`](../reference/configuration.md#asset-delivery)
+holds the entry `<script>` itself until the first frame has been presented.
+Together they guarantee the server-rendered document paints with **zero
+JavaScript in flight** — no hydration chunk is even discovered before first
+paint. Interactivity arrives a beat later (one frame plus the network's
+fetch time); nothing about the paint changes, because the document was
+complete server HTML all along. Leave the defaults for app-like pages where
+time-to-interactive is the product.
+
+## Inline stylesheets: trading cacheability for first paint
+
+By default a production page links its compiled CSS with ordinary
+`<link rel="stylesheet">` tags. Links are cache-friendly — a returning visitor
+already has the sheets — but they are **render-blocking**: on a first visit the
+browser cannot paint until every linked sheet has made its own round trip, which
+is routinely the largest chunk of First Contentful Paint on a fast server.
+
+The `assets.inlineStylesheets` config knob embeds the same compiled CSS
+directly into the HTML document instead:
+
+```json
+{
+  "assets": {
+    "inlineStylesheets": "auto",
+    "inlineStylesheetLimit": 8192
+  }
+}
+```
+
+| Value | Behaviour |
+|-------|-----------|
+| `"never"` (default) | Always link. Best when most traffic is returning visitors with warm caches. |
+| `"auto"` | Inline any sheet whose file is at most `inlineStylesheetLimit` bytes (default 8192); larger sheets keep their link. |
+| `"always"` | Inline every sheet. First paint never waits on a stylesheet request — the right trade for landing/marketing pages where most visits are first visits. |
+
+The styles are byte-identical either way — inlining changes how they arrive,
+never what applies — and each inlined block carries a
+`data-pyxle-css="<asset url>"` attribute naming the file it replaced, plus a
+`disabled` link marker so the client runtime knows the sheet is already
+present and never downloads it a second time on hydration. The cost is that
+inlined CSS rides along in every HTML response instead of being cached once
+per visitor (the HTML itself is gzipped, so the wire cost is the sheet's
+gzipped size). Client-side navigation is unaffected: other pages' sheets still
+load on demand, and a sheet that fails to read at render time (a truncated
+deploy) degrades to its normal link rather than an unstyled page.
 
 ## Inspecting the bundle — `pyxle build --analyze`
 

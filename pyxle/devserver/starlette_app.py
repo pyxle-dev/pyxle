@@ -38,6 +38,7 @@ from pyxle.cache import (
     warm_page_cache,
 )
 from pyxle.cli.logger import ConsoleLogger
+from pyxle.config import DEFAULT_PUBLIC_MAX_AGE
 from pyxle.ssr import (
     ComponentRenderer,
     build_page_navigation_response,
@@ -262,12 +263,19 @@ _STATIC_CACHE_MAX_FILE_BYTES = 1024 * 1024
 _STATIC_CACHE_MAX_TOTAL_BYTES = 32 * 1024 * 1024
 
 
-def _static_cache_control(path: str, *, is_client: bool, debug: bool = False) -> bytes:
+def _static_cache_control(
+    path: str,
+    *,
+    is_client: bool,
+    debug: bool = False,
+    public_max_age: int = DEFAULT_PUBLIC_MAX_AGE,
+) -> bytes:
     """Cache-Control value for a static asset URL path.
 
     Vite content-hashed bundles (``/client/.../dist/assets/...``) are immutable
-    and cacheable forever regardless of mode. In production, other assets get a
-    one-hour cache. In development, public assets get ``no-cache`` so the browser
+    and cacheable forever regardless of mode. In production, other assets get
+    ``public_max_age`` (the ``assets.publicMaxAge`` config knob; default one
+    hour). In development, public assets get ``no-cache`` so the browser
     revalidates on every request — a change to a ``public/`` file is reflected on
     the next refresh (a 304 is still returned while it is unchanged) instead of
     being masked by an hour-long cache. Dev never long-caches public assets, but
@@ -278,7 +286,7 @@ def _static_cache_control(path: str, *, is_client: bool, debug: bool = False) ->
         return b"public, max-age=31536000, immutable"
     if debug and not is_client:
         return b"no-cache"
-    return b"public, max-age=3600"
+    return b"public, max-age=%d" % public_max_age
 
 
 @dataclass(frozen=True, slots=True)
@@ -328,6 +336,7 @@ def _load_static_memory_cache(
     prefix: str = "",
     max_file_bytes: int,
     budget: int,
+    public_max_age: int = DEFAULT_PUBLIC_MAX_AGE,
 ) -> tuple[dict[str, _CachedAsset], int]:
     """Load files from ``directory`` into memory, returning the remaining budget.
 
@@ -366,7 +375,12 @@ def _load_static_memory_cache(
             (b"content-type", media_type.encode("latin-1")),
             (b"last-modified", formatdate(stat_result.st_mtime, usegmt=True).encode("latin-1")),
             (b"etag", etag.encode("latin-1")),
-            (b"cache-control", _static_cache_control(url_path, is_client=bool(prefix))),
+            (
+                b"cache-control",
+                _static_cache_control(
+                    url_path, is_client=bool(prefix), public_max_age=public_max_age
+                ),
+            ),
         )
         cache[url_path] = _CachedAsset(
             body=body,
@@ -404,9 +418,11 @@ class StaticAssetsMiddleware:
         public_index: StaticFileIndex | None = None,
         cache_max_file_bytes: int = _STATIC_CACHE_MAX_FILE_BYTES,
         cache_max_total_bytes: int = _STATIC_CACHE_MAX_TOTAL_BYTES,
+        public_max_age: int = DEFAULT_PUBLIC_MAX_AGE,
     ) -> None:
         self.app = app
         self._debug = debug
+        self._public_max_age = public_max_age
         self._public_static = (
             HttpOnlyStaticFiles(directory=public_directory, check_dir=False)
             if public_directory is not None
@@ -436,12 +452,14 @@ class StaticAssetsMiddleware:
                 public_directory,
                 max_file_bytes=cache_max_file_bytes,
                 budget=budget,
+                public_max_age=public_max_age,
             )
             client_cache, budget = _load_static_memory_cache(
                 client_directory,
                 prefix=_CLIENT_ASSET_URL_PREFIX,
                 max_file_bytes=cache_max_file_bytes,
                 budget=budget,
+                public_max_age=public_max_age,
             )
             self._memory_cache.update(client_cache)
 
@@ -477,12 +495,18 @@ class StaticAssetsMiddleware:
                 send,
                 prefix=_CLIENT_ASSET_URL_PREFIX,
                 debug=self._debug,
+                public_max_age=self._public_max_age,
             ):
                 return
 
         if self._public_static is not None and not under_client:
             if path in self._public_paths and await self._try_static(
-                self._public_static, scope, receive, send, debug=self._debug
+                self._public_static,
+                scope,
+                receive,
+                send,
+                debug=self._debug,
+                public_max_age=self._public_max_age,
             ):
                 return
 
@@ -526,6 +550,7 @@ class StaticAssetsMiddleware:
         *,
         prefix: str = "",
         debug: bool = False,
+        public_max_age: int = DEFAULT_PUBLIC_MAX_AGE,
     ) -> bool:
         selected_scope = scope
         original_path = scope.get("path", "")
@@ -547,7 +572,10 @@ class StaticAssetsMiddleware:
         # are immutable and can be cached forever; see _static_cache_control.
         # Only the client mount passes a prefix, matching _load_static_memory_cache.
         cache_control = _static_cache_control(
-            original_path, is_client=bool(prefix), debug=debug
+            original_path,
+            is_client=bool(prefix),
+            debug=debug,
+            public_max_age=public_max_age,
         )
 
         async def _send_with_cache_headers(message):
@@ -2249,6 +2277,13 @@ def create_starlette_app(
             # header so a browser refresh reflects an edited asset.
             debug=settings.debug,
             public_index=static_public_index,
+            # assets.publicMaxAge — how long browsers/CDNs may cache un-hashed
+            # public/ files in production (hashed bundles stay immutable-1y).
+            public_max_age=(
+                settings.assets.public_max_age
+                if settings.assets is not None
+                else DEFAULT_PUBLIC_MAX_AGE
+            ),
         )
 
     middleware_stack: list[Middleware] = []

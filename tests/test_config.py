@@ -706,3 +706,93 @@ def test_load_config_rejects_invalid_app_name(tmp_path: Path, bad: object) -> No
         load_config(tmp_path)
 
     assert "'name'" in str(excinfo.value)
+
+
+# ── the assets block — production asset-delivery policy ──────────────
+
+
+def test_load_config_assets_defaults(tmp_path: Path) -> None:
+    """Absent block → link stylesheets, one-hour public cache."""
+    result = load_config(tmp_path)
+    assert result.assets.inline_stylesheets == "never"
+    assert result.assets.inline_stylesheet_limit == 8192
+    assert result.assets.public_max_age == 3600
+
+
+def test_load_config_parses_assets_block(tmp_path: Path) -> None:
+    write_config(
+        tmp_path,
+        {
+            "assets": {
+                "inlineStylesheets": "always",
+                "inlineStylesheetLimit": 16384,
+                "publicMaxAge": 604800,
+            }
+        },
+    )
+    result = load_config(tmp_path)
+    assert result.assets.inline_stylesheets == "always"
+    assert result.assets.inline_stylesheet_limit == 16384
+    assert result.assets.public_max_age == 604800
+
+
+def test_assets_config_flows_into_devserver_kwargs(tmp_path: Path) -> None:
+    write_config(tmp_path, {"assets": {"inlineStylesheets": "auto"}})
+    kwargs = load_config(tmp_path).to_devserver_kwargs()
+    assert kwargs["assets"].inline_stylesheets == "auto"
+
+
+def test_assets_inline_limit_for() -> None:
+    from pyxle.config import AssetsConfig
+
+    assert AssetsConfig(inline_stylesheets="always").inline_limit_for(10**9)
+    auto = AssetsConfig(inline_stylesheets="auto", inline_stylesheet_limit=100)
+    assert auto.inline_limit_for(100)
+    assert not auto.inline_limit_for(101)
+    assert not AssetsConfig().inline_limit_for(0)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"assets": "always"},
+        {"assets": {"inlineStylesheets": "sometimes"}},
+        {"assets": {"inlineStylesheets": True}},
+        {"assets": {"inlineStylesheetLimit": -1}},
+        {"assets": {"inlineStylesheetLimit": True}},
+        {"assets": {"publicMaxAge": -5}},
+        {"assets": {"publicMaxAge": "1h"}},
+        {"assets": {"publicMaxAge": True}},
+        {"assets": {"maxAge": 60}},
+    ],
+)
+def test_load_config_rejects_bad_assets_values(tmp_path: Path, payload: dict) -> None:
+    write_config(tmp_path, payload)
+    with pytest.raises(ConfigError):
+        load_config(tmp_path)
+
+
+def test_load_config_parses_assets_module_preload(tmp_path: Path) -> None:
+    write_config(tmp_path, {"assets": {"modulePreload": False}})
+    assert load_config(tmp_path).assets.module_preload is False
+    write_config(tmp_path, {"assets": {}})
+    assert load_config(tmp_path).assets.module_preload is True
+
+
+def test_load_config_rejects_bad_assets_module_preload(tmp_path: Path) -> None:
+    write_config(tmp_path, {"assets": {"modulePreload": "yes"}})
+    with pytest.raises(ConfigError):
+        load_config(tmp_path)
+
+
+def test_load_config_parses_assets_hydration(tmp_path: Path) -> None:
+    write_config(tmp_path, {"assets": {"hydration": "after-paint"}})
+    assert load_config(tmp_path).assets.hydration == "after-paint"
+    write_config(tmp_path, {"assets": {}})
+    assert load_config(tmp_path).assets.hydration == "eager"
+
+
+def test_load_config_rejects_bad_assets_hydration(tmp_path: Path) -> None:
+    write_config(tmp_path, {"assets": {"hydration": "lazy"}})
+    with pytest.raises(ConfigError):
+        load_config(tmp_path)

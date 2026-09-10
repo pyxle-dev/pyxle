@@ -44,6 +44,13 @@ Pyxle is configured via `pyxle.config.json` in the project root. All fields are 
     "exemptPaths": []
   },
   "cache": {},
+  "assets": {
+    "inlineStylesheets": "never",
+    "inlineStylesheetLimit": 8192,
+    "publicMaxAge": 3600,
+    "modulePreload": true,
+    "hydration": "eager"
+  },
   "navigation": {},
   "rateLimit": {
     "requests": 0,
@@ -268,6 +275,30 @@ Each key is a route pattern; each value is the shared-cache lifetime in seconds:
 | `cache."<pattern>"` | `integer` \| `{ "sMaxage": integer }` | -- | Lifetime in seconds (≥ 0) for the matched route. The object-form key is `sMaxage` (camelCase); `maxAge` is accepted as a legacy alias. |
 
 > **Turning it on at the edge.** These headers make a response *eligible* for shared caching, but some CDNs don't cache HTML by default. On Cloudflare, you must also add a Cache Rule ("Cache Everything") for the cached paths -- the headers alone are necessary but not sufficient. See [Deployment → CDN and edge caching](../guides/deployment.md#cdn-and-edge-caching).
+
+## Asset delivery
+
+How production responses deliver the *assets themselves* -- distinct from
+[edge caching](#edge-caching), which governs page responses.
+
+```json
+{
+  "assets": {
+    "inlineStylesheets": "auto",
+    "inlineStylesheetLimit": 8192,
+    "publicMaxAge": 604800
+  }
+}
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `assets` | `object` | `{}` | Production asset-delivery policy. |
+| `assets.inlineStylesheets` | `"never"` \| `"auto"` \| `"always"` | `"never"` | Whether a production render embeds the page's compiled CSS in the document instead of emitting render-blocking `<link rel="stylesheet">` tags. `"auto"` inlines sheets up to `inlineStylesheetLimit` bytes; `"always"` inlines everything -- first paint stops waiting on a stylesheet round trip, at the cost of the CSS bytes riding in every HTML response instead of being cached once. See [Build optimization → Inline stylesheets](../guides/build-optimization.md#inline-stylesheets-trading-cacheability-for-first-paint). |
+| `assets.inlineStylesheetLimit` | `integer` | `8192` | Per-sheet size threshold (bytes, ≥ 0) used by `"auto"`. |
+| `assets.modulePreload` | `boolean` | `true` | Whether the production shell emits `<link rel="modulepreload">` hints for the page's hydration chunks (always `fetchpriority="low"`). `false` drops the hints so only the entry module is discovered pre-paint -- hydration chunks then download after the entry evaluates, keeping large chunks out of the pre-paint window at the cost of hydration starting a beat later. |
+| `assets.hydration` | `"eager"` \| `"after-paint"` | `"eager"` | When the client entry starts loading in production. `"after-paint"` injects the module script only after the first frame has been presented: the server-rendered document paints with zero JavaScript in flight, and hydration begins a frame later. Content-first mode -- pair it with `modulePreload: false`, and leave `"eager"` for app-like pages where time-to-interactive is the product. |
+| `assets.publicMaxAge` | `integer` | `3600` | `Cache-Control: max-age` (seconds, ≥ 0) that production `pyxle serve` sends for un-hashed `public/` files. Content-hashed client bundles are always `max-age=31536000, immutable` regardless -- their URLs change with their bytes, so only `public/` needs a policy. Development always serves `public/` with `no-cache`. |
 
 ## Navigation
 

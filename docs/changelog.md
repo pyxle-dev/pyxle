@@ -4,6 +4,14 @@ Release notes for Pyxle. While we're in beta (`0.x`), minor versions may include
 
 ## 0.9.4
 
+- **`assets.inlineStylesheets`: inline a page's compiled CSS into the document instead of render-blocking `<link>` tags** — `"never"` (default) / `"auto"` (up to `inlineStylesheetLimit` bytes per sheet) / `"always"`; first paint stops waiting on a stylesheet round trip, an unreadable sheet degrades to its normal link, and the [build-optimization guide](guides/build-optimization.md#inline-stylesheets-trading-cacheability-for-first-paint) covers the cacheability trade.
+
+- **`assets.publicMaxAge`: configurable `Cache-Control` lifetime for un-hashed `public/` files in production** — the previous fixed one hour is now the default; hashed client bundles stay `immutable` for a year, and development keeps `no-cache`.
+
+- **Module-preload hints are now `fetchpriority="low"`, and `assets.modulePreload: false` can drop them entirely** — hydration chunks exist to hydrate a page the server already painted, so they no longer compete with the document, CSS, or the LCP image for pre-paint bandwidth; content-first pages can opt out of the hints altogether.
+
+- **`assets.hydration: "after-paint"`: paint first, hydrate a frame later** — the production shell injects the client entry only after the first frame has been presented, so a content-first page paints its (already complete) server HTML with zero JavaScript in flight. Default stays `"eager"`.
+
 - **Docs: a whole-file `.pyxl` example is now one `pyxl` code block instead of a `python` fence stacked on a `jsx` fence** — one file in the docs the way it is one file on disk.
 
 ## 0.9.3

@@ -1275,7 +1275,10 @@ def test_http_only_static_ignores_lifespan_scope(project: DevServerSettings) -> 
 
 
 def _static_assets_app(
-    *, public_directory: Path | None = None, client_directory: Path | None = None
+    *,
+    public_directory: Path | None = None,
+    client_directory: Path | None = None,
+    **middleware_kwargs,
 ) -> Starlette:
     """Build a Starlette app whose only middleware is StaticAssetsMiddleware,
     falling through to a sentinel handler when no static file matches."""
@@ -1292,6 +1295,7 @@ def _static_assets_app(
                 StaticAssetsMiddleware,
                 public_directory=public_directory,
                 client_directory=client_directory,
+                **middleware_kwargs,
             )
         ],
     )
@@ -1417,6 +1421,49 @@ def test_static_assets_middleware_public_branch_when_client_dir_present(
     assert resp.text == "ICON"
     # public assets get the short-lived cache header (not the immutable one).
     assert resp.headers["cache-control"] == "public, max-age=3600"
+
+
+def test_static_assets_middleware_public_max_age_is_configurable(
+    tmp_path: Path,
+) -> None:
+    """``assets.publicMaxAge`` reaches the header, on both serving paths:
+    straight from disk and from the startup memory cache."""
+    public_dir = tmp_path / "public"
+    public_dir.mkdir()
+    (public_dir / "shot.png").write_bytes(b"PNG")
+
+    disk = TestClient(
+        _static_assets_app(public_directory=public_dir, public_max_age=604800)
+    )
+    resp = disk.get("/shot.png")
+    assert resp.status_code == 200
+    assert resp.headers["cache-control"] == "public, max-age=604800"
+
+    cached = TestClient(
+        _static_assets_app(
+            public_directory=public_dir, cache_in_memory=True, public_max_age=604800
+        )
+    )
+    resp = cached.get("/shot.png")
+    assert resp.status_code == 200
+    assert resp.headers["cache-control"] == "public, max-age=604800"
+
+
+def test_static_assets_middleware_public_max_age_never_touches_hashed_assets(
+    tmp_path: Path,
+) -> None:
+    """The knob governs public/ files only — hashed bundles stay immutable."""
+    client_dir = tmp_path / "client" / "dist"
+    hashed_dir = client_dir / "assets"
+    hashed_dir.mkdir(parents=True)
+    (hashed_dir / "index-a1b2c3d4.js").write_text("export const x = 1;", encoding="utf-8")
+
+    client = TestClient(
+        _static_assets_app(client_directory=client_dir, public_max_age=60)
+    )
+    resp = client.get("/client/dist/assets/index-a1b2c3d4.js")
+    assert resp.status_code == 200
+    assert resp.headers["cache-control"] == "public, max-age=31536000, immutable"
 
 
 def test_static_assets_middleware_serves_hashed_client_asset_immutable(

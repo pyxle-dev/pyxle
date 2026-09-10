@@ -441,8 +441,10 @@ Two things to know before relying on it:
 
 Content-hashed client bundles (under `/client/dist/assets/`) are already sent
 `Cache-Control: public, max-age=31536000, immutable`, and other static files get
-`public, max-age=3600` -- independent of the `cache` block above, which governs
-*page* responses.
+`public, max-age=3600` by default -- raise it for slow-changing `public/` assets
+(screenshots, brand SVGs) with
+[`assets.publicMaxAge`](../reference/configuration.md#asset-delivery). Both are
+independent of the `cache` block above, which governs *page* responses.
 
 ## Docker
 
