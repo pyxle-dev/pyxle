@@ -316,10 +316,21 @@ def test_render_document_injects_modulepreload_in_production(
 
     # The entry module itself is preloaded (so it fetches during head parse,
     # not when the <script> at the body end is reached)...
-    assert '<link rel="modulepreload" href="/client/assets/index.js" />' in html
-    # ...and so are the chunks it statically imports.
-    assert '<link rel="modulepreload" href="/client/dist/assets/vendor.js" />' in html
-    assert '<link rel="modulepreload" href="/client/dist/assets/shared.js" />' in html
+    assert (
+        '<link rel="modulepreload" fetchpriority="low" href="/client/assets/index.js" />'
+        in html
+    )
+    # ...and so are the chunks it statically imports. Every hint is
+    # fetchpriority="low": hydration code must never outrank the resources
+    # that produce the first paint.
+    assert (
+        '<link rel="modulepreload" fetchpriority="low" href="/client/dist/assets/vendor.js" />'
+        in html
+    )
+    assert (
+        '<link rel="modulepreload" fetchpriority="low" href="/client/dist/assets/shared.js" />'
+        in html
+    )
 
 
 def test_render_document_embeds_only_non_default_csrf_names(
@@ -1405,3 +1416,235 @@ def test_error_document_production_never_shows_the_origin(
     assert "relimp.pyxl" not in html
     assert "GREETING" not in html
     assert '<div class="pyxle-origin">' not in html
+
+
+class TestInlineStylesheets:
+    """``assets.inlineStylesheets`` — the render-blocking-CSS knob.
+
+    ``always``/``auto`` swap the manifest ``<link rel="stylesheet">`` for a
+    ``<style data-pyxle-css>`` block carrying the same bytes, so first paint
+    stops waiting on a stylesheet round-trip; ``never`` (the default) keeps
+    the cache-friendly links. Anything unreadable degrades to a link — a
+    truncated deploy must never cost a page its styling.
+    """
+
+    @staticmethod
+    def _prod_settings(tmp_path: Path, assets, css_files: dict[str, str]):
+        from pyxle.config import AssetsConfig  # noqa: F401 - fixture type
+
+        settings = DevServerSettings.from_project_root(
+            tmp_path,
+            debug=False,
+            assets=assets,
+            page_manifest={
+                "/": {
+                    "client": {
+                        "file": "assets/index.js",
+                        "imports": [],
+                        "css": list(css_files),
+                    }
+                }
+            },
+        )
+        for name, contents in css_files.items():
+            target = settings.client_build_dir / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(contents, encoding="utf-8")
+        return settings
+
+    def _render(self, settings, page_route) -> str:
+        return render_document(
+            settings=settings,
+            page=page_route,
+            body_html="<div>Prod</div>",
+            props={},
+            script_nonce="secure",
+            head_elements=page_route.head_elements,
+        )
+
+    def test_always_inlines_every_sheet(self, page_route, tmp_path: Path) -> None:
+        from pyxle.config import AssetsConfig
+
+        settings = self._prod_settings(
+            tmp_path,
+            AssetsConfig(inline_stylesheets="always"),
+            {"assets/index.css": ".pane { color: red }"},
+        )
+        html = self._render(settings, page_route)
+        assert '<style data-pyxle-css="/client/assets/index.css">' in html
+        assert ".pane { color: red }" in html
+        # The only stylesheet link is the DISABLED dedupe marker that stops
+        # Vite's preload helper re-downloading the inlined sheet on hydration.
+        assert (
+            '<link rel="stylesheet" href="/client/assets/index.css" disabled'
+            in html
+        )
+        assert html.count('rel="stylesheet"') == 1
+
+    def test_never_keeps_the_links(self, page_route, tmp_path: Path) -> None:
+        from pyxle.config import AssetsConfig
+
+        settings = self._prod_settings(
+            tmp_path,
+            AssetsConfig(inline_stylesheets="never"),
+            {"assets/index.css": ".pane { color: red }"},
+        )
+        html = self._render(settings, page_route)
+        assert 'rel="stylesheet" href="/client/assets/index.css"' in html
+        assert "data-pyxle-css" not in html
+
+    def test_no_assets_config_keeps_the_links(self, page_route, tmp_path: Path) -> None:
+        settings = self._prod_settings(
+            tmp_path, None, {"assets/index.css": ".pane { color: red }"}
+        )
+        html = self._render(settings, page_route)
+        assert 'rel="stylesheet" href="/client/assets/index.css"' in html
+        assert "data-pyxle-css" not in html
+
+    def test_auto_inlines_only_under_the_limit(self, page_route, tmp_path: Path) -> None:
+        from pyxle.config import AssetsConfig
+
+        small = ".a { color: red }"
+        big = ".b { color: blue }" + "/* pad */" * 64
+        settings = self._prod_settings(
+            tmp_path,
+            AssetsConfig(inline_stylesheets="auto", inline_stylesheet_limit=len(small)),
+            {"assets/small.css": small, "assets/big.css": big},
+        )
+        html = self._render(settings, page_route)
+        assert '<style data-pyxle-css="/client/assets/small.css">' in html
+        assert 'rel="stylesheet" href="/client/assets/big.css"' in html
+
+    def test_a_missing_file_degrades_to_a_link(self, page_route, tmp_path: Path) -> None:
+        from pyxle.config import AssetsConfig
+
+        settings = self._prod_settings(
+            tmp_path, AssetsConfig(inline_stylesheets="always"), {}
+        )
+        settings = replace(
+            settings,
+            page_manifest={
+                "/": {
+                    "client": {
+                        "file": "assets/index.js",
+                        "imports": [],
+                        "css": ["assets/ghost.css"],
+                    }
+                }
+            },
+        )
+        html = self._render(settings, page_route)
+        assert 'rel="stylesheet" href="/client/assets/ghost.css"' in html
+
+    def test_a_traversing_asset_path_degrades_to_a_link(
+        self, page_route, tmp_path: Path
+    ) -> None:
+        """The manifest is our own build output, but a path that escapes the
+        client build dir is still never read — belt and braces."""
+        from pyxle.config import AssetsConfig
+
+        (tmp_path / "secret.css").write_text("leak{}", encoding="utf-8")
+        settings = self._prod_settings(
+            tmp_path, AssetsConfig(inline_stylesheets="always"), {}
+        )
+        settings = replace(
+            settings,
+            page_manifest={
+                "/": {
+                    "client": {
+                        "file": "assets/index.js",
+                        "imports": [],
+                        "css": ["../../../secret.css"],
+                    }
+                }
+            },
+        )
+        html = self._render(settings, page_route)
+        assert "leak{}" not in html
+
+    def test_inlined_css_escapes_style_breakers(self, page_route, tmp_path: Path) -> None:
+        """A sheet containing ``</style>`` (a content string can) must not be
+        able to terminate the style block early."""
+        from pyxle.config import AssetsConfig
+
+        settings = self._prod_settings(
+            tmp_path,
+            AssetsConfig(inline_stylesheets="always"),
+            {"assets/index.css": '.x::after { content: "</style><script>" }'},
+        )
+        html = self._render(settings, page_route)
+        assert "</style><script>" not in html
+
+
+def test_module_preload_hints_can_be_disabled(page_route, tmp_path: Path) -> None:
+    """``assets.modulePreload: false`` drops every hint; the entry <script>
+    stays — hydration chunks are then discovered by the entry, post-paint."""
+    from pyxle.config import AssetsConfig
+
+    settings = DevServerSettings.from_project_root(
+        tmp_path,
+        debug=False,
+        assets=AssetsConfig(module_preload=False),
+        page_manifest={
+            "/": {
+                "client": {
+                    "file": "assets/index.js",
+                    "imports": ["dist/assets/vendor.js"],
+                    "css": [],
+                }
+            }
+        },
+    )
+
+    html = render_document(
+        settings=settings,
+        page=page_route,
+        body_html="<div>Prod</div>",
+        props={},
+        script_nonce="secure",
+        head_elements=page_route.head_elements,
+    )
+
+    assert "modulepreload" not in html
+    assert '<script type="module" src="/client/assets/index.js"></script>' in html
+
+
+class TestAfterPaintHydration:
+    """``assets.hydration: "after-paint"`` — hydrate one frame after paint."""
+
+    @staticmethod
+    def _html(tmp_path: Path, page_route, assets) -> str:
+        settings = DevServerSettings.from_project_root(
+            tmp_path,
+            debug=False,
+            assets=assets,
+            page_manifest={
+                "/": {"client": {"file": "assets/index.js", "imports": [], "css": []}}
+            },
+        )
+        return render_document(
+            settings=settings,
+            page=page_route,
+            body_html="<div>Prod</div>",
+            props={},
+            script_nonce="secure",
+            head_elements=page_route.head_elements,
+        )
+
+    def test_after_paint_defers_the_entry(self, page_route, tmp_path: Path) -> None:
+        from pyxle.config import AssetsConfig
+
+        html = self._html(tmp_path, page_route, AssetsConfig(hydration="after-paint"))
+        # No parser-visible module script — the bootstrap injects it.
+        assert '<script type="module" src="/client/assets/index.js"></script>' not in html
+        assert '"/client/assets/index.js"' in html
+        assert "requestAnimationFrame" in html
+        # The bootstrap honours the CSP nonce like every other inline script.
+        assert html.count('nonce="secure"') >= 1
+
+    def test_eager_is_the_default_and_unchanged(self, page_route, tmp_path: Path) -> None:
+        from pyxle.config import AssetsConfig
+
+        for assets in (None, AssetsConfig()):
+            html = self._html(tmp_path, page_route, assets)
+            assert '<script type="module" src="/client/assets/index.js"></script>' in html

@@ -108,6 +108,82 @@ class CacheConfig:
         return best_age
 
 
+#: Inline-stylesheet policy values accepted by ``assets.inlineStylesheets``.
+ASSETS_INLINE_MODES = ("never", "auto", "always")
+
+#: Default per-sheet size threshold (bytes) for ``inlineStylesheets: "auto"``.
+DEFAULT_INLINE_STYLESHEET_LIMIT = 8192
+
+#: Default ``Cache-Control: max-age`` (seconds) for un-hashed ``public/``
+#: assets in production. Hashed client bundles are always immutable-forever.
+DEFAULT_PUBLIC_MAX_AGE = 3600
+
+#: Hydration timing values accepted by ``assets.hydration``.
+ASSETS_HYDRATION_MODES = ("eager", "after-paint")
+
+
+@dataclass(frozen=True, slots=True)
+class AssetsConfig:
+    """Production asset-delivery policy.
+
+    ``inline_stylesheets`` controls whether a production render embeds the
+    page's compiled CSS into the document instead of emitting render-blocking
+    ``<link rel="stylesheet">`` tags:
+
+    * ``"never"`` (default) — always link; the browser caches each sheet
+      across page loads.
+    * ``"auto"`` — inline any sheet whose file size is at most
+      ``inline_stylesheet_limit`` bytes; larger sheets keep their link.
+    * ``"always"`` — inline every sheet. First paint no longer waits on a
+      stylesheet round-trip, at the cost of the CSS bytes riding along in
+      every HTML response instead of being cached once. The right trade for
+      sites where most visits are first visits.
+
+    Inlining changes *how* the styles arrive, never *which* styles: the
+    document is styled identically either way, and client-side navigation
+    still loads other pages' sheets on demand.
+
+    ``public_max_age`` is the ``Cache-Control: max-age`` (seconds) production
+    ``pyxle serve`` sends for un-hashed ``public/`` assets. Content-hashed
+    client bundles are always ``max-age=31536000, immutable`` regardless —
+    their URLs change with their bytes, so only ``public/`` needs a policy.
+
+    ``module_preload`` controls the production shell's
+    ``<link rel="modulepreload">`` hints for the page's hydration chunks.
+    ``True`` (default) flattens the module waterfall — hydration starts a
+    couple hundred milliseconds sooner on real networks. ``False`` drops the
+    hints so only the entry module is discovered pre-paint: hydration chunks
+    then download after the entry evaluates, keeping every large chunk out of
+    the pre-paint window entirely — the right trade for content-first pages
+    whose interactivity is enhancement rather than the product.
+
+    ``hydration`` is when the production client entry starts loading.
+    ``"eager"`` (default) emits the ordinary ``<script type="module">`` — the
+    browser fetches the module graph in parallel with parsing, so
+    interactivity arrives as soon as possible. ``"after-paint"`` injects that
+    script only after the first frame has been presented: the server-rendered
+    document paints with *zero* JavaScript in flight, and hydration begins a
+    frame later. The page is complete server HTML either way — this is a
+    content-first mode for pages whose interactivity is enhancement, and it
+    usually belongs together with ``modulePreload: false`` (preload hints
+    would start the downloads pre-paint again).
+    """
+
+    inline_stylesheets: str = "never"
+    inline_stylesheet_limit: int = DEFAULT_INLINE_STYLESHEET_LIMIT
+    public_max_age: int = DEFAULT_PUBLIC_MAX_AGE
+    module_preload: bool = True
+    hydration: str = "eager"
+
+    def inline_limit_for(self, size: int) -> bool:
+        """Whether a stylesheet of ``size`` bytes should be inlined."""
+        if self.inline_stylesheets == "always":
+            return True
+        if self.inline_stylesheets == "auto":
+            return size <= self.inline_stylesheet_limit
+        return False
+
+
 @dataclass(frozen=True, slots=True)
 class NavigationConfig:
     """Client-side navigation (prefetch) cache policy.
@@ -299,6 +375,7 @@ class PyxleConfig:
     cors: CorsConfig = CorsConfig()
     csrf: CsrfConfig = CsrfConfig()
     cache: CacheConfig = CacheConfig()
+    assets: AssetsConfig = AssetsConfig()
     navigation: NavigationConfig = NavigationConfig()
     rate_limit: RateLimitConfig = RateLimitConfig()
     observability: ObservabilityConfig = ObservabilityConfig()
@@ -333,6 +410,7 @@ class PyxleConfig:
             "cors": self.cors,
             "csrf": self.csrf,
             "cache": self.cache,
+            "assets": self.assets,
             "navigation": self.navigation,
             "rate_limit": self.rate_limit,
             "observability": self.observability,
@@ -447,6 +525,7 @@ def _parse_config_dict(data: Dict[str, Any], *, source: Path) -> PyxleConfig:
         "cors",
         "csrf",
         "cache",
+        "assets",
         "navigation",
         "rateLimit",
         "observability",
@@ -486,6 +565,7 @@ def _parse_config_dict(data: Dict[str, Any], *, source: Path) -> PyxleConfig:
     cors_config = _parse_cors_block(data.get("cors"), source=source)
     csrf_config = _parse_csrf_block(data.get("csrf"), source=source)
     cache_config = _parse_cache_block(data.get("cache"), source=source)
+    assets_config = _parse_assets_block(data.get("assets"), source=source)
     navigation_config = _parse_navigation_block(data.get("navigation"), source=source)
     rate_limit_config = _parse_rate_limit_block(data.get("rateLimit"), source=source)
     observability_config = _parse_observability_block(data.get("observability"), source=source)
@@ -513,6 +593,7 @@ def _parse_config_dict(data: Dict[str, Any], *, source: Path) -> PyxleConfig:
         cors=cors_config,
         csrf=csrf_config,
         cache=cache_config,
+        assets=assets_config,
         navigation=navigation_config,
         rate_limit=rate_limit_config,
         observability=observability_config,
@@ -961,6 +1042,80 @@ def _parse_cache_block(value: Any, *, source: Path) -> CacheConfig:
     return CacheConfig(routes=tuple(routes))
 
 
+def _parse_assets_block(value: Any, *, source: Path) -> AssetsConfig:
+    """Parse the ``assets`` block — production asset-delivery policy.
+
+    ``{"inlineStylesheets": "never"|"auto"|"always",
+       "inlineStylesheetLimit": <bytes>, "publicMaxAge": <seconds>}`` —
+    every key optional. See :class:`AssetsConfig`.
+    """
+    if value is None:
+        return AssetsConfig()
+    if not isinstance(value, Mapping):
+        raise ConfigError(
+            f"Invalid 'assets' block in '{source}': expected an object with "
+            f"'inlineStylesheets', 'inlineStylesheetLimit' and/or 'publicMaxAge'."
+        )
+    _reject_unknown_keys(
+        value,
+        allowed={
+            "inlineStylesheets",
+            "inlineStylesheetLimit",
+            "publicMaxAge",
+            "modulePreload",
+            "hydration",
+        },
+        source=source,
+        block="assets",
+    )
+
+    inline = value.get("inlineStylesheets", "never")
+    if inline not in ASSETS_INLINE_MODES:
+        formatted = ", ".join(f"'{mode}'" for mode in ASSETS_INLINE_MODES)
+        raise ConfigError(
+            f"Invalid value for 'assets.inlineStylesheets' in '{source}': "
+            f"expected one of {formatted}."
+        )
+
+    limit = value.get("inlineStylesheetLimit", DEFAULT_INLINE_STYLESHEET_LIMIT)
+    # bool is an int subclass — reject explicitly so 'true' isn't a byte count.
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 0:
+        raise ConfigError(
+            f"Invalid value for 'assets.inlineStylesheetLimit' in '{source}': "
+            f"expected a non-negative integer (bytes)."
+        )
+
+    max_age = value.get("publicMaxAge", DEFAULT_PUBLIC_MAX_AGE)
+    if not isinstance(max_age, int) or isinstance(max_age, bool) or max_age < 0:
+        raise ConfigError(
+            f"Invalid value for 'assets.publicMaxAge' in '{source}': "
+            f"expected a non-negative integer (seconds)."
+        )
+
+    module_preload = value.get("modulePreload", True)
+    if not isinstance(module_preload, bool):
+        raise ConfigError(
+            f"Invalid value for 'assets.modulePreload' in '{source}': "
+            f"expected a boolean."
+        )
+
+    hydration = value.get("hydration", "eager")
+    if hydration not in ASSETS_HYDRATION_MODES:
+        formatted = ", ".join(f"'{mode}'" for mode in ASSETS_HYDRATION_MODES)
+        raise ConfigError(
+            f"Invalid value for 'assets.hydration' in '{source}': "
+            f"expected one of {formatted}."
+        )
+
+    return AssetsConfig(
+        inline_stylesheets=inline,
+        inline_stylesheet_limit=limit,
+        public_max_age=max_age,
+        module_preload=module_preload,
+        hydration=hydration,
+    )
+
+
 def _parse_navigation_block(value: Any, *, source: Path) -> NavigationConfig:
     """Parse the ``navigation`` block — client prefetch/nav-cache settings.
 
@@ -1333,6 +1488,7 @@ def apply_env_overrides(config: PyxleConfig) -> PyxleConfig:
 __all__ = [
     "PyxleConfig",
     "ConfigError",
+    "AssetsConfig",
     "CorsConfig",
     "CsrfConfig",
     "DevConfig",
