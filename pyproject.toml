@@ -44,7 +44,7 @@ dependencies = [
   # unused imports, redefinitions) beyond the parser's syntax check. Tiny and
   # pure-Python with zero transitive dependencies; imported lazily so it only
   # loads for ``pyxle check``, never on the compile/serve hot path.
-  "pyflakes>=3.1,<4.0",
+  "pyflakes>=3.1,<5.0",
   # pyxle-langkit ships the self-contained JSX component extractor that powers
   # the JSX layer of ``pyxle check``. It is a default dependency so ``check``
   # works out of the box on a fresh install — previously it exited 1 on a
